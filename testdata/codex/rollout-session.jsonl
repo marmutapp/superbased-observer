@@ -1,0 +1,10 @@
+{"id":"sc","timestamp":"2026-04-16T12:00:00Z","type":"session_configured","payload":{"session_id":"cx-001","model":"gpt-5-codex","cwd":"/tmp/superbased-fixture-codex","git_branch":"main"}}
+{"id":"um-1","timestamp":"2026-04-16T12:00:01Z","type":"user_message","payload":{"content":"Show me main.go and run the tests"}}
+{"id":"tc-1","timestamp":"2026-04-16T12:00:02Z","type":"tool_call","payload":{"call_id":"call_01","tool":"file_read","input":{"path":"/tmp/superbased-fixture-codex/main.go"}}}
+{"id":"to-1","timestamp":"2026-04-16T12:00:03Z","type":"tool_output","payload":{"call_id":"call_01","output":"package main\n\nfunc main() {}","success":true}}
+{"id":"tc-2","timestamp":"2026-04-16T12:00:04Z","type":"tool_call","payload":{"call_id":"call_02","tool":"shell","input":{"command":["bash","-lc","go test ./..."]}}}
+{"id":"to-2","timestamp":"2026-04-16T12:00:05Z","type":"tool_output","payload":{"call_id":"call_02","output":"FAIL\nexit status 1","success":false}}
+{"id":"tk-1","timestamp":"2026-04-16T12:00:05Z","type":"token_count","payload":{"input_tokens":1000,"output_tokens":220,"cached_input_tokens":800,"model":"gpt-5-codex"}}
+{"id":"tc-3","timestamp":"2026-04-16T12:00:10Z","type":"tool_call","payload":{"call_id":"call_03","tool":"web_search","input":{"query":"go testing best practices"}}}
+{"id":"to-3","timestamp":"2026-04-16T12:00:11Z","type":"tool_output","payload":{"call_id":"call_03","output":"[result list]","success":true}}
+{"id":"tk-2","timestamp":"2026-04-16T12:00:12Z","type":"token_count","payload":{"input_tokens":1600,"output_tokens":340,"cached_input_tokens":1200,"model":"gpt-5-codex"}}

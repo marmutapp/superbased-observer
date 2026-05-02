@@ -1,0 +1,48 @@
+{
+  "name": "@superbased/observer",
+  "version": "0.0.0",
+  "description": "SuperBased Observer — capture, normalize, compress, and analyze AI coding tool activity across Claude Code, Codex, Cursor, Cline/Roo, and Copilot.",
+  "keywords": [
+    "ai",
+    "observability",
+    "anthropic",
+    "openai",
+    "claude-code",
+    "codex",
+    "cursor",
+    "mcp",
+    "tokens",
+    "cost"
+  ],
+  "homepage": "https://github.com/marmutapp/superbased-observer",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/marmutapp/superbased-observer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/marmutapp/superbased-observer/issues"
+  },
+  "license": "Apache-2.0",
+  "author": "Santosh Kathira <contact@marmut.app>",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "observer": "bin/observer.js"
+  },
+  "files": [
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "optionalDependencies": {
+    "@superbased/observer-linux-x64": "0.0.0",
+    "@superbased/observer-linux-arm64": "0.0.0",
+    "@superbased/observer-darwin-x64": "0.0.0",
+    "@superbased/observer-darwin-arm64": "0.0.0",
+    "@superbased/observer-win32-x64": "0.0.0"
+  },
+  "scripts": {
+    "test": "node bin/observer.js --version"
+  }
+}

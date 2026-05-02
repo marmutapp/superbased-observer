@@ -1,0 +1,62 @@
+# Binaries
+bin/
+*.exe
+*.test
+*.out
+
+# But re-include the npm-package shim and platform-bin placeholder
+# files. The bin/ rule above hides Go build outputs everywhere; npm/
+# packages legitimately need a bin/ directory in source for the Node
+# shim and for .gitkeep placeholders that the release CI fills with
+# the cross-compiled binaries.
+!npm/observer/bin/
+!npm/observer/bin/observer.js
+!npm/observer-*/bin/
+!npm/observer-*/bin/.gitkeep
+
+# Build artifacts
+dist/
+build/
+
+# Go
+*.o
+*.so
+*.dylib
+vendor/
+
+# Coverage
+coverage.txt
+coverage.html
+*.cover
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local databases / scratch
+*.db
+*.db-wal
+*.db-shm
+.observer/
+tmp/
+
+# Secrets / env
+.env
+.env.local
+
+# Internal docs — kept locally on the private repo for development
+# context, untracked from the public repo. The dashboard's runtime
+# walkthrough asset under internal/intelligence/dashboard/static/ is
+# unaffected.
+/CLAUDE.md
+/PROGRESS.md
+/kickstart-prompt.md
+/superbased-final-spec-v2.md
+/docs/
+/scripts/release.sh

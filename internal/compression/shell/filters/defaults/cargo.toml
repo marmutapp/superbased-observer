@@ -1,0 +1,15 @@
+# Default filter for `cargo`. Drops the `Fresh` cache-hit progress lines
+# that cargo emits once per up-to-date crate — commonly the bulk of a
+# workspace build output — while keeping `Compiling`, `Finished`, and
+# warning/error lines.
+
+command = "cargo"
+description = "drop cargo 'Fresh' cache-hit progress and squash blank lines"
+
+[[rule]]
+type = "line_drop"
+pattern = '^\s*Fresh\s'
+comment = "crate already cached; no work performed"
+
+[[rule]]
+type = "squash_whitespace"

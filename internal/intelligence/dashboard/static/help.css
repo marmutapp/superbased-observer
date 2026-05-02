@@ -1,0 +1,500 @@
+/* SuperBased Observer — help system styles.
+   Owned by static/help.js (popover + drawer).
+   Loading-state styles also live here since they're cross-cutting UI
+   polish keyed off the same single-page app. */
+
+/* ---------- Toggle button group ---------- */
+/* Used on charts that need a unit/mode switch (tokens vs bytes,
+   linear vs log, etc.). Renders as a connected pill of small buttons
+   matching the dark theme. */
+.toggle-group {
+  display: inline-flex;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #0e1117;
+}
+.toggle-group button {
+  background: transparent;
+  color: #8b949e;
+  border: 0;
+  padding: 0.25rem 0.65rem;
+  font: inherit;
+  font-size: 0.72rem;
+  cursor: pointer;
+  border-right: 1px solid #30363d;
+}
+.toggle-group button:last-child { border-right: 0; }
+.toggle-group button:hover { color: #e6edf3; background: #1c2128; }
+.toggle-group button.active {
+  background: #1c2128;
+  color: #58a6ff;
+  font-weight: 600;
+}
+
+/* ---------- Loading states ---------- */
+@keyframes obs-spin { to { transform: rotate(360deg); } }
+@keyframes obs-shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+@keyframes obs-progress {
+  0%   { left: -30%; }
+  100% { left: 100%; }
+}
+
+/* Top-of-page progress bar — non-blocking, fires during loadTab. */
+#load-bar {
+  position: fixed;
+  top: 0; left: 0;
+  height: 2px;
+  width: 100%;
+  background: transparent;
+  z-index: 500;
+  pointer-events: none;
+  display: none;
+}
+body.tab-loading #load-bar { display: block; }
+body.tab-loading #load-bar::before {
+  content: '';
+  position: absolute;
+  top: 0; bottom: 0;
+  left: -30%;
+  width: 30%;
+  background: linear-gradient(90deg, transparent, #58a6ff, transparent);
+  animation: obs-progress 1.1s ease-in-out infinite;
+}
+
+/* Spinner glyph — used inline on buttons. */
+.spinner {
+  display: inline-block;
+  width: 0.9em;
+  height: 0.9em;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: obs-spin 0.8s linear infinite;
+  vertical-align: -2px;
+  margin-right: 0.35rem;
+}
+
+/* Disabled-during-action state for toolbar buttons. */
+.toolbar button.is-loading {
+  opacity: 0.55;
+  pointer-events: none;
+  cursor: progress;
+}
+
+/* Chart-panel loading overlay. The .panel wraps a canvas inside
+   .chart-wrap; while .loading is on the section/panel, show an
+   absolute overlay with a centered spinner. */
+.panel { position: relative; }
+section.tab-loading .panel .chart-wrap::after,
+.panel.is-loading .chart-wrap::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: rgba(14, 17, 23, 0.55);
+  border-radius: 6px;
+  z-index: 5;
+}
+section.tab-loading .panel .chart-wrap::before,
+.panel.is-loading .chart-wrap::before {
+  content: '';
+  position: absolute;
+  /* Centering via calc() rather than `transform: translate(-50%, -50%)`
+     because the obs-spin animation re-sets the `transform` property
+     every frame to rotate(N) — that overrides the translate and the
+     spinner drifts to the top-left between frames before the rotation
+     reset, producing visible jitter. With absolute top/left calc'd
+     against the parent, the only transform on the element is the
+     rotation, which keeps the spinner pinned. */
+  top: calc(50% - 14px);
+  left: calc(50% - 14px);
+  width: 28px;
+  height: 28px;
+  border: 3px solid #30363d;
+  border-top-color: #58a6ff;
+  border-radius: 50%;
+  animation: obs-spin 0.8s linear infinite;
+  z-index: 6;
+}
+
+/* Table skeleton rows — when a tab is loading, render shimmery
+   placeholder cells over the existing tbody. We render the placeholder
+   via td.empty.skeleton class on the JS side; a simpler CSS-only
+   variant: pulse opacity on the existing tbody to signal "stale". */
+section.tab-loading table tbody {
+  opacity: 0.55;
+  transition: opacity 0.2s;
+}
+
+/* Empty-chart placeholder — shown when a chart has no data. The
+   .chart-wrap gets an .empty class via JS; CSS positions an SVG icon
+   + message centered with a subtle pulse to signal "we're alive,
+   just nothing to plot". */
+.chart-wrap.empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.chart-wrap.empty canvas {
+  display: none;
+}
+.chart-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  color: #6e7681;
+  text-align: center;
+  padding: 1rem;
+  animation: obs-empty-pulse 3s ease-in-out infinite;
+}
+.chart-empty-state svg {
+  width: 56px;
+  height: 56px;
+  stroke: #58a6ff;
+  stroke-width: 1.5;
+  fill: none;
+  opacity: 0.7;
+}
+.chart-empty-state .chart-empty-title {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #8b949e;
+}
+.chart-empty-state .chart-empty-msg {
+  font-size: 0.75rem;
+  color: #6e7681;
+  max-width: 380px;
+  line-height: 1.45;
+}
+.chart-empty-state .chart-empty-msg code {
+  background: #0e1117;
+  border: 1px solid #30363d;
+  padding: 0.05rem 0.35rem;
+  border-radius: 3px;
+  color: #d2a8ff;
+  font-size: 0.72rem;
+}
+@keyframes obs-empty-pulse {
+  0%, 100% { opacity: 0.85; }
+  50%      { opacity: 0.6; }
+}
+
+/* KPI card skeleton — pulse the value + sub fields while loading. */
+section.tab-loading .card .value,
+section.tab-loading .card .sub {
+  background: linear-gradient(90deg,
+    #1c2128 25%,
+    rgba(48, 54, 61, 0.6) 50%,
+    #1c2128 75%);
+  background-size: 200% 100%;
+  animation: obs-shimmer 1.4s infinite;
+  color: transparent;
+  border-radius: 3px;
+  min-height: 1em;
+}
+section.tab-loading .card .value { min-height: 1.4rem; }
+
+
+
+/* hover popover */
+#help-tip {
+  position: fixed;
+  z-index: 200;
+  max-width: 340px;
+  background: #1c2128;
+  color: #e6edf3;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 0.55rem 0.7rem;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+  font-size: 0.75rem;
+  line-height: 1.35;
+  pointer-events: none;
+}
+#help-tip .help-tip-title {
+  font-weight: 600;
+  color: #58a6ff;
+  margin-bottom: 0.2rem;
+}
+#help-tip .help-tip-line { color: #e6edf3; }
+#help-tip .help-tip-hint {
+  margin-top: 0.35rem;
+  color: #8b949e;
+  font-size: 0.68rem;
+  font-style: italic;
+}
+
+/* visual cue that an element has help */
+[data-help] {
+  cursor: help;
+}
+th[data-help],
+.card .label[data-help] {
+  text-decoration: underline dotted rgba(139, 148, 158, 0.6);
+  text-underline-offset: 3px;
+}
+nav button[data-help],
+.toolbar label[data-help],
+.panel h3[data-help] {
+  /* don't underline these — they already have visual affordance */
+  text-decoration: none;
+}
+
+/* topbar help button */
+#help-btn {
+  background: transparent;
+  color: #8b949e;
+  border: 1px solid #30363d;
+  padding: 0.25rem 0.55rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+  margin-left: 0.5rem;
+}
+#help-btn:hover { color: #e6edf3; background: #1c2128; }
+
+/* tab description strip — one-liner under each <h2> */
+section h2 + .tab-blurb {
+  color: #8b949e;
+  font-size: 0.78rem;
+  margin: -0.3rem 0 0.7rem;
+  font-style: italic;
+}
+
+/* drawer */
+#help-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: min(560px, 96vw);
+  height: 100vh;
+  background: #161b22;
+  border-left: 1px solid #30363d;
+  box-shadow: -10px 0 30px rgba(0, 0, 0, 0.4);
+  z-index: 300;
+  display: flex;
+  flex-direction: column;
+  transform: translateX(100%);
+  transition: transform 0.18s ease-out;
+}
+#help-drawer.open { transform: translateX(0); }
+
+.help-drawer-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.6rem 0.85rem;
+  border-bottom: 1px solid #30363d;
+  background: #1c2128;
+}
+.help-drawer-head #help-search {
+  flex: 1;
+  background: #0e1117;
+  color: #e6edf3;
+  border: 1px solid #30363d;
+  padding: 0.35rem 0.55rem;
+  font: inherit;
+  border-radius: 4px;
+}
+.help-drawer-head #help-close {
+  background: transparent;
+  color: #8b949e;
+  border: 1px solid #30363d;
+  width: 1.9rem;
+  height: 1.9rem;
+  font-size: 1.1rem;
+  border-radius: 4px;
+  cursor: pointer;
+  line-height: 1;
+}
+.help-drawer-head #help-close:hover { color: #e6edf3; background: #21262d; }
+
+.help-drawer-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.6rem 0.9rem 1.5rem;
+}
+.help-drawer-foot {
+  border-top: 1px solid #30363d;
+  padding: 0.55rem 0.85rem;
+  background: #1c2128;
+  color: #8b949e;
+  font-size: 0.72rem;
+}
+.help-drawer-foot kbd {
+  background: #0e1117;
+  border: 1px solid #30363d;
+  border-radius: 3px;
+  padding: 0 0.3rem;
+  font-size: 0.7rem;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+}
+.help-drawer-foot a { color: #58a6ff; text-decoration: none; }
+.help-drawer-foot a:hover { text-decoration: underline; }
+
+.help-cat {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: #8b949e;
+  margin: 0.9rem 0 0.4rem;
+  padding-bottom: 0.25rem;
+  border-bottom: 1px solid #30363d;
+}
+
+.help-entry {
+  margin-bottom: 0.7rem;
+  padding: 0.55rem 0.7rem;
+  background: #1c2128;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  transition: background 0.18s, border-color 0.18s;
+}
+.help-entry.flash {
+  background: #1f2a3d;
+  border-color: #58a6ff;
+}
+.help-entry-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.25rem;
+}
+.help-entry-title {
+  color: #58a6ff;
+  font-weight: 600;
+  text-decoration: none;
+  font-size: 0.85rem;
+}
+.help-entry-title:hover { text-decoration: underline; }
+.help-entry-cat {
+  color: #8b949e;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.help-entry-line {
+  color: #e6edf3;
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+.help-entry-desc {
+  color: #c9d1d9;
+  font-size: 0.76rem;
+  line-height: 1.5;
+  margin-top: 0.4rem;
+}
+.help-entry-why {
+  margin-top: 0.45rem;
+  padding: 0.4rem 0.55rem;
+  background: rgba(88, 166, 255, 0.07);
+  border-left: 3px solid #58a6ff;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  color: #e6edf3;
+  line-height: 1.45;
+}
+.help-entry-why .why-label {
+  display: block;
+  color: #58a6ff;
+  font-weight: 600;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 0.2rem;
+}
+.help-entry-actionable {
+  margin-top: 0.35rem;
+  font-size: 0.72rem;
+  color: #c9d1d9;
+}
+.help-entry-methodology {
+  margin-top: 0.55rem;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  background: #0e1117;
+}
+.help-entry-methodology > summary {
+  cursor: pointer;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.72rem;
+  color: #58a6ff;
+  font-weight: 600;
+  list-style: none;
+  user-select: none;
+}
+.help-entry-methodology > summary::-webkit-details-marker { display: none; }
+.help-entry-methodology > summary::before {
+  content: '▸ ';
+  color: #8b949e;
+  font-weight: 400;
+}
+.help-entry-methodology[open] > summary::before {
+  content: '▾ ';
+}
+.help-entry-methodology > summary:hover { color: #79c0ff; }
+.help-entry-methodology[open] > summary {
+  border-bottom: 1px solid #30363d;
+  color: #c9d1d9;
+}
+.help-entry-methodology > p {
+  margin: 0.45rem 0.7rem;
+  font-size: 0.74rem;
+  color: #c9d1d9;
+  line-height: 1.55;
+}
+.help-entry-methodology > p:first-of-type { margin-top: 0.55rem; }
+.help-entry-methodology > p:last-of-type { margin-bottom: 0.55rem; }
+.help-entry-methodology code {
+  background: #1c2128;
+  border: 1px solid #30363d;
+  padding: 0.05rem 0.3rem;
+  border-radius: 3px;
+  color: #d2a8ff;
+  font-size: 0.7rem;
+}
+.help-entry-methodology strong {
+  color: #e6edf3;
+  font-weight: 600;
+}
+.help-entry-formula,
+.help-entry-source,
+.help-entry-example,
+.help-entry-related {
+  margin-top: 0.35rem;
+  font-size: 0.72rem;
+  color: #c9d1d9;
+}
+.help-entry-related a {
+  color: #58a6ff;
+  text-decoration: none;
+}
+.help-entry-related a:hover { text-decoration: underline; }
+.help-entry .muted {
+  color: #8b949e;
+  text-transform: uppercase;
+  font-size: 0.65rem;
+  letter-spacing: 0.05em;
+  margin-right: 0.35rem;
+}
+.help-entry code {
+  background: #0e1117;
+  border: 1px solid #30363d;
+  padding: 0.05rem 0.3rem;
+  border-radius: 3px;
+  color: #d2a8ff;
+  font-size: 0.72rem;
+}
+.help-empty {
+  color: #8b949e;
+  font-style: italic;
+  padding: 1rem;
+  text-align: center;
+}

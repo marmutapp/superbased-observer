@@ -1,0 +1,182 @@
+# Release the observer Go binary as 6 npm packages whenever a v* tag
+# is pushed.
+#
+# Flow:
+#   1. build job (matrix x5)  — cross-compile each binary, upload as
+#                               an artifact named after the platform
+#                               package directory.
+#   2. publish job            — pull all 5 binary artifacts, drop them
+#                               into npm/observer-<plat>-<arch>/bin/,
+#                               stamp the version into every
+#                               package.json, npm publish each
+#                               platform package, then publish the
+#                               main package last so its
+#                               optionalDependencies resolve.
+#
+# Auth: NPM_TOKEN_OBSERVER repo secret — a granular npm token scoped
+# to @superbased/observer*. See docs at
+# https://docs.npmjs.com/about-access-tokens.
+
+name: npm-release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  # ----------------------------------------------------------------
+  # Build the 5 platform binaries in parallel.
+  # ----------------------------------------------------------------
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: linux-x64
+            goos: linux
+            goarch: amd64
+            ext: ''
+          - target: linux-arm64
+            goos: linux
+            goarch: arm64
+            ext: ''
+          - target: darwin-x64
+            goos: darwin
+            goarch: amd64
+            ext: ''
+          - target: darwin-arm64
+            goos: darwin
+            goarch: arm64
+            ext: ''
+          - target: win32-x64
+            goos: windows
+            goarch: amd64
+            ext: '.exe'
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Cross-compile
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'  # pure-Go thanks to modernc.org/sqlite
+        run: |
+          # Strip the leading 'v' from the tag (v1.2.3 -> 1.2.3) so the
+          # binary's `observer --version` matches the npm package version.
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p npm/observer-${{ matrix.target }}/bin
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+            -o npm/observer-${{ matrix.target }}/bin/observer${{ matrix.ext }} \
+            ./cmd/observer
+          # Make the unix binary executable. Windows .exe is fine as-is.
+          if [ -z "${{ matrix.ext }}" ]; then
+            chmod +x npm/observer-${{ matrix.target }}/bin/observer
+          fi
+          ls -l npm/observer-${{ matrix.target }}/bin/
+          # Sanity-check the embedded version inline on the linux-x64
+          # build (the runner OS) — fail the job if it doesn't match.
+          if [ "${{ matrix.target }}" = "linux-x64" ]; then
+            EMBEDDED=$(./npm/observer-linux-x64/bin/observer --version 2>&1 | head -1 | awk '{print $NF}')
+            if [ "$EMBEDDED" != "$VERSION" ]; then
+              echo "::error::version mismatch: --version reports '$EMBEDDED' want '$VERSION'"
+              exit 1
+            fi
+            echo "embedded version: $EMBEDDED ✓"
+          fi
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: observer-${{ matrix.target }}
+          path: npm/observer-${{ matrix.target }}/bin/observer${{ matrix.ext }}
+          retention-days: 7
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------
+  # Publish all 6 packages from a single job after every binary is
+  # built. Sequential publish so a failure mid-flight is recoverable
+  # (idempotent — npm rejects re-publishing the same version, so just
+  # re-run from where it stopped).
+  # ----------------------------------------------------------------
+  publish:
+    name: publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download all platform binaries
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+
+      - name: Place binaries in their package directories
+        run: |
+          set -euo pipefail
+          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            mkdir -p "npm/observer-${target}/bin"
+            cp "artifacts/observer-${target}/observer" "npm/observer-${target}/bin/observer"
+            chmod +x "npm/observer-${target}/bin/observer"
+          done
+          mkdir -p npm/observer-win32-x64/bin
+          cp artifacts/observer-win32-x64/observer.exe npm/observer-win32-x64/bin/observer.exe
+          # Sanity print before publish so the workflow log shows
+          # exactly which binaries were packaged.
+          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+            echo "=== npm/observer-${target}/bin/ ==="
+            ls -l "npm/observer-${target}/bin/"
+          done
+
+      - name: Stamp release version into every package.json
+        run: ./scripts/sync-npm-version.sh "${GITHUB_REF_NAME}"
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN_OBSERVER }}
+        run: |
+          set -euo pipefail
+          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+            (cd "npm/observer-${target}" && npm publish --access public)
+          done
+
+      - name: Publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN_OBSERVER }}
+        run: |
+          # Main goes last so its optionalDependencies resolve cleanly
+          # for any user installing the moment after this step finishes.
+          cd npm/observer && npm publish --access public
+
+      - name: Summary
+        run: |
+          {
+            echo "## npm-release ${GITHUB_REF_NAME} published"
+            echo ""
+            echo "Six packages updated:"
+            echo "- \`@superbased/observer@${GITHUB_REF_NAME#v}\`"
+            for t in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+              echo "- \`@superbased/observer-${t}@${GITHUB_REF_NAME#v}\`"
+            done
+            echo ""
+            echo "Smoke test:"
+            echo '```bash'
+            echo "npm install -g @superbased/observer@${GITHUB_REF_NAME#v}"
+            echo "observer --version"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

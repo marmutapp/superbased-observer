@@ -1,0 +1,22 @@
+{
+  "name": "@superbased/observer-linux-arm64",
+  "version": "0.0.0",
+  "description": "Linux arm64 binary for @superbased/observer.",
+  "homepage": "https://github.com/marmutapp/superbased-observer",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/marmutapp/superbased-observer.git"
+  },
+  "license": "Apache-2.0",
+  "author": "Santosh Kathira <contact@marmut.app>",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin",
+    "README.md"
+  ]
+}

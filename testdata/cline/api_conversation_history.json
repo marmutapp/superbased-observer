@@ -1,0 +1,53 @@
+[
+  {
+    "role": "user",
+    "ts": 1713261600000,
+    "content": "Refactor the auth middleware and run tests"
+  },
+  {
+    "role": "assistant",
+    "ts": 1713261601000,
+    "model": "claude-sonnet-4-20250514",
+    "content": [
+      {"type": "text", "text": "I'll read the middleware file first."},
+      {"type": "tool_use", "id": "cl_01", "name": "read_file", "input": {"path": "/tmp/superbased-fixture-cline/auth.go"}}
+    ],
+    "usage": {"input_tokens": 2000, "output_tokens": 80, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 1500}
+  },
+  {
+    "role": "user",
+    "ts": 1713261602000,
+    "content": [
+      {"type": "tool_result", "tool_use_id": "cl_01", "content": "package auth\n\nfunc Middleware() {}", "is_error": false}
+    ]
+  },
+  {
+    "role": "assistant",
+    "ts": 1713261603000,
+    "model": "claude-sonnet-4-20250514",
+    "content": [
+      {"type": "tool_use", "id": "cl_02", "name": "replace_in_file", "input": {"path": "/tmp/superbased-fixture-cline/auth.go", "diff": "..."}}
+    ]
+  },
+  {
+    "role": "user",
+    "ts": 1713261604000,
+    "content": [
+      {"type": "tool_result", "tool_use_id": "cl_02", "content": "applied", "is_error": false}
+    ]
+  },
+  {
+    "role": "assistant",
+    "ts": 1713261605000,
+    "content": [
+      {"type": "tool_use", "id": "cl_03", "name": "execute_command", "input": {"command": "go test ./..."}}
+    ]
+  },
+  {
+    "role": "user",
+    "ts": 1713261606000,
+    "content": [
+      {"type": "tool_result", "tool_use_id": "cl_03", "content": "--- FAIL: TestAuth\nexit status 1", "is_error": true}
+    ]
+  }
+]

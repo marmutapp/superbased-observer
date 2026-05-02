@@ -1,0 +1,19 @@
+# Default filter for `git`. Strips git's chatty usage hints and the
+# "(use \"git add ...\")" inline advice blocks that show up in git status,
+# git diff --stat, git push, etc. Real diffs / status lines are left intact.
+
+command = "git"
+description = "strip git usage hints and collapse blank runs"
+
+[[rule]]
+type = "line_drop"
+pattern = '^hint:'
+comment = "`hint:` lines emitted by advice.* configuration"
+
+[[rule]]
+type = "line_drop"
+pattern = '^\s*\(use "git '
+comment = "parenthesized (use \"git ...\") inline advice"
+
+[[rule]]
+type = "squash_whitespace"

@@ -1,0 +1,3822 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SuperBased Observer — Dashboard</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="favicon.png">
+<link rel="apple-touch-icon" href="favicon.png">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js" defer></script>
+<link rel="stylesheet" href="help.css">
+<script src="help.js" defer></script>
+<style>
+  :root {
+    --bg: #0e1117; --panel: #161b22; --panel2: #1c2128; --line: #30363d;
+    --fg: #e6edf3; --fg-mute: #8b949e; --accent: #58a6ff; --warn: #f85149;
+    --ok: #3fb950; --warn2: #d29922; --chart1: #58a6ff; --chart2: #d2a8ff;
+    --chart3: #ffa657; --chart4: #f778ba; --chart5: #56d364;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: ui-monospace, Menlo, Consolas, monospace;
+    margin: 0; color: var(--fg); background: var(--bg); font-size: 13px; }
+  header { padding: 1rem 1.25rem; border-bottom: 1px solid var(--line);
+    background: var(--panel); display: flex; align-items: center;
+    justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+  header h1 { font-size: 0.95rem; margin: 0; font-weight: 600;
+    display: flex; align-items: center; gap: 0.55rem; }
+  header h1 img.logo { height: 22px; width: auto; display: block; }
+  header .meta { color: var(--fg-mute); font-size: 0.75rem; }
+  nav { display: flex; gap: 0.25rem; padding: 0.4rem 0.75rem; flex-wrap: wrap;
+    background: var(--panel); border-bottom: 1px solid var(--line); }
+  nav button { background: transparent; border: 1px solid transparent;
+    color: var(--fg-mute); padding: 0.3rem 0.7rem; font: inherit;
+    cursor: pointer; border-radius: 6px; }
+  nav button:hover { color: var(--fg); background: var(--panel2); }
+  nav button.active { color: var(--fg); background: var(--panel2);
+    border-color: var(--line); }
+  .toolbar { display: flex; gap: 0.5rem; align-items: center;
+    padding: 0.5rem 1.25rem; background: var(--panel); border-bottom: 1px solid var(--line);
+    flex-wrap: wrap; }
+  .toolbar label { color: var(--fg-mute); font-size: 0.75rem; }
+  .toolbar select, .toolbar input {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+    padding: 0.25rem 0.5rem; font: inherit; border-radius: 4px; min-width: 90px; }
+  .toolbar button { background: var(--accent); color: #0d1117; border: 0;
+    padding: 0.3rem 0.7rem; border-radius: 4px; cursor: pointer; font: inherit;
+    font-weight: 600; }
+  .toolbar button.ghost { background: transparent; color: var(--fg-mute);
+    border: 1px solid var(--line); }
+  main { padding: 1rem 1.25rem; max-width: 1600px; margin: 0 auto; }
+  section { display: none; }
+  section.active { display: block; }
+  section h2 { font-size: 0.95rem; margin: 0 0 0.6rem;
+    color: var(--fg-mute); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+  .grid { display: grid; gap: 0.75rem; }
+  .grid.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  @media (max-width: 900px) {
+    .grid.cols-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.cols-2 { grid-template-columns: 1fr; }
+  }
+  .card { background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 0.85rem; }
+  .card .label { color: var(--fg-mute); font-size: 0.7rem; text-transform: uppercase;
+    letter-spacing: 0.05em; margin-bottom: 0.25rem; }
+  .card .value { font-size: 1.4rem; font-weight: 600; }
+  .card .sub { color: var(--fg-mute); font-size: 0.7rem; margin-top: 0.2rem; }
+  .panel { background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+  .panel h3 { font-size: 0.9rem; margin: 0 0 0.7rem;
+    color: var(--fg); font-weight: 600; }
+  .panel .panel-meta { color: var(--fg-mute); font-size: 0.75rem; margin-bottom: 0.5rem; }
+  .chart-wrap { position: relative; height: 280px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
+  th, td { text-align: left; padding: 0.35rem 0.6rem;
+    border-bottom: 1px solid var(--line); white-space: nowrap; vertical-align: top; }
+  th { font-weight: 600; color: var(--fg-mute);
+    text-transform: uppercase; letter-spacing: 0.04em; font-size: 0.7rem;
+    cursor: pointer; }
+  td { color: var(--fg); }
+  tr.row-clickable { cursor: pointer; }
+  tr.row-clickable:hover td { background: var(--panel2); }
+  .number { text-align: right; font-variant-numeric: tabular-nums; }
+  .warn { color: var(--warn); }
+  .ok { color: var(--ok); }
+  .muted { color: var(--fg-mute); }
+  .pill { display: inline-block; padding: 0.05rem 0.35rem;
+    border-radius: 8px; font-size: 0.7rem; background: var(--panel2);
+    color: var(--fg-mute); border: 1px solid var(--line); }
+  .pager { display: flex; gap: 0.5rem; align-items: center; margin-top: 0.7rem;
+    color: var(--fg-mute); font-size: 0.75rem; }
+  .pager button { background: transparent; color: var(--fg);
+    border: 1px solid var(--line); padding: 0.2rem 0.5rem;
+    cursor: pointer; border-radius: 3px; }
+  .pager button:disabled { opacity: 0.4; cursor: default; }
+  .empty { color: var(--fg-mute); padding: 1.2rem; text-align: center;
+    font-style: italic; }
+  .modal-back { position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+    display: none; align-items: flex-start; justify-content: center;
+    z-index: 100; padding: 4rem 1rem 1rem; overflow-y: auto; }
+  .modal-back.open { display: flex; }
+  .modal { background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; max-width: 1400px; width: 100%; padding: 1.2rem;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    /* Belt-and-braces clip — children that are intrinsically wider
+       (a long table cell, a chart canvas, etc.) overflow the modal's
+       layout box. Without this they render past the visible edge,
+       and on top of horizontal-scroll-active pages the modal-back's
+       fixed positioning leaves visible gaps. Clip everything that
+       reaches past the modal's bounds — every panel inside should
+       have its OWN scroll container if it has wide content.
+       Width was bumped 1000→1400 in v1.4.28 after the per-message
+       timeline grew two columns (Elapsed + Tool time) — at 1000px
+       the messages table forced a horizontal scrollbar on every
+       session detail. */
+    overflow-x: hidden; }
+  .modal-header { display: flex; justify-content: space-between;
+    align-items: center; margin-bottom: 1rem; }
+  .modal-header h3 { margin: 0; }
+  .modal-header button { background: transparent; color: var(--fg-mute);
+    border: 1px solid var(--line); padding: 0.2rem 0.6rem; cursor: pointer;
+    font: inherit; border-radius: 4px; }
+  code { background: var(--panel2); padding: 0.05rem 0.3rem; border-radius: 3px;
+    color: var(--accent); }
+
+  /* Toast spinner animation — used by showToast for the running state. */
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Session-id link styling. Default browser blue is too bright on the
+     dark panel; align with the rest of the dashboard's accent + add a
+     subtle underline-on-hover for affordance. */
+  a.session-link, .row-clickable {
+    color: var(--accent); text-decoration: none; cursor: pointer;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+  }
+  a.session-link:hover, .row-clickable:hover { text-decoration: underline; }
+  a.session-link:visited { color: var(--accent); }
+
+  /* Session-detail messages table scroller. Without this the table's
+     global td { white-space: nowrap } combined with wide ID + target
+     columns + the colSpan=12 expand row pushes the table past the
+     modal's 1400px max-width on narrower viewports. Scoped horizontal
+     scroll keeps the panel boundaries intact. The width:100% (not
+     just max-width) forces the scroller to fill its parent's content
+     area instead of growing with the intrinsic width of the table
+     inside it — without that, max-width alone has no effect because
+     the parent has no definite width and the scroller's auto-width
+     follows the table. */
+  .session-messages-scroller { overflow-x: auto; max-width: 100%; width: 100%; }
+
+  /* Truncated-id affordance — visible hint that the full value is
+     available on hover and click-to-copy. Without the hint users
+     don't know the truncated `aabbcc…` is interactive. Pairs with
+     the title attribute for the actual hover tooltip. */
+  .id-copy {
+    cursor: copy;
+    border-bottom: 1px dotted var(--fg-mute);
+  }
+  .id-copy:hover { border-bottom-color: var(--accent); color: var(--accent); }
+  .id-copy.copied { color: var(--ok); border-bottom-color: var(--ok); }
+  /* Expandable text — pre-truncated content the user can click to
+     reveal in full. Marker (…) at the end lets the eye spot truncation
+     before hovering. */
+  .expandable { cursor: pointer; }
+  .expandable:hover { color: var(--accent); }
+  .expandable.expanded { white-space: normal; word-break: break-word; }
+  /* Expand row (the "N ▾" pill's drop-down) wraps long target / error
+     text instead of inheriting the global nowrap rule, so the inline
+     tool-call entries don't push the parent table wider. */
+  tr.session-message-tools td { white-space: normal; word-break: break-word; }
+
+  /* Backfill table — long descriptions wrap, action column stays put.
+     Without this scoped override, the global td white-space: nowrap
+     forces a horizontal scrollbar (B1). Drops the Flag column at <
+     900px to keep the table readable on narrower screens. */
+  table.backfill-table { table-layout: fixed; width: 100%; }
+  table.backfill-table th, table.backfill-table td {
+    white-space: normal; word-break: break-word; vertical-align: top; }
+  table.backfill-table .col-mode  { width: 14%; min-width: 140px; }
+  table.backfill-table .col-flag  { width: 16%; min-width: 160px; }
+  table.backfill-table .col-cand  { width: 9%;  min-width: 80px; }
+  table.backfill-table .col-desc  { width: 42%; }
+  table.backfill-table .col-stat  { width: 10%; min-width: 88px; }
+  table.backfill-table .col-act   { width: 9%;  min-width: 70px; }
+  @media (max-width: 900px) {
+    table.backfill-table .col-flag { display: none; }
+    table.backfill-table .col-mode { width: 22%; }
+    table.backfill-table .col-desc { width: 50%; }
+  }
+
+  /* Settings tab — left rail + content pane. Stacks under 900px width
+     so mobile users still get a usable view. */
+  .settings-shell { display: grid; grid-template-columns: 220px 1fr; gap: 1rem; }
+  .settings-rail { display: flex; flex-direction: column; gap: 0.2rem;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 0.5rem; align-self: start; }
+  .settings-rail button { background: transparent; border: 1px solid transparent;
+    color: var(--fg-mute); padding: 0.4rem 0.6rem; font: inherit;
+    cursor: pointer; border-radius: 6px; text-align: left; width: 100%; }
+  .settings-rail button:hover { color: var(--fg); background: var(--panel2); }
+  .settings-rail button.active { color: var(--fg); background: var(--panel2);
+    border-color: var(--line); }
+  .settings-content { background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 1rem; min-height: 320px; }
+  .settings-content textarea { width: 100%; min-height: 320px; font-family:
+    ui-monospace, Menlo, Consolas, monospace; font-size: 0.78rem;
+    background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 4px; padding: 0.5rem; resize: vertical; }
+  .settings-content pre { background: var(--bg); border: 1px solid var(--line);
+    border-radius: 4px; padding: 0.6rem; overflow-x: auto; font-size: 0.78rem;
+    color: var(--fg); margin: 0; }
+  .settings-status { color: var(--fg-mute); font-size: 0.75rem;
+    margin: 0.5rem 0 0; }
+  @media (max-width: 900px) {
+    .settings-shell { grid-template-columns: 1fr; }
+    .settings-rail { flex-direction: row; flex-wrap: wrap; }
+  }
+</style>
+</head>
+<body>
+<div id="load-bar"></div>
+<header>
+  <div>
+    <h1><img class="logo" src="logo-white.png" alt="SuperBased">SuperBased Observer Dashboard</h1>
+    <div class="meta" id="db-meta">loading…</div>
+  </div>
+  <div style="display: flex; align-items: center; gap: 0.5rem;">
+    <div class="meta" id="last-refresh"></div>
+    <button id="help-btn" onclick="window.openHelp && window.openHelp()" title="Open help drawer (or press ?)">? Help</button>
+  </div>
+</header>
+<nav id="nav">
+  <button data-tab="overview" data-help="tab.overview" class="active">Overview</button>
+  <button data-tab="cost" data-help="tab.cost">Cost</button>
+  <button data-tab="analysis" data-help="tab.analysis">Analysis</button>
+  <button data-tab="sessions" data-help="tab.sessions">Sessions</button>
+  <button data-tab="actions" data-help="tab.actions">Actions</button>
+  <button data-tab="tools" data-help="tab.tools">Tools</button>
+  <button data-tab="compression" data-help="tab.compression">Compression</button>
+  <button data-tab="discover" data-help="tab.discovery">Discovery</button>
+  <button data-tab="patterns" data-help="tab.patterns">Patterns</button>
+  <button data-tab="settings" data-help="tab.settings">Settings</button>
+</nav>
+<div class="toolbar">
+  <label data-help="filter.window">window</label>
+  <select id="window">
+    <option value="7">7 days</option>
+    <option value="30" selected>30 days</option>
+    <option value="90">90 days</option>
+    <option value="365">1 year</option>
+    <option value="0">All time</option>
+  </select>
+  <label data-help="filter.tool">tool</label>
+  <select id="tool-filter"><option value="">all</option></select>
+  <label data-help="filter.project">project</label>
+  <select id="project-filter"><option value="">all</option></select>
+  <button id="refresh-btn">Refresh</button>
+  <button id="export-btn" class="ghost" title="Download all dashboard data as a multi-sheet Excel workbook (.xlsx). Honors the current window/tool/project filters.">Export Excel</button>
+  <span class="muted" style="margin-left: auto" id="status-msg"></span>
+</div>
+
+<main>
+  <!-- ================= OVERVIEW ================= -->
+  <section id="overview" class="active">
+    <h2 data-help="tab.overview">Overview</h2>
+    <div class="tab-blurb">High-level snapshot — KPI tiles, daily cost &amp; activity, plus top-N models and tools for the selected window.</div>
+    <div class="grid cols-4" id="cards"></div>
+    <div class="grid cols-2" style="margin-top: 1rem">
+      <div class="panel">
+        <h3 data-help="chart.cost_over_time">Cost over time</h3>
+        <div class="panel-meta" id="cost-chart-meta"></div>
+        <div class="chart-wrap"><canvas id="cost-chart"></canvas></div>
+      </div>
+      <div class="panel">
+        <h3 data-help="chart.actions_over_time">Actions over time</h3>
+        <div class="panel-meta" id="actions-chart-meta"></div>
+        <div class="chart-wrap"><canvas id="actions-chart"></canvas></div>
+      </div>
+    </div>
+    <div class="grid cols-2" style="margin-top: 1rem">
+      <div class="panel">
+        <h3 data-help="chart.top_models">Top models (by tokens)</h3>
+        <div class="chart-wrap"><canvas id="model-chart"></canvas></div>
+      </div>
+      <div class="panel">
+        <h3 data-help="chart.top_tools">Top tools (actions over time)</h3>
+        <div class="panel-meta" id="tool-chart-meta"></div>
+        <div class="chart-wrap"><canvas id="tool-chart"></canvas></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= COST ================= -->
+  <section id="cost-section">
+    <h2 data-help="tab.cost">Cost — by model over the selected window</h2>
+    <div class="tab-blurb">Per-model token consumption split into the four billable buckets (net input, cache read, cache write, output) with computed dollar cost. Hover any column header for definitions and formulas.</div>
+    <div class="panel">
+      <div class="panel-meta" id="cost-summary"></div>
+      <table id="cost-table"></table>
+    </div>
+    <div class="panel">
+      <h3 data-help="chart.token_volume_per_day">Token volume per day</h3>
+      <div class="chart-wrap"><canvas id="cost-stacked-chart"></canvas></div>
+    </div>
+    <div class="panel">
+      <h3 data-help="chart.token_volume_by_model">Token volume per day, split by model</h3>
+      <div class="panel-meta" id="cost-by-model-meta"></div>
+      <div class="chart-wrap"><canvas id="cost-by-model-chart"></canvas></div>
+    </div>
+  </section>
+
+  <!-- ================= ANALYSIS ================= -->
+  <section id="analysis">
+    <h2 data-help="tab.analysis">Analysis — spending insights for the selected window</h2>
+    <div class="tab-blurb">Headline KPIs comparing this period to the prior period of equal length, daily trend with dimension toggle, top movers, and cost-sensitive signals (LC tier surcharge, cache efficacy, routing efficiency suggestions, top expensive sessions). All numbers honor the time-window picker above.</div>
+    <div class="grid cols-4" id="analysis-cards"></div>
+    <div class="panel" style="margin-top: 1rem">
+      <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; flex-wrap: wrap;">
+        <h3 data-help="chart.analysis_trend" style="margin: 0;">Daily spend, split by <span id="analysis-trend-dim-label">model</span></h3>
+        <div class="toggle-group" id="analysis-trend-dim-toggle">
+          <button type="button" data-dim="model" class="active">Model</button>
+          <button type="button" data-dim="project">Project</button>
+          <button type="button" data-dim="tool">Tool</button>
+        </div>
+      </div>
+      <div class="panel-meta" id="analysis-trend-meta"></div>
+      <div class="chart-wrap"><canvas id="analysis-trend-chart"></canvas></div>
+    </div>
+    <div class="grid cols-2" style="margin-top: 1rem">
+      <div class="panel">
+        <h3 data-help="chart.analysis_movers">What changed — top movers</h3>
+        <div class="panel-meta" id="analysis-movers-meta"></div>
+        <table id="analysis-movers-table"></table>
+      </div>
+<div class="panel">
+        <h3 data-help="chart.analysis_new_entrants">New this period</h3>
+        <div class="panel-meta" id="analysis-entrants-meta"></div>
+        <table id="analysis-entrants-table"></table>
+      </div>
+    </div>
+    <div class="panel" style="margin-top: 1rem">
+      <h3 data-help="chart.analysis_top_sessions">Top expensive sessions</h3>
+      <div class="panel-meta" id="analysis-top-sessions-meta"></div>
+      <table id="analysis-top-sessions-table"></table>
+    </div>
+    <div class="panel" style="margin-top: 1rem">
+      <h3 data-help="chart.analysis_routing">Routing efficiency suggestions</h3>
+      <div class="panel-meta" id="analysis-routing-meta"></div>
+      <table id="analysis-routing-table"></table>
+    </div>
+  </section>
+
+  <!-- ================= SESSIONS ================= -->
+  <section id="sessions">
+    <h2 data-help="tab.sessions">Sessions <span class="pill" id="sessions-count"></span></h2>
+    <div class="tab-blurb">One row per AI-coding session. Click a row to see action breakdown, token buckets, cost, and recent actions in a modal.</div>
+    <div class="panel">
+      <div class="panel-meta" id="sessions-meta"></div>
+      <table id="sessions-table"></table>
+      <div class="pager" id="sessions-pager"></div>
+    </div>
+  </section>
+
+  <!-- ================= ACTIONS ================= -->
+  <section id="actions">
+    <h2 data-help="tab.actions">Actions <span class="pill" id="actions-count"></span></h2>
+    <div class="tab-blurb">The flat firehose — every recorded tool call, normalised across adapters. Filter by type below.</div>
+    <div class="panel">
+      <div class="toolbar" style="padding: 0; margin-bottom: 0.7rem; border: 0; background: transparent">
+        <label data-help="filter.action_type">type</label>
+        <select id="action-type-filter">
+          <option value="">all</option>
+          <option>read_file</option>
+          <option>write_file</option>
+          <option>edit_file</option>
+          <option>run_command</option>
+          <option>search_text</option>
+          <option>search_files</option>
+          <option>web_search</option>
+          <option>web_fetch</option>
+          <option>spawn_subagent</option>
+          <option>todo_update</option>
+          <option>ask_user</option>
+          <option>mcp_call</option>
+          <option>user_prompt</option>
+          <option>task_complete</option>
+        </select>
+      </div>
+      <table id="actions-table"></table>
+      <div class="pager" id="actions-pager"></div>
+    </div>
+  </section>
+
+  <!-- ================= TOOLS ================= -->
+  <section id="tools">
+    <h2 data-help="tab.tools">Tools — per AI client</h2>
+    <div class="tab-blurb">"Tool" here means the AI <em>client</em> (claude-code / cursor / codex / cline / copilot), not the per-message tool name. KPI tiles summarise activity in the selected window; the charts below show <strong>when</strong> each tool was active and <strong>what kind of work</strong> it actually did (read vs edit vs run-command vs search, etc.).</div>
+    <div class="grid cols-4" id="tools-cards"></div>
+    <div class="grid cols-2" style="margin-top: 1rem">
+      <div class="panel">
+        <h3 data-help="chart.tools_activity">Activity over time</h3>
+        <div class="panel-meta" id="tools-ts-meta"></div>
+        <div class="chart-wrap"><canvas id="tools-ts-chart"></canvas></div>
+      </div>
+      <div class="panel">
+        <h3 data-help="chart.tools_breakdown">Action-type mix per tool</h3>
+        <div class="panel-meta" id="tools-bd-meta"></div>
+        <div class="chart-wrap"><canvas id="tools-bd-chart"></canvas></div>
+      </div>
+    </div>
+    <div class="panel" style="margin-top: 1rem">
+      <h3>Per-tool aggregates</h3>
+      <table id="tools-table"></table>
+    </div>
+  </section>
+
+  <!-- ================= COMPRESSION ================= -->
+  <section id="compression">
+    <h2 data-help="tab.compression">Compression savings</h2>
+    <div class="tab-blurb">The proxy compresses each upstream request before forwarding — truncating large tool_result blocks and replacing dropped content with markers. The proxy can measure <strong>bytes</strong> directly; what costs you is <strong>tokens</strong> (estimated as bytes ÷ 4) and <strong>dollars</strong> (tokens × the row's input rate). Tokens and $ are the headline metrics; bytes are the source of truth.</div>
+    <div class="grid cols-4" id="compression-cards"></div>
+    <div class="panel" style="margin-top: 1rem">
+      <h3 data-help="chart.compression_over_time">Savings per day</h3>
+      <div class="panel-meta" id="compression-chart-meta"></div>
+      <div class="chart-wrap"><canvas id="compression-chart"></canvas></div>
+    </div>
+    <div class="panel">
+      <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; flex-wrap: wrap;">
+        <h3 data-help="chart.compression_by_mechanism" style="margin: 0;">Savings by mechanism</h3>
+        <div class="toggle-group" id="compression-mech-unit-toggle">
+          <button type="button" data-unit="tokens" class="active">tokens</button>
+          <button type="button" data-unit="bytes">bytes</button>
+        </div>
+      </div>
+      <div class="panel-meta" id="compression-mech-meta"></div>
+      <div class="chart-wrap"><canvas id="compression-mech-chart"></canvas></div>
+    </div>
+    <div class="panel">
+      <h3>Per-model breakdown</h3>
+      <div class="panel-meta" id="compression-meta"></div>
+      <table id="compression-table"></table>
+    </div>
+    <div class="panel">
+      <h3 data-help="term.compression_events">Recent compression events <span class="pill" id="compression-events-count"></span></h3>
+      <div class="panel-meta">One row per individual compression decision — what mechanism fired, how big the input was, how big it ended up. Lets you see which content types and which message slots are doing the saving.</div>
+      <table id="compression-events-table"></table>
+      <div class="pager" id="compression-events-pager"></div>
+    </div>
+  </section>
+
+  <!-- ================= DISCOVER ================= -->
+  <section id="discover">
+    <h2 data-help="tab.discovery">Discovery — stale re-reads <span class="pill" data-help="metric.stale_count" title="Click for why we scope to a single session">same-session only</span></h2>
+    <div class="tab-blurb">Files re-read <strong>after they changed inside the same session</strong> burned prompt tokens to re-discover what the AI client should still have in context. The observer <em>detects and reports</em> these — it doesn't auto-prevent. The headline below is the savings opportunity if you fix the underlying habit (cache_control on hot files, shorter sessions, scoping context). Cross-session reads are excluded — a fresh session has no memory of a prior session, so re-reading a changed file is a first look, not a stale rediscovery.</div>
+    <div class="grid cols-4" id="discover-cards"></div>
+    <div class="panel" style="margin-top: 1rem">
+      <h3>Top files re-read</h3>
+      <table id="stale-table"></table>
+      <div class="pager" id="stale-pager"></div>
+    </div>
+    <h2 data-help="metric.no_change_reruns">Repeated commands</h2>
+    <div class="tab-blurb">Commands run multiple times with no relevant inputs changed in between — usually a sign the model didn't trust its own previous result. Each rerun pays output tokens for an answer that hasn't changed.</div>
+    <div class="panel">
+      <table id="repeat-table"></table>
+      <div class="pager" id="repeat-pager"></div>
+    </div>
+    <h2 data-help="term.cross_platform_tool_calling">Cross-tool overlap <span class="pill" title="Files touched by 2+ AI clients in the window — the cross-platform sharing surface">multi-client</span></h2>
+    <div class="tab-blurb">Files touched by <strong>more than one AI client</strong> (claude-code, cursor, codex, …) in the selected window. This is the visible side of cross-platform tool-call sharing: every MCP query (<code>get_file_history</code>, <code>check_file_freshness</code>, <code>get_last_test_result</code>, …) pulls from the same database, so when one agent reads a file, the next agent's query sees it. Click the heading for the full mechanism.</div>
+    <div class="panel">
+      <table id="cross-tool-table"></table>
+    </div>
+  </section>
+
+  <!-- ================= PATTERNS ================= -->
+  <section id="patterns">
+    <h2 data-help="tab.patterns">Patterns <span class="pill" id="patterns-count"></span></h2>
+    <div class="tab-blurb"><strong>Repeatable behaviours the observer noticed across your sessions</strong> — for example, "after running <code>go test</code>, you almost always run <code>go vet</code>", or "the file <code>auth.ts</code> shows up in 80% of sessions touching <code>login.tsx</code>". These get fed into <code>observer suggest</code> which writes them into <code>CLAUDE.md</code> / <code>AGENTS.md</code> / <code>.cursorrules</code> so new sessions inherit the habit without you re-typing instructions. <strong>Confidence</strong> is how sure the observer is the pattern is real — high-confidence patterns are documented behaviours, low-confidence ones are guesses.</div>
+    <div class="panel">
+      <table id="patterns-table"></table>
+      <div class="pager" id="patterns-pager"></div>
+    </div>
+  </section>
+
+  <!-- ================= SETTINGS ================= -->
+  <section id="settings">
+    <h2 data-help="tab.settings">Settings — config viewer + pricing editor + backfill status</h2>
+    <div class="tab-blurb">View and edit the live <code>config.toml</code>. Pricing is fully editable and hot-reloads — saves write the file (with a <code>.bak</code> of the prior version) and refresh the cost engine in place. Other sections render read-only this PR; restart-on-save plumbing arrives in the next iteration. Backfill section shows candidate row counts for SQL-checkable backfill modes; run them from <code>observer backfill</code> on the CLI for now.</div>
+    <div class="settings-shell">
+      <aside class="settings-rail" id="settings-rail">
+        <button type="button" data-section="pricing" class="active">Pricing</button>
+        <button type="button" data-section="backfill">Backfill</button>
+        <button type="button" data-section="observer">Observer</button>
+        <button type="button" data-section="watcher">Watcher</button>
+        <button type="button" data-section="freshness">Freshness</button>
+        <button type="button" data-section="retention">Retention</button>
+        <button type="button" data-section="hooks">Hooks</button>
+        <button type="button" data-section="proxy">Proxy</button>
+        <button type="button" data-section="compression">Compression</button>
+        <button type="button" data-section="intelligence">Intelligence</button>
+      </aside>
+      <div class="settings-content" id="settings-content">
+        <div class="empty">Loading…</div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- ================= SESSION DETAIL MODAL ================= -->
+<div class="modal-back" id="session-modal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="session-modal-title">Session</h3>
+      <button id="session-modal-close">close</button>
+    </div>
+    <div class="grid cols-4" id="session-cards"></div>
+    <div class="grid cols-2" style="margin-top: 1rem">
+      <div class="panel" style="margin: 0">
+        <h3 data-help="term.action">Action breakdown</h3>
+        <div class="chart-wrap"><canvas id="session-action-chart"></canvas></div>
+      </div>
+      <div class="panel" style="margin: 0">
+        <h3 data-help="calc.token_math">Tokens</h3>
+        <table id="session-tokens-table"></table>
+        <div class="panel-meta" id="session-cost-meta" style="margin-top: 0.5rem"></div>
+      </div>
+    </div>
+    <div class="panel" style="margin-top: 1rem">
+      <h3 data-help="col.cost.model">Per-model breakdown</h3>
+      <div class="panel-meta" id="session-per-model-meta"></div>
+      <table id="session-per-model-table"></table>
+    </div>
+    <div class="panel" style="margin-top: 1rem">
+      <h3 data-help="term.api_turn">Messages</h3>
+      <div class="panel-meta">
+        <label style="margin-right: 0.5rem; cursor: pointer">
+          <input type="radio" name="session-msg-filter" value="tool" checked>
+          Tool messages only
+        </label>
+        <label style="cursor: pointer">
+          <input type="radio" name="session-msg-filter" value="all">
+          All messages
+        </label>
+        <span id="session-messages-meta" style="margin-left: 1rem; opacity: 0.7"></span>
+      </div>
+      <div class="session-messages-scroller">
+        <table id="session-messages-table"></table>
+      </div>
+      <div id="session-messages-pager" class="pager" style="display: none">
+        <button id="session-messages-prev">← Prev</button>
+        <span id="session-messages-pageinfo"></span>
+        <button id="session-messages-next">Next →</button>
+        <label style="margin-left: 1rem">
+          Page size:
+          <select id="session-messages-pagesize">
+            <option value="50">50</option>
+            <option value="100" selected>100</option>
+            <option value="200">200</option>
+          </select>
+        </label>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const state = {
+  tab: 'overview',
+  windowDays: 30,
+  toolFilter: '',
+  projectFilter: '',
+  charts: {},
+  sessionsPage: 1,
+  actionsPage: 1,
+  actionsTypeFilter: '',
+  discoverStalePage: 1,
+  discoverRepeatPage: 1,
+  patternsPage: 1,
+  compressionEventsPage: 1,
+  // 'tokens' or 'bytes' — what unit the Savings-by-mechanism chart's
+  // y-axis is showing. Tokens is default because that's what costs
+  // money; bytes is the source of truth available on click.
+  compressionMechUnit: 'tokens',
+  // 'model' | 'project' | 'tool' — what's stacked on the Analysis
+  // tab's Trend chart. Re-fetched from the server on toggle.
+  analysisTrendDim: 'model',
+  // Active section on the Settings tab.
+  settingsSection: 'pricing',
+  // Cached config payload from /api/config so the Pricing editor and
+  // other section viewers don't refetch on every rail click.
+  settingsCache: null,
+  // Backfill section state — { [mode]: { jobId, status, output, exit, error } }.
+  // Key is the mode flag; only one job per mode is tracked at a time
+  // (running another mode while the first is in flight is OK; running
+  // the SAME mode again replaces the first entry).
+  backfillJobs: {},
+  // Pricing form state — populated lazily on Pricing-section render.
+  // pricingDefaults: baked-in table from /api/config/pricing/defaults
+  // pricingOverrides: array of {model, values, showLC} edited in place
+  // pricingFilter: substring filter for the override + defaults tables
+  pricingDefaults: null,
+  pricingOverrides: [],
+  pricingFilter: '',
+  sessionDetail: { id: null, page: 1, pageSize: 100, total: 0 },
+};
+
+// Build a "&project=…&tool=…" suffix for any endpoint that accepts those
+// filters. Returns "" when both filters are at "all".
+function filterQS() {
+  const parts = [];
+  if (state.toolFilter)    parts.push('tool='    + encodeURIComponent(state.toolFilter));
+  if (state.projectFilter) parts.push('project=' + encodeURIComponent(state.projectFilter));
+  return parts.length ? '&' + parts.join('&') : '';
+}
+
+// --- formatting helpers ---
+const fmtN = n => {
+  if (n == null) return '—';
+  if (typeof n !== 'number') n = Number(n);
+  if (!Number.isFinite(n)) return '—';
+  if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return Math.round(n).toString();
+};
+const fmtUSD = n => '$' + (Number(n) || 0).toFixed(4);
+const fmtBytes = n => {
+  if (!n) return '0 B';
+  if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(2) + ' GB';
+  if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(2) + ' MB';
+  if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(1) + ' KB';
+  return n + ' B';
+};
+const fmtPct = ratio => ratio == null ? '' : (ratio * 100).toFixed(1) + '%';
+// fmtDuration renders a millisecond gap as a human-friendly delta:
+// sub-second → "Xms", under a minute → "X.Ys", under an hour → "Xm Ys",
+// otherwise → "Xh Ym". Returns "—" for null / non-numeric so the
+// per-message Elapsed column degrades gracefully on rows where the
+// successor timestamp couldn't be parsed.
+const fmtDuration = ms => {
+  if (ms == null) return '—';
+  if (typeof ms !== 'number') ms = Number(ms);
+  if (!Number.isFinite(ms) || ms < 0) return '—';
+  if (ms < 1000) return Math.round(ms) + 'ms';
+  const s = ms / 1000;
+  if (s < 60) return s.toFixed(s < 10 ? 1 : 0) + 's';
+  const m = Math.floor(s / 60);
+  const rs = Math.round(s - m * 60);
+  if (m < 60) return m + 'm ' + rs + 's';
+  const h = Math.floor(m / 60);
+  return h + 'h ' + (m - h * 60) + 'm';
+};
+const short = (s, n) => s == null ? '' : (s.length > n ? s.slice(0, n) + '…' : s);
+const fmtTs = s => {
+  if (!s) return '';
+  return s.replace('T', ' ').slice(0, 19);
+};
+
+async function getJSON(path) {
+  const r = await fetch(path);
+  if (!r.ok) throw new Error(path + ': ' + r.status);
+  return r.json();
+}
+
+// HTML-escape arbitrary string content so model names like "<synthetic>",
+// command strings with angle brackets, and pattern data with quotes can't
+// inject markup or render invisibly.
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// idCopy renders a short-with-tooltip id span that copies its full
+// value on click. Used for session_id / message_id / call_id cells
+// where the user often wants to grab the value but the column is too
+// narrow to show it in full. The class .id-copy gives a visual hover
+// hint (dotted underline + cursor:copy); the global click handler
+// below reads dataset.copy and writes it to the clipboard.
+function idCopy(value, max) {
+  if (value == null || value === '') return '<span class="muted">—</span>';
+  const v = String(value);
+  const display = v.length > max ? v.slice(0, max) + '…' : v;
+  return '<code class="id-copy" title="' + escapeHtml(v) + '" data-copy="' + escapeHtml(v) + '">'
+    + escapeHtml(display) + '</code>';
+}
+
+// expandable wraps a long string in a click-to-expand span. Renders
+// the truncated form by default and stores the full value in
+// data-full so the global click handler can swap them. For values
+// short enough to fit, returns the value as-is — no UI clutter.
+function expandable(value, max) {
+  if (value == null || value === '') return '';
+  const v = String(value);
+  if (v.length <= max) return escapeHtml(v);
+  return '<span class="expandable" title="click to expand" data-full="' + escapeHtml(v) + '" data-short="' + escapeHtml(v.slice(0, max) + '…') + '">'
+    + escapeHtml(v.slice(0, max) + '…') + '</span>';
+}
+
+// Global delegated click handler — runs once per page, intercepts
+// clicks on .id-copy (copy to clipboard + brief flash) and
+// .expandable (toggle between short and full text). Single listener
+// keeps the per-row JS work minimal even for tables with hundreds of
+// rows.
+document.addEventListener('click', e => {
+  const copyEl = e.target.closest('.id-copy');
+  if (copyEl && copyEl.dataset.copy) {
+    e.preventDefault();
+    e.stopPropagation();
+    const text = copyEl.dataset.copy;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => {
+        copyEl.classList.add('copied');
+        const orig = copyEl.textContent;
+        copyEl.textContent = '✓ copied';
+        setTimeout(() => {
+          copyEl.classList.remove('copied');
+          copyEl.textContent = orig;
+        }, 900);
+      }).catch(() => {});
+    }
+    return;
+  }
+  const expEl = e.target.closest('.expandable');
+  if (expEl && expEl.dataset.full) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (expEl.classList.contains('expanded')) {
+      expEl.textContent = expEl.dataset.short;
+      expEl.classList.remove('expanded');
+    } else {
+      expEl.textContent = expEl.dataset.full;
+      expEl.classList.add('expanded');
+    }
+  }
+});
+
+// Format a JSON pattern_data blob into a single-line list of key=value
+// pairs. Falls back to the raw string for non-JSON or array shapes.
+// Keeps the dashboard's Patterns tab readable when entries are simple
+// objects like {file_path:"...", reads:11}.
+function fmtPatternData(s) {
+  if (!s) return '';
+  let parsed;
+  try { parsed = JSON.parse(s); } catch { return escapeHtml(short(s, 100)); }
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const parts = Object.entries(parsed).map(([k, v]) => {
+      const valStr = typeof v === 'string' ? v : JSON.stringify(v);
+      return '<span class="muted">' + escapeHtml(k) + '</span>=' + escapeHtml(short(valStr, 40));
+    });
+    return parts.join('  ');
+  }
+  return escapeHtml(short(s, 100));
+}
+
+function renderTable(el, rows, columns, opts = {}) {
+  if (!rows || !rows.length) {
+    el.innerHTML = '<tbody><tr><td class="empty" colspan="' + columns.length + '">no data</td></tr></tbody>';
+    return;
+  }
+  // Each column may carry a `help` registry id; emit it as data-help so
+  // the tooltip popover and drawer pick it up. Also propagate the
+  // column's className to the <th> so right-aligned numeric columns
+  // have right-aligned headers (otherwise the header sits at the left
+  // edge while the values sit at the right edge — looks misaligned
+  // even though the cells line up).
+  const head = '<thead><tr>' + columns.map(c =>
+    '<th' +
+    (c.className ? ' class="' + c.className + '"' : '') +
+    (c.help ? ' data-help="' + c.help + '"' : '') +
+    '>' + c.label + '</th>'
+  ).join('') + '</tr></thead>';
+  const body = '<tbody>' + rows.map((r, i) => {
+    const tr = opts.onRowClick ? ' class="row-clickable" data-row-index="' + i + '"' : '';
+    return '<tr' + tr + '>' +
+      columns.map(c => {
+        // Column render() receives both the row and its index so cells
+        // can emit per-row markers (e.g. data-row="<i>") for post-render
+        // wiring like click-to-expand handlers.
+        const v = c.render ? c.render(r, i) : (r[c.key] ?? '');
+        return '<td class="' + (c.className || '') + '">' + v + '</td>';
+      }).join('') + '</tr>';
+  }).join('') + '</tbody>';
+  el.innerHTML = head + body;
+  if (opts.onRowClick) {
+    el.querySelectorAll('tr.row-clickable').forEach(tr => {
+      tr.addEventListener('click', () => opts.onRowClick(rows[Number(tr.dataset.rowIndex)]));
+    });
+  }
+}
+
+// --- chart helpers ---
+function destroyChart(id) {
+  if (state.charts[id]) { state.charts[id].destroy(); delete state.charts[id]; }
+}
+
+// SVG icon library for empty-chart states. Each returns the inner
+// markup of an <svg viewBox="0 0 24 24"> — strokes only so the dark
+// theme can colour them via CSS.
+const CHART_ICONS = {
+  noProxy: '<path d="M3 12h4l2-7 4 14 2-7h6"/><circle cx="12" cy="12" r="9.5" stroke-dasharray="3 2"/>',
+  noData:  '<path d="M3 18l5-6 4 4 5-9 4 7"/><path d="M3 21h18" stroke-dasharray="2 2"/>',
+  empty:   '<rect x="3" y="3" width="18" height="18" rx="2" stroke-dasharray="3 3"/><path d="M8 14l3-3 2 2 3-4"/>',
+  scales:  '<path d="M3 21h18M6 21V8m12 13V8M3 8l9-5 9 5"/><path d="M6 13l-2 4M18 13l2 4" stroke-dasharray="2 2"/>',
+};
+
+// Render a centered illustrative placeholder over a chart canvas
+// when the underlying data has no points to plot. Drops the .empty
+// class on the wrapping .chart-wrap so CSS hides the canvas; injects
+// a sibling DOM node for the icon + title + message. Idempotent —
+// safe to call repeatedly with different messages.
+function renderEmptyChart(canvasId, opts) {
+  opts = opts || {};
+  const can = document.getElementById(canvasId);
+  if (!can) return;
+  const wrap = can.closest('.chart-wrap');
+  if (!wrap) return;
+  destroyChart(canvasId);
+  wrap.classList.add('empty');
+  // Replace any existing empty-state node (so we don't stack them
+  // when the user changes filters).
+  let node = wrap.querySelector('.chart-empty-state');
+  if (!node) {
+    node = document.createElement('div');
+    node.className = 'chart-empty-state';
+    wrap.appendChild(node);
+  }
+  const iconKey = opts.icon || 'empty';
+  const inner = CHART_ICONS[iconKey] || CHART_ICONS.empty;
+  node.innerHTML =
+    '<svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">' + inner + '</svg>' +
+    '<div class="chart-empty-title">' + escapeHtml(opts.title || 'No data yet') + '</div>' +
+    (opts.message ? '<div class="chart-empty-msg">' + opts.message + '</div>' : '');
+}
+
+// Clear the empty-state overlay before drawing a real chart. Called
+// from lineChart() so any prior empty placeholder is removed when
+// new data lands.
+function clearEmptyChart(canvasId) {
+  const can = document.getElementById(canvasId);
+  if (!can) return;
+  const wrap = can.closest('.chart-wrap');
+  if (!wrap) return;
+  wrap.classList.remove('empty');
+  const node = wrap.querySelector('.chart-empty-state');
+  if (node) node.remove();
+}
+function chartTheme() {
+  return {
+    color: '#8b949e',
+    grid: { color: '#30363d' },
+    ticks: { color: '#8b949e', font: { family: 'ui-monospace' } },
+  };
+}
+function lineChart(canvasId, labels, datasets, opts = {}) {
+  destroyChart(canvasId);
+  clearEmptyChart(canvasId);
+  const ctx = document.getElementById(canvasId).getContext('2d');
+  const t = chartTheme();
+  // X-axis tick layout: keep labels horizontal, but cap how many show
+  // up so they don't crowd / overlap. Chart.js ticks.maxTicksLimit
+  // works for category scales (the type we use here) and produces an
+  // evenly-spaced subset of labels rather than the cramped every-bucket
+  // default.
+  const xTicks = {
+    ...t.ticks,
+    autoSkip: true,
+    maxTicksLimit: 8,
+    maxRotation: 0,
+    minRotation: 0,
+  };
+  state.charts[canvasId] = new Chart(ctx, {
+    type: opts.type || 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: { duration: 200 },
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { labels: { color: t.color, boxWidth: 12, font: { size: 11 } } },
+        tooltip: { backgroundColor: '#161b22', borderColor: '#30363d', borderWidth: 1 },
+      },
+      scales: {
+        x: { stacked: !!opts.stacked, grid: t.grid, ticks: xTicks },
+        y: { stacked: !!opts.stacked, grid: t.grid, ticks: t.ticks, beginAtZero: true,
+             ...(opts.yMaxFormatter ? { ticks: { ...t.ticks, callback: opts.yMaxFormatter } } : {}) },
+      },
+    },
+  });
+}
+
+// --- API loaders ---
+async function loadStatus() {
+  const status = await getJSON('/api/status');
+  document.getElementById('db-meta').textContent =
+    'DB: ' + status.db_path + '  ·  schema v' + status.schema_version +
+    '  ·  ' + (status.db_size_bytes / 1e6).toFixed(1) + ' MB';
+  document.getElementById('last-refresh').textContent =
+    'last activity ' + (status.last_action_at || '—') +
+    '  ·  refreshed ' + new Date().toLocaleTimeString();
+
+  // populate tool filter from per_tool_last_seen
+  const sel = document.getElementById('tool-filter');
+  const current = sel.value;
+  sel.innerHTML = '<option value="">all</option>' +
+    (status.per_tool_last_seen || []).map(t => '<option value="' + t.tool + '">' + t.tool + '</option>').join('');
+  sel.value = current;
+
+  await loadProjects();
+  renderOverviewCards(status);
+}
+
+// Hydrate the project-filter dropdown from /api/projects so users can
+// scope Sessions / Actions / Cost / Discover queries to a single project
+// root. Sorted by recent activity server-side.
+async function loadProjects() {
+  let data;
+  try {
+    data = await getJSON('/api/projects');
+  } catch (e) {
+    return; // benign — leave the "all" option in place
+  }
+  const sel = document.getElementById('project-filter');
+  const current = sel.value;
+  const opts = ['<option value="">all</option>'];
+  for (const p of (data.rows || [])) {
+    if (!p.root_path) continue;
+    // Show only the trailing path segment so the dropdown stays narrow,
+    // but keep the full root_path as the option value (the API needs the
+    // exact match).
+    const tail = p.root_path.split('/').filter(Boolean).slice(-2).join('/');
+    const label = tail + '  (' + (p.session_count || 0) + ')';
+    opts.push('<option value="' + p.root_path + '" title="' + p.root_path +
+              '">' + label + '</option>');
+  }
+  sel.innerHTML = opts.join('');
+  sel.value = current;
+}
+
+function renderOverviewCards(status) {
+  const c = status.counts || {};
+  const cards = [
+    { label: 'Sessions',           help: 'tile.sessions',     value: fmtN(c.sessions), sub: c.actions ? c.actions + ' actions' : '' },
+    { label: 'API turns (proxy)',  help: 'tile.api_turns',    value: fmtN(c.api_turns), sub: 'accurate token source' },
+    { label: 'Token rows (jsonl)', help: 'tile.token_rows',   value: fmtN(c.token_usage), sub: 'unreliable but plentiful' },
+    { label: 'Failures (24h)',     help: 'tile.failures_24h', value: fmtN(status.recent_failures_24h),
+      sub: status.recent_failures_24h ? 'check Discovery tab' : 'all green' },
+  ];
+  document.getElementById('cards').innerHTML = cards.map(c =>
+    '<div class="card"><div class="label"' + (c.help ? ' data-help="' + c.help + '"' : '') + '>' + c.label + '</div>' +
+    '<div class="value">' + c.value + '</div>' +
+    '<div class="sub">' + c.sub + '</div></div>'
+  ).join('');
+}
+
+async function loadOverviewCharts() {
+  const days = state.windowDays;
+  const qs = filterQS();
+  const [costTs, actionsTs, models] = await Promise.all([
+    getJSON('/api/timeseries/cost?bucket=day&days=' + days + qs),
+    getJSON('/api/timeseries/actions?bucket=day&days=' + days + qs),
+    getJSON('/api/models?days=' + days + qs),
+  ]);
+
+  // Cost chart — stacked bars: net_in / cache_read / cache_creation / output
+  const costSeries = costTs.series || [];
+  const labels = costSeries.map(p => p.bucket);
+  document.getElementById('cost-chart-meta').textContent =
+    costSeries.length ?
+      'window: ' + days + 'd · ' + costSeries.length + ' day(s)' +
+      ' · cost: ' + fmtUSD(costSeries.reduce((a, b) => a + b.cost_usd, 0))
+      : 'no proxy data in window';
+  if (costSeries.length === 0) {
+    renderEmptyChart('cost-chart', {
+      icon: 'noProxy',
+      title: 'No proxy traffic in this window',
+      message: 'Engage the proxy with the env var matching your AI client: Claude Code → <code>ANTHROPIC_BASE_URL=http://127.0.0.1:8820</code>; Codex / OpenAI-compatible → <code>OPENAI_BASE_URL=http://127.0.0.1:8820/v1</code>. JSONL log parsing will still feed Token rows but only the proxy gets you per-day cost over time.',
+    });
+  } else {
+    lineChart('cost-chart', labels, [
+      { label: 'Net Input', data: costSeries.map(p => p.input), borderColor: 'var(--chart1)', backgroundColor: '#58a6ff44', tension: 0.2 },
+      { label: 'Cache Read', data: costSeries.map(p => p.cache_read), borderColor: 'var(--chart2)', backgroundColor: '#d2a8ff44', tension: 0.2 },
+      { label: 'Cache Write', data: costSeries.map(p => p.cache_creation), borderColor: 'var(--chart3)', backgroundColor: '#ffa65744', tension: 0.2 },
+      { label: 'Output', data: costSeries.map(p => p.output), borderColor: 'var(--chart4)', backgroundColor: '#f778ba44', tension: 0.2 },
+    ], { yMaxFormatter: fmtN });
+  }
+
+  // Actions chart — total + failures
+  const aSeries = actionsTs.series || [];
+  document.getElementById('actions-chart-meta').textContent =
+    aSeries.length ? aSeries.length + ' day(s) · ' + aSeries.reduce((a, b) => a + b.total, 0) + ' total actions' : 'no data';
+  if (aSeries.length === 0) {
+    renderEmptyChart('actions-chart', {
+      icon: 'noData',
+      title: 'No actions in this window',
+      message: 'Try widening the window selector or removing tool/project filters.',
+    });
+  } else {
+    lineChart('actions-chart', aSeries.map(p => p.bucket), [
+      { label: 'Total', data: aSeries.map(p => p.total), borderColor: 'var(--chart5)', backgroundColor: '#56d36444', tension: 0.2 },
+      { label: 'Failures', data: aSeries.map(p => p.failures), borderColor: 'var(--warn)', backgroundColor: '#f8514944', tension: 0.2 },
+    ], { yMaxFormatter: fmtN });
+  }
+
+  // Top models by tokens (horizontal bar chart)
+  const modelRows = (models.rows || []).slice(0, 8);
+  if (modelRows.length === 0) {
+    renderEmptyChart('model-chart', {
+      icon: 'scales',
+      title: 'No model usage data',
+      message: 'No proxy traffic or JSONL token rows in this window. Engage the proxy or wait for AI activity.',
+    });
+  } else {
+    lineChart('model-chart', modelRows.map(r => r.key), [
+      { label: 'Net Input', data: modelRows.map(r => r.tokens.input || 0), backgroundColor: '#58a6ff' },
+      { label: 'Cache Read', data: modelRows.map(r => r.tokens.cache_read || 0), backgroundColor: '#d2a8ff' },
+      { label: 'Output', data: modelRows.map(r => r.tokens.output || 0), backgroundColor: '#f778ba' },
+    ], { type: 'bar', stacked: true, yMaxFormatter: fmtN });
+  }
+
+  // Top tools — stacked area over time, one band per tool. Reuses
+  // /api/timeseries/actions which already returns by_tool per bucket.
+  // Caps at top-6 tools by total in the window so the chart stays
+  // legible; overflow rolls into "other".
+  const labelsTs = aSeries.map(p => p.bucket);
+  const totals = {};
+  for (const p of aSeries) {
+    for (const [t, n] of Object.entries(p.by_tool || {})) {
+      totals[t] = (totals[t] || 0) + n;
+    }
+  }
+  const topToolsList = Object.entries(totals).sort((a, b) => b[1] - a[1]);
+  const TOP_N = 6;
+  const featured = topToolsList.slice(0, TOP_N).map(([t]) => t);
+  const featuredSet = new Set(featured);
+  const palette = ['#58a6ff', '#d2a8ff', '#ffa657', '#f778ba', '#56d364', '#79c0ff', '#8b949e'];
+  const toolDatasets = featured.map((t, i) => ({
+    label: t,
+    data: aSeries.map(p => (p.by_tool || {})[t] || 0),
+    backgroundColor: palette[i % palette.length] + 'cc',
+    borderColor: palette[i % palette.length],
+    fill: true, tension: 0.2, pointRadius: 0,
+  }));
+  if (topToolsList.length > TOP_N) {
+    toolDatasets.push({
+      label: 'other',
+      data: aSeries.map(p => {
+        let other = 0;
+        for (const [t, n] of Object.entries(p.by_tool || {})) {
+          if (!featuredSet.has(t)) other += n;
+        }
+        return other;
+      }),
+      backgroundColor: palette[palette.length - 1] + 'cc',
+      borderColor: palette[palette.length - 1],
+      fill: true, tension: 0.2, pointRadius: 0,
+    });
+  }
+  document.getElementById('tool-chart-meta').textContent =
+    aSeries.length
+      ? aSeries.length + ' day(s) · ' + featured.length + ' tool(s)'
+        + (topToolsList.length > TOP_N ? ' (+ ' + (topToolsList.length - TOP_N) + ' rolled into "other")' : '')
+      : 'no data';
+  if (toolDatasets.length === 0 || aSeries.length === 0) {
+    renderEmptyChart('tool-chart', {
+      icon: 'noData',
+      title: 'No tool activity in this window',
+      message: 'No actions recorded across any AI client. Try a wider window.',
+    });
+  } else {
+    lineChart('tool-chart', labelsTs, toolDatasets, { stacked: true, yMaxFormatter: fmtN });
+  }
+}
+
+// fmtDeltaPct formats a signed percentage (e.g. +14.2%) for the
+// period-over-period tile. Negative deltas are good for spend, so the
+// caller chooses how to colour the result (red for up, green for down).
+function fmtDeltaPct(pct, priorIsZero) {
+  if (priorIsZero) return 'no prior data';
+  const sign = pct >= 0 ? '+' : '';
+  return sign + pct.toFixed(1) + '%';
+}
+
+// renderAnalysisTrend draws the daily-spend stacked-bar chart for the
+// active dimension (model / project / tool). Same top-N+other rollup
+// pattern as the Cost tab's per-model chart so the legend stays
+// readable on accounts with many keys.
+async function renderAnalysisTrend() {
+  const days = state.windowDays;
+  const dim = state.analysisTrendDim;
+  document.getElementById('analysis-trend-dim-label').textContent = dim;
+  document.querySelectorAll('#analysis-trend-dim-toggle button').forEach(b => {
+    b.classList.toggle('active', b.dataset.dim === dim);
+  });
+
+  const trend = await getJSON('/api/analysis/trend?dim=' + dim + '&days=' + days);
+  const series = trend.series || [];
+
+  const dayBuckets = Array.from(new Set(series.map(p => p.bucket))).sort();
+  const keyTotals = {};
+  for (const p of series) {
+    const k = p.key || '<unknown>';
+    keyTotals[k] = (keyTotals[k] || 0) + (p.cost_usd || 0);
+  }
+  const sortedKeys = Object.entries(keyTotals).sort((a, b) => b[1] - a[1]);
+  const TOP_N = 6;
+  const featured = sortedKeys.slice(0, TOP_N).map(([k]) => k);
+  const featuredSet = new Set(featured);
+  const palette = ['#58a6ff', '#d2a8ff', '#ffa657', '#f778ba', '#56d364', '#79c0ff', '#8b949e'];
+  const cell = {};
+  for (const p of series) {
+    if (!cell[p.bucket]) cell[p.bucket] = {};
+    cell[p.bucket][p.key || '<unknown>'] = p.cost_usd || 0;
+  }
+  const datasets = featured.map((k, i) => ({
+    label: dim === 'project' ? (k.split('/').filter(Boolean).slice(-2).join('/') || k) : k,
+    data: dayBuckets.map(d => (cell[d] && cell[d][k]) || 0),
+    backgroundColor: palette[i % palette.length],
+  }));
+  if (sortedKeys.length > TOP_N) {
+    datasets.push({
+      label: 'other',
+      data: dayBuckets.map(d => {
+        let other = 0;
+        for (const [k, v] of Object.entries(cell[d] || {})) {
+          if (!featuredSet.has(k)) other += v;
+        }
+        return other;
+      }),
+      backgroundColor: palette[palette.length - 1],
+    });
+  }
+
+  const meta = document.getElementById('analysis-trend-meta');
+  if (meta) {
+    meta.textContent = dayBuckets.length === 0
+      ? 'no data in window'
+      : dayBuckets.length + ' day(s) · ' + featured.length + ' ' + dim + '(s)' +
+        (sortedKeys.length > TOP_N ? ' (+ ' + (sortedKeys.length - TOP_N) + ' rolled into "other")' : '');
+  }
+  if (dayBuckets.length === 0) {
+    renderEmptyChart('analysis-trend-chart', {
+      icon: 'noProxy',
+      title: 'No spending data in this window',
+      message: 'Engage the proxy or widen the window to populate the trend.',
+    });
+  } else {
+    lineChart('analysis-trend-chart', dayBuckets, datasets,
+      { type: 'bar', stacked: true, yMaxFormatter: fmtUSD });
+  }
+}
+
+// renderAnalysisMovers populates the top-movers + new-entrants tables.
+// Honors the same dim toggle as the Trend chart so the two panels move
+// together when the user switches between Model / Project / Tool.
+async function renderAnalysisMovers() {
+  const days = state.windowDays;
+  const dim = state.analysisTrendDim;
+  const data = await getJSON('/api/analysis/movers?dim=' + dim + '&days=' + days);
+
+  const fmtKey = (k) => {
+    if (!k) return '<span class="muted">' + escapeHtml(k || '<unknown>') + '</span>';
+    if (dim === 'project') {
+      const tail = k.split('/').filter(Boolean).slice(-2).join('/');
+      return '<span title="' + escapeHtml(k) + '">' + escapeHtml(tail || k) + '</span>';
+    }
+    return escapeHtml(k);
+  };
+  const fmtSignedPct = (n) => (n >= 0 ? '+' : '') + n.toFixed(1) + '%';
+
+  // Movers table — interleave increases (red, +Δ) and decreases (green, −Δ),
+  // sorted by absolute Δ$ DESC. A user scanning the table sees the biggest
+  // hitter regardless of direction first.
+  const allMovers = (data.increases || []).concat(data.decreases || []);
+  allMovers.sort((a, b) => Math.abs(b.delta_usd) - Math.abs(a.delta_usd));
+  const mvTable = document.getElementById('analysis-movers-table');
+  if (allMovers.length === 0) {
+    mvTable.innerHTML = '<tbody><tr><td class="empty">No period-over-period changes — too short a window or no overlap.</td></tr></tbody>';
+  } else {
+    let html = '<thead><tr>'
+      + '<th>' + dim.charAt(0).toUpperCase() + dim.slice(1) + '</th>'
+      + '<th class="number">Prior $</th>'
+      + '<th class="number">Current $</th>'
+      + '<th class="number">Δ$</th>'
+      + '<th class="number">Δ%</th>'
+      + '</tr></thead><tbody>';
+    for (const m of allMovers) {
+      const cls = m.delta_usd >= 0 ? 'warn' : 'ok';
+      html += '<tr>'
+        + '<td>' + fmtKey(m.key) + '</td>'
+        + '<td class="number muted">' + fmtUSD(m.prior_usd) + '</td>'
+        + '<td class="number">' + fmtUSD(m.current_usd) + '</td>'
+        + '<td class="number ' + cls + '">' + (m.delta_usd >= 0 ? '+' : '') + fmtUSD(m.delta_usd) + '</td>'
+        + '<td class="number ' + cls + '">' + fmtSignedPct(m.delta_pct) + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody>';
+    mvTable.innerHTML = html;
+  }
+  document.getElementById('analysis-movers-meta').textContent =
+    'top movers by absolute Δ$, ' + days + 'd vs prior ' + days + 'd · split by ' + dim;
+
+  // New entrants — keys present in current but not prior. Sorted by
+  // current cost DESC server-side.
+  const ent = data.new_entrants || [];
+  const entTable = document.getElementById('analysis-entrants-table');
+  if (ent.length === 0) {
+    entTable.innerHTML = '<tbody><tr><td class="empty">No new ' + dim + 's this period.</td></tr></tbody>';
+  } else {
+    let html = '<thead><tr><th>' + dim.charAt(0).toUpperCase() + dim.slice(1) + '</th><th class="number">Current $</th></tr></thead><tbody>';
+    for (const e of ent) {
+      html += '<tr><td>' + fmtKey(e.key) + '</td><td class="number">' + fmtUSD(e.current_usd) + '</td></tr>';
+    }
+    html += '</tbody>';
+    entTable.innerHTML = html;
+  }
+  document.getElementById('analysis-entrants-meta').textContent =
+    ent.length + ' ' + dim + '(s) appeared in current period that weren\'t in prior';
+}
+
+// renderAnalysisTopSessions populates the most-expensive-sessions
+// table. Each row carries explanatory badges (opus / lc_tier /
+// many_turns / large_prompt) so a price-sensitive user can scan the
+// table and see WHY the session ranks high without opening it.
+async function renderAnalysisTopSessions() {
+  const days = state.windowDays;
+  const data = await getJSON('/api/analysis/top-sessions?days=' + days + '&limit=10');
+  const sessions = data.sessions || [];
+  const table = document.getElementById('analysis-top-sessions-table');
+
+  if (sessions.length === 0) {
+    table.innerHTML = '<tbody><tr><td class="empty">No spending data in this window.</td></tr></tbody>';
+    document.getElementById('analysis-top-sessions-meta').textContent = '';
+    return;
+  }
+
+  const badgeLabels = {
+    opus:         { text: 'Opus',          cls: 'warn'  },
+    lc_tier:      { text: 'LC tier',       cls: 'warn'  },
+    many_turns:   { text: 'many turns',    cls: 'warn2' },
+    large_prompt: { text: 'large prompt',  cls: 'warn2' },
+  };
+  const fmtBadges = (badges) => (badges || []).map(b => {
+    const meta = badgeLabels[b] || { text: b, cls: 'muted' };
+    return '<span class="pill ' + meta.cls + '" style="margin-right: 0.25rem">' + meta.text + '</span>';
+  }).join('');
+  const fmtModelList = (ms) => {
+    if (!ms || ms.length === 0) return '<span class="muted">—</span>';
+    if (ms.length === 1) return escapeHtml(ms[0]);
+    return escapeHtml(ms[0]) + ' <span class="muted">+' + (ms.length - 1) + '</span>';
+  };
+
+  let html = '<thead><tr>'
+    + '<th>Session</th>'
+    + '<th>Tool</th>'
+    + '<th>Model(s)</th>'
+    + '<th class="number">Turns</th>'
+    + '<th class="number">Cost</th>'
+    + '<th>Why</th>'
+    + '</tr></thead><tbody>';
+  for (const s of sessions) {
+    html += '<tr class="row-clickable" data-session-id="' + escapeHtml(s.id) + '">'
+      + '<td>' + idCopy(s.id, 8) + '</td>'
+      + '<td>' + escapeHtml(s.tool || '') + '</td>'
+      + '<td>' + fmtModelList(s.models) + '</td>'
+      + '<td class="number">' + s.turns + '</td>'
+      + '<td class="number">' + fmtUSD(s.cost_usd) + '</td>'
+      + '<td>' + (fmtBadges(s.badges) || '<span class="muted">—</span>') + '</td>'
+      + '</tr>';
+  }
+  html += '</tbody>';
+  table.innerHTML = html;
+  document.getElementById('analysis-top-sessions-meta').textContent =
+    sessions.length + ' session(s) · top by cost over ' + days + 'd · click row to drill in';
+
+  // Hook click → existing session detail modal so users can drill in
+  // directly from the Analysis page.
+  table.querySelectorAll('tr.row-clickable').forEach(tr => {
+    tr.onclick = () => openSessionModal(tr.dataset.sessionId);
+  });
+}
+
+// renderAnalysisRouting populates the routing-efficiency suggestions
+// table — sessions on Opus that the work-profile heuristic flags as
+// "could have used Sonnet for ~$X less." Soft framing; informational
+// only. Click a row → existing session detail modal so the user can
+// drill into what the session actually did before judging the call.
+async function renderAnalysisRouting() {
+  const days = state.windowDays;
+  const data = await getJSON('/api/analysis/routing-suggestions?days=' + days);
+  const suggestions = data.suggestions || [];
+  const table = document.getElementById('analysis-routing-table');
+  const meta = document.getElementById('analysis-routing-meta');
+
+  if (suggestions.length === 0) {
+    table.innerHTML = '<tbody><tr><td class="empty">No routing inefficiencies detected — every Opus session in this window had a non-trivial profile (large prompt, high output, or LC-tier turns).</td></tr></tbody>';
+    meta.textContent = 'no flagged sessions · informational only — model choice may be deliberate';
+    return;
+  }
+
+  let html = '<thead><tr>'
+    + '<th>Session</th>'
+    + '<th>Model migration</th>'
+    + '<th class="number">Current $</th>'
+    + '<th class="number">Sonnet $</th>'
+    + '<th class="number">Savings</th>'
+    + '<th>Why flagged</th>'
+    + '</tr></thead><tbody>';
+  for (const s of suggestions) {
+    const sid = (s.session_id || '').slice(0, 8);
+    html += '<tr class="row-clickable" data-session-id="' + escapeHtml(s.session_id) + '">'
+      + '<td>' + idCopy(s.session_id, 8) + '</td>'
+      + '<td><code>' + escapeHtml(s.current_model) + '</code> → <code>' + escapeHtml(s.suggested_model) + '</code></td>'
+      + '<td class="number">' + fmtUSD(s.current_cost_usd) + '</td>'
+      + '<td class="number muted">' + fmtUSD(s.suggested_cost_usd) + '</td>'
+      + '<td class="number ok">' + fmtUSD(s.savings_usd) + '</td>'
+      + '<td class="muted" style="font-size: 0.72rem">' +
+      (s.reasons || []).map(r => escapeHtml(r)).join(' · ') + '</td>'
+      + '</tr>';
+  }
+  html += '</tbody>';
+  table.innerHTML = html;
+
+  meta.innerHTML = suggestions.length + ' flagged · projected total savings ' +
+    '<span class="ok">' + fmtUSD(data.total_savings_usd || 0) + '</span> · ' +
+    '<span class="muted">informational only — model choice may be deliberate</span>';
+
+  table.querySelectorAll('tr.row-clickable').forEach(tr => {
+    tr.onclick = () => openSessionModal(tr.dataset.sessionId);
+  });
+}
+
+async function loadAnalysis() {
+  const days = state.windowDays;
+  const data = await getJSON('/api/analysis/headline?days=' + days);
+
+  const period = data.period || {};
+  const month = data.month || {};
+  const eff = data.effective || {};
+  const cache = data.cache || {};
+  const lc = data.long_context || {};
+  const waste = data.waste || {};
+
+  // Period vs prior — colour-code the delta. Up-vs-prior is bad
+  // (spending more); down-vs-prior is good. Zero or no-prior cases
+  // render in muted grey.
+  let deltaCls = 'muted';
+  if (!period.prior_is_zero) {
+    if (period.delta_pct > 0.5) deltaCls = 'warn';
+    else if (period.delta_pct < -0.5) deltaCls = 'ok';
+  }
+  const periodSub = '<span class="' + deltaCls + '">' +
+    fmtDeltaPct(period.delta_pct, period.prior_is_zero) + '</span> vs prior ' +
+    days + 'd · ' + fmtUSD(period.prior_cost_usd);
+
+  // Month-to-date + projection. When a budget is set, render a
+  // budget % line; otherwise show only the projection.
+  let monthSub;
+  if (month.budget_usd > 0) {
+    let budgetCls = 'muted';
+    if (month.budget_pct > 100) budgetCls = 'warn';
+    else if (month.budget_pct > 75) budgetCls = 'warn2';
+    else budgetCls = 'ok';
+    monthSub = '<span class="' + budgetCls + '">' + month.budget_pct.toFixed(0) +
+      '% of $' + month.budget_usd.toFixed(0) + ' budget</span> · proj ' +
+      fmtUSD(month.projection_usd);
+  } else {
+    monthSub = 'proj ' + fmtUSD(month.projection_usd) +
+      ' (day ' + month.days_elapsed + '/' + month.days_in_month + ')';
+  }
+
+  // Cache efficacy — green above 80%, amber 50-80%, red below.
+  let cacheCls = 'muted';
+  if (cache.efficacy >= 0.8) cacheCls = 'ok';
+  else if (cache.efficacy >= 0.5) cacheCls = 'warn2';
+  else if (cache.efficacy > 0)    cacheCls = 'warn';
+  const cacheSub = '<span class="' + cacheCls + '">' +
+    fmtPct(cache.efficacy) + '</span> · ' +
+    fmtN(cache.read_tokens) + ' read · ' + fmtN(cache.write_tokens) + ' written';
+
+  // LC tier surcharge — only show $ if we found any LC turns; otherwise
+  // signal the explicit zero so the user sees the tile is "working."
+  const lcValue = lc.turns > 0 ? fmtUSD(lc.surcharge_usd) : '$0';
+  const lcSub = lc.turns > 0 ?
+    fmtN(lc.turns) + ' turns repriced (>200K / >272K)' :
+    'no turns crossed an LC threshold';
+
+  // Effective rate — period $ ÷ effective tokens ÷ 1M.
+  const effSub = eff.tokens > 0 ?
+    fmtN(eff.tokens) + ' effective tokens (output + cache write)' :
+    'no traffic in window';
+
+  const wasteSub = waste.tokens > 0 ?
+    fmtN(waste.tokens) + ' tokens × $' + (waste.blended_rate_per_million || 0).toFixed(2) + '/M' :
+    'no stale-read waste detected';
+
+  const cards = [
+    {
+      label:  'Spend (' + days + 'd)',
+      help:   'tile.analysis.period_cost',
+      value:  fmtUSD(period.cost_usd),
+      sub:    periodSub,
+    },
+    {
+      label:  'Month-to-date',
+      help:   'tile.analysis.mtd',
+      value:  fmtUSD(month.to_date_usd),
+      sub:    monthSub,
+    },
+    {
+      label:  'Effective rate',
+      help:   'tile.analysis.effective_rate',
+      value:  '$' + (eff.rate_per_million || 0).toFixed(2) + ' /M',
+      sub:    effSub,
+    },
+    {
+      label:  'Cache efficacy',
+      help:   'tile.analysis.cache_efficacy',
+      value:  fmtPct(cache.efficacy),
+      sub:    cacheSub,
+    },
+    {
+      label:  'LC tier surcharge',
+      help:   'tile.analysis.lc_surcharge',
+      value:  lcValue,
+      sub:    lcSub,
+    },
+    {
+      label:  'Waste $',
+      help:   'tile.analysis.waste',
+      value:  fmtUSD(waste.usd),
+      sub:    wasteSub,
+    },
+  ];
+
+  document.getElementById('analysis-cards').innerHTML = cards.map(c =>
+    '<div class="card"><div class="label"' + (c.help ? ' data-help="' + c.help + '"' : '') + '>' + c.label + '</div>' +
+    '<div class="value">' + c.value + '</div>' +
+    '<div class="sub">' + c.sub + '</div></div>'
+  ).join('');
+
+  await Promise.all([
+    renderAnalysisTrend(),
+    renderAnalysisMovers(),
+    renderAnalysisTopSessions(),
+    renderAnalysisRouting(),
+  ]);
+}
+
+async function loadCost() {
+  const days = state.windowDays;
+  const qs = filterQS();
+  const cost = await getJSON('/api/cost?days=' + days + '&group_by=model' + qs);
+  const tt = cost.total_tokens || {};
+  document.getElementById('cost-summary').textContent =
+    'total ' + fmtUSD(cost.total_cost_usd) + ' · turns ' + (cost.turn_count || 0) +
+    ' · net in ' + fmtN(tt.input) + ' · cache read ' + fmtN(tt.cache_read) +
+    ' · cache write ' + fmtN(tt.cache_creation) + ' · output ' + fmtN(tt.output) +
+    ' · reliability ' + (cost.reliability || '?') +
+    (cost.unknown_model_count ? ' · ' + cost.unknown_model_count + ' model(s) without pricing' : '');
+  renderTable(document.getElementById('cost-table'),
+    (cost.rows || []),
+    [
+      // escapeHtml so model names containing '<' (e.g. "<synthetic>")
+      // don't render as invisible custom HTML elements.
+      { label: 'Model',   help: 'col.cost.model',   render: r => escapeHtml(r.key) },
+      { label: 'Net In',  help: 'col.cost.net_in',  className: 'number', render: r => fmtN(r.tokens && r.tokens.input) },
+      { label: 'Cache R', help: 'col.cost.cache_r', className: 'number', render: r => fmtN(r.tokens && r.tokens.cache_read) },
+      { label: 'Cache W', help: 'col.cost.cache_w', className: 'number', render: r => fmtN(r.tokens && r.tokens.cache_creation) },
+      { label: 'Output',  help: 'col.cost.output',  className: 'number', render: r => fmtN(r.tokens && r.tokens.output) },
+      { label: 'Cost',    help: 'col.cost.cost',    className: 'number', render: r => fmtUSD(r.cost_usd) },
+      { label: 'Turns',   help: 'col.cost.turns',   className: 'number', render: r => r.turn_count },
+      { label: 'Source',  help: 'col.cost.source',  render: r => r.source },
+      { label: 'Reliab.', help: 'col.cost.reliab',  render: r => {
+          // Tilde + tooltip when pricing came via fallback (family
+          // prefix, date-stripped, or no match) so users see which
+          // rows are priced from baked-in exact rates vs inferred ones.
+          const ps = r.pricing_source || '';
+          const fallback = ps && ps !== 'exact' && ps !== '';
+          if (fallback) {
+            const tip = ps === 'miss'
+              ? 'no pricing entry — cost is $0; the model id is in unknown_models'
+              : 'pricing inferred via ' + ps + ' fallback (family prefix or date-stripped). Add an explicit entry under [intelligence.pricing.models."<id>"] in config.toml to pin the rate.';
+            return r.reliability + ' <span title="' + tip + '" style="opacity:.7">~</span>';
+          }
+          return r.reliability;
+        } },
+    ]);
+
+  // Stacked bar of total tokens per day
+  const ts = await getJSON('/api/timeseries/cost?bucket=day&days=' + days + qs);
+  const series = ts.series || [];
+  if (series.length === 0) {
+    renderEmptyChart('cost-stacked-chart', {
+      icon: 'noProxy',
+      title: 'No daily token data',
+      message: 'No proxy traffic in this window. Engage the proxy: Claude Code → <code>ANTHROPIC_BASE_URL=http://127.0.0.1:8820</code>; Codex / OpenAI-compatible → <code>OPENAI_BASE_URL=http://127.0.0.1:8820/v1</code>. Or widen the window selector.',
+    });
+  } else {
+    lineChart('cost-stacked-chart', series.map(p => p.bucket), [
+      { label: 'Net Input', data: series.map(p => p.input), backgroundColor: '#58a6ff' },
+      { label: 'Cache Read', data: series.map(p => p.cache_read), backgroundColor: '#d2a8ff' },
+      { label: 'Cache Write', data: series.map(p => p.cache_creation), backgroundColor: '#ffa657' },
+      { label: 'Output', data: series.map(p => p.output), backgroundColor: '#f778ba' },
+    ], { type: 'bar', stacked: true, yMaxFormatter: fmtN });
+  }
+
+  // Stacked bar of total tokens per day, split by model. Same source
+  // (cost engine, SourceAuto: proxy preferred, JSONL fallback) as the
+  // chart above; only the dimensionality differs (model vs bucket type).
+  const tbm = await getJSON('/api/timeseries/tokens-by-model?days=' + days + qs);
+  const tbmSeries = tbm.series || [];
+  // Pivot the flat (day, model) list into a labels axis + per-model
+  // series. Chronological days dictate the x-axis; top-6 models by
+  // total tokens get their own dataset; everything else rolls up
+  // into "other" so the legend stays readable on accounts that ping
+  // many models.
+  const dayBuckets = Array.from(new Set(tbmSeries.map(p => p.bucket))).sort();
+  const modelTotals = {};
+  for (const p of tbmSeries) {
+    modelTotals[p.model] = (modelTotals[p.model] || 0) + (p.total_tokens || 0);
+  }
+  const sortedModels = Object.entries(modelTotals).sort((a, b) => b[1] - a[1]);
+  const TOP_N_MODELS = 6;
+  const featuredModels = sortedModels.slice(0, TOP_N_MODELS).map(([m]) => m);
+  const featuredModelSet = new Set(featuredModels);
+  const modelPalette = ['#58a6ff', '#d2a8ff', '#ffa657', '#f778ba', '#56d364', '#79c0ff', '#8b949e'];
+  // Build a (day → model → tokens) lookup once so we aren't doing
+  // O(days × models × series) scans inside the dataset map below.
+  const cellLookup = {};
+  for (const p of tbmSeries) {
+    if (!cellLookup[p.bucket]) cellLookup[p.bucket] = {};
+    cellLookup[p.bucket][p.model] = p.total_tokens || 0;
+  }
+  const modelDatasets = featuredModels.map((m, i) => ({
+    label: m,
+    data: dayBuckets.map(d => (cellLookup[d] && cellLookup[d][m]) || 0),
+    backgroundColor: modelPalette[i % modelPalette.length],
+  }));
+  if (sortedModels.length > TOP_N_MODELS) {
+    modelDatasets.push({
+      label: 'other',
+      data: dayBuckets.map(d => {
+        let other = 0;
+        for (const [m, n] of Object.entries(cellLookup[d] || {})) {
+          if (!featuredModelSet.has(m)) other += n;
+        }
+        return other;
+      }),
+      backgroundColor: modelPalette[modelPalette.length - 1],
+    });
+  }
+  const tbmMeta = document.getElementById('cost-by-model-meta');
+  if (tbmMeta) {
+    tbmMeta.textContent = dayBuckets.length === 0
+      ? 'no data'
+      : dayBuckets.length + ' day(s) · ' + featuredModels.length + ' model(s)'
+        + (sortedModels.length > TOP_N_MODELS ? ' (+ ' + (sortedModels.length - TOP_N_MODELS) + ' rolled into "other")' : '');
+  }
+  if (dayBuckets.length === 0) {
+    renderEmptyChart('cost-by-model-chart', {
+      icon: 'noProxy',
+      title: 'No per-model token data',
+      message: 'Same data source as the chart above — engage the proxy or widen the window.',
+    });
+  } else {
+    lineChart('cost-by-model-chart', dayBuckets, modelDatasets, { type: 'bar', stacked: true, yMaxFormatter: fmtN });
+  }
+}
+
+async function loadSessions() {
+  const limit = 25;
+  const params = new URLSearchParams({
+    limit,
+    page: state.sessionsPage,
+    days: state.windowDays,
+  });
+  if (state.toolFilter)    params.set('tool',    state.toolFilter);
+  if (state.projectFilter) params.set('project', state.projectFilter);
+  const data = await getJSON('/api/sessions?' + params.toString());
+  document.getElementById('sessions-count').textContent = (data.total || 0) + ' total';
+
+  // Quality / Errors / Redundancy columns are only meaningful when
+  // `observer score` has run. If no session in the current filter has
+  // a quality_score set, drop those columns and show a one-line hint
+  // instead of three columns of dashes. Saves horizontal space and
+  // tells the user how to populate them.
+  const showScores = (data.scored_count || 0) > 0;
+  const meta = document.getElementById('sessions-meta');
+  if (meta) {
+    meta.textContent = showScores
+      ? data.scored_count + ' of ' + (data.total || 0) + ' scored'
+      : 'quality / errors / redundancy hidden — run `observer score` to populate';
+  }
+
+  const columns = [
+    { label: 'ID',      help: 'col.sessions.id',      render: r => idCopy(r.id, 12) },
+    { label: 'Tool',    help: 'col.sessions.tool',    key: 'tool' },
+    // Project column — show the trailing two path segments so the
+    // table stays narrow; full path on hover.
+    { label: 'Project', help: 'col.sessions.project', render: r => {
+        const p = r.project || '';
+        if (!p) return '<span class="muted">—</span>';
+        const tail = p.split('/').filter(Boolean).slice(-2).join('/');
+        return '<span title="' + p + '">' + tail + '</span>';
+      } },
+    { label: 'Started', help: 'col.sessions.started', render: r => fmtTs(r.started_at) },
+    { label: 'Actions', help: 'col.sessions.actions', className: 'number', key: 'total_actions' },
+    { label: 'Sub-agent', help: 'term.sidechain', className: 'number', render: r => {
+        const n = r.sidechain_action_count || 0;
+        if (n === 0) return '<span class="muted">—</span>';
+        return '<span class="pill" title="actions emitted inside a sub-agent runtime spawned by this session\'s Agent tool calls">' + fmtN(n) + '</span>';
+      } },
+    { label: 'Tokens', help: 'col.sessions.tokens', className: 'number', render: r => {
+        const n = r.total_tokens || 0;
+        if (n === 0) return '<span class="muted">—</span>';
+        return fmtN(n);
+      } },
+    { label: 'Cost', help: 'col.sessions.cost', className: 'number', render: r => {
+        const c = r.cost_usd || 0;
+        if (c === 0 && (r.total_tokens || 0) === 0) return '<span class="muted">—</span>';
+        const rel = r.cost_reliability || '';
+        const dollars = fmtUSD(c);
+        // Mark approximate / unreliable rows with a trailing tilde so users
+        // see at a glance which numbers are billing-grade vs estimated.
+        if (rel === 'accurate' || rel === '') return dollars;
+        return '<span title="reliability: ' + rel + ' — see term.proxy_vs_jsonl">' + dollars + ' ~</span>';
+      } },
+  ];
+  if (showScores) {
+    columns.push(
+      { label: 'Quality', help: 'col.sessions.quality', className: 'number',
+        render: r => r.quality_score != null ? r.quality_score.toFixed(2) : '<span class="muted">—</span>' },
+      { label: 'Errors', help: 'col.sessions.errors', className: 'number',
+        render: r => r.error_rate != null ? (r.error_rate * 100).toFixed(1) + '%' : '<span class="muted">—</span>' },
+      { label: 'Redundancy', help: 'col.sessions.redundancy', className: 'number',
+        render: r => r.redundancy_ratio != null ? (r.redundancy_ratio * 100).toFixed(1) + '%' : '<span class="muted">—</span>' },
+    );
+  }
+  renderTable(document.getElementById('sessions-table'),
+    (data.rows || []), columns,
+    { onRowClick: row => openSessionModal(row.id) });
+  renderPager('sessions-pager', data, page => { state.sessionsPage = page; loadSessions(); });
+}
+
+async function loadActions() {
+  const limit = 50;
+  const params = new URLSearchParams({ limit, page: state.actionsPage });
+  if (state.toolFilter)        params.set('tool',        state.toolFilter);
+  if (state.projectFilter)     params.set('project',     state.projectFilter);
+  if (state.actionsTypeFilter) params.set('action_type', state.actionsTypeFilter);
+  const data = await getJSON('/api/actions?' + params.toString());
+  document.getElementById('actions-count').textContent = (data.total || 0) + ' total';
+  renderTable(document.getElementById('actions-table'),
+    data.rows || [],
+    [
+      { label: 'When',      help: 'col.actions.when',      render: r => fmtTs(r.timestamp) },
+      { label: 'Tool',      help: 'col.actions.tool',      key: 'tool' },
+      { label: 'Type',      help: 'col.actions.type',      render: r => '<span class="pill">' + r.action_type + '</span>' },
+      { label: 'Tool name', help: 'col.actions.tool_name', render: r => r.raw_tool_name || '<span class="muted">—</span>' },
+      { label: 'Target',    help: 'col.actions.target',    render: r => expandable(r.target, 60) },
+      // Session: clickable link to the existing session-detail modal,
+      // matching the Compression events table's affordance. Truncated
+      // to 8 chars; full id in the title attribute.
+      { label: 'Session',   help: 'col.actions.session',   render: r => r.session_id
+          ? '<a href="javascript:void(0)" class="session-link" title="' + escapeHtml(r.session_id) + '" onclick="openSessionModal(\'' + escapeHtml(r.session_id) + '\')">' + escapeHtml(short(r.session_id, 8)) + '</a>'
+          : '<span class="muted">—</span>' },
+      // Upstream Anthropic msg_xxx id from the parent api_turn.
+      // Populated by the claudecode adapter + the message-id backfill;
+      // empty for older rows that pre-date migration 012.
+      { label: 'Msg ID',    help: 'col.actions.message_id', render: r => r.message_id
+          ? idCopy(r.message_id, 12)
+          : '<span class="muted">—</span>' },
+      { label: 'OK',        help: 'col.actions.ok',        render: r => r.success ? '<span class="ok">✓</span>' : '<span class="warn">✗</span>' },
+      { label: 'Error',     help: 'col.actions.error',     render: r => r.error_message ? '<span class="warn">' + expandable(r.error_message, 60) + '</span>' : '' },
+    ]);
+  renderPager('actions-pager', data, page => { state.actionsPage = page; loadActions(); });
+}
+
+async function loadTools() {
+  const days = state.windowDays;
+  const qs = filterQS();
+  const [tools, actionsTs, breakdown] = await Promise.all([
+    getJSON('/api/tools?days=' + days + qs),
+    getJSON('/api/timeseries/actions?bucket=day&days=' + days + qs),
+    getJSON('/api/tools/breakdown?days=' + days + qs),
+  ]);
+  const toolList = tools.tools || [];
+
+  // KPI tiles
+  const totalActions = toolList.reduce((s, r) => s + (r.action_count || 0), 0);
+  const totalFailures = toolList.reduce((s, r) => s + (r.failure_count || 0), 0);
+  const overallSuccess = totalActions ? 1 - totalFailures / totalActions : 0;
+  const busiest = toolList[0] || null;
+  const cards = totalActions === 0
+    ? [{ label: 'No tool activity', help: 'tab.tools', value: '—', sub: 'no actions recorded in this window' }]
+    : [
+      { label: 'Total actions', help: 'col.tools.actions',      value: fmtN(totalActions),    sub: 'across all tools' },
+      { label: 'Distinct tools', help: 'tab.tools',             value: toolList.length,       sub: 'AI clients seen' },
+      { label: 'Overall success', help: 'col.tools.success_rate', value: fmtPct(overallSuccess), sub: fmtN(totalFailures) + ' failures' },
+      { label: 'Busiest tool', help: 'col.tools.tool',          value: busiest ? escapeHtml(busiest.tool) : '—',
+        sub: busiest ? fmtN(busiest.action_count) + ' actions · ' + fmtPct(busiest.success_rate) + ' ok' : '' },
+    ];
+  document.getElementById('tools-cards').innerHTML = cards.map(c =>
+    '<div class="card"><div class="label"' + (c.help ? ' data-help="' + c.help + '"' : '') + '>' + c.label + '</div>' +
+    '<div class="value">' + c.value + '</div>' +
+    '<div class="sub">' + c.sub + '</div></div>'
+  ).join('');
+
+  // Activity over time — per-tool stacked area, top-6 by total + "other".
+  const aSeries = actionsTs.series || [];
+  const tsLabels = aSeries.map(p => p.bucket);
+  const totals = {};
+  for (const p of aSeries) {
+    for (const [t, n] of Object.entries(p.by_tool || {})) totals[t] = (totals[t] || 0) + n;
+  }
+  const ranked = Object.entries(totals).sort((a, b) => b[1] - a[1]);
+  const TOP_N = 6;
+  const featured = ranked.slice(0, TOP_N).map(([t]) => t);
+  const featuredSet = new Set(featured);
+  const palette = ['#58a6ff', '#d2a8ff', '#ffa657', '#f778ba', '#56d364', '#79c0ff', '#8b949e'];
+  const tsDatasets = featured.map((t, i) => ({
+    label: t,
+    data: aSeries.map(p => (p.by_tool || {})[t] || 0),
+    backgroundColor: palette[i % palette.length] + 'cc',
+    borderColor: palette[i % palette.length],
+    fill: true, tension: 0.2, pointRadius: 0,
+  }));
+  if (ranked.length > TOP_N) {
+    tsDatasets.push({
+      label: 'other',
+      data: aSeries.map(p => {
+        let other = 0;
+        for (const [t, n] of Object.entries(p.by_tool || {})) {
+          if (!featuredSet.has(t)) other += n;
+        }
+        return other;
+      }),
+      backgroundColor: palette[palette.length - 1] + 'cc',
+      borderColor: palette[palette.length - 1],
+      fill: true, tension: 0.2, pointRadius: 0,
+    });
+  }
+  document.getElementById('tools-ts-meta').textContent =
+    aSeries.length
+      ? aSeries.length + ' day(s) · ' + featured.length + ' tool(s)'
+        + (ranked.length > TOP_N ? ' (+ ' + (ranked.length - TOP_N) + ' rolled into "other")' : '')
+      : 'no data';
+  if (tsDatasets.length === 0 || aSeries.length === 0) {
+    renderEmptyChart('tools-ts-chart', {
+      icon: 'noData',
+      title: 'No tool activity',
+      message: 'No actions recorded across any AI client in this window.',
+    });
+  } else {
+    lineChart('tools-ts-chart', tsLabels, tsDatasets, { stacked: true, yMaxFormatter: fmtN });
+  }
+
+  // Action-type mix per tool — horizontal stacked bar, one row per tool,
+  // segments per action_type. Useful for spotting "claude-code is 60%
+  // read_file, cursor is mostly edits." Limits display to top-8 tools.
+  const bdTools = (breakdown.tools || []).slice(0, 8);
+  // Collect union of action types, sorted by total descending so the
+  // dominant types render first in each bar.
+  const typeTotals = {};
+  for (const t of bdTools) {
+    for (const [k, n] of Object.entries(t.by_type || {})) typeTotals[k] = (typeTotals[k] || 0) + n;
+  }
+  const typeOrder = Object.entries(typeTotals).sort((a, b) => b[1] - a[1]).map(([k]) => k);
+  const typePalette = ['#58a6ff', '#d2a8ff', '#ffa657', '#f778ba', '#56d364', '#79c0ff', '#3fb950', '#f85149', '#d29922', '#8b949e'];
+  const bdLabels = bdTools.map(t => t.tool);
+  const bdDatasets = typeOrder.map((typ, i) => ({
+    label: typ,
+    data: bdTools.map(t => (t.by_type || {})[typ] || 0),
+    backgroundColor: typePalette[i % typePalette.length],
+  }));
+  document.getElementById('tools-bd-meta').textContent = bdTools.length
+    ? bdTools.length + ' tool(s) · ' + typeOrder.length + ' action type(s)'
+    : 'no data';
+  destroyChart('tools-bd-chart');
+  if (!bdTools.length) {
+    renderEmptyChart('tools-bd-chart', {
+      icon: 'scales',
+      title: 'No action-type data',
+      message: 'No tool calls recorded in this window. Once any AI client runs through the observer, this chart will show what each one actually does.',
+    });
+  } else {
+    clearEmptyChart('tools-bd-chart');
+    const ctx = document.getElementById('tools-bd-chart').getContext('2d');
+    const t = chartTheme();
+    state.charts['tools-bd-chart'] = new Chart(ctx, {
+      type: 'bar',
+      data: { labels: bdLabels, datasets: bdDatasets },
+      options: {
+        indexAxis: 'y',
+        responsive: true, maintainAspectRatio: false, animation: { duration: 200 },
+        interaction: { mode: 'index', intersect: false },
+        plugins: { legend: { labels: { color: t.color, boxWidth: 12, font: { size: 11 } } } },
+        scales: {
+          x: { stacked: true, grid: t.grid, ticks: { ...t.ticks, callback: fmtN } },
+          y: { stacked: true, grid: t.grid, ticks: t.ticks },
+        },
+      },
+    });
+  }
+
+  // Existing table at the bottom.
+  renderTable(document.getElementById('tools-table'),
+    toolList,
+    [
+      { label: 'Tool',         help: 'col.tools.tool',         key: 'tool' },
+      { label: 'Actions',      help: 'col.tools.actions',      className: 'number', render: r => fmtN(r.action_count) },
+      { label: 'Failures',     help: 'col.tools.failures',     className: 'number', render: r => fmtN(r.failure_count) },
+      { label: 'Success rate', help: 'col.tools.success_rate', className: 'number', render: r => fmtPct(r.success_rate) },
+      { label: 'Sessions',     help: 'col.tools.sessions',     className: 'number', render: r => r.session_count },
+      { label: 'First seen',   help: 'col.tools.first_seen',   render: r => fmtTs(r.first_seen) },
+      { label: 'Last seen',    help: 'col.tools.last_seen',    render: r => fmtTs(r.last_seen) },
+    ]);
+}
+
+async function loadCompression() {
+  const days = state.windowDays;
+  const qs = filterQS();
+  const [cost, ts, mechTs, events] = await Promise.all([
+    getJSON('/api/cost?days=' + days + '&group_by=model' + qs),
+    getJSON('/api/timeseries/cost?bucket=day&days=' + days + qs),
+    getJSON('/api/compression/timeseries?bucket=day&days=' + days),
+    getJSON('/api/compression/events?days=' + days + '&page=' + state.compressionEventsPage + '&limit=50'),
+  ]);
+  const tc = cost.total_compression || {};
+  const savedBytes = (tc.original_bytes || 0) - (tc.compressed_bytes || 0);
+  const savedTokens = tc.tokens_saved_est || 0;
+  const savedUSD = tc.cost_saved_usd_est || 0;
+
+  // KPI tiles — token & $ savings as headline metrics, bytes demoted.
+  const cls = (n) => n < 0 ? ' warn' : (n > 0 ? ' ok' : '');
+  const cards = (tc.original_bytes || 0) === 0
+    ? [{ label: 'Compression', help: 'tab.compression', value: '—', sub: 'no proxy data in window — set ANTHROPIC_BASE_URL to engage' }]
+    : [
+      { label: 'Tokens saved (est.)', help: 'metric.tokens_saved_est', value: '<span class="' + cls(savedTokens).trim() + '">' + fmtN(savedTokens) + '</span>', sub: '~bytes ÷ 4' },
+      { label: 'Dollars saved (est.)', help: 'metric.cost_saved_usd_est', value: '<span class="' + cls(savedUSD).trim() + '">' + fmtUSD(savedUSD) + '</span>', sub: 'tokens × input rate' },
+      { label: 'Bytes saved', help: 'metric.saved_bytes', value: '<span class="' + cls(savedBytes).trim() + '">' + fmtBytes(savedBytes) + '</span>', sub: fmtBytes(tc.original_bytes) + ' → ' + fmtBytes(tc.compressed_bytes) },
+      { label: 'Turns compressed', help: 'col.compression.turns', value: fmtN(tc.turns || 0), sub: (tc.compressed_count || 0) + ' results · ' + (tc.dropped_count || 0) + ' dropped · ' + (tc.marker_count || 0) + ' markers' },
+    ];
+  document.getElementById('compression-cards').innerHTML = cards.map(c =>
+    '<div class="card"><div class="label"' + (c.help ? ' data-help="' + c.help + '"' : '') + '>' + c.label + '</div>' +
+    '<div class="value">' + c.value + '</div>' +
+    '<div class="sub">' + c.sub + '</div></div>'
+  ).join('');
+
+  // Per-day savings chart — line, two series (tokens + $ on dual axes).
+  // When there's no compression data the chart hides itself.
+  const series = (ts.series || []).filter(p =>
+    (p.compression_bytes_saved || 0) !== 0 || (p.compression_tokens_saved_est || 0) !== 0);
+  if (series.length) {
+    document.getElementById('compression-chart-meta').textContent =
+      series.length + ' day(s) with compression activity · ' +
+      'totals shown above are over the full window (' + days + 'd)';
+    destroyChart('compression-chart');
+    clearEmptyChart('compression-chart');
+    const ctx = document.getElementById('compression-chart').getContext('2d');
+    const t = chartTheme();
+    state.charts['compression-chart'] = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: series.map(p => p.bucket),
+        datasets: [
+          { label: 'Tokens saved (est.)', data: series.map(p => p.compression_tokens_saved_est || 0), borderColor: 'var(--chart1)', backgroundColor: '#58a6ff44', tension: 0.2, yAxisID: 'y' },
+          { label: 'Bytes saved',         data: series.map(p => p.compression_bytes_saved || 0),       borderColor: 'var(--chart3)', backgroundColor: '#ffa65744', tension: 0.2, yAxisID: 'yB' },
+        ],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: { duration: 200 },
+        interaction: { mode: 'index', intersect: false },
+        plugins: { legend: { labels: { color: t.color, boxWidth: 12, font: { size: 11 } } } },
+        scales: {
+          x: { grid: t.grid, ticks: { ...t.ticks, autoSkip: true, maxTicksLimit: 8, maxRotation: 0 } },
+          y: { position: 'left', grid: t.grid, ticks: { ...t.ticks, callback: fmtN }, title: { display: true, text: 'tokens', color: t.color } },
+          yB: { position: 'right', grid: { drawOnChartArea: false }, ticks: { ...t.ticks, callback: fmtN }, title: { display: true, text: 'bytes', color: t.color } },
+        },
+      },
+    });
+  } else {
+    document.getElementById('compression-chart-meta').textContent = 'no per-day compression data in this window';
+    renderEmptyChart('compression-chart', {
+      icon: 'noProxy',
+      title: 'No compression activity',
+      message: 'The conversation-compression pipeline only runs when the proxy intercepts a request. Engage the proxy with <code>ANTHROPIC_BASE_URL=http://127.0.0.1:8820</code> (Claude Code) or <code>OPENAI_BASE_URL=http://127.0.0.1:8820/v1</code> (Codex / OpenAI-compatible) and ensure <code>[compression.conversation].enabled = true</code> in observer config.',
+    });
+  }
+
+  // Per-model breakdown table — tokens and $ savings as primary
+  // columns; bytes demoted to a single column with original→compressed
+  // visible on hover.
+  const rows = (cost.rows || []).filter(r => r.compression && (r.compression.original_bytes || 0) > 0);
+  document.getElementById('compression-meta').textContent =
+    rows.length ? rows.length + ' model(s) with compression data' : '';
+  const renderTokensSaved = r => {
+    const v = r.compression.tokens_saved_est || 0;
+    const txt = fmtN(v);
+    return v < 0 ? '<span class="warn" title="compression added overhead beyond what was dropped — usually small payloads">' + txt + '</span>' : v > 0 ? '<span class="ok">' + txt + '</span>' : txt;
+  };
+  const renderCostSaved = r => {
+    const v = r.compression.cost_saved_usd_est || 0;
+    const txt = fmtUSD(v);
+    return v < 0 ? '<span class="warn">' + txt + '</span>' : v > 0 ? '<span class="ok">' + txt + '</span>' : txt;
+  };
+  const renderSavedBytes = r => {
+    const saved = (r.compression.original_bytes || 0) - (r.compression.compressed_bytes || 0);
+    const orig = r.compression.original_bytes || 0;
+    const comp = r.compression.compressed_bytes || 0;
+    const tip = 'orig ' + fmtBytes(orig) + ' → comp ' + fmtBytes(comp);
+    const txt = '<span title="' + tip + '">' + fmtBytes(saved) + '</span>';
+    return saved < 0 ? '<span class="warn">' + txt + '</span>' : txt;
+  };
+  const renderSavedPct = r => {
+    const orig = r.compression.original_bytes || 0;
+    if (orig === 0) return fmtPct(0);
+    const ratio = (orig - (r.compression.compressed_bytes || 0)) / orig;
+    const txt = fmtPct(ratio);
+    return ratio < 0 ? '<span class="warn">' + txt + '</span>' : txt;
+  };
+  renderTable(document.getElementById('compression-table'), rows, [
+    { label: 'Model',          help: 'col.compression.model',         render: r => escapeHtml(r.key) },
+    { label: 'Tokens saved ~', help: 'metric.tokens_saved_est',       className: 'number', render: renderTokensSaved },
+    { label: '$ saved ~',      help: 'metric.cost_saved_usd_est',     className: 'number', render: renderCostSaved },
+    { label: 'Bytes saved',    help: 'col.compression.saved',         className: 'number', render: renderSavedBytes },
+    { label: 'Saved %',        help: 'col.compression.saved_pct',     className: 'number', render: renderSavedPct },
+    { label: 'Turns',          help: 'col.compression.turns',         className: 'number', render: r => r.compression.turns || 0 },
+    { label: 'Tool results',   help: 'col.compression.tool_results',  className: 'number', render: r => r.compression.compressed_count || 0 },
+    { label: 'Dropped',        help: 'col.compression.dropped',       className: 'number', render: r => r.compression.dropped_count || 0 },
+    { label: 'Markers',        help: 'col.compression.markers',       className: 'number', render: r => r.compression.marker_count || 0 },
+  ]);
+
+  // Savings by mechanism — per-day stacked bar with one segment per
+  // mechanism (json/code/logs/text/diff/html/drop). Sourced from the
+  // compression_events table (migration 009) — only post-009 data
+  // populates here. Y-axis unit toggleable between bytes (the source
+  // of truth) and tokens (= bytes ÷ 4, what actually costs money).
+  const mechSeries = mechTs.series || [];
+  const mechs = ['json', 'code', 'logs', 'text', 'diff', 'html', 'drop'];
+  const mechLabels = mechSeries.map(p => p.bucket);
+  const mechColors = {
+    json: '#58a6ff', code: '#56d364', logs: '#ffa657',
+    text: '#d2a8ff', diff: '#79c0ff', html: '#f778ba', drop: '#f85149',
+  };
+  const useTokens = state.compressionMechUnit === 'tokens';
+  const valueOf = (mech) => mech ? (useTokens ? Math.round((mech.saved_bytes || 0) / 4) : (mech.saved_bytes || 0)) : 0;
+  const mechDatasets = mechs.map(m => ({
+    label: m,
+    data: mechSeries.map(p => valueOf(p.by_mechanism && p.by_mechanism[m])),
+    backgroundColor: mechColors[m],
+  })).filter(ds => ds.data.some(v => v !== 0));
+  document.getElementById('compression-mech-meta').textContent = mechSeries.length
+    ? mechSeries.length + ' day(s) · ' + mechDatasets.length + ' mechanism(s) firing — ' + (useTokens ? '~tokens' : 'bytes') + ' saved per mechanism per day'
+    : 'no per-event compression data yet (recorded for proxy turns only, post migration 009)';
+  if (mechSeries.length === 0 || mechDatasets.length === 0) {
+    renderEmptyChart('compression-mech-chart', {
+      icon: 'noProxy',
+      title: 'No per-event compression data',
+      message: 'Per-event detail is recorded only for proxy turns processed after migration 009 ran. Engage the proxy — Claude Code: <code>ANTHROPIC_BASE_URL=http://127.0.0.1:8820</code>; Codex / OpenAI-compatible: <code>OPENAI_BASE_URL=http://127.0.0.1:8820/v1</code>. Ensure <code>[compression.conversation].enabled = true</code>; new turns will populate this chart.',
+    });
+  } else {
+    destroyChart('compression-mech-chart');
+    clearEmptyChart('compression-mech-chart');
+    const ctx = document.getElementById('compression-mech-chart').getContext('2d');
+    const t = chartTheme();
+    const yTickFmt = useTokens ? fmtN : fmtBytes;
+    const yTitle = useTokens ? '~tokens saved (bytes ÷ 4)' : 'bytes saved';
+    state.charts['compression-mech-chart'] = new Chart(ctx, {
+      type: 'bar',
+      data: { labels: mechLabels, datasets: mechDatasets },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: { duration: 200 },
+        interaction: { mode: 'index', intersect: false },
+        plugins: { legend: { labels: { color: t.color, boxWidth: 12, font: { size: 11 } } } },
+        scales: {
+          x: { stacked: true, grid: t.grid, ticks: { ...t.ticks, autoSkip: true, maxTicksLimit: 8, maxRotation: 0 } },
+          y: { stacked: true, grid: t.grid, ticks: { ...t.ticks, callback: yTickFmt }, title: { display: true, text: yTitle, color: t.color } },
+        },
+      },
+    });
+  }
+
+  // Recent compression events — paginated detail. Each row is one
+  // compression decision (json compressor fired, drop happened, etc.)
+  // joined back to its turn for model + session context.
+  document.getElementById('compression-events-count').textContent =
+    (events.total || 0) + ' total';
+  renderTable(document.getElementById('compression-events-table'), events.rows || [], [
+    { label: 'When',      render: r => fmtTs(r.timestamp) },
+    { label: 'Mechanism', render: r => '<span class="pill" data-help="mechanism.' + r.mechanism + '">' + escapeHtml(r.mechanism) + '</span>' },
+    { label: 'Source',    help: 'term.sidechain', render: r => r.is_subagent_runtime
+        ? '<span class="pill" title="api_turn correlated with sidechain actions in the same session within ±2 min — likely a sub-agent runtime call">sub-agent</span>'
+        : '<span class="muted">main</span>' },
+    { label: 'Model',     render: r => escapeHtml(r.model || '—') },
+    // Bytes saved (signed) + the ~tokens equivalent. Tokens are
+    // estimated as bytes/4 — same heuristic the cost engine's
+    // CompressionStats uses, so per-event numbers stay consistent
+    // with the summary tiles above the table.
+    { label: 'Saved (B)', className: 'number', render: r => {
+        const cls = r.saved_bytes < 0 ? 'warn' : (r.saved_bytes > 0 ? 'ok' : '');
+        return '<span class="' + cls + '" title="' + fmtBytes(r.original_bytes) + ' → ' + fmtBytes(r.compressed_bytes) + '">' + fmtBytes(r.saved_bytes) + '</span>';
+      } },
+    { label: 'Saved (tok)', className: 'number', render: r => {
+        const cls = r.saved_tokens_est < 0 ? 'warn' : (r.saved_tokens_est > 0 ? 'ok' : '');
+        return '<span class="' + cls + '" title="estimated as bytes ÷ 4">~' + fmtN(r.saved_tokens_est) + '</span>';
+      } },
+    { label: 'Saved %',   className: 'number', render: r => {
+        if (!r.original_bytes) return '—';
+        return fmtPct(r.saved_bytes / r.original_bytes);
+      } },
+    { label: 'Msg #',     className: 'number', render: r => r.msg_index >= 0 ? r.msg_index : '<span class="muted">—</span>' },
+    // Session id — truncated to first 8 chars; click opens the
+    // existing session detail modal so users can drill into the
+    // surrounding turn.
+    { label: 'Session',   render: r => r.session_id
+        ? '<a href="javascript:void(0)" class="row-clickable" title="' + escapeHtml(r.session_id) + '" onclick="openSessionModal(\'' + escapeHtml(r.session_id) + '\')">' + escapeHtml(r.session_id.slice(0, 8)) + '…</a>'
+        : '<span class="muted">—</span>' },
+    // Upstream Anthropic msg_xxx id from the same api_turn — joinable
+    // back to the per-message timeline. Truncated; full id in title.
+    { label: 'Msg ID',    render: r => r.message_id
+        ? idCopy(r.message_id, 12)
+        : '<span class="muted">—</span>' },
+    { label: 'Importance',className: 'number', render: r => r.mechanism === 'drop'
+        ? '<span title="below this score, the budget enforcer dropped the message">' + r.importance_score.toFixed(3) + '</span>'
+        : '<span class="muted">—</span>' },
+  ]);
+  renderPager('compression-events-pager', events,
+    page => { state.compressionEventsPage = page; loadCompression(); });
+}
+
+async function loadDiscover() {
+  const params = new URLSearchParams({
+    days: state.windowDays,
+    stale_page: state.discoverStalePage,
+    stale_limit: 20,
+    repeated_page: state.discoverRepeatPage,
+    repeated_limit: 20,
+  });
+  if (state.toolFilter)    params.set('tool',    state.toolFilter);
+  if (state.projectFilter) params.set('project', state.projectFilter);
+  const data = await getJSON('/api/discover?' + params.toString());
+
+  // KPI tiles — turn the diagnostic into a concrete cost number. Uses
+  // a per-install BLENDED input rate computed by the cost engine from
+  // the last-30d api_turns mix (each observed model weighted by its
+  // prompt-token volume). Falls back to a representative $3/1M when
+  // no proxy data exists.
+  const sum = data.summary || {};
+  const wastedTokens = sum.est_wasted_tokens || 0;
+  const blendedRate = data.blended_input_rate_per_million || 3;
+  const wastedUSD = wastedTokens * blendedRate / 1_000_000;
+  const filesAffected = (data.stale_reads || []).length;
+  const xthread = sum.cross_thread_stale_count || 0;
+  const xthreadSub = xthread > 0
+    ? fmtN(xthread) + ' cross-thread (parent ↔ sub-agent)'
+    : 'same-session only';
+  const cards = wastedTokens === 0
+    ? [{ label: 'Stale rereads',  help: 'metric.stale_count', value: '0', sub: 'no in-session rereads detected — clean signal' }]
+    : [
+      { label: 'Stale rereads',     help: 'metric.stale_count',        value: fmtN(sum.stale_read_count || 0), sub: xthreadSub },
+      { label: '~Tokens wasted',    help: 'col.discover.wasted',       value: '<span class="warn">' + fmtN(wastedTokens) + '</span>', sub: 'estimated, file_size ÷ 4' },
+      { label: '~$ wasted',         help: 'col.discover.wasted',       value: '<span class="warn">' + fmtUSD(wastedUSD) + '</span>', sub: '@ ~$' + blendedRate.toFixed(2) + '/1M (your blended rate)' },
+      { label: 'Affected files',    help: 'tab.discovery',             value: fmtN(filesAffected), sub: 'top 20 shown in table' },
+    ];
+  document.getElementById('discover-cards').innerHTML = cards.map(c =>
+    '<div class="card"><div class="label"' + (c.help ? ' data-help="' + c.help + '"' : '') + '>' + c.label + '</div>' +
+    '<div class="value">' + c.value + '</div>' +
+    '<div class="sub">' + c.sub + '</div></div>'
+  ).join('');
+
+  // Stale re-reads — files re-read with no intervening edit. Columns
+  // mirror discover.StaleReadFile JSON tags exactly (the frontend used
+  // to read stale_rereads / read_count / last_tool, none of which exist).
+  renderTable(document.getElementById('stale-table'), data.stale_reads || [], [
+    { label: 'File',               help: 'col.discover.file',   render: r => expandable(r.file_path || '', 60) },
+    { label: 'Reads',              help: 'col.discover.reads',  className: 'number', render: r => fmtN(r.total_reads) },
+    { label: 'Stale',              help: 'col.discover.stale',  className: 'number', render: r => fmtN(r.stale_count) },
+    { label: 'Cross-thread', help: 'term.sidechain', className: 'number', render: r => {
+        const x = r.cross_thread_stale_count || 0;
+        if (x === 0) return '<span class="muted">0</span>';
+        return '<span class="warn" title="parent ↔ sub-agent re-reads — pass content via Agent\'s prompt parameter to avoid">' + fmtN(x) + '</span>';
+      } },
+    { label: 'Est. wasted tokens', help: 'col.discover.wasted', className: 'number', render: r => fmtN(r.est_wasted_tokens) },
+    { label: 'Project', help: 'term.project', render: r => {
+        const p = r.project || '';
+        if (!p) return '<span class="muted">—</span>';
+        const tail = p.split('/').filter(Boolean).slice(-2).join('/');
+        return '<span title="' + p + '">' + tail + '</span>';
+      } },
+  ]);
+  // Repeated commands — match discover.RepeatedCommand JSON tags.
+  renderTable(document.getElementById('repeat-table'), data.repeated_commands || [], [
+    { label: 'Command',          help: 'col.discover.command',          render: r => '<code>' + expandable(r.command || '', 80) + '</code>' },
+    { label: 'Runs',             help: 'col.discover.runs',             className: 'number', render: r => fmtN(r.total_runs) },
+    { label: 'No-change reruns', help: 'col.discover.no_change_reruns', className: 'number', render: r => fmtN(r.no_change_reruns) },
+    { label: 'Failed',           help: 'col.discover.failed',           className: 'number', render: r => fmtN(r.failed_runs) },
+    { label: 'Project', help: 'term.project', render: r => {
+        const p = r.project || '';
+        if (!p) return '<span class="muted">—</span>';
+        const tail = p.split('/').filter(Boolean).slice(-2).join('/');
+        return '<span title="' + p + '">' + tail + '</span>';
+      } },
+  ]);
+
+  // Pagers under each panel — keys mirror the per-panel envelope the
+  // backend returns (stale_page/limit/total + repeated_page/limit/total).
+  renderPager('stale-pager',
+    { rows: data.stale_reads || [], total: data.stale_total || 0,
+      page: data.stale_page || 1, limit: data.stale_limit || 20 },
+    page => { state.discoverStalePage = page; loadDiscover(); });
+  renderPager('repeat-pager',
+    { rows: data.repeated_commands || [], total: data.repeated_total || 0,
+      page: data.repeated_page || 1, limit: data.repeated_limit || 20 },
+    page => { state.discoverRepeatPage = page; loadDiscover(); });
+
+  // Cross-tool overlap — files touched by ≥2 AI clients. Surfaces the
+  // database-level cross-platform sharing the MCP tools also depend on.
+  renderTable(document.getElementById('cross-tool-table'),
+    data.cross_tool_files || [], [
+      { label: 'File',     help: 'col.discover.file', render: r => expandable(r.file_path || '', 60) },
+      { label: 'Tools',    help: 'term.cross_platform_tool_calling', render: r => (r.tools || []).map(t => '<span class="pill">' + escapeHtml(t) + '</span>').join(' ') },
+      { label: 'Accesses', className: 'number', render: r => fmtN(r.accesses) },
+      { label: 'Project',  help: 'term.project', render: r => {
+          const p = r.project || '';
+          if (!p) return '<span class="muted">—</span>';
+          const tail = p.split('/').filter(Boolean).slice(-2).join('/');
+          return '<span title="' + p + '">' + tail + '</span>';
+        } },
+    ]);
+}
+
+async function loadPatterns() {
+  const limit = 50;
+  const data = await getJSON('/api/patterns?limit=' + limit + '&page=' + state.patternsPage);
+  document.getElementById('patterns-count').textContent = (data.total || 0) + ' total';
+  const rows = data.rows || [];
+  renderTable(document.getElementById('patterns-table'), rows, [
+    { label: 'Type',         help: 'col.patterns.type', key: 'pattern_type' },
+    { label: 'Project',      help: 'term.project', render: r => {
+        const p = r.project || '';
+        if (!p) return '<span class="muted">—</span>';
+        const tail = p.split('/').filter(Boolean).slice(-2).join('/');
+        return '<span title="' + escapeHtml(p) + '">' + escapeHtml(tail) + '</span>';
+      } },
+    { label: 'Confidence',   help: 'col.patterns.confidence',   className: 'number', render: r => r.confidence.toFixed(2) },
+    { label: 'Observations', help: 'col.patterns.observations', className: 'number', key: 'observation_count' },
+    { label: 'Data',         help: 'col.patterns.data',         render: r => fmtPatternData(r.data) },
+  ]);
+  renderPager('patterns-pager', data,
+    page => { state.patternsPage = page; loadPatterns(); });
+}
+
+function renderPager(elID, data, onPage) {
+  const el = document.getElementById(elID);
+  const totalPages = Math.max(1, Math.ceil((data.total || 0) / (data.limit || 1)));
+  el.innerHTML =
+    '<button id="' + elID + '-prev"' + (data.page <= 1 ? ' disabled' : '') + '>← prev</button>' +
+    '<span>page ' + data.page + ' / ' + totalPages + '</span>' +
+    '<button id="' + elID + '-next"' + (data.page >= totalPages ? ' disabled' : '') + '>next →</button>' +
+    '<span class="muted">showing ' + (data.rows || []).length + ' of ' + (data.total || 0) + '</span>';
+  document.getElementById(elID + '-prev').onclick = () => data.page > 1 && onPage(data.page - 1);
+  document.getElementById(elID + '-next').onclick = () => data.page < totalPages && onPage(data.page + 1);
+}
+
+// --- session detail modal ---
+async function openSessionModal(id) {
+  state.sessionDetail.id = id;
+  state.sessionDetail.page = 1;
+  document.getElementById('session-modal-title').textContent = 'Session ' + id;
+  document.getElementById('session-modal').classList.add('open');
+  await renderSessionDetail();
+}
+async function renderSessionDetail() {
+  const id = state.sessionDetail.id;
+  if (!id) return;
+  const pageSize = state.sessionDetail.pageSize || 100;
+  const offset = ((state.sessionDetail.page || 1) - 1) * pageSize;
+  const msgsURL = '/api/session/' + encodeURIComponent(id)
+    + '/messages?limit=' + pageSize + '&offset=' + offset;
+  const [detail, messages] = await Promise.all([
+    getJSON('/api/session/' + encodeURIComponent(id)),
+    getJSON(msgsURL),
+  ]);
+  const cards = [
+    { label: 'Tool', value: detail.tool, sub: detail.model || '' },
+    { label: 'Started', value: fmtTs(detail.started_at), sub: detail.ended_at ? 'ended ' + fmtTs(detail.ended_at) : 'still active' },
+    { label: 'Actions', value: detail.total_actions,
+      sub: detail.success_actions + ' ok · ' + detail.failure_actions + ' fail' },
+    { label: 'Cost', value: fmtUSD(detail.cost_usd), sub: 'this session' },
+  ];
+  document.getElementById('session-cards').innerHTML = cards.map(c =>
+    '<div class="card"><div class="label">' + c.label + '</div>' +
+    '<div class="value">' + c.value + '</div>' +
+    '<div class="sub">' + c.sub + '</div></div>'
+  ).join('');
+
+  const breakdown = detail.tool_breakdown || [];
+  if (breakdown.length === 0) {
+    renderEmptyChart('session-action-chart', {
+      icon: 'empty',
+      title: 'No action breakdown',
+      message: 'This session has no recorded actions yet.',
+    });
+  } else {
+    lineChart('session-action-chart', breakdown.map(b => b.action_type), [
+      { label: 'Successful', data: breakdown.map(b => b.count - b.failures), backgroundColor: '#3fb950' },
+      { label: 'Failures', data: breakdown.map(b => b.failures), backgroundColor: '#f85149' },
+    ], { type: 'bar', stacked: true, yMaxFormatter: fmtN });
+  }
+
+  const tk = detail.tokens || {};
+  renderTable(document.getElementById('session-tokens-table'),
+    [{ k: 'Net Input', v: tk.input },
+     { k: 'Cache Read', v: tk.cache_read },
+     { k: 'Cache Write', v: tk.cache_creation },
+     { k: 'Output', v: tk.output }],
+    [{ label: 'Bucket', key: 'k' },
+     { label: 'Tokens', className: 'number', render: r => fmtN(r.v) }]);
+  document.getElementById('session-cost-meta').textContent =
+    'cost ' + fmtUSD(detail.cost_usd) + ' · quality ' +
+    (detail.quality_score != null ? detail.quality_score.toFixed(3) : '—');
+
+  // Per-model breakdown — shows haiku/opus split when a session uses
+  // multiple models (Claude Code's main vs sub-agent dispatches always
+  // hit the cheaper model for the sub-agent). Same per-turn-deduped
+  // numbers as the bucket table above; just sliced by model.
+  const perModel = detail.per_model || [];
+  const perModelMeta = document.getElementById('session-per-model-meta');
+  if (perModelMeta) {
+    perModelMeta.textContent = perModel.length === 0
+      ? 'no model-attributed token rows for this session'
+      : perModel.length + ' model' + (perModel.length === 1 ? '' : 's')
+        + ' — proxy preferred per turn, JSONL fills the gaps';
+  }
+  renderTable(document.getElementById('session-per-model-table'),
+    perModel,
+    [
+      { label: 'Model',     render: r => '<code>' + escapeHtml(r.model || '<unknown>') + '</code>' },
+      { label: 'Net In',    className: 'number', render: r => fmtN(r.input) },
+      { label: 'Cache R',   className: 'number', render: r => fmtN(r.cache_read) },
+      { label: 'Cache W',   className: 'number', render: r => fmtN(r.cache_creation) },
+      { label: 'Output',    className: 'number', render: r => fmtN(r.output) },
+      { label: 'Turns',     className: 'number', render: r => r.turn_count },
+      { label: 'Cost',      className: 'number', render: r => fmtUSD(r.cost_usd) },
+    ]);
+
+  // Messages timeline — one row per upstream Anthropic message.id.
+  // Toggle filters between "Tool messages only" (default — assistant
+  // turns with at least one tool call + user prompts that triggered
+  // them) and "All messages" (also pure-text assistant replies).
+  state.sessionDetail.messages = messages.messages || [];
+  state.sessionDetail.total = messages.total || 0;
+  state.sessionDetail.msgFilter = state.sessionDetail.msgFilter || 'tool';
+  // Bind the radio onChange once per modal open. We re-attach every
+  // render (cheap, fewer than two listeners ever live) so a fresh
+  // open after a previous close still wires up.
+  document.querySelectorAll('input[name="session-msg-filter"]').forEach(el => {
+    el.checked = el.value === state.sessionDetail.msgFilter;
+    el.onchange = () => {
+      state.sessionDetail.msgFilter = el.value;
+      renderSessionMessages();
+    };
+  });
+  // Wire pagination controls — page-size selector triggers a reload
+  // that resets to page 1; prev/next reload at the new offset.
+  const pageSizeSel = document.getElementById('session-messages-pagesize');
+  if (pageSizeSel) {
+    pageSizeSel.value = String(state.sessionDetail.pageSize || 100);
+    pageSizeSel.onchange = () => {
+      state.sessionDetail.pageSize = Number(pageSizeSel.value) || 100;
+      state.sessionDetail.page = 1;
+      renderSessionDetail();
+    };
+  }
+  const prevBtn = document.getElementById('session-messages-prev');
+  const nextBtn = document.getElementById('session-messages-next');
+  if (prevBtn) prevBtn.onclick = () => {
+    if ((state.sessionDetail.page || 1) <= 1) return;
+    state.sessionDetail.page = (state.sessionDetail.page || 1) - 1;
+    renderSessionDetail();
+  };
+  if (nextBtn) nextBtn.onclick = () => {
+    const total = state.sessionDetail.total || 0;
+    const size = state.sessionDetail.pageSize || 100;
+    const lastPage = Math.max(1, Math.ceil(total / size));
+    if ((state.sessionDetail.page || 1) >= lastPage) return;
+    state.sessionDetail.page = (state.sessionDetail.page || 1) + 1;
+    renderSessionDetail();
+  };
+  renderSessionMessages();
+}
+
+function renderSessionMessages() {
+  const all = state.sessionDetail.messages || [];
+  const filter = state.sessionDetail.msgFilter || 'tool';
+  // 'tool' = user prompts + assistant messages with > 0 tool calls.
+  // 'all'  = everything, including pure-text assistant replies.
+  const rows = filter === 'all'
+    ? all
+    : all.filter(m => m.role === 'user' || (m.tool_call_count || 0) > 0);
+  const meta = document.getElementById('session-messages-meta');
+  const total = state.sessionDetail.total || all.length;
+  const page = state.sessionDetail.page || 1;
+  const pageSize = state.sessionDetail.pageSize || 100;
+  if (meta) {
+    const filtSuffix = (rows.length === all.length)
+      ? '' : ' (' + rows.length + ' after filter)';
+    meta.textContent = all.length + ' of ' + total + ' messages on this page'
+      + filtSuffix + ' · proxy preferred per turn, JSONL fills the gaps';
+  }
+  // Show / hide and update the pager based on whether there's more than
+  // a single page of data. Filter happens client-side AFTER server
+  // pagination, so the pager always reflects the server total.
+  const pager = document.getElementById('session-messages-pager');
+  const pageInfo = document.getElementById('session-messages-pageinfo');
+  const prevBtn = document.getElementById('session-messages-prev');
+  const nextBtn = document.getElementById('session-messages-next');
+  if (pager) {
+    const lastPage = Math.max(1, Math.ceil(total / pageSize));
+    const showPager = total > pageSize;
+    pager.style.display = showPager ? '' : 'none';
+    if (pageInfo) pageInfo.textContent = 'page ' + page + ' / ' + lastPage;
+    if (prevBtn) prevBtn.disabled = page <= 1;
+    if (nextBtn) nextBtn.disabled = page >= lastPage;
+  }
+  // Cache the rows on the table element so the click-to-expand handler
+  // can look up the tool_calls array for each row by index.
+  const tbl = document.getElementById('session-messages-table');
+  tbl.__rows = rows;
+  renderTable(tbl, rows,
+    [
+      { label: 'When',    render: r => fmtTs(r.timestamp) },
+      { label: 'Elapsed', className: 'number',
+        render: r => r.elapsed_ms == null
+          ? '<span class="muted">—</span>'
+          : '<span title="wall-clock gap to the next message in this session">' + fmtDuration(r.elapsed_ms) + '</span>' },
+      { label: 'Message', render: r => idCopy(r.message_id || '', 14) },
+      { label: 'Role',    render: r => '<span class="pill">' + r.role + '</span>' },
+      { label: 'Model',   render: r => r.model ? '<code>' + escapeHtml(r.model) + '</code>' : '<span class="muted">—</span>' },
+      { label: 'Net In',  className: 'number', render: r => r.input ? fmtN(r.input) : '<span class="muted">—</span>' },
+      { label: 'Cache R', className: 'number', render: r => r.cache_read ? fmtN(r.cache_read) : '<span class="muted">—</span>' },
+      { label: 'Cache W', className: 'number', render: r => r.cache_creation ? fmtN(r.cache_creation) : '<span class="muted">—</span>' },
+      { label: 'Output',  className: 'number', render: r => r.output ? fmtN(r.output) : '<span class="muted">—</span>' },
+      { label: 'Cost',    className: 'number', render: r => r.cost_usd ? fmtUSD(r.cost_usd) : '<span class="muted">—</span>' },
+      { label: 'Tool time', className: 'number',
+        render: r => (r.tool_duration_ms || 0) === 0
+          ? '<span class="muted">—</span>'
+          : '<span title="sum of duration_ms across this turn\'s tool calls">' + fmtDuration(r.tool_duration_ms) + '</span>' },
+      { label: 'Tools',   className: 'number', render: (r, i) => {
+          const n = r.tool_call_count || 0;
+          if (n === 0) return '<span class="muted">—</span>';
+          return '<span class="pill" style="cursor:pointer" data-msg-row="' + i + '">' + n + ' ▾</span>';
+        } },
+    ]);
+  // Wire up the click-to-expand handlers and rendered the expand-row
+  // markup once per row.
+  tbl.querySelectorAll('span[data-msg-row]').forEach(pill => {
+    const idx = Number(pill.dataset.msgRow);
+    pill.addEventListener('click', () => toggleSessionMessageTools(pill, tbl, idx));
+  });
+}
+
+// Click handler for the "N ▾" tool-call pill. Inserts an expand row
+// directly after the message row (lazily on first click), or toggles
+// its visibility on subsequent clicks.
+function toggleSessionMessageTools(pill, tbl, idx) {
+  const tr = pill.closest('tr');
+  if (!tr || !tr.parentNode) return;
+  // Find or create the expand row immediately after this message row.
+  let expand = tr.nextElementSibling;
+  if (!expand || !expand.classList.contains('session-message-tools')
+      || expand.dataset.msgIdx !== String(idx)) {
+    const r = (tbl.__rows || [])[idx] || {};
+    expand = document.createElement('tr');
+    expand.className = 'session-message-tools';
+    expand.dataset.msgIdx = String(idx);
+    const td = document.createElement('td');
+    td.colSpan = 12;
+    td.style.padding = '0.5rem 1rem';
+    td.style.background = '#0d1117';
+    td.innerHTML = (r.tool_calls || []).map(tc =>
+      '<div style="margin: 0.25rem 0">'
+      + (tc.success ? '<span class="ok">✓</span> ' : '<span class="warn">✗</span> ')
+      + '<span class="pill">' + escapeHtml(tc.action_type) + '</span> '
+      + '<code>' + escapeHtml(tc.raw_tool_name || '') + '</code> '
+      + ((tc.duration_ms || 0) > 0 ? ' <span class="muted" style="font-size: 0.85em" title="actions.duration_ms">[' + fmtDuration(tc.duration_ms) + ']</span> ' : '')
+      + '<span style="opacity: 0.7">' + expandable(tc.target, 100) + '</span>'
+      + (tc.error_message ? ' <span class="warn" style="font-size: 0.85em">— ' + expandable(tc.error_message, 80) + '</span>' : '')
+      + '</div>'
+    ).join('');
+    expand.appendChild(td);
+    tr.parentNode.insertBefore(expand, tr.nextSibling);
+    pill.textContent = pill.textContent.replace('▾', '▴');
+    return;
+  }
+  // Toggle visibility on subsequent clicks.
+  if (expand.style.display === 'none') {
+    expand.style.display = 'table-row';
+    pill.textContent = pill.textContent.replace('▾', '▴');
+  } else {
+    expand.style.display = 'none';
+    pill.textContent = pill.textContent.replace('▴', '▾');
+  }
+}
+function closeSessionModal() {
+  document.getElementById('session-modal').classList.remove('open');
+  state.sessionDetail.id = null;
+}
+
+// --- tab switching ---
+function showTab(tab) {
+  state.tab = tab;
+  document.querySelectorAll('nav button').forEach(b => {
+    b.classList.toggle('active', b.dataset.tab === tab);
+  });
+  document.querySelectorAll('main section').forEach(s => s.classList.remove('active'));
+  // 'cost' section id in HTML is 'cost-section' to avoid clashing with the
+  // anchor name; everything else matches its data-tab directly.
+  const id = tab === 'cost' ? 'cost-section' : tab;
+  const el = document.getElementById(id);
+  if (el) el.classList.add('active');
+  loadTab(tab);
+}
+
+// Toggle the body-level + active-section loading flag. Triggers the
+// top-of-page progress bar, the chart-panel spinner overlays, the
+// dimmed-table indicator, and the KPI-card shimmer — all CSS-driven
+// so JS just toggles the class.
+function setTabLoading(on) {
+  document.body.classList.toggle('tab-loading', !!on);
+  const id = state.tab === 'cost' ? 'cost-section' : state.tab;
+  const sec = document.getElementById(id);
+  if (sec) sec.classList.toggle('tab-loading', !!on);
+}
+
+async function loadTab(tab) {
+  const msg = document.getElementById('status-msg');
+  msg.textContent = 'loading…';
+  setTabLoading(true);
+  try {
+    if (tab === 'overview') await loadOverviewCharts();
+    else if (tab === 'cost') await loadCost();
+    else if (tab === 'analysis') await loadAnalysis();
+    else if (tab === 'sessions') await loadSessions();
+    else if (tab === 'actions') await loadActions();
+    else if (tab === 'tools') await loadTools();
+    else if (tab === 'compression') await loadCompression();
+    else if (tab === 'discover') await loadDiscover();
+    else if (tab === 'patterns') await loadPatterns();
+    else if (tab === 'settings') await loadSettings();
+    msg.textContent = '';
+  } catch (e) {
+    // Surface the failure so users notice silent 500s instead of
+    // staring at a blank panel. escapeHtml because the message may
+    // contain a URL with a query string and (in dev) raw error text.
+    msg.innerHTML = '<span class="warn">' + escapeHtml(tab) +
+      ' tab failed: ' + escapeHtml(e.message || String(e)) + '</span>';
+    console.error('loadTab(' + tab + ')', e);
+  } finally {
+    setTabLoading(false);
+  }
+}
+
+// =====================================================================
+// SETTINGS TAB
+// =====================================================================
+
+async function loadSettings() {
+  // Fetch the full config + capability list once per tab activation.
+  // Section switches re-render from the cache without round-tripping.
+  state.settingsCache = await getJSON('/api/config');
+  renderSettingsSection(state.settingsSection);
+}
+
+function renderSettingsSection(name) {
+  state.settingsSection = name;
+  document.querySelectorAll('#settings-rail button').forEach(b => {
+    b.classList.toggle('active', b.dataset.section === name);
+  });
+  const content = document.getElementById('settings-content');
+  if (!state.settingsCache) {
+    content.innerHTML = '<div class="empty">Loading…</div>';
+    return;
+  }
+  if (name === 'pricing') {
+    renderSettingsPricing(content);
+  } else if (name === 'backfill') {
+    renderSettingsBackfill(content);
+  } else if (name === 'compression') {
+    renderSettingsCompression(content);
+  } else if (SECTION_FIELDS[name]) {
+    renderSettingsStructuredSection(content, name);
+  } else {
+    renderSettingsEditableSection(content, name);
+  }
+}
+
+// PRICING_FIELDS lists the standard rate fields shown inline in the
+// override row. LC fields render in an expandable detail row below
+// each model so the table stays scannable on narrow screens.
+const PRICING_FIELDS = [
+  { key: 'input',             label: 'Input' },
+  { key: 'output',            label: 'Output' },
+  { key: 'cache_read',        label: 'Cache R' },
+  { key: 'cache_creation',    label: 'CC 5m' },
+  { key: 'cache_creation_1h', label: 'CC 1h' },
+];
+const PRICING_LC_FIELDS = [
+  { key: 'long_context_threshold',          label: 'Threshold (tokens)', step: '1000' },
+  { key: 'long_context_input',              label: 'LC Input' },
+  { key: 'long_context_output',             label: 'LC Output' },
+  { key: 'long_context_cache_read',         label: 'LC Cache R' },
+  { key: 'long_context_cache_creation',     label: 'LC CC 5m' },
+  { key: 'long_context_cache_creation_1h',  label: 'LC CC 1h' },
+];
+
+// Serialize state.pricingOverrides back into the models-map shape that
+// PUT /api/config/pricing expects. Empty fields are omitted so the
+// engine's fillDefaults path stays the source of truth for unspecified
+// rates (avoids accidentally pinning zeros).
+function pricingOverridesToModels(rows) {
+  const models = {};
+  for (const row of rows) {
+    if (!row.model) continue;
+    const entry = {};
+    for (const f of PRICING_FIELDS.concat(PRICING_LC_FIELDS)) {
+      const v = row.values[f.key];
+      if (v !== '' && v !== null && v !== undefined && !Number.isNaN(Number(v))) {
+        entry[f.key] = Number(v);
+      }
+    }
+    models[row.model] = entry;
+  }
+  return models;
+}
+
+// Pricing struct returned by /api/config (Go field names) → flat keys
+// the form uses. Both paths funnel through here so first-load and
+// post-save round-trips look the same.
+function pricingFromGoStruct(p) {
+  if (!p) return {};
+  return {
+    input:                       p.Input || p.input || 0,
+    output:                      p.Output || p.output || 0,
+    cache_read:                  p.CacheRead || p.cache_read || 0,
+    cache_creation:              p.CacheCreation || p.cache_creation || 0,
+    cache_creation_1h:           p.CacheCreation1h || p.cache_creation_1h || 0,
+    long_context_threshold:      p.LongContextThreshold || p.long_context_threshold || 0,
+    long_context_input:          p.LongContextInput || p.long_context_input || 0,
+    long_context_output:         p.LongContextOutput || p.long_context_output || 0,
+    long_context_cache_read:     p.LongContextCacheRead || p.long_context_cache_read || 0,
+    long_context_cache_creation: p.LongContextCacheCreation || p.long_context_cache_creation || 0,
+    long_context_cache_creation_1h: p.LongContextCacheCreation1h || p.long_context_cache_creation_1h || 0,
+  };
+}
+
+async function renderSettingsPricing(content) {
+  // Lazy-load the baked-in defaults; reuse the cached map across
+  // re-renders within a single Settings tab visit.
+  if (!state.pricingDefaults) {
+    try {
+      const r = await getJSON('/api/config/pricing/defaults');
+      state.pricingDefaults = r.defaults || {};
+    } catch (e) {
+      state.pricingDefaults = {};
+    }
+  }
+
+  // Build editable override rows from the user's current saved
+  // intelligence.pricing.models. Sort alphabetically so the table is
+  // stable across renders even when the user adds new entries.
+  const cfg = state.settingsCache.config || {};
+  const intel = cfg.Intelligence || {};
+  const pricing = intel.Pricing || {};
+  const savedModels = pricing.Models || {};
+  state.pricingOverrides = Object.keys(savedModels).sort().map(model => ({
+    model,
+    values: pricingFromGoStruct(savedModels[model]),
+    showLC: false,
+  }));
+
+  paintPricingForm(content);
+}
+
+function paintPricingForm(content) {
+  const filter = (state.pricingFilter || '').toLowerCase();
+  const filteredRows = state.pricingOverrides
+    .map((row, idx) => ({ row, idx }))
+    .filter(r => !filter || r.row.model.toLowerCase().includes(filter));
+
+  let html =
+    '<h3 style="margin-top: 0">Pricing overrides</h3>' +
+    (SECTION_BLURBS.pricing ? '<div class="settings-status" style="margin-bottom: 0.5rem">' + escapeHtml(SECTION_BLURBS.pricing) + '</div>' : '') +
+    '<div class="settings-status">Each row pins the rates for one model id. ' +
+    'Empty cells fall back to the baked-in defaults (lower section, expandable). ' +
+    'Save writes <code>' + escapeHtml(state.settingsCache.config_path || '(no path)') +
+    '</code> with a <code>.bak</code> of the prior version, and the cost engine ' +
+    'reloads in place — no restart needed.</div>' +
+    '<div style="display: flex; gap: 0.5rem; align-items: center; margin: 0.6rem 0">' +
+    '  <input type="text" id="pricing-filter" placeholder="filter by model id…" ' +
+    '         value="' + escapeHtml(state.pricingFilter || '') + '" ' +
+    '         style="flex: 1; min-width: 180px; background: var(--bg); color: var(--fg); ' +
+    '         border: 1px solid var(--line); padding: 0.3rem 0.5rem; font: inherit; border-radius: 4px">' +
+    '  <button type="button" id="pricing-add-btn">+ Add override</button>' +
+    '  <button type="button" id="pricing-save-btn">Save pricing</button>' +
+    '  <span class="settings-status" id="pricing-msg" style="margin: 0"></span>' +
+    '</div>';
+
+  if (state.pricingOverrides.length === 0) {
+    html += '<div class="empty">No active overrides — using baked-in defaults for every model. Click "+ Add override" to start.</div>';
+  } else if (filteredRows.length === 0) {
+    html += '<div class="empty">No overrides match "' + escapeHtml(state.pricingFilter || '') + '".</div>';
+  } else {
+    html += '<table id="pricing-table" style="font-size: 0.75rem"><thead><tr>'
+      + '<th style="min-width: 180px">Model</th>';
+    for (const f of PRICING_FIELDS) {
+      html += '<th class="number">' + escapeHtml(f.label) + '</th>';
+    }
+    html += '<th></th><th></th></tr></thead><tbody>';
+    for (const r of filteredRows) {
+      const row = r.row;
+      const isOverDefault = state.pricingDefaults[row.model] !== undefined;
+      html += '<tr data-row-idx="' + r.idx + '" style="border-left: 3px solid var(--accent)">'
+        + '<td><code>' + escapeHtml(row.model) + '</code>' +
+        (isOverDefault ? '' : ' <span class="pill" title="No baked-in default for this id">custom</span>') + '</td>';
+      for (const f of PRICING_FIELDS) {
+        html += '<td class="number">'
+          + '<input type="number" step="0.001" min="0" data-rate-key="' + f.key + '" '
+          + 'value="' + escapeHtml(String(row.values[f.key] || '')) + '" '
+          + 'style="width: 80px; background: var(--bg); color: var(--fg); '
+          + 'border: 1px solid var(--line); padding: 0.15rem 0.3rem; '
+          + 'font: inherit; font-size: 0.75rem; text-align: right; border-radius: 3px">'
+          + '</td>';
+      }
+      html += '<td><button type="button" class="pricing-lc-btn" title="Toggle long-context tier fields">'
+        + (row.showLC ? '▾ LC' : '▸ LC') + '</button></td>';
+      html += '<td><button type="button" class="pricing-row-actions" data-action="reset" title="Restore baked-in defaults">↺</button> '
+        + '<button type="button" class="pricing-row-actions" data-action="delete" title="Remove this override">✕</button></td>';
+      html += '</tr>';
+      if (row.showLC) {
+        html += '<tr class="pricing-lc-row" data-row-idx="' + r.idx + '"><td colspan="8" '
+          + 'style="background: var(--panel2); padding: 0.5rem">'
+          + '<div style="display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: center">';
+        for (const f of PRICING_LC_FIELDS) {
+          html += '<label style="display: flex; flex-direction: column; gap: 0.15rem; font-size: 0.7rem; color: var(--fg-mute)">'
+            + escapeHtml(f.label)
+            + '<input type="number" step="' + (f.step || '0.001') + '" min="0" data-rate-key="' + f.key + '" '
+            + 'value="' + escapeHtml(String(row.values[f.key] || '')) + '" '
+            + 'style="width: 100px; background: var(--bg); color: var(--fg); '
+            + 'border: 1px solid var(--line); padding: 0.15rem 0.3rem; '
+            + 'font: inherit; font-size: 0.75rem; text-align: right; border-radius: 3px">'
+            + '</label>';
+        }
+        html += '</div></td></tr>';
+      }
+    }
+    html += '</tbody>';
+  }
+
+  // Defaults reference list — collapsed by default. Lets users browse the
+  // 60+ baked-in models and click "Override" to graft a row into the
+  // active overrides table pre-filled with the default rates.
+  html += '<details style="margin-top: 1rem">'
+    + '<summary style="cursor: pointer; padding: 0.5rem; background: var(--panel2); border-radius: 4px">'
+    + 'Baked-in defaults (' + Object.keys(state.pricingDefaults).length + ' models — click to expand)</summary>'
+    + '<table style="font-size: 0.75rem; margin-top: 0.5rem">'
+    + '<thead><tr><th style="min-width: 180px">Model</th>';
+  for (const f of PRICING_FIELDS) {
+    html += '<th class="number">' + escapeHtml(f.label) + '</th>';
+  }
+  html += '<th></th></tr></thead><tbody>';
+  for (const model of Object.keys(state.pricingDefaults).sort()) {
+    const p = pricingFromGoStruct(state.pricingDefaults[model]);
+    const alreadyOverridden = state.pricingOverrides.some(r => r.model === model);
+    html += '<tr><td><code>' + escapeHtml(model) + '</code>' +
+      (p.long_context_threshold > 0 ? ' <span class="pill" title="Has long-context tier">LC</span>' : '') + '</td>';
+    for (const f of PRICING_FIELDS) {
+      html += '<td class="number muted">' + (p[f.key] || 0) + '</td>';
+    }
+    html += '<td><button type="button" class="pricing-default-override" data-model="' + escapeHtml(model) + '"' +
+      (alreadyOverridden ? ' disabled style="opacity: 0.4"' : '') + '>Override</button></td>';
+    html += '</tr>';
+  }
+  html += '</tbody></table></details>';
+
+  content.innerHTML = html;
+
+  content.querySelectorAll('button').forEach(b => {
+    b.style.background = 'var(--accent)';
+    b.style.color = '#0d1117';
+    b.style.border = '0';
+    b.style.padding = '0.2rem 0.55rem';
+    b.style.borderRadius = '4px';
+    b.style.cursor = b.disabled ? 'not-allowed' : 'pointer';
+    b.style.font = 'inherit';
+    b.style.fontSize = '0.7rem';
+    b.style.fontWeight = '600';
+  });
+
+  // Wire the form's interactivity.
+  document.getElementById('pricing-filter').oninput = e => {
+    state.pricingFilter = e.target.value;
+    paintPricingForm(content);
+    // Restore focus + cursor after re-render.
+    const input = document.getElementById('pricing-filter');
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+  };
+  document.getElementById('pricing-add-btn').onclick = () => addPricingOverride(content);
+  document.getElementById('pricing-save-btn').onclick = () => savePricingOverrides(content);
+
+  content.querySelectorAll('input[type="number"][data-rate-key]').forEach(input => {
+    input.oninput = e => {
+      const tr = e.target.closest('tr');
+      const idx = Number(tr.dataset.rowIdx);
+      if (!state.pricingOverrides[idx]) return;
+      state.pricingOverrides[idx].values[e.target.dataset.rateKey] = e.target.value;
+    };
+  });
+  content.querySelectorAll('.pricing-lc-btn').forEach(btn => {
+    btn.onclick = e => {
+      const tr = e.target.closest('tr');
+      const idx = Number(tr.dataset.rowIdx);
+      state.pricingOverrides[idx].showLC = !state.pricingOverrides[idx].showLC;
+      paintPricingForm(content);
+    };
+  });
+  content.querySelectorAll('.pricing-row-actions').forEach(btn => {
+    btn.onclick = e => {
+      const tr = e.target.closest('tr');
+      const idx = Number(tr.dataset.rowIdx);
+      const action = e.target.dataset.action;
+      if (action === 'delete') {
+        state.pricingOverrides.splice(idx, 1);
+      } else if (action === 'reset') {
+        const model = state.pricingOverrides[idx].model;
+        const def = state.pricingDefaults[model];
+        if (def) {
+          state.pricingOverrides[idx].values = pricingFromGoStruct(def);
+        }
+      }
+      paintPricingForm(content);
+    };
+  });
+  content.querySelectorAll('.pricing-default-override').forEach(btn => {
+    btn.onclick = e => {
+      const model = e.target.dataset.model;
+      if (state.pricingOverrides.some(r => r.model === model)) return;
+      state.pricingOverrides.push({
+        model,
+        values: pricingFromGoStruct(state.pricingDefaults[model]),
+        showLC: false,
+      });
+      state.pricingOverrides.sort((a, b) => a.model.localeCompare(b.model));
+      paintPricingForm(content);
+    };
+  });
+}
+
+function addPricingOverride(content) {
+  const id = prompt('Model id to override (e.g. claude-sonnet-4-6):');
+  if (!id) return;
+  const trimmed = id.trim();
+  if (!trimmed) return;
+  if (state.pricingOverrides.some(r => r.model === trimmed)) {
+    alert('Override for "' + trimmed + '" already exists.');
+    return;
+  }
+  // Pre-fill from baked-in defaults if available; otherwise empty so
+  // the user fills in custom rates for an unrecognized model.
+  const def = state.pricingDefaults[trimmed];
+  state.pricingOverrides.push({
+    model: trimmed,
+    values: def ? pricingFromGoStruct(def) : pricingFromGoStruct({}),
+    showLC: false,
+  });
+  state.pricingOverrides.sort((a, b) => a.model.localeCompare(b.model));
+  paintPricingForm(content);
+}
+
+async function savePricingOverrides(content) {
+  const msg = document.getElementById('pricing-msg');
+  const models = pricingOverridesToModels(state.pricingOverrides);
+  msg.textContent = 'Saving…';
+  try {
+    const r = await fetch('/api/config/pricing', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ models }),
+    });
+    if (!r.ok) throw new Error(r.status + ': ' + (await r.text()));
+    const resp = await r.json();
+    msg.innerHTML = '<span class="ok">✓ Saved · prior version backed up to ' +
+      escapeHtml(resp.backup_path || '') + '</span>';
+    state.settingsCache = await getJSON('/api/config');
+  } catch (e) {
+    msg.innerHTML = '<span class="warn">Save failed: ' + escapeHtml(e.message) + '</span>';
+  }
+}
+
+async function renderSettingsBackfill(content) {
+  content.innerHTML = '<h3 style="margin-top: 0">Backfill</h3><div class="empty">Loading…</div>';
+  let data;
+  try {
+    data = await getJSON('/api/backfill/status');
+  } catch (e) {
+    content.innerHTML = '<div class="warn">Failed to load backfill status: ' + escapeHtml(e.message) + '</div>';
+    return;
+  }
+  const modes = data.modes || [];
+
+  let html =
+    '<div style="display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; flex-wrap: wrap">' +
+    '  <h3 style="margin: 0">Backfill</h3>' +
+    '  <button type="button" id="backfill-run-all">Run all</button>' +
+    '</div>' +
+    (SECTION_BLURBS.backfill ? '<div class="settings-status" style="margin-bottom: 0.5rem">' + escapeHtml(SECTION_BLURBS.backfill) + '</div>' : '') +
+    '<div class="settings-status">SQL-checkable modes show how many rows have a NULL/empty target column ' +
+    '— a non-zero count means a backfill could populate them. File-walk modes (per-adapter source scans) ' +
+    'show <code>—</code> because counting candidates requires the same scan as running the backfill. ' +
+    'Click <strong>Run</strong> to spawn the matching <code>observer backfill --&lt;flag&gt;</code> as a child process; ' +
+    'output appears below the table when finished.</div>' +
+    '<table class="backfill-table" style="margin-top: 0.6rem"><thead><tr>' +
+    '<th class="col-mode">Mode</th>' +
+    '<th class="col-flag">Flag</th>' +
+    '<th class="number col-cand">Candidates</th>' +
+    '<th class="col-desc">Description</th>' +
+    '<th class="col-stat">Status</th>' +
+    '<th class="col-act"></th>' +
+    '</tr></thead><tbody id="backfill-tbody">';
+  for (const m of modes) {
+    const candCell = m.candidates < 0
+      ? '<span class="muted" title="' + escapeHtml(m.candidates_note || '') + '">—</span>'
+      : (m.candidates > 0
+        ? '<span class="warn2">' + fmtN(m.candidates) + '</span>'
+        : '<span class="ok">' + fmtN(m.candidates) + '</span>');
+    html += '<tr data-mode="' + escapeHtml(m.mode) + '">'
+      + '<td class="col-mode">' + escapeHtml(m.mode) + '</td>'
+      + '<td class="col-flag"><code>' + escapeHtml(m.flag) + '</code></td>'
+      + '<td class="number col-cand">' + candCell + '</td>'
+      + '<td class="muted col-desc">' + escapeHtml(m.description) + '</td>'
+      + '<td class="backfill-status muted col-stat">idle</td>'
+      + '<td class="col-act"><button type="button" class="backfill-run-btn" data-mode="' + escapeHtml(m.mode) + '">Run</button></td>'
+      + '</tr>';
+  }
+  html += '</tbody>';
+  html += '<div id="backfill-output-panel" style="margin-top: 0.7rem"></div>';
+  content.innerHTML = html;
+
+  // Style every button uniformly. The toolbar button styles live on
+  // header buttons only, not generic buttons inside main content.
+  content.querySelectorAll('button').forEach(b => {
+    b.style.background = 'var(--accent)';
+    b.style.color = '#0d1117';
+    b.style.border = '0';
+    b.style.padding = '0.25rem 0.6rem';
+    b.style.borderRadius = '4px';
+    b.style.cursor = 'pointer';
+    b.style.font = 'inherit';
+    b.style.fontWeight = '600';
+    b.style.fontSize = '0.75rem';
+  });
+
+  // Wire per-row Run buttons.
+  content.querySelectorAll('.backfill-run-btn').forEach(btn => {
+    btn.onclick = () => kickBackfillRun(btn.dataset.mode);
+  });
+  document.getElementById('backfill-run-all').onclick = () => kickBackfillRun('all');
+
+  // Restore any pre-existing job rows (if user kicked a job, switched
+  // sections, came back). The polling loop runs cross-render so the
+  // UI just needs to reflect current state.
+  for (const [mode, job] of Object.entries(state.backfillJobs)) {
+    paintBackfillRow(mode, job);
+  }
+}
+
+// showToast is the dashboard's persistent feedback channel for async
+// operations. Returns the toast's id so callers can update or dismiss
+// it as the operation progresses. Toasts stack vertically in the top-
+// right of the viewport; failed/done toasts can be clicked to dismiss.
+//
+// status: 'running' | 'done' | 'failed' — drives the color + icon.
+// title:  short label (e.g. "Run all backfills"), unchanging across
+//         updates so the user can track which toast is which.
+// detail: longer description that updates as the operation progresses
+//         ("re-scanning files…" → "running surgical backfills…" →
+//          "✓ recovered 350 rows").
+// autoDismissMs: zero = sticky; positive = auto-remove after that many ms.
+function showToast(id, status, title, detail, autoDismissMs) {
+  let container = document.getElementById('toast-container');
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'toast-container';
+    container.style.cssText =
+      'position: fixed; top: 1rem; right: 1rem; z-index: 200; ' +
+      'display: flex; flex-direction: column; gap: 0.5rem; ' +
+      'max-width: 380px; pointer-events: none;';
+    document.body.appendChild(container);
+  }
+  let el = id ? document.getElementById('toast-' + id) : null;
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'toast-' + (id || ('t' + Date.now()));
+    el.style.cssText =
+      'background: var(--panel); border: 1px solid var(--line); ' +
+      'border-radius: 8px; padding: 0.6rem 0.85rem; box-shadow: 0 6px 18px rgba(0,0,0,0.35); ' +
+      'pointer-events: auto; cursor: pointer; font-size: 0.78rem; ' +
+      'transition: opacity 0.2s ease, transform 0.2s ease; opacity: 0; transform: translateX(20px);';
+    container.appendChild(el);
+    requestAnimationFrame(() => {
+      el.style.opacity = '1';
+      el.style.transform = 'translateX(0)';
+    });
+    el.onclick = () => dismissToast(el.id.slice('toast-'.length));
+  }
+  let icon = '<span style="display: inline-block; width: 0.9rem; height: 0.9rem; border: 2px solid var(--accent); border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle"></span>';
+  let borderColor = 'var(--accent)';
+  if (status === 'done') {
+    icon = '<span class="ok" style="font-size: 1rem">✓</span>';
+    borderColor = 'var(--ok)';
+  } else if (status === 'failed') {
+    icon = '<span class="warn" style="font-size: 1rem">✗</span>';
+    borderColor = 'var(--warn)';
+  }
+  el.style.borderLeft = '3px solid ' + borderColor;
+  el.innerHTML =
+    '<div style="display: flex; align-items: center; gap: 0.5rem; font-weight: 600; color: var(--fg)">' +
+    icon + ' ' + escapeHtml(title) + '</div>' +
+    (detail ? '<div style="margin-top: 0.25rem; color: var(--fg-mute); font-size: 0.72rem">' + escapeHtml(detail) + '</div>' : '');
+  if (autoDismissMs && autoDismissMs > 0) {
+    setTimeout(() => dismissToast(el.id.slice('toast-'.length)), autoDismissMs);
+  }
+  return el.id.slice('toast-'.length);
+}
+
+function dismissToast(id) {
+  const el = document.getElementById('toast-' + id);
+  if (!el) return;
+  el.style.opacity = '0';
+  el.style.transform = 'translateX(20px)';
+  setTimeout(() => el.remove(), 200);
+}
+
+async function kickBackfillRun(mode) {
+  const tr = document.querySelector('#backfill-tbody tr[data-mode="' + mode + '"]');
+  if (mode !== 'all' && !tr) return;
+
+  const toastID = 'backfill-' + mode;
+  const label = mode === 'all' ? 'Recovering missing data — running all backfills' : 'Running ' + mode;
+  showToast(toastID, 'running', label,
+    mode === 'all'
+      ? 'Re-scanning every JSONL from offset 0 + filling in any missing columns. This can take a minute or two on large databases.'
+      : 'Subprocess kicked. Output will land below the table when finished.',
+    0); // sticky while running
+
+  try {
+    const r = await fetch('/api/backfill/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }),
+    });
+    if (!r.ok) throw new Error(r.status + ': ' + (await r.text()));
+    const resp = await r.json();
+    state.backfillJobs[mode] = {
+      jobId: resp.job_id,
+      status: 'running',
+      startedAt: resp.started_at,
+    };
+    paintBackfillRow(mode, state.backfillJobs[mode]);
+    pollBackfillJob(mode, resp.job_id);
+  } catch (e) {
+    state.backfillJobs[mode] = { status: 'failed', error: e.message };
+    paintBackfillRow(mode, state.backfillJobs[mode]);
+    showToast(toastID, 'failed', label, 'Failed to start: ' + e.message, 0);
+  }
+}
+
+async function pollBackfillJob(mode, jobId) {
+  const toastID = 'backfill-' + mode;
+  const label = mode === 'all' ? 'Recovering missing data — running all backfills' : 'Running ' + mode;
+  // 2-second cadence is gentle enough not to spam the daemon and
+  // tight enough that finishes feel responsive. File-walk backfills
+  // can take 30s–2m on large user DBs; cap our patience at 30 minutes
+  // so we don't spin forever if the daemon misbehaves.
+  const deadline = Date.now() + 30 * 60 * 1000;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 2000));
+    let job;
+    try {
+      job = await getJSON('/api/backfill/jobs/' + jobId);
+    } catch (e) {
+      state.backfillJobs[mode] = { status: 'failed', error: e.message };
+      paintBackfillRow(mode, state.backfillJobs[mode]);
+      showToast(toastID, 'failed', label, 'Job poll failed: ' + e.message, 0);
+      return;
+    }
+    state.backfillJobs[mode] = {
+      jobId,
+      status: job.status,
+      output: job.output,
+      exitCode: job.exit_code,
+      error: job.error,
+    };
+    paintBackfillRow(mode, state.backfillJobs[mode]);
+
+    if (job.status === 'running') {
+      // Mid-flight progress — extract the most recent "complete:" line
+      // from the captured output so the toast reflects current progress.
+      // Backfill helpers print one summary line per phase; tailing them
+      // gives the user a live ETA without parsing structured progress.
+      const tail = (job.output || '').trim().split('\n').slice(-1)[0] || '';
+      const detail = tail.length > 0 ? tail : 'subprocess running…';
+      showToast(toastID, 'running', label, detail.slice(0, 220), 0);
+      continue;
+    }
+
+    // Terminal status — done or failed.
+    if (job.status === 'done') {
+      // Sum any "inserted N" / "updated N" / "recovered N" numbers from
+      // the captured output for a one-line summary on the toast.
+      const summary = summarizeBackfillOutput(job.output || '');
+      showToast(toastID, 'done', label, summary || 'finished', 8000);
+    } else {
+      showToast(toastID, 'failed', label,
+        (job.error ? job.error : 'Backfill failed') +
+        (job.exitCode ? ' (exit ' + job.exitCode + ')' : ''),
+        0);
+    }
+    return;
+  }
+  // Timed out client-side — the daemon may still be running.
+  showToast(toastID, 'failed', label,
+    'No completion within 30 minutes — check the daemon log; the subprocess may still be running.', 0);
+}
+
+// summarizeBackfillOutput pulls a short "what changed" line out of the
+// captured CLI output for the toast. The CLI prints lines like:
+//   "is_sidechain backfill complete: scanned 344 files, 24332 sidechain lines, updated 350 rows"
+// We tally any "updated N" / "inserted N" / "recovered N" / "files_processed=N"
+// counters across all phases for a one-line bottom-line summary.
+function summarizeBackfillOutput(output) {
+  const totals = { inserted: 0, updated: 0, files: 0 };
+  const numRE = /(?:inserted|updated|recovered)\s+(\d+)|files_processed=(\d+)/gi;
+  let m;
+  while ((m = numRE.exec(output)) !== null) {
+    if (m[1] !== undefined) {
+      // Heuristic: the verb before the digit was "inserted" / "updated" / "recovered".
+      const verbStart = output.lastIndexOf('inserted', m.index);
+      const verbStartU = output.lastIndexOf('updated', m.index);
+      const n = parseInt(m[1], 10) || 0;
+      if (verbStart > -1 && verbStart >= verbStartU) totals.inserted += n;
+      else totals.updated += n;
+    } else if (m[2] !== undefined) {
+      totals.files += parseInt(m[2], 10) || 0;
+    }
+  }
+  const parts = [];
+  if (totals.files > 0) parts.push(totals.files + ' file(s) re-scanned');
+  if (totals.inserted > 0) parts.push(totals.inserted + ' row(s) inserted');
+  if (totals.updated > 0) parts.push(totals.updated + ' row(s) updated');
+  return parts.join(' · ');
+}
+
+function paintBackfillRow(mode, job) {
+  const tr = document.querySelector('#backfill-tbody tr[data-mode="' + mode + '"]');
+  if (tr) {
+    const cell = tr.querySelector('.backfill-status');
+    const btn = tr.querySelector('.backfill-run-btn');
+    if (cell) {
+      if (job.status === 'running') {
+        cell.innerHTML = '<span class="warn2">⟳ running…</span>';
+      } else if (job.status === 'done') {
+        cell.innerHTML = '<span class="ok">✓ done</span>';
+      } else if (job.status === 'failed') {
+        cell.innerHTML = '<span class="warn">✗ failed</span>';
+      } else {
+        cell.innerHTML = '<span class="muted">' + escapeHtml(job.status || 'idle') + '</span>';
+      }
+    }
+    if (btn) {
+      btn.disabled = (job.status === 'running');
+      btn.style.opacity = btn.disabled ? '0.5' : '1';
+      btn.style.cursor = btn.disabled ? 'not-allowed' : 'pointer';
+    }
+  }
+  // Update the output panel so the user can see captured stdout +
+  // any error message from the most recent run regardless of which
+  // mode they ran. Keyed on mode in the heading so users know
+  // which run produced what.
+  const panel = document.getElementById('backfill-output-panel');
+  if (panel && job.status && job.status !== 'running') {
+    const cls = job.status === 'done' ? 'ok' : 'warn';
+    panel.innerHTML =
+      '<div style="margin: 0.6rem 0 0.3rem; font-weight: 600">' +
+      '  Last run: <code>' + escapeHtml(mode) + '</code> · ' +
+      '  <span class="' + cls + '">' + escapeHtml(job.status) + '</span>' +
+      (job.exitCode != null ? ' · exit ' + job.exitCode : '') +
+      '</div>' +
+      (job.error ? '<div class="warn settings-status">' + escapeHtml(job.error) + '</div>' : '') +
+      '<pre style="max-height: 280px; overflow: auto">' + escapeHtml(job.output || '(no output)') + '</pre>';
+  }
+}
+
+// settingsSectionSlice extracts the JSON shape that belongs to a
+// rail-section name out of the GET /api/config payload. Rail names
+// don't always map 1:1 to top-level cfg fields — Watcher / Freshness /
+// Retention / Hooks live nested under Observer, and the "observer"
+// rail entry covers only the scalar top-level fields (DBPath,
+// LogLevel) so saving it doesn't clobber the nested sub-structs.
+function settingsSectionSlice(cfg, name) {
+  const obs = cfg.Observer || {};
+  const intel = cfg.Intelligence || {};
+  switch (name) {
+    case 'observer':
+      return { DBPath: obs.DBPath, LogLevel: obs.LogLevel };
+    case 'watcher':     return obs.Watch || {};
+    case 'freshness':   return obs.Freshness || {};
+    case 'retention':   return obs.Retention || {};
+    case 'hooks':       return obs.Hooks || {};
+    case 'proxy':       return cfg.Proxy || {};
+    case 'compression': return cfg.Compression || {};
+    case 'intelligence':
+      // Pricing has its own editor; expose only the editable subset.
+      return {
+        CodeGraph:        intel.CodeGraph,
+        APIKeyEnv:        intel.APIKeyEnv,
+        SummaryModel:     intel.SummaryModel,
+        MonthlyBudgetUSD: intel.MonthlyBudgetUSD,
+      };
+    default: return null;
+  }
+}
+
+// renderSettingsCompression is a structured form for the Compression
+// section — 4 cards (CodeGraph / Shell / Indexing / Conversation), each
+// with an Enabled toggle + sub-options. Surfaces the same restart banner
+// the JSON-textarea editor does because the proxy/watcher/MCP consumers
+// bind compression config at startup.
+function renderSettingsCompression(content) {
+  const cfg = state.settingsCache.config || {};
+  const c = cfg.Compression || {};
+  // Pre-pull each layer's current values into local mutables. The form
+  // mutates these in place; Save serializes them back via PUT.
+  const cur = {
+    CodeGraph: {
+      Enabled:     !!(c.CodeGraph && c.CodeGraph.Enabled),
+      AutoInstall: !!(c.CodeGraph && c.CodeGraph.AutoInstall),
+      AutoIndex:   !!(c.CodeGraph && c.CodeGraph.AutoIndex),
+    },
+    Shell: {
+      Enabled:         !!(c.Shell && c.Shell.Enabled),
+      ExcludeCommands: (c.Shell && c.Shell.ExcludeCommands) || [],
+    },
+    Indexing: {
+      Enabled:         !!(c.Indexing && c.Indexing.Enabled),
+      MaxExcerptBytes: (c.Indexing && c.Indexing.MaxExcerptBytes) || 0,
+      Embeddings:      !!(c.Indexing && c.Indexing.Embeddings),
+    },
+    Conversation: {
+      Enabled:       !!(c.Conversation && c.Conversation.Enabled),
+      Mode:          (c.Conversation && c.Conversation.Mode) || 'token',
+      TargetRatio:   (c.Conversation && c.Conversation.TargetRatio) || 0,
+      PreserveLastN: (c.Conversation && c.Conversation.PreserveLastN) || 0,
+      CompressTypes: (c.Conversation && c.Conversation.CompressTypes) || [],
+    },
+  };
+
+  // Build the cards as a single innerHTML pass; wire interactivity
+  // afterwards. Each form control's id encodes the field path so the
+  // collector at save time can read them generically.
+  content.innerHTML =
+    '<h3 style="margin-top: 0">Compression <span class="pill">restart required on save</span></h3>' +
+    (SECTION_BLURBS.compression ? '<div class="settings-status" style="margin-bottom: 0.5rem">' + escapeHtml(SECTION_BLURBS.compression) + '</div>' : '') +
+    '<div class="settings-status">Toggle individual compression techniques. Each card\'s Enabled checkbox is the primary on/off switch; sub-options apply when the layer is enabled. ' +
+    'Saves write <code>' + escapeHtml(state.settingsCache.config_path || '(no path)') + '</code> ' +
+    '(prior version preserved at <code>.bak</code>); the daemon needs a restart to pick up changes ' +
+    '— the banner appears after save.</div>' +
+    '<div class="settings-status" style="margin-bottom: 0.4rem; color: var(--fg-mute)">Per the v1.4.20 audit (<code>docs/compression-audit.md</code>): Shell, Indexing (excerpts), and Conversation compression are all wired to live consumers. Code-graph integration is configured under Settings → Intelligence → Code graph (<code>compression.code_graph.*</code> was duplicated here pre-audit and removed because no Go consumer read it). The "Embeddings" sub-toggle on Indexing remains visible but is flagged as not-yet-wired; toggling it has no effect today.</div>' +
+    '<div class="grid cols-2" style="margin-top: 0.6rem; gap: 1rem">' +
+      structuredCard('Shell', 'Shell output filters',
+        'RTK-style truncation of large shell-command stdout. Listed commands are excluded so tools that need full output (curl, playwright) aren\'t clipped.',
+        [
+          { kind: 'bool', path: 'Shell.Enabled',         label: 'Enabled',          value: cur.Shell.Enabled, primary: true },
+          { kind: 'list', path: 'Shell.ExcludeCommands', label: 'Exclude commands', value: cur.Shell.ExcludeCommands.join(', '), help: 'comma-separated' },
+        ]) +
+      structuredCard('Indexing', 'Tool output indexing (FTS5)',
+        'Full-text-searchable index of every tool-call output. Excerpts are trimmed to the configured byte cap so the FTS5 table stays compact.',
+        [
+          { kind: 'bool', path: 'Indexing.Enabled',         label: 'Enabled',           value: cur.Indexing.Enabled, primary: true },
+          { kind: 'int',  path: 'Indexing.MaxExcerptBytes', label: 'Max excerpt bytes', value: cur.Indexing.MaxExcerptBytes },
+          { kind: 'bool', path: 'Indexing.Embeddings',      label: 'Use embeddings — experimental, not yet wired', value: cur.Indexing.Embeddings },
+        ]) +
+      structuredCard('Conversation', 'Conversation compression (proxy)',
+        'Spec §10 Layer 3 — the proxy rewrites large tool_result blocks before forwarding to the upstream API. Sub-options control which content types compress and how aggressively.',
+        [
+          { kind: 'bool',   path: 'Conversation.Enabled',       label: 'Enabled',          value: cur.Conversation.Enabled, primary: true },
+          { kind: 'select', path: 'Conversation.Mode',          label: 'Mode',             value: cur.Conversation.Mode, options: ['token', 'byte'] },
+          { kind: 'float',  path: 'Conversation.TargetRatio',   label: 'Target ratio (0–1)', value: cur.Conversation.TargetRatio, step: '0.05' },
+          { kind: 'int',    path: 'Conversation.PreserveLastN', label: 'Preserve last N',  value: cur.Conversation.PreserveLastN },
+          { kind: 'list',   path: 'Conversation.CompressTypes', label: 'Compress types',   value: cur.Conversation.CompressTypes.join(', '), help: 'comma-separated · e.g. json, logs, text' },
+        ]) +
+    '</div>' +
+    '<div style="display: flex; align-items: center; gap: 0.5rem; margin-top: 0.8rem">' +
+    '  <button type="button" id="compression-save-btn">Save compression</button>' +
+    '  <span class="settings-status" id="compression-msg" style="margin: 0"></span>' +
+    '</div>';
+
+  // Style the Save button to match the rest of the Settings tab.
+  const btn = document.getElementById('compression-save-btn');
+  btn.style.background = 'var(--accent)';
+  btn.style.color = '#0d1117';
+  btn.style.border = '0';
+  btn.style.padding = '0.3rem 0.7rem';
+  btn.style.borderRadius = '4px';
+  btn.style.cursor = 'pointer';
+  btn.style.fontWeight = '600';
+  btn.style.font = 'inherit';
+
+  btn.onclick = async () => {
+    const msg = document.getElementById('compression-msg');
+    const payload = collectStructuredForm(content);
+    msg.textContent = 'Saving…';
+    try {
+      const r = await fetch('/api/config/section/compression', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!r.ok) throw new Error(r.status + ': ' + (await r.text()));
+      const resp = await r.json();
+      msg.innerHTML = '<span class="ok">✓ Saved · prior version backed up to ' +
+        escapeHtml(resp.backup_path || '') + '</span>';
+      if (resp.restart_required) showSettingsRestartBanner();
+      state.settingsCache = await getJSON('/api/config');
+    } catch (e) {
+      msg.innerHTML = '<span class="warn">Save failed: ' + escapeHtml(e.message) + '</span>';
+    }
+  };
+}
+
+// structuredCard renders one of the four panel-style cards in the
+// Compression form. fields is a list of { kind, path, label, value, ... }
+// — each becomes an input wired to data-path so collectStructuredForm
+// can scrape them by path on save.
+function structuredCard(layer, title, description, fields) {
+  let html =
+    '<div class="panel" style="margin: 0">' +
+    '  <h3 style="margin: 0 0 0.4rem">' + escapeHtml(title) + '</h3>' +
+    '  <div class="settings-status" style="margin: 0 0 0.6rem">' + escapeHtml(description) + '</div>';
+  for (const f of fields) {
+    html += structuredField(f);
+  }
+  html += '</div>';
+  return html;
+}
+
+function structuredField(f) {
+  const id = 'cmp-field-' + f.path.replace(/\./g, '-');
+  const labelStyle = f.primary
+    ? 'font-weight: 600; color: var(--fg); margin-bottom: 0.4rem'
+    : 'color: var(--fg-mute); margin-bottom: 0.3rem';
+  if (f.kind === 'bool') {
+    return '<label style="display: flex; align-items: center; gap: 0.4rem; ' + labelStyle + '">'
+      + '<input type="checkbox" id="' + id + '" data-path="' + escapeHtml(f.path) + '" data-kind="bool"'
+      + (f.value ? ' checked' : '') + '>'
+      + escapeHtml(f.label) + '</label>';
+  }
+  if (f.kind === 'select') {
+    let opts = '';
+    for (const o of f.options) {
+      opts += '<option value="' + escapeHtml(o) + '"' + (o === f.value ? ' selected' : '') + '>' + escapeHtml(o) + '</option>';
+    }
+    return '<label style="display: flex; flex-direction: column; gap: 0.2rem; ' + labelStyle + '">'
+      + escapeHtml(f.label)
+      + '<select id="' + id + '" data-path="' + escapeHtml(f.path) + '" data-kind="select" '
+      + 'style="background: var(--bg); color: var(--fg); border: 1px solid var(--line); '
+      + 'padding: 0.2rem 0.4rem; font: inherit; font-size: 0.78rem; border-radius: 3px">'
+      + opts + '</select></label>';
+  }
+  if (f.kind === 'int' || f.kind === 'float') {
+    const step = f.step || (f.kind === 'float' ? '0.01' : '1');
+    return '<label style="display: flex; flex-direction: column; gap: 0.2rem; ' + labelStyle + '">'
+      + escapeHtml(f.label)
+      + '<input type="number" id="' + id + '" data-path="' + escapeHtml(f.path) + '" data-kind="' + f.kind + '" '
+      + 'step="' + step + '" min="0" value="' + escapeHtml(String(f.value || '')) + '" '
+      + 'style="width: 140px; background: var(--bg); color: var(--fg); border: 1px solid var(--line); '
+      + 'padding: 0.2rem 0.4rem; font: inherit; font-size: 0.78rem; border-radius: 3px">'
+      + '</label>';
+  }
+  if (f.kind === 'list') {
+    return '<label style="display: flex; flex-direction: column; gap: 0.2rem; ' + labelStyle + '">'
+      + escapeHtml(f.label) +
+      (f.help ? ' <span class="muted" style="font-size: 0.7rem">(' + escapeHtml(f.help) + ')</span>' : '')
+      + '<input type="text" id="' + id + '" data-path="' + escapeHtml(f.path) + '" data-kind="list" '
+      + 'value="' + escapeHtml(f.value || '') + '" '
+      + 'style="background: var(--bg); color: var(--fg); border: 1px solid var(--line); '
+      + 'padding: 0.2rem 0.4rem; font: inherit; font-size: 0.78rem; border-radius: 3px"></label>';
+  }
+  if (f.kind === 'string') {
+    return '<label style="display: flex; flex-direction: column; gap: 0.2rem; ' + labelStyle + '">'
+      + escapeHtml(f.label) +
+      (f.help ? ' <span class="muted" style="font-size: 0.7rem">(' + escapeHtml(f.help) + ')</span>' : '')
+      + '<input type="text" id="' + id + '" data-path="' + escapeHtml(f.path) + '" data-kind="string" '
+      + 'value="' + escapeHtml(String(f.value || '')) + '" '
+      + (f.placeholder ? 'placeholder="' + escapeHtml(f.placeholder) + '" ' : '')
+      + 'style="background: var(--bg); color: var(--fg); border: 1px solid var(--line); '
+      + 'padding: 0.2rem 0.4rem; font: inherit; font-size: 0.78rem; border-radius: 3px"></label>';
+  }
+  return '';
+}
+
+// collectStructuredForm walks every input/select with a data-path and
+// builds the nested CompressionConfig object the section endpoint
+// expects. The path looks like "Conversation.CompressTypes" and gets
+// split into the appropriate nested key.
+function collectStructuredForm(content) {
+  const out = {};
+  content.querySelectorAll('[data-path]').forEach(el => {
+    const path = el.dataset.path;
+    const kind = el.dataset.kind;
+    let value;
+    if (kind === 'bool') value = el.checked;
+    else if (kind === 'int') value = parseInt(el.value, 10) || 0;
+    else if (kind === 'float') value = parseFloat(el.value) || 0;
+    else if (kind === 'list') {
+      value = el.value.split(',').map(s => s.trim()).filter(Boolean);
+    } else {
+      value = el.value;
+    }
+    const parts = path.split('.');
+    let cursor = out;
+    for (let i = 0; i < parts.length - 1; i++) {
+      cursor[parts[i]] = cursor[parts[i]] || {};
+      cursor = cursor[parts[i]];
+    }
+    cursor[parts[parts.length - 1]] = value;
+  });
+  return out;
+}
+
+// SECTION_FIELDS drives the per-field forms for non-pricing,
+// non-compression sections. Each entry is a flat list of field specs
+// (kind / path / label / help / options) consumed by structuredField.
+// Sections without an entry fall back to the JSON textarea editor.
+//
+// Path uses Go field names (capitalized) so the GET /api/config payload
+// (which marshals through json.Marshal of the config struct) can be
+// scraped directly without a name-mangling layer. The PUT handler in
+// settings.go decodes into the matching struct via the same names.
+const SECTION_FIELDS = {
+  observer: [
+    { kind: 'string', path: 'DBPath',   label: 'DB path',
+      help: 'absolute path to observer.db; ~ expands to $HOME', placeholder: '~/.observer/observer.db' },
+    { kind: 'select', path: 'LogLevel', label: 'Log level',
+      options: ['debug', 'info', 'warn', 'error'] },
+  ],
+  watcher: [
+    { kind: 'int',  path: 'PollIntervalSeconds', label: 'Poll interval (seconds)',
+      help: 'fsnotify fallback poll cadence on filesystems without inotify (Mac, Windows)' },
+    { kind: 'int',  path: 'MaxFileSizeMB',       label: 'Max file size (MB)',
+      help: 'JSONL files larger than this are skipped — usually a sign of a corrupt session log' },
+    { kind: 'list', path: 'EnabledAdapters',     label: 'Enabled adapters',
+      help: 'comma-separated; subset of: claude-code, codex, cline, roo-code, cursor, copilot, opencode, openclaw, pi' },
+  ],
+  freshness: [
+    { kind: 'bool', path: 'EnableContentHashing', label: 'Enable content hashing',
+      help: 'detect file changes via SHA256 rather than mtime — slightly slower but immune to clock skew' },
+    { kind: 'int',  path: 'MaxHashFileSizeMB',    label: 'Max hash file size (MB)',
+      help: 'files larger than this skip the hash and use mtime only' },
+    { kind: 'bool', path: 'FastPathStatOnly',     label: 'Fast-path stat-only',
+      help: 'when set, mtime equality short-circuits hashing (huge speedup on hot paths)' },
+    { kind: 'list', path: 'IgnorePatterns',       label: 'Ignore patterns',
+      help: 'comma-separated glob patterns; e.g. node_modules/, .git/, *.exe' },
+  ],
+  retention: [
+    { kind: 'int',  path: 'MaxAgeDays',            label: 'Max age (days)',
+      help: 'sessions older than this get pruned on the daily cycle' },
+    { kind: 'int',  path: 'MaxDBSizeMB',           label: 'Max DB size (MB)',
+      help: 'best-effort cap; prune trims oldest sessions until size fits' },
+    { kind: 'bool', path: 'PruneOnStartup',        label: 'Prune on startup',
+      help: 'run a prune pass when the daemon launches (skip for fast cold starts)' },
+    { kind: 'int',  path: 'ObserverLogMaxAgeDays', label: 'Observer log max age (days)',
+      help: 'rotation cap for ~/.observer/observer.log' },
+  ],
+  hooks: [
+    { kind: 'int', path: 'TimeoutMS', label: 'Timeout (ms)',
+      help: 'per-hook execution budget; hooks that exceed this are killed and a partial event is recorded' },
+  ],
+  proxy: [
+    { kind: 'bool',   path: 'Enabled',           label: 'Enabled',
+      help: 'when off, the API reverse proxy doesn\'t bind a listener — token tracking falls back to JSONL adapters' },
+    { kind: 'int',    path: 'Port',              label: 'Port',
+      help: 'TCP port for the proxy listener (default 8820)' },
+    { kind: 'string', path: 'AnthropicUpstream', label: 'Anthropic upstream',
+      placeholder: 'https://api.anthropic.com' },
+    { kind: 'string', path: 'OpenAIUpstream',    label: 'OpenAI upstream',
+      placeholder: 'https://api.openai.com' },
+  ],
+  intelligence: [
+    { kind: 'bool',   path: 'CodeGraph.Enabled',  label: 'Code graph enabled',
+      help: 'expose codebase-memory-mcp queries via the intelligence layer' },
+    { kind: 'string', path: 'APIKeyEnv',          label: 'API key env var',
+      help: 'name of the env variable holding the upstream provider API key (Anthropic / OpenAI)' },
+    { kind: 'string', path: 'SummaryModel',       label: 'Summary model',
+      help: 'model id used by intelligence summaries; e.g. claude-haiku-4-5' },
+    { kind: 'float',  path: 'MonthlyBudgetUSD',   label: 'Monthly budget (USD)',
+      help: 'optional spend cap surfaced on the Analysis tab\'s headline tile; 0 hides the readout',
+      step: '1' },
+  ],
+};
+
+// SECTION_BLURBS gives each Settings section a one-paragraph
+// explainer that surfaces ABOVE the form fields. Every entry covers
+// what the section does, when you'd touch it, and any cross-cutting
+// behaviour the user should know (e.g. "log_level changes need
+// restart" / "watcher.enabled_adapters drives which session formats
+// get parsed"). Rendered alongside the restart-required pill.
+const SECTION_BLURBS = {
+  observer:
+    'Top-level daemon settings — where observer.db lives and how chatty the logs are. Both fields are read at startup; saving here requires a daemon restart. Most users never touch DBPath after install (it defaults to ~/.observer/observer.db). Drop log_level to "warn" once the install is stable; bump to "debug" when triaging an issue.',
+  watcher:
+    'Live-watcher settings — how the fsnotify daemon discovers and tails AI-tool session files. EnabledAdapters is the safety valve for installs running an AI tool with a buggy adapter (drop it from the list to skip parsing). PollIntervalSeconds is the fallback cadence on filesystems without inotify (Mac, Windows). MaxFileSizeMB skips abnormally large session files — usually a sign the AI tool wrote corrupted JSONL.',
+  freshness:
+    'Freshness engine — how observer detects "is this file the same as last time?" for stale-read flagging on the Discovery tab. Hashing is more reliable than mtime (immune to clock skew) but slower; FastPathStatOnly short-circuits hashing when mtime hasn\'t changed. IgnorePatterns trims the working set so node_modules / .git / vendor noise don\'t get hashed.',
+  retention:
+    'Database hygiene — how long observer keeps actions, sessions, and observer_log entries before pruning them. The daily prune cycle runs in the background; PruneOnStartup also runs one when the daemon launches (skip for fast cold starts). MaxDBSizeMB is a soft cap — when exceeded, oldest sessions are trimmed first.',
+  hooks:
+    'AI-tool hook timeouts — how long a single hook event (registered by `observer init`) is allowed to run before the daemon kills it. If your AI tool is occasionally seeing "hook timed out" warnings, bump this; if hooks are blocking your prompts, drop it. Hooks are registered at start time; saves require restart.',
+  proxy:
+    'API reverse proxy — when enabled, the proxy listens on Port and forwards Anthropic / OpenAI requests upstream. Accurate per-turn token counts come from this path (the JSONL adapters are approximate). Disable this section if you don\'t want to route requests through observer; you\'ll lose proxy-grade cost accuracy but the watcher still captures activity. The listener binds at startup — saves require restart.',
+  intelligence:
+    'Intelligence layer — derived patterns (`observer suggest`), session summaries, the cost engine, and the Analysis-tab dashboard. CodeGraph.Enabled gates the codebase-memory-mcp integration that enriches MCP queries with structural code context. APIKeyEnv is the env-var name observer reads when intelligence features need to call an upstream LLM (summaries, etc.). MonthlyBudgetUSD surfaces on the Analysis tab\'s headline tile — set it to your monthly spend cap to see "you\'re at 73% of $100" instead of just dollar totals.',
+  pricing:
+    'Per-model pricing overrides. The cost engine ships with baked-in defaults for every common Anthropic / OpenAI / Gemini / xAI model (60+ entries — see the reference list at the bottom of this page). Override a row when you have a custom contract rate or when a new SKU lands before observer\'s defaults catch up. This section hot-reloads — the cost engine swaps the active table atomically on save, no restart needed.',
+  compression:
+    'Compression layers — each card toggles one technique. Code Graph adds structural context to MCP queries; Shell filters truncate noisy bash output; Tool output indexing builds a searchable FTS5 index of past tool calls; Conversation compression rewrites large tool_result blocks before forwarding to the upstream API.',
+  backfill:
+    'Recovery + maintenance for historical data. Click "Run all" when the Actions tab looks gappy — the runner re-walks every JSONL from offset 0 (recovers any rows the live watcher dropped silently) and then runs the surgical column-update backfills on top. Per-mode buttons re-run a single backfill when you only care about one specific column.',
+};
+
+// renderSettingsStructuredSection renders a flat per-field form using
+// the section's spec from SECTION_FIELDS. Save POSTs the collected
+// nested object to /api/config/section/<name>. Same restart-required
+// banner the JSON editor uses since the underlying config fields all
+// bind at startup. Falls through to the JSON editor for sections the
+// registry doesn't cover.
+function renderSettingsStructuredSection(content, name) {
+  const fields = SECTION_FIELDS[name];
+  if (!fields) {
+    return renderSettingsEditableSection(content, name);
+  }
+  const cfg = state.settingsCache.config || {};
+  const slice = settingsSectionSlice(cfg, name) || {};
+  const upper = name.charAt(0).toUpperCase() + name.slice(1);
+
+  // Hydrate field values from the slice using the same dot-path
+  // resolution structuredField/collectStructuredForm use on save.
+  const hydrated = fields.map(f => {
+    const value = pathLookup(slice, f.path);
+    if (f.kind === 'list' && Array.isArray(value)) {
+      return Object.assign({}, f, { value: value.join(', ') });
+    }
+    return Object.assign({}, f, { value: value });
+  });
+
+  const blurb = SECTION_BLURBS[name];
+  let html =
+    '<h3 style="margin-top: 0">' + escapeHtml(upper) +
+    ' <span class="pill">restart required on save</span></h3>' +
+    (blurb ? '<div class="settings-status" style="margin-bottom: 0.5rem">' + escapeHtml(blurb) + '</div>' : '') +
+    '<div class="settings-status">Saves write <code>' +
+    escapeHtml(state.settingsCache.config_path || '(no path)') +
+    '</code> (prior version backed up to <code>.bak</code>); the daemon needs a restart to pick up changes — banner appears after save.</div>' +
+    '<div style="display: flex; flex-direction: column; gap: 0.6rem; max-width: 640px; margin-top: 0.7rem">';
+  for (const f of hydrated) {
+    html += structuredField(f);
+  }
+  html += '</div>';
+  html +=
+    '<div style="display: flex; align-items: center; gap: 0.5rem; margin-top: 0.8rem">' +
+    '  <button type="button" id="section-form-save-btn">Save ' + escapeHtml(name) + '</button>' +
+    '  <span class="settings-status" id="section-form-msg" style="margin: 0"></span>' +
+    '</div>';
+  content.innerHTML = html;
+
+  const btn = document.getElementById('section-form-save-btn');
+  btn.style.background = 'var(--accent)';
+  btn.style.color = '#0d1117';
+  btn.style.border = '0';
+  btn.style.padding = '0.3rem 0.7rem';
+  btn.style.borderRadius = '4px';
+  btn.style.cursor = 'pointer';
+  btn.style.fontWeight = '600';
+  btn.style.font = 'inherit';
+  btn.onclick = async () => {
+    const msg = document.getElementById('section-form-msg');
+    const payload = collectStructuredForm(content);
+    msg.textContent = 'Saving…';
+    try {
+      const r = await fetch('/api/config/section/' + encodeURIComponent(name), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!r.ok) throw new Error(r.status + ': ' + (await r.text()));
+      const resp = await r.json();
+      msg.innerHTML = '<span class="ok">✓ Saved · prior version backed up to ' +
+        escapeHtml(resp.backup_path || '') + '</span>';
+      if (resp.restart_required) showSettingsRestartBanner();
+      state.settingsCache = await getJSON('/api/config');
+    } catch (e) {
+      msg.innerHTML = '<span class="warn">Save failed: ' + escapeHtml(e.message) + '</span>';
+    }
+  };
+}
+
+// pathLookup resolves a dot-path like "CodeGraph.Enabled" against an
+// object. Mirrors the path semantics structuredField + collectStructuredForm
+// use on save so hydration round-trips cleanly.
+function pathLookup(obj, path) {
+  const parts = path.split('.');
+  let cursor = obj;
+  for (const p of parts) {
+    if (cursor == null) return undefined;
+    cursor = cursor[p];
+  }
+  return cursor;
+}
+
+// renderSettingsEditableSection renders a JSON-textarea editor for any
+// non-pricing section. Saves PUT /api/config/section/<name>, which
+// returns restart_required=true; the UI then surfaces the global
+// "Restart daemon" banner so the user knows the change isn't live yet.
+function renderSettingsEditableSection(content, name) {
+  const cfg = state.settingsCache.config || {};
+  const slice = settingsSectionSlice(cfg, name);
+  const initial = JSON.stringify(slice, null, 2);
+  const upper = name.charAt(0).toUpperCase() + name.slice(1);
+
+  content.innerHTML =
+    '<h3 style="margin-top: 0">' + escapeHtml(upper) + ' <span class="pill">restart required on save</span></h3>' +
+    '<div class="settings-status">Edit the JSON below and save. Saves write <code>' +
+    escapeHtml(state.settingsCache.config_path || '(no path)') +
+    '</code> (prior version preserved at <code>.bak</code>) but the daemon needs a restart to pick up the change ' +
+    '(unlike pricing, which hot-reloads). The "Restart daemon" banner appears after save.</div>' +
+    '<textarea id="settings-section-textarea" spellcheck="false">' + escapeHtml(initial) + '</textarea>' +
+    '<div style="display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem">' +
+    '  <button type="button" id="settings-section-save">Save ' + escapeHtml(name) + '</button>' +
+    '  <span class="settings-status" id="settings-section-msg"></span>' +
+    '</div>';
+
+  const btn = document.getElementById('settings-section-save');
+  btn.style.background = 'var(--accent)';
+  btn.style.color = '#0d1117';
+  btn.style.border = '0';
+  btn.style.padding = '0.3rem 0.7rem';
+  btn.style.borderRadius = '4px';
+  btn.style.cursor = 'pointer';
+  btn.style.fontWeight = '600';
+  btn.onclick = async () => {
+    const ta = document.getElementById('settings-section-textarea');
+    const msg = document.getElementById('settings-section-msg');
+    let parsed;
+    try {
+      parsed = JSON.parse(ta.value || '{}');
+    } catch (e) {
+      msg.innerHTML = '<span class="warn">JSON parse error: ' + escapeHtml(e.message) + '</span>';
+      return;
+    }
+    msg.textContent = 'Saving…';
+    try {
+      const r = await fetch('/api/config/section/' + encodeURIComponent(name), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(parsed),
+      });
+      if (!r.ok) {
+        throw new Error(r.status + ': ' + (await r.text()));
+      }
+      const resp = await r.json();
+      msg.innerHTML = '<span class="ok">✓ Saved · prior version backed up to ' +
+        escapeHtml(resp.backup_path || '') + '</span>';
+      if (resp.restart_required) {
+        showSettingsRestartBanner();
+      }
+      // Refresh cache so subsequent section renders show the new values.
+      state.settingsCache = await getJSON('/api/config');
+    } catch (e) {
+      msg.innerHTML = '<span class="warn">Save failed: ' + escapeHtml(e.message) + '</span>';
+    }
+  };
+}
+
+// showSettingsRestartBanner inserts a sticky banner above the
+// settings-shell that lets the user trigger /api/admin/restart. Calling
+// it multiple times is idempotent (replaces any existing banner).
+function showSettingsRestartBanner() {
+  let bar = document.getElementById('settings-restart-banner');
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'settings-restart-banner';
+    bar.style.cssText = 'background: var(--warn2); color: #0d1117;' +
+      'padding: 0.6rem 0.9rem; border-radius: 6px; margin-bottom: 0.75rem;' +
+      'display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; font-weight: 600;';
+    const settings = document.getElementById('settings');
+    settings.insertBefore(bar, settings.querySelector('.settings-shell'));
+  }
+  bar.innerHTML =
+    '<span>⚠ A configuration change requires a daemon restart to take effect.</span>' +
+    '<button id="settings-restart-btn" type="button" style="background: #0d1117; color: var(--fg); ' +
+    'border: 1px solid var(--line); padding: 0.3rem 0.7rem; border-radius: 4px; cursor: pointer; font: inherit; font-weight: 600">Restart daemon</button>';
+  document.getElementById('settings-restart-btn').onclick = async () => {
+    if (!confirm(
+      'Restart the observer daemon now?\n\n' +
+      'The dashboard will become temporarily unreachable. ' +
+      'If you\'re running via the npm wrapper or a supervisor, ' +
+      'the daemon should come back automatically. ' +
+      'For a foreground "observer dashboard" shell, you\'ll need to relaunch manually.'
+    )) return;
+    try {
+      const r = await fetch('/api/admin/restart', { method: 'POST' });
+      if (!r.ok) throw new Error(r.status + ': ' + (await r.text()));
+      bar.innerHTML = '<span>↻ Restart scheduled — refresh the page in 5–10 seconds. ' +
+        'If the dashboard doesn\'t come back, relaunch the daemon from the shell.</span>';
+    } catch (e) {
+      bar.innerHTML = '<span class="warn">Restart failed: ' + escapeHtml(e.message) + '</span>';
+    }
+  };
+}
+
+// --- bootstrap ---
+document.querySelectorAll('nav button').forEach(b => {
+  b.onclick = () => showTab(b.dataset.tab);
+});
+// Reset every per-tab page counter — called from filter handlers so a
+// filter change always lands you on page 1 of whatever you're looking at.
+function resetPages() {
+  state.sessionsPage = 1;
+  state.actionsPage = 1;
+  state.discoverStalePage = 1;
+  state.discoverRepeatPage = 1;
+  state.patternsPage = 1;
+  state.compressionEventsPage = 1;
+}
+document.getElementById('window').onchange = e => {
+  state.windowDays = Number(e.target.value);
+  resetPages();
+  loadStatus().then(() => loadTab(state.tab));
+};
+document.getElementById('tool-filter').onchange = e => {
+  state.toolFilter = e.target.value;
+  resetPages();
+  loadTab(state.tab);
+};
+document.getElementById('project-filter').onchange = e => {
+  state.projectFilter = e.target.value;
+  resetPages();
+  loadTab(state.tab);
+};
+document.getElementById('action-type-filter').onchange = e => {
+  state.actionsTypeFilter = e.target.value;
+  state.actionsPage = 1;
+  loadActions();
+};
+// Compression-by-mechanism y-axis unit toggle (tokens vs bytes).
+document.getElementById('settings-rail').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-section]');
+  if (!btn) return;
+  const section = btn.dataset.section;
+  if (state.settingsSection === section) return;
+  renderSettingsSection(section);
+});
+document.getElementById('analysis-trend-dim-toggle').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-dim]');
+  if (!btn) return;
+  const dim = btn.dataset.dim;
+  if (state.analysisTrendDim === dim) return;
+  state.analysisTrendDim = dim;
+  // Trend chart and What-Changed tables both pivot on the same dim, so
+  // re-roll them together. Headline tiles are dim-agnostic.
+  if (state.tab === 'analysis') {
+    renderAnalysisTrend();
+    renderAnalysisMovers();
+  }
+});
+document.getElementById('compression-mech-unit-toggle').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-unit]');
+  if (!btn) return;
+  const unit = btn.dataset.unit;
+  if (state.compressionMechUnit === unit) return;
+  state.compressionMechUnit = unit;
+  document.querySelectorAll('#compression-mech-unit-toggle button').forEach(b => {
+    b.classList.toggle('active', b.dataset.unit === unit);
+  });
+  // Re-render the Compression tab if it's the active tab; otherwise the
+  // change will take effect on next load.
+  if (state.tab === 'compression') loadCompression();
+});
+document.getElementById('refresh-btn').onclick = (e) => {
+  const btn = e.currentTarget;
+  btn.classList.add('is-loading');
+  loadStatus()
+    .then(() => loadTab(state.tab))
+    .finally(() => btn.classList.remove('is-loading'));
+};
+document.getElementById('export-btn').onclick = async (e) => {
+  // Excel export — fetch the workbook with a loading indicator on the
+  // button (xlsx generation involves multiple internal queries so it
+  // can take a couple of seconds). Anchor + blob URL pattern triggers
+  // the download without leaving the SPA.
+  const btn = e.currentTarget;
+  if (btn.classList.contains('is-loading')) return;
+  btn.classList.add('is-loading');
+  const original = btn.textContent;
+  btn.innerHTML = '<span class="spinner"></span>Preparing…';
+  try {
+    const parts = ['days=' + state.windowDays];
+    if (state.toolFilter)    parts.push('tool='    + encodeURIComponent(state.toolFilter));
+    if (state.projectFilter) parts.push('project=' + encodeURIComponent(state.projectFilter));
+    const url = '/api/export.xlsx?' + parts.join('&');
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('export ' + r.status);
+    const blob = await r.blob();
+    const blobURL = URL.createObjectURL(blob);
+    const cd = r.headers.get('Content-Disposition') || '';
+    const m = /filename="([^"]+)"/.exec(cd);
+    const fname = m ? m[1] : 'observer-export.xlsx';
+    const a = document.createElement('a');
+    a.href = blobURL; a.download = fname; a.style.display = 'none';
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { a.remove(); URL.revokeObjectURL(blobURL); }, 1000);
+  } catch (err) {
+    document.getElementById('status-msg').innerHTML =
+      '<span class="warn">export failed: ' + escapeHtml(err.message || String(err)) + '</span>';
+    console.error('export', err);
+  } finally {
+    btn.classList.remove('is-loading');
+    btn.textContent = original;
+  }
+};
+document.getElementById('session-modal-close').onclick = closeSessionModal;
+document.getElementById('session-modal').onclick = e => {
+  if (e.target.id === 'session-modal') closeSessionModal();
+};
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeSessionModal();
+});
+
+// renderWatcherHealthBanner queries /api/health/watcher and renders a
+// sticky top-of-page banner when the watcher is behind on any JSONL
+// file by more than the threshold. Click → opens Settings → Backfill
+// pre-pointed at the Run-All affordance so the user can recover the
+// missing data.
+//
+// Threshold: 10 KB. Smaller gaps are usually transient (a JSONL line
+// being written right now that the watcher will pick up on the next
+// poll). Anything bigger has been outstanding for a while and
+// represents real data loss until the user re-scans.
+async function renderWatcherHealthBanner() {
+  let data;
+  try {
+    data = await getJSON('/api/health/watcher');
+  } catch (e) {
+    return; // benign — endpoint not available, skip the banner
+  }
+  const thresholdBytes = 10 * 1024;
+  // Skip orphan_unmatched rows — parse_cursors entries no current
+  // adapter recognises. Rescan can't process them so they'd otherwise
+  // sit in the banner forever, with no recovery path the user could
+  // take. The server tags them; the client just hides them.
+  const concerning = (data.files || [])
+    .filter(f => !f.orphan_unmatched)
+    .filter(f => f.behind_bytes > thresholdBytes);
+  const existing = document.getElementById('watcher-health-banner');
+  if (concerning.length === 0) {
+    if (existing) existing.remove();
+    return;
+  }
+  // Pick the worst N for the headline; total bytes covers the rest.
+  const top = concerning.slice(0, 3).map(f => {
+    const tail = f.path.split('/').slice(-2).join('/');
+    return tail + ' (' + fmtBytes(f.behind_bytes) + ')';
+  }).join(', ');
+  const more = concerning.length > 3 ? ' +' + (concerning.length - 3) + ' more' : '';
+
+  let bar = existing;
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'watcher-health-banner';
+    bar.style.cssText =
+      'background: var(--warn2); color: #0d1117; padding: 0.55rem 0.9rem; ' +
+      'display: flex; align-items: center; justify-content: space-between; gap: 0.6rem; ' +
+      'font-size: 0.78rem; font-weight: 600; cursor: pointer;';
+    bar.title = 'Click to open Settings → Backfill';
+    document.body.insertBefore(bar, document.body.firstChild);
+  }
+  bar.innerHTML =
+    '<span>⚠ Watcher is behind on ' + concerning.length + ' file(s) — ' +
+    escapeHtml(top) + escapeHtml(more) +
+    ' · click to recover via Settings → Backfill → Run all</span>' +
+    '<span style="opacity: 0.7">total: ' + fmtBytes(data.behind_total_bytes) + '</span>';
+  bar.onclick = () => {
+    state.settingsSection = 'backfill';
+    showTab('settings');
+  };
+}
+
+// fmtBytes is defined once near the top of the file (the existing
+// helper used by Compression-tab tables). Re-using it here.
+
+// Wait for Chart.js to load (defer'd) before first paint.
+window.addEventListener('load', () => {
+  loadStatus().then(() => loadTab('overview'));
+  // Run health check on initial load + every 60s afterwards.
+  // Surfaces the falling-behind-watcher case the user just hit.
+  renderWatcherHealthBanner();
+  setInterval(renderWatcherHealthBanner, 60_000);
+});
+</script>
+</body>
+</html>

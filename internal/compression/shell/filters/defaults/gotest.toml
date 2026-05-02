@@ -1,0 +1,21 @@
+# Default filter for `go test`. Drops verbose-mode scaffolding (=== RUN /
+# CONT / PAUSE) and passing-subtest markers. Preserves `--- FAIL:`,
+# `=== FAIL`, panics, stack traces, and the final `ok`/`FAIL` summary lines —
+# the AI-relevant signal in test output.
+
+command = "go"
+subcommands = ["test"]
+description = "drop go test verbose scaffolding while keeping failure details"
+
+[[rule]]
+type = "line_drop"
+pattern = '^=== (RUN|CONT|PAUSE)(\s|$)'
+comment = "verbose-mode test-lifecycle markers"
+
+[[rule]]
+type = "line_drop"
+pattern = '^\s*--- PASS:'
+comment = "passing subtest markers (indented and top-level)"
+
+[[rule]]
+type = "squash_whitespace"
