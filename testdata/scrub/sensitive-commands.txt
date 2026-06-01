@@ -1,0 +1,8 @@
+curl -H 'Authorization: Bearer sk-ant-abc123DEF456GHI789jkl012MNO345pqr' https://api.example.com/
+export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+export GITHUB_TOKEN=ghp_aaaabbbbccccddddeeeeffffgggghhhhiiii
+password=hunter2
+api_key: sk_DEMO_FAKEFIXTUREVALUE000111
+psql postgres://alice:superSecret123@db.internal:5432/app
+fetch('https://api.example.com', { headers: { 'X-API-KEY': 'pk_test_abcdefghij1234567890' } })
+echo "connection: mysql://root:rootpass@localhost/foo"

@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "superbased-observer"
+dynamic = ["version"]
+description = "SuperBased Observer — capture, normalize, compress, and analyze AI coding tool activity across Claude Code, Codex, Cursor, Cline/Roo, and Copilot."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Santosh Kathira", email = "contact@marmut.app" }]
+requires-python = ">=3.8"
+keywords = [
+  "ai",
+  "observability",
+  "anthropic",
+  "openai",
+  "claude-code",
+  "codex",
+  "cursor",
+  "mcp",
+  "tokens",
+  "cost",
+]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "Intended Audience :: System Administrators",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development",
+  "Topic :: System :: Monitoring",
+]
+
+[project.urls]
+Homepage = "https://github.com/marmutapp/superbased-observer"
+Documentation = "https://github.com/marmutapp/superbased-observer#readme"
+Issues = "https://github.com/marmutapp/superbased-observer/issues"
+Changelog = "https://github.com/marmutapp/superbased-observer/blob/main/CHANGELOG.md"
+
+[project.scripts]
+observer = "observer.__main__:main"
+
+[tool.hatch.version]
+path = "src/observer/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/observer"]
+# The bundled binary lives under src/observer/_bin/. Hatchling treats
+# the `packages` glob as recursive, so the binary rides along
+# automatically. No explicit `force-include` block needed.
+exclude = ["src/observer/_bin/.gitkeep"]
