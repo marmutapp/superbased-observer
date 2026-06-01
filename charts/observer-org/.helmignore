@@ -1,0 +1,10 @@
+# Patterns to ignore when packaging the chart.
+.DS_Store
+.git/
+.gitignore
+*.tmproj
+*.bak
+*.orig
+*~
+# CI-only test values are not part of the packaged chart.
+ci/

@@ -1,0 +1,70 @@
+# codex-safe recipe — gpt-mini / gpt-full family
+#
+# Empirically validated against gpt-5.4-mini and gpt-5.5 in the v4
+# compression A/B session (docs/v4-codex-compression-recipe-and-issues.md):
+#   * gpt-5.4-mini × medium: -22% cost vs Anthropic-style default
+#   * gpt-5.4-mini × high:   -56% cost
+#   * gpt-5.4-mini × xhigh:  -19% cost
+#
+# Key differences from the Anthropic / Claude recipe:
+#   * compress_types = ["logs"] only — JSON sentinel substitution
+#     destroys data values that codex relies on, triggering
+#     re-derivation cascades (V7-2). Logs dedup is the only
+#     content-preserving per-type compressor on codex today.
+#   * target_ratio 0.95 — codex re-pays cache_read on every turn for
+#     every dropped-message marker; a less aggressive budget pays for
+#     itself.
+#   * preserve_last_n 15 — codex's reactive style chews into recent
+#     context aggressively; keep more of it raw.
+#   * max_excerpt_bytes 16384 — codex re-reads in chunks if first
+#     chunk is too small; one big chunk is cheaper.
+#   * Expanded exclude_commands — outputs the agent will parse
+#     (rg/cat/head/verify scripts) must come through verbatim, or it
+#     re-runs them.
+#
+# Pair with: any non-`-codex` OpenAI model (gpt-5, gpt-5.4-mini,
+# gpt-5.5 etc.). For `-codex` family models use codex-variant instead.
+
+[compression.shell]
+enabled = true
+exclude_commands = [
+    "curl",
+    "playwright",
+    "rg",
+    "ripgrep",
+    "grep",
+    "cat",
+    "type",
+    "Get-Content",
+    "head",
+    "tail",
+    "less",
+    "more",
+    "node verify",
+    "node test",
+    "node check",
+]
+
+[compression.indexing]
+enabled           = true
+max_excerpt_bytes = 16384
+
+[compression.conversation]
+enabled         = true
+mode            = "token"
+target_ratio    = 0.95
+preserve_last_n = 15
+compress_types  = ["logs"]
+# V7-21: tool-defs trim is opt-in via the "tools" sentinel and is NOT
+# included here — see docs/v1.7.21-tools-defs-gate-plan-2026-06-01.md.
+# Opt in if you want it: compress_types = ["logs", "tools"].
+
+[compression.conversation.logs]
+max_lines = 200
+head      = 100
+tail      = 100
+
+[compression.conversation.stash]
+enabled         = false
+threshold_bytes = 8192
+max_total_mb    = 1024

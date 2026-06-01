@@ -1,0 +1,2 @@
+{"type":"assistant","uuid":"uasst-sidechain","sessionId":"11111111-2222-3333-4444-555555555555","isSidechain":true}
+{"type":"assistant","uuid":"other-uuid-not-in-audit","sessionId":"11111111-2222-3333-4444-555555555555","isSidechain":true}

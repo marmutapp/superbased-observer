@@ -1,0 +1,24 @@
+-- 015_compaction_injected_at.sql
+--
+-- D23 (Tier 3 / v1.4.43+) compaction-survival visibility column.
+--
+-- Pre-fix: the compaction.Injector built post-compact recovery context
+-- and the proxy prepended it to every Anthropic request for the
+-- session, but there was no record of WHICH compaction events had
+-- actually had injection fired vs. which ones the user opted out of
+-- (or that fired before injection was wired). The dashboard couldn't
+-- tell "compactions seen" from "compactions surfaced as recovery
+-- context".
+--
+-- Post-fix: compaction.Injector.Get sets injected_at = now() on the
+-- most-recent compaction_events row for the session the first time it
+-- builds non-empty content. Idempotent — UPDATE clause guards on
+-- injected_at IS NULL so repeat calls don't churn the timestamp.
+-- The dashboard counts INJECT_FIRED = COUNT(injected_at IS NOT NULL).
+--
+-- No backfill: pre-migration compaction events leave injected_at NULL
+-- and surface as "compaction recorded but no injection fired" — the
+-- right interpretation since none of those events had the injector
+-- attached either.
+ALTER TABLE compaction_events ADD COLUMN injected_at TEXT;
+CREATE INDEX IF NOT EXISTS idx_compaction_events_injected ON compaction_events(injected_at) WHERE injected_at IS NOT NULL;

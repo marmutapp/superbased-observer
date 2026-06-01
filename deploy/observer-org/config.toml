@@ -1,0 +1,32 @@
+# Dev/compose config for the org server. Paths point at the in-container
+# locations the keygen init service populates. NOT for production — the
+# external_url is plain HTTP on localhost and the SCIM token is a known dev
+# value. A real deployment uses HTTPS (TLS terminated upstream), real SAML
+# IdP metadata, and secrets from a secret manager.
+
+[server]
+listen = ":8443"
+external_url = "http://localhost:8443"
+db_path = "/var/lib/observer-org/server.db"
+data_retention_days = 730
+session_key_path = "/etc/observer-org/session.key"
+log_level = "info"
+
+[saml]
+sp_entity_id = "http://localhost:8443/saml/metadata"
+sp_cert_path = "/etc/observer-org/saml/sp.crt"
+sp_key_path = "/etc/observer-org/saml/sp.key"
+# The org server fetches IdP metadata over the compose network from the
+# dev SimpleSAMLphp IdP.
+idp_metadata_url = "http://idp:8080/simplesaml/saml2/idp/metadata.php"
+attribute_mapping = { email = "email", display_name = "displayName", groups = "groups" }
+
+[scim]
+auth_token_path = "/etc/observer-org/scim/token"
+
+[bearer]
+signing_key_path = "/etc/observer-org/bearer/signing.key"
+default_lifetime_days = 90
+
+[enrolment]
+default_token_lifetime_days = 7

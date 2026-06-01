@@ -1,0 +1,76 @@
+# Local dev stack for the SuperBased Observer org server:
+#
+#   keygen   one-shot: generates dev secrets + seeds config into a volume
+#   idp      SimpleSAMLphp test SAML IdP (dev only)
+#   org      the org server (built from Dockerfile.observer-org)
+#
+# Bring it up:   docker compose -f deploy/observer-org/docker-compose.yaml up
+# Dashboard:     http://localhost:8443/  (redirects to SSO when logged out)
+# IdP login:     user1 / user1pass  (kristophjunge/test-saml-idp defaults)
+#
+# DEV ONLY — plain HTTP, generated throwaway secrets, a known SCIM token.
+# The M5 E2E CI job reuses this stack. A "fake SCIM client" one-shot is
+# provided under the `tools` profile (does not run on a plain `up`).
+
+name: observer-org-dev
+
+services:
+  keygen:
+    image: alpine:3.20
+    volumes:
+      - org-config:/etc/observer-org
+      - ./:/seed:ro
+    command: ["sh", "-c", "apk add --no-cache openssl >/dev/null && sh /seed/keygen.sh"]
+
+  idp:
+    image: kristophjunge/test-saml-idp
+    environment:
+      SIMPLESAMLPHP_SP_ENTITY_ID: http://localhost:8443/saml/metadata
+      SIMPLESAMLPHP_SP_ASSERTION_CONSUMER_SERVICE: http://localhost:8443/saml/acs
+      SIMPLESAMLPHP_SP_SINGLE_LOGOUT_SERVICE: http://localhost:8443/saml/slo
+    ports:
+      - "8088:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/simplesaml/saml2/idp/metadata.php"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  org:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.observer-org
+    depends_on:
+      keygen:
+        condition: service_completed_successfully
+      idp:
+        condition: service_healthy
+    volumes:
+      - org-config:/etc/observer-org:ro
+      - org-data:/var/lib/observer-org
+    ports:
+      - "8443:8443"
+
+  # Fake SCIM client: provisions one user via the SCIM API. Run explicitly:
+  #   docker compose -f deploy/observer-org/docker-compose.yaml --profile tools run scim-provision
+  scim-provision:
+    image: curlimages/curl:8.10.1
+    profiles: ["tools"]
+    depends_on:
+      org:
+        condition: service_started
+    command:
+      - "-sS"
+      - "-X"
+      - "POST"
+      - "http://org:8443/scim/v2/Users"
+      - "-H"
+      - "Authorization: Bearer dev-scim-token-change-me"
+      - "-H"
+      - "Content-Type: application/scim+json"
+      - "-d"
+      - '{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"userName":"user1@example.com","emails":[{"value":"user1@example.com","primary":true}],"active":true}'
+
+volumes:
+  org-config:
+  org-data:

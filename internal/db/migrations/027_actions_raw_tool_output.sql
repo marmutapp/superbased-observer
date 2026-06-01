@@ -1,0 +1,40 @@
+-- 027_actions_raw_tool_output.sql
+--
+-- v1.6.29 full-text on-demand capture: store the FULL, untruncated
+-- tool_output body per action so the dashboard's clipboard buttons
+-- can serve the operator real content beyond the FTS5 excerpt cap.
+--
+-- Pre-fix: every adapter that produced tool output truncated it to
+-- 4000 bytes (truncate(body, 4000)) before handing it to the store.
+-- The store layer then routed that already-truncated body through
+-- the FTS5 Indexer, which further trimmed to 2048 bytes
+-- (DefaultMaxExcerptBytes) and persisted only into the contentless
+-- action_excerpts virtual table. There was no surface holding the
+-- full body, so the dashboard's "copy output" button could only ever
+-- copy ≤2048 bytes — frequently a small fraction of a real bash
+-- command or grep result the operator wanted to keep.
+--
+-- Post-fix: a new TEXT column on actions stores the untruncated
+-- tool_output (capped by the adapter layer at 1 MB via
+-- internal/models.CapWithMarker as a safety belt against pathological
+-- rows like `cat /var/log/syslog`). The FTS5 indexer keeps its
+-- 2048-byte excerpt for search. A new endpoint
+-- GET /api/actions/{id}/full_text serves the column on demand so the
+-- /messages timeline payload doesn't have to embed multi-MB blobs
+-- for every action row.
+--
+-- ON CONFLICT semantics mirror raw_tool_input (insertActionSQL):
+-- on (source_file, source_event_id) conflict, replace when the new
+-- value is strictly longer OR when the existing value is empty/null.
+-- Adapter rescans can legitimately surface more-complete output than
+-- the original capture (e.g. a hook captured pre-completion, the
+-- JSONL adapter sees the final body) — length-merge keeps the richer
+-- bytes without ever clobbering good data with a regression.
+--
+-- No backfill for pre-migration rows: their tool_output bodies are
+-- gone (only the 2048-byte action_excerpts excerpt remains). The
+-- column is NULL on historical actions; the dashboard treats
+-- NULL/empty as "no full output captured" and falls back to the
+-- excerpt as today.
+
+ALTER TABLE actions ADD COLUMN raw_tool_output TEXT;
