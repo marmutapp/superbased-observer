@@ -1,0 +1,9 @@
+# Default filter for `kubectl`. Conservative by design — kubectl output is
+# already dense, and most subcommands (get, describe, logs) surface data the
+# AI needs verbatim. Only blank-line runs are collapsed.
+
+command = "kubectl"
+description = "collapse blank-line runs in kubectl output"
+
+[[rule]]
+type = "squash_whitespace"
