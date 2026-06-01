@@ -1,0 +1,262 @@
+/* ============================================================
+   SuperBased Observer — Design Tokens
+   ============================================================ */
+:root, :root[data-theme="dark"] {
+  /* Surfaces — layered elevation, low to high */
+  --bg-0: #08090d;          /* page background, deepest */
+  --bg-1: #0e1018;          /* sidebar / app shell */
+  --bg-2: #14171f;          /* card / panel */
+  --bg-3: #1a1d27;          /* nested card / chart shell */
+  --bg-4: #21252f;          /* input / hover / row alt */
+  --bg-5: #2a2f3d;          /* strong hover / active row */
+
+  /* Borders */
+  --line-1: #1c1f29;        /* subtle divider */
+  --line-2: #262a36;        /* card border */
+  --line-3: #353a48;        /* strong border / input outline */
+
+  /* Foreground */
+  --fg-0: #f5f7fb;          /* hero numbers, headings */
+  --fg-1: #e2e6ef;          /* primary body text */
+  --fg-2: #9aa2b2;          /* secondary / labels */
+  --fg-3: #6b7388;          /* tertiary / muted */
+  --fg-4: #474d5e;          /* disabled */
+
+  /* Brand */
+  --brand-from: #6199f0;
+  --brand-to:   #8b5cf6;
+  --brand-grad: linear-gradient(135deg, var(--brand-from) 0%, var(--brand-to) 100%);
+  --brand-soft: rgba(139, 92, 246, 0.12);
+
+  /* Accent — primary interactive */
+  --accent: #7c9eff;
+  --on-accent: #0a0d18;
+  --accent-strong: #93b1ff;
+  --accent-soft: rgba(124, 158, 255, 0.10);
+  --accent-ring: rgba(124, 158, 255, 0.35);
+
+  /* Semantic */
+  --success: #34d399;       /* savings, success rate, green pills */
+  --success-soft: rgba(52, 211, 153, 0.12);
+  --warn: #fbbf24;          /* approximate, cost, attention */
+  --warn-soft: rgba(251, 191, 36, 0.12);
+  --danger: #f87171;        /* failures, unreliable, over-budget */
+  --danger-soft: rgba(248, 113, 113, 0.12);
+  --info: #60a5fa;
+  --info-soft: rgba(96, 165, 250, 0.12);
+
+  /* Token bucket colors (4 Anthropic billing buckets — used in every cost chart) */
+  --tok-net:    #60a5fa;   /* net input  — blue */
+  --tok-read:   #a78bfa;   /* cache read — lavender */
+  --tok-write:  #fbbf24;   /* cache write — amber */
+  --tok-out:    #f472b6;   /* output     — pink */
+
+  /* Tool brand colors (consistent across every tab) */
+  --tool-claude-code:  #f59e0b;
+  --tool-codex:        #10b981;
+  --tool-cursor:       #a855f7;
+  --tool-cline:        #3b82f6;
+  --tool-copilot:      #94a3b8;
+  --tool-cowork:       #ec4899;
+  --tool-antigravity:  #14b8a6;
+  --tool-opencode:     #f97316;
+  --tool-openclaw:     #06b6d4;
+  --tool-pi:           #84cc16;
+  --tool-gemini:       #6366f1;
+  --tool-other:        #64748b;
+
+  /* Action-type category colors */
+  --act-file:    #60a5fa;   /* read/write/edit */
+  --act-cmd:     #34d399;   /* run_command */
+  --act-search:  #a855f7;   /* search_* */
+  --act-web:     #14b8a6;   /* web_* */
+  --act-meta:    #94a3b8;   /* session/setup/config */
+  --act-fail:    #f87171;   /* tool_failure, api_error */
+  --act-agent:   #ec4899;   /* subagent_*, spawn */
+  --act-mcp:     #fbbf24;   /* mcp_call */
+  --act-user:    #c084fc;   /* user_prompt */
+
+  /* Pattern type colors */
+  --pat-hot:       #fbbf24;
+  --pat-cochange:  #60a5fa;
+  --pat-edittest:  #34d399;
+  --pat-knowledge: #c084fc;
+  --pat-command:   #06b6d4;
+
+  /* Reliability */
+  --rel-accurate:    var(--success);
+  --rel-approximate: var(--warn);
+  --rel-unreliable:  var(--danger);
+
+  /* Typography */
+  --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  --font-display: "Inter", system-ui, sans-serif;
+
+  /* Type scale */
+  --t-hero:  34px;   /* big KPI numbers */
+  --t-hero2: 26px;   /* secondary big numbers */
+  --t-h1:    22px;
+  --t-h2:    16px;
+  --t-h3:    14px;
+  --t-body:  13px;
+  --t-sm:    12px;
+  --t-xs:    11px;
+
+  /* Tracking */
+  --tr-label: 0.06em;   /* uppercase labels */
+  --tr-tight: -0.02em;  /* headings */
+
+  /* Radius */
+  --r-1: 4px;
+  --r-2: 6px;
+  --r-3: 8px;
+  --r-4: 12px;
+  --r-pill: 999px;
+
+  /* Spacing — 4px grid */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 20px;
+  --s-6: 24px;
+  --s-7: 32px;
+  --s-8: 48px;
+
+  /* Layout */
+  --sidebar-w: 220px;
+  --sidebar-w-collapsed: 56px;
+  --header-h: 52px;
+  --filterbar-h: 56px;
+
+  /* Shadow */
+  --shadow-1: 0 1px 0 rgba(255,255,255,0.02) inset, 0 1px 2px rgba(0,0,0,0.4);
+  --shadow-2: 0 4px 16px rgba(0,0,0,0.4), 0 1px 0 rgba(255,255,255,0.02) inset;
+  --shadow-3: 0 16px 48px rgba(0,0,0,0.55), 0 1px 0 rgba(255,255,255,0.03) inset;
+  --shadow-drawer: -16px 0 48px rgba(0,0,0,0.6);
+
+  /* Motion */
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --dur-fast: 120ms;
+  --dur:      200ms;
+}
+
+/* ============================================================
+   LIGHT THEME — overrides applied via [data-theme="light"] or
+   via system preference when [data-theme="system"]
+   ============================================================ */
+:root[data-theme="light"] {
+  /* Surfaces — warm-cool neutral, low contrast steps */
+  --bg-0: #f4f5f9;
+  --bg-1: #ffffff;
+  --bg-2: #ffffff;
+  --bg-3: #f6f7fb;
+  --bg-4: #eef0f6;
+  --bg-5: #e2e6ef;
+
+  /* Borders */
+  --line-1: #ebedf2;
+  --line-2: #dde0e8;
+  --line-3: #c1c6d2;
+
+  /* Foreground */
+  --fg-0: #0c0f15;
+  --fg-1: #1b1f28;
+  --fg-2: #56607a;
+  --fg-3: #828aa0;
+  --fg-4: #b3b9c7;
+
+  /* Brand mark gradient unchanged */
+  --brand-soft: rgba(139, 92, 246, 0.10);
+
+  /* Accent — slightly darker for AA contrast on white */
+  --accent: #4763ed;
+  --accent-strong: #3850dd;
+  --accent-soft: rgba(71, 99, 237, 0.10);
+  --accent-ring: rgba(71, 99, 237, 0.25);
+  --on-accent: #ffffff;
+
+  /* Semantic — same hues, darker for white background */
+  --success: #10b981;
+  --success-soft: rgba(16, 185, 129, 0.10);
+  --warn: #d97706;
+  --warn-soft: rgba(217, 119, 6, 0.10);
+  --danger: #e53e3e;
+  --danger-soft: rgba(229, 62, 62, 0.10);
+  --info: #2563eb;
+  --info-soft: rgba(37, 99, 235, 0.10);
+
+  /* Token bucket colors — darker for contrast */
+  --tok-net:    #2563eb;
+  --tok-read:   #7c3aed;
+  --tok-write:  #d97706;
+  --tok-out:    #db2777;
+
+  /* Tool brand colors keep same hues (they're already brand-tinted) */
+  --tool-claude-code:  #d97706;
+  --tool-codex:        #059669;
+  --tool-cursor:       #7c3aed;
+  --tool-cline:        #2563eb;
+  --tool-copilot:      #64748b;
+  --tool-cowork:       #db2777;
+  --tool-antigravity:  #0d9488;
+  --tool-opencode:     #ea580c;
+  --tool-openclaw:     #0891b2;
+  --tool-pi:           #65a30d;
+  --tool-gemini:       #4f46e5;
+  --tool-other:        #475569;
+
+  /* Action-type colors — darker variants */
+  --act-file:    #2563eb;
+  --act-cmd:     #10b981;
+  --act-search:  #7c3aed;
+  --act-web:     #0d9488;
+  --act-meta:    #64748b;
+  --act-fail:    #e53e3e;
+  --act-agent:   #db2777;
+  --act-mcp:     #d97706;
+  --act-user:    #9333ea;
+
+  /* Pattern colors */
+  --pat-hot:       #d97706;
+  --pat-cochange:  #2563eb;
+  --pat-edittest:  #10b981;
+  --pat-knowledge: #9333ea;
+  --pat-command:   #0891b2;
+
+  /* Shadows — much softer on light */
+  --shadow-1: 0 1px 0 rgba(0,0,0,0.02), 0 1px 2px rgba(15,23,42,0.04);
+  --shadow-2: 0 4px 16px rgba(15,23,42,0.06), 0 1px 0 rgba(0,0,0,0.02);
+  --shadow-3: 0 16px 48px rgba(15,23,42,0.12), 0 1px 0 rgba(0,0,0,0.02);
+  --shadow-drawer: -16px 0 48px rgba(15,23,42,0.12);
+}
+
+/* System theme — use light vars when OS prefers light */
+@media (prefers-color-scheme: light) {
+  :root[data-theme="system"] {
+    --bg-0: #f4f5f9; --bg-1: #ffffff; --bg-2: #ffffff; --bg-3: #f6f7fb; --bg-4: #eef0f6; --bg-5: #e2e6ef;
+    --line-1: #ebedf2; --line-2: #dde0e8; --line-3: #c1c6d2;
+    --fg-0: #0c0f15; --fg-1: #1b1f28; --fg-2: #56607a; --fg-3: #828aa0; --fg-4: #b3b9c7;
+    --brand-soft: rgba(139, 92, 246, 0.10);
+    --accent: #4763ed; --accent-strong: #3850dd;
+    --accent-soft: rgba(71, 99, 237, 0.10);
+    --accent-ring: rgba(71, 99, 237, 0.25);
+    --on-accent: #ffffff;
+    --success: #10b981; --success-soft: rgba(16, 185, 129, 0.10);
+    --warn: #d97706; --warn-soft: rgba(217, 119, 6, 0.10);
+    --danger: #e53e3e; --danger-soft: rgba(229, 62, 62, 0.10);
+    --info: #2563eb; --info-soft: rgba(37, 99, 235, 0.10);
+    --tok-net: #2563eb; --tok-read: #7c3aed; --tok-write: #d97706; --tok-out: #db2777;
+    --tool-claude-code: #d97706; --tool-codex: #059669; --tool-cursor: #7c3aed; --tool-cline: #2563eb;
+    --tool-copilot: #64748b; --tool-cowork: #db2777; --tool-antigravity: #0d9488; --tool-opencode: #ea580c;
+    --tool-openclaw: #0891b2; --tool-pi: #65a30d; --tool-gemini: #4f46e5; --tool-other: #475569;
+    --act-file: #2563eb; --act-cmd: #10b981; --act-search: #7c3aed; --act-web: #0d9488;
+    --act-meta: #64748b; --act-fail: #e53e3e; --act-agent: #db2777; --act-mcp: #d97706; --act-user: #9333ea;
+    --pat-hot: #d97706; --pat-cochange: #2563eb; --pat-edittest: #10b981; --pat-knowledge: #9333ea; --pat-command: #0891b2;
+    --shadow-1: 0 1px 0 rgba(0,0,0,0.02), 0 1px 2px rgba(15,23,42,0.04);
+    --shadow-2: 0 4px 16px rgba(15,23,42,0.06);
+    --shadow-3: 0 16px 48px rgba(15,23,42,0.12);
+    --shadow-drawer: -16px 0 48px rgba(15,23,42,0.12);
+  }
+}
