@@ -1,0 +1,13 @@
+{
+  "sessionId": "local_cccc-dddd-eeee",
+  "processName": "happy-test-fixture",
+  "cliSessionId": "11111111-2222-3333-4444-555555555555",
+  "cwd": "/tmp/cowork-test/outputs",
+  "userSelectedFolders": ["/tmp/cowork-test/workspace"],
+  "createdAt": 1700000000000,
+  "lastActivityAt": 1700000600000,
+  "model": "claude-opus-4-6",
+  "isArchived": false,
+  "title": "Fixture session for adapter tests",
+  "hostLoopMode": true
+}
