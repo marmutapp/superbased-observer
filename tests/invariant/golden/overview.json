@@ -1,0 +1,35 @@
+{
+  "counts": {
+    "action_excerpts": 0,
+    "actions": 7,
+    "api_turns": 2,
+    "failure_context": 0,
+    "file_state": 0,
+    "projects": 2,
+    "sessions": 3,
+    "token_usage": 3
+  },
+  "db_path": "/inv/observer.db",
+  "db_size_bytes": 0,
+  "last_action_at": "\u003cTS\u003e",
+  "last_action_tool": "codex",
+  "per_tool_last_seen": [
+    {
+      "action_count": 3,
+      "last_seen_at": "\u003cTS\u003e",
+      "tool": "claude-code"
+    },
+    {
+      "action_count": 2,
+      "last_seen_at": "\u003cTS\u003e",
+      "tool": "codex"
+    },
+    {
+      "action_count": 2,
+      "last_seen_at": "\u003cTS\u003e",
+      "tool": "cursor"
+    }
+  ],
+  "recent_failures_24h": 0,
+  "schema_version": 34
+}
