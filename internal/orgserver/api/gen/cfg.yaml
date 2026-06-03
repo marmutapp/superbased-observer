@@ -1,0 +1,21 @@
+# oapi-codegen config for the server-side handler interface.
+# std-http-server emits a ServerInterface against the stdlib net/http
+# ServeMux (Go 1.22+ method+path patterns) — no third-party router, per
+# spec §2.7. M0 generates the interface only; the concrete handlers
+# (internal/orgserver) implement it in M1/M2.
+package: gen
+output: internal/orgserver/api/gen/server.gen.go
+generate:
+  models: true
+  std-http-server: true
+output-options:
+  # Prune to the agent-tagged operations' schemas only. The M3 dashboard
+  # schemas (which x-go-type to internal/orgserver/rollup) must NOT leak into
+  # this agent-only interface; pruning keeps the orgcontract aliases + Error
+  # (all referenced by enroll/push) and drops everything else.
+  skip-prune: false
+  # Generate handlers ONLY for the agent protocol (enroll, push). The SCIM,
+  # SAML, dashboard, and admin paths are documented in the spec but served by
+  # dedicated packages / libraries, not the generated ServerInterface.
+  include-tags:
+    - agent
