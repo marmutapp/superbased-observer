@@ -1,0 +1,46 @@
+{
+  "sessionId": "55555555-6666-7777-8888-999999999999",
+  "projectHash": "fedcba9876543210",
+  "startTime": "2026-04-02T14:30:00.000Z",
+  "messages": [
+    {
+      "id": "u1",
+      "role": "user",
+      "timestamp": "2026-04-02T14:30:01.000Z",
+      "cwd": "/tmp/multiturn-project",
+      "content": [{"type": "text", "text": "find all TODO comments"}]
+    },
+    {
+      "id": "m1",
+      "role": "gemini",
+      "timestamp": "2026-04-02T14:30:02.000Z",
+      "model": "gemini-3-pro",
+      "content": [
+        {"type": "functionCall", "functionCall": {"id": "c1", "name": "grep", "args": {"pattern": "TODO", "path": "."}}}
+      ],
+      "tokens": {"input": 800, "output": 40, "total": 840}
+    },
+    {
+      "id": "t1",
+      "role": "tool",
+      "timestamp": "2026-04-02T14:30:03.000Z",
+      "content": [{"type": "functionResponse", "functionResponse": {"id": "c1", "name": "grep", "response": {"matches": ["main.go:14: // TODO: refactor"]}}}]
+    },
+    {
+      "id": "u2",
+      "role": "user",
+      "timestamp": "2026-04-02T14:30:04.000Z",
+      "content": [{"type": "text", "text": "now read main.go"}]
+    },
+    {
+      "id": "m2",
+      "role": "gemini",
+      "timestamp": "2026-04-02T14:30:05.000Z",
+      "model": "gemini-3-pro",
+      "content": [
+        {"type": "functionCall", "functionCall": {"id": "c2", "name": "read_file", "args": {"absolute_path": "/tmp/multiturn-project/main.go"}}}
+      ],
+      "tokens": {"input": 1200, "output": 30, "thoughtsTokenCount": 8, "total": 1238}
+    }
+  ]
+}

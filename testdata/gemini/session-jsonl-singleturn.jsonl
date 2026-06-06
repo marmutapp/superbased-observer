@@ -1,0 +1,5 @@
+{"type":"session_metadata","sessionId":"jsonl-1111-2222","projectHash":"deadbeef","startTime":"2026-04-03T09:00:00.000Z","cwd":"/tmp/jsonl-project"}
+{"type":"user","id":"u1","timestamp":"2026-04-03T09:00:01.000Z","content":[{"type":"text","text":"hello world"}]}
+{"type":"gemini","id":"m1","timestamp":"2026-04-03T09:00:02.000Z","model":"gemini-2.5-flash","content":[{"type":"functionCall","functionCall":{"id":"call-jsonl-1","name":"runShellCommand","args":{"command":"echo hi"}}}],"tokens":{"input":50,"output":10,"total":60}}
+{"type":"tool","id":"t1","timestamp":"2026-04-03T09:00:03.000Z","content":[{"type":"functionResponse","functionResponse":{"id":"call-jsonl-1","name":"runShellCommand","response":{"output":"hi\n"}}}]}
+{"type":"message_update","id":"m1","timestamp":"2026-04-03T09:00:04.000Z","model":"gemini-2.5-flash","tokens":{"input":50,"output":11,"thoughtsTokenCount":3,"total":64}}

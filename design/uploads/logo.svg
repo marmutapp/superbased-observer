@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 460 120" fill="none">
+  <defs>
+    <linearGradient id="icon-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#6199f0"></stop>
+      <stop offset="100%" stop-color="#8b5cf6"></stop>
+    </linearGradient>
+    
+  </defs>
+  
+  <rect width="100" height="100" rx="20" y="10" fill="url(#icon-grad)"></rect>
+  <text x="50" y="84" text-anchor="middle" font-family="system-ui,-apple-system,sans-serif" font-size="70" font-weight="800" fill="#fff">S</text>
+  
+  <text x="120" y="78" font-family="&#39;Outfit&#39;,system-ui,-apple-system,sans-serif" font-size="52" font-weight="800" letter-spacing="-1.5" fill="#e8ecf4">SuperBased</text>
+</svg>
