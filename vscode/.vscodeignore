@@ -1,0 +1,23 @@
+.vscode/**
+.vscode-test/**
+src/**
+test/**
+out/test/**
+node_modules/**
+!node_modules/adm-zip/**
+!node_modules/tar/**
+**/*.map
+**/*.ts
+!out/extension.js
+.gitignore
+.eslintrc*
+esbuild.mjs
+tsconfig.json
+*.vsix
+# Belt-and-braces: never let secrets ride into the VSIX even if a
+# .env file accidentally lands under vscode/ during a publish flow.
+# The canonical .env is at repo root and is .gitignored there.
+.env
+.env.*
+**/.env
+**/.env.*
