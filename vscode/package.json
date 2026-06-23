@@ -1,0 +1,330 @@
+{
+  "name": "superbased-observer",
+  "displayName": "SuperBased Observer",
+  "description": "Capture, normalise, and analyse every AI coding tool's activity locally. Sees Claude Code, Codex, Cursor, Cline + Cline CLI, Copilot, Hermes Agent, Kilo Code + 9 more. No telemetry. No cloud.",
+  "version": "1.10.0",
+  "publisher": "superbased",
+  "license": "Apache-2.0",
+  "author": "Santosh Kathira <contact@superbased.app>",
+  "homepage": "https://github.com/marmutapp/superbased-observer",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/marmutapp/superbased-observer"
+  },
+  "bugs": {
+    "url": "https://github.com/marmutapp/superbased-observer/issues"
+  },
+  "qna": "https://github.com/marmutapp/superbased-observer/discussions",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other",
+    "AI",
+    "Visualization"
+  ],
+  "keywords": [
+    "ai",
+    "claude",
+    "codex",
+    "copilot",
+    "cursor",
+    "cline",
+    "cost",
+    "observability",
+    "local-first",
+    "no-telemetry"
+  ],
+  "icon": "media/icon.png",
+  "galleryBanner": {
+    "color": "#0f172a",
+    "theme": "dark"
+  },
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "observer.doctor",
+        "title": "Observer: Doctor"
+      },
+      {
+        "command": "observer.start",
+        "title": "Observer: Start Daemon"
+      },
+      {
+        "command": "observer.stop",
+        "title": "Observer: Stop Daemon"
+      },
+      {
+        "command": "observer.openDashboard",
+        "title": "Observer: Open Dashboard"
+      },
+      {
+        "command": "observer.init",
+        "title": "Observer: Init for this project"
+      },
+      {
+        "command": "observer.initWithMCP",
+        "title": "Observer: Enable MCP for this project"
+      },
+      {
+        "command": "observer.copyProxyEnv",
+        "title": "Observer: Copy Proxy Env Vars"
+      },
+      {
+        "command": "observer.launchClaude",
+        "title": "Observer: Launch Claude Code (proxied)"
+      },
+      {
+        "command": "observer.launchCodex",
+        "title": "Observer: Launch Codex (proxied)"
+      },
+      {
+        "command": "observer.enroll",
+        "title": "Observer: Enroll in Org"
+      },
+      {
+        "command": "observer.refreshTrees",
+        "title": "Observer: Refresh All Trees",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "observer.openSession",
+        "title": "Observer: Open Session in Dashboard"
+      },
+      {
+        "command": "observer.copySessionId",
+        "title": "Observer: Copy Session ID"
+      },
+      {
+        "command": "observer.copyPath",
+        "title": "Observer: Copy Path"
+      },
+      {
+        "command": "observer.refreshInstructions",
+        "title": "Observer: Refresh Instructions from Learnings"
+      },
+      {
+        "command": "observer.previewInstructions",
+        "title": "Observer: Preview Instruction Suggestions"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "observer",
+          "title": "Observer",
+          "icon": "media/icon-activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "observer": [
+        {
+          "id": "observer.today",
+          "name": "Today"
+        },
+        {
+          "id": "observer.sessions",
+          "name": "Sessions"
+        },
+        {
+          "id": "observer.discovery",
+          "name": "Discovery"
+        },
+        {
+          "id": "observer.costs",
+          "name": "Costs (7d)"
+        }
+      ]
+    },
+    "terminal": {
+      "profiles": [
+        {
+          "id": "observer.terminalProfile",
+          "title": "AI Coding Tool (Observer-proxied)",
+          "icon": "$(rocket)"
+        }
+      ]
+    },
+    "walkthroughs": [
+      {
+        "id": "observer.getStarted",
+        "title": "Get Started with SuperBased Observer",
+        "description": "Connect Observer to your AI coding workflow in about 5 minutes.",
+        "steps": [
+          {
+            "id": "welcome",
+            "title": "Welcome to Observer",
+            "description": "Observer captures, normalises, and analyses every AI coding tool's activity — locally, with no telemetry.\n[Open Sidebar](command:workbench.view.extension.observer)",
+            "media": {
+              "markdown": "walkthroughs/01-welcome.md"
+            },
+            "completionEvents": [
+              "onView:observer.today"
+            ]
+          },
+          {
+            "id": "doctor",
+            "title": "Verify your install",
+            "description": "Run `Observer: Doctor` to confirm the binary is resolved and the daemon's DB / hooks / MCP registrations are all healthy.\n[Run Observer: Doctor](command:observer.doctor)",
+            "media": {
+              "markdown": "walkthroughs/02-doctor.md"
+            },
+            "completionEvents": [
+              "onCommand:observer.doctor"
+            ]
+          },
+          {
+            "id": "daemon",
+            "title": "Pick a daemon mode",
+            "description": "Decide whether the extension attaches to a daemon you start manually (`detect`, default), spawns + supervises its own (`managed`), or auto-detects (`auto`).\n[Open observer.daemon.mode setting](command:workbench.action.openSettings?%22observer.daemon.mode%22)",
+            "media": {
+              "markdown": "walkthroughs/03-daemon.md"
+            },
+            "completionEvents": [
+              "onSettingChanged:observer.daemon.mode",
+              "onCommand:observer.start"
+            ]
+          },
+          {
+            "id": "dashboard",
+            "title": "Open the dashboard",
+            "description": "The full React analytics dashboard renders inside an editor tab. Same surface as the standalone http://127.0.0.1:8081/.\n[Open Dashboard](command:observer.openDashboard)",
+            "media": {
+              "markdown": "walkthroughs/04-dashboard.md"
+            },
+            "completionEvents": [
+              "onCommand:observer.openDashboard"
+            ]
+          },
+          {
+            "id": "proxy",
+            "title": "Route AI CLIs through the proxy",
+            "description": "Use the contributed terminal profile, or copy the proxy env vars to your existing terminal. Accurate token counts only work when the AI CLI talks to 127.0.0.1:8820.\n[Copy Proxy Env Vars](command:observer.copyProxyEnv)",
+            "media": {
+              "markdown": "walkthroughs/05-proxy.md"
+            },
+            "completionEvents": [
+              "onCommand:observer.copyProxyEnv"
+            ]
+          },
+          {
+            "id": "instructions",
+            "title": "Auto-update your instruction files",
+            "description": "Open a `CLAUDE.md`, `AGENTS.md`, or `.cursorrules` to see two CodeLenses at the top. Preview composes Observer's suggestions into a side editor; Refresh materialises them into the file.\n[Run Observer: Preview Instruction Suggestions](command:observer.previewInstructions)",
+            "media": {
+              "markdown": "walkthroughs/06-instructions.md"
+            },
+            "completionEvents": [
+              "onCommand:observer.previewInstructions",
+              "onCommand:observer.refreshInstructions"
+            ]
+          },
+          {
+            "id": "done",
+            "title": "You're set",
+            "description": "Observer is wired into VS Code. The full user guide covers per-AI-tool workflows.\n[Open Dashboard](command:observer.openDashboard)",
+            "media": {
+              "markdown": "walkthroughs/07-done.md"
+            },
+            "completionEvents": [
+              "onLink:https://github.com/marmutapp/superbased-observer/blob/main/docs/vscode-extension-user-guide.md"
+            ]
+          }
+        ]
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "observer.refreshTrees",
+          "when": "view == observer.today || view == observer.sessions || view == observer.discovery || view == observer.costs",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "observer.openSession",
+          "when": "view == observer.sessions && viewItem == session",
+          "group": "navigation@1"
+        },
+        {
+          "command": "observer.copySessionId",
+          "when": "view == observer.sessions && viewItem == session",
+          "group": "navigation@2"
+        },
+        {
+          "command": "observer.copyPath",
+          "when": "view == observer.discovery && viewItem == discoveryFile",
+          "group": "navigation@1"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Observer",
+      "properties": {
+        "observer.daemon.mode": {
+          "type": "string",
+          "enum": [
+            "detect",
+            "managed",
+            "auto"
+          ],
+          "default": "detect",
+          "description": "How the extension manages the observer daemon. 'detect' attaches only; 'managed' spawns on activation and kills on deactivate; 'auto' attaches if a daemon is found, otherwise spawns."
+        },
+        "observer.binary.path": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the observer binary. Empty = auto-detect (PATH, then bundled, then download)."
+        },
+        "observer.dashboard.port": {
+          "type": "number",
+          "default": 8081,
+          "description": "Local port the observer dashboard listens on."
+        },
+        "observer.proxy.port": {
+          "type": "number",
+          "default": 8820,
+          "description": "Local port the observer API proxy listens on."
+        },
+        "observer.statusBar.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the today-spend status bar item."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "node esbuild.mjs --production",
+    "watch": "node esbuild.mjs --watch",
+    "lint": "eslint src --ext ts",
+    "test": "node --import tsx --test test/unit/*.test.ts",
+    "package": "vsce package",
+    "package:platform": "vsce package --target ${TARGET}"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "tar": "^7.4.3"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.5",
+    "@types/node": "^20.0.0",
+    "@types/tar": "^6.1.13",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.24.0",
+    "ovsx": "^0.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0"
+  }
+}

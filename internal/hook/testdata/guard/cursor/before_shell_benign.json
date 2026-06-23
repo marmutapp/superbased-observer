@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "beforeShellExecution",
+  "conversation_id": "fixture-cur-2",
+  "generation_id": "gen-2",
+  "workspace_roots": ["/home/dev/proj"],
+  "command": "go test ./..."
+}

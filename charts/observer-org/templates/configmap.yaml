@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "observer-org.fullname" . }}-config
+  labels:
+    {{- include "observer-org.labels" . | nindent 4 }}
+data:
+  config.toml: |
+    # Rendered by the observer-org Helm chart. Secret-file paths point at the
+    # mounted Secret (.Values.secrets.existingSecret) under /etc/observer-org/secrets.
+    [server]
+    listen = ":{{ .Values.service.port }}"
+    external_url = {{ .Values.config.externalURL | quote }}
+    db_path = "/var/lib/observer-org/server.db"
+    data_retention_days = {{ .Values.config.dataRetentionDays }}
+    session_key_path = "/etc/observer-org/secrets/session.key"
+    log_level = {{ .Values.config.logLevel | quote }}
+
+    [saml]
+    sp_entity_id = {{ .Values.config.saml.spEntityID | quote }}
+    sp_cert_path = "/etc/observer-org/secrets/sp.crt"
+    sp_key_path = "/etc/observer-org/secrets/sp.key"
+    idp_metadata_url = {{ .Values.config.saml.idpMetadataURL | quote }}
+    attribute_mapping = { email = {{ .Values.config.saml.attributeMapping.email | quote }}, display_name = {{ .Values.config.saml.attributeMapping.display_name | quote }}, groups = {{ .Values.config.saml.attributeMapping.groups | quote }} }
+
+    [scim]
+    auth_token_path = "/etc/observer-org/secrets/scim-token"
+
+    [bearer]
+    signing_key_path = "/etc/observer-org/secrets/bearer-signing.key"
+    default_lifetime_days = {{ .Values.config.bearer.defaultLifetimeDays }}
+
+    [enrolment]
+    default_token_lifetime_days = {{ .Values.config.enrolment.defaultTokenLifetimeDays }}
+
+    [dashboard]
+    # Org admins — emails that resolve to the admin role (see the M3 role
+    # model). Team leads are assigned via SCIM group membership instead.
+    admin_emails = [{{ range $i, $e := .Values.config.dashboard.adminEmails }}{{ if $i }}, {{ end }}{{ $e | quote }}{{ end }}]
+    budget_poll_seconds = {{ .Values.config.dashboard.budgetPollSeconds }}

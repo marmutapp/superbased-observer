@@ -1,0 +1,12 @@
+-- 011_otel_content_session_idx.sql — index otel_content by session_id for the
+-- audited message-content viewer (Teams dashboard Phase 7).
+--
+-- Migration 007 created otel_content with an index on user_id only. The Phase 7
+-- viewer (GET /api/org/sessions/{id}/messages) queries the bodies for ONE
+-- session, so it needs a session_id index to avoid a full table scan as the
+-- table grows.
+--
+-- SERVER-SIDE ONLY: this touches no wire shape and has NO paired agent
+-- migration (it only indexes data the agent already ships under
+-- full_content / admin_managed). It does not change the privacy posture.
+CREATE INDEX IF NOT EXISTS idx_otel_content_session ON otel_content(session_id);
