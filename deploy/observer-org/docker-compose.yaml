@@ -1,0 +1,111 @@
+# Local dev stack for the SuperBased Observer org server:
+#
+#   keygen   one-shot: generates dev secrets + seeds config into a volume
+#   idp      SimpleSAMLphp test SAML IdP (dev only)
+#   org      the org server (built from Dockerfile.observer-org)
+#
+# Bring it up:   docker compose -f deploy/observer-org/docker-compose.yaml up
+# Dashboard:     http://localhost:8443/  (redirects to SSO when logged out)
+# IdP login:     user1 / user1pass  (kristophjunge/test-saml-idp defaults)
+#
+# DEV ONLY — plain HTTP, generated throwaway secrets, a known SCIM token.
+# The M5 E2E CI job reuses this stack. A "fake SCIM client" one-shot is
+# provided under the `tools` profile (does not run on a plain `up`).
+
+name: observer-org-dev
+
+services:
+  keygen:
+    image: alpine:3.20
+    volumes:
+      - org-config:/etc/observer-org
+      - ./:/seed:ro
+    command: ["sh", "-c", "apk add --no-cache openssl >/dev/null && sh /seed/keygen.sh"]
+
+  idp:
+    image: kristophjunge/test-saml-idp
+    environment:
+      SIMPLESAMLPHP_SP_ENTITY_ID: http://localhost:8443/saml/metadata
+      SIMPLESAMLPHP_SP_ASSERTION_CONSUMER_SERVICE: http://localhost:8443/saml/acs
+      SIMPLESAMLPHP_SP_SINGLE_LOGOUT_SERVICE: http://localhost:8443/saml/slo
+    # M3.3 (v1.8.0) + post-v1.8.1 regression fix:
+    # Pin baseurlpath to a single host-reachable URL so the IdP
+    # advertises the same entityID whether the SP fetches metadata at
+    # idp:8080 (docker DNS) or a WSL browser hits localhost:8088. Without
+    # this, SimpleSAMLphp's `__DYNAMIC:1__` default produces a per-host
+    # entityID and the SAML round-trip 403s.
+    #
+    # An earlier attempt mounted ./idp-config-override.php over
+    # /var/www/simplesamlphp/config/config.php; that override did
+    # `require '/var/simplesamlphp/config/config.php.dist'` (wrong path,
+    # no `.dist` ships with kristophjunge/test-saml-idp). Result: PHP
+    # fatal as metadata → org server fails first-boot. See
+    # docs/teams-test-regression-2026-06-03.md §5 / N1.
+    #
+    # Fix: don't override the config at all — sed the pin in-place
+    # against the image's own complete config.php, then chain to the
+    # image's apache2-foreground default. Idempotent across restarts.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        sed -i "s|'baseurlpath' => '.*'|'baseurlpath' => 'http://localhost:8088/simplesaml/'|" \
+          /var/www/simplesamlphp/config/config.php
+        exec apache2-foreground
+    ports:
+      - "8088:8080"
+    # Healthcheck greps the body for <EntityDescriptor (the SAML metadata
+    # root element). SimpleSAMLphp serves PHP fatal errors as HTTP 200
+    # with an HTML error body, so a status-only check would read those
+    # as Healthy — N3 in the same regression doc.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/simplesaml/saml2/idp/metadata.php | grep -q EntityDescriptor"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  org:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.observer-org
+    depends_on:
+      keygen:
+        condition: service_completed_successfully
+      idp:
+        condition: service_healthy
+    volumes:
+      - org-config:/etc/observer-org:ro
+      - org-data:/var/lib/observer-org
+    # M3.3 note: the pinned baseurlpath in idp-config-override.php
+    # makes the IdP advertise `http://localhost:8088/simplesaml/` URLs
+    # regardless of which network endpoint fetched the metadata. The
+    # SP fetches metadata at `idp:8080` (docker DNS) but the
+    # SSO/redirect URLs it then hands the browser all resolve to the
+    # host's `localhost:8088`. The browser and the SP therefore agree
+    # on entityID + ACS without any extra_hosts trickery.
+    ports:
+      - "8443:8443"
+
+  # Fake SCIM client: provisions one user via the SCIM API. Run explicitly:
+  #   docker compose -f deploy/observer-org/docker-compose.yaml --profile tools run scim-provision
+  scim-provision:
+    image: curlimages/curl:8.10.1
+    profiles: ["tools"]
+    depends_on:
+      org:
+        condition: service_started
+    command:
+      - "-sS"
+      - "-X"
+      - "POST"
+      - "http://org:8443/scim/v2/Users"
+      - "-H"
+      - "Authorization: Bearer dev-scim-token-change-me"
+      - "-H"
+      - "Content-Type: application/scim+json"
+      - "-d"
+      - '{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"userName":"user1@example.com","emails":[{"value":"user1@example.com","primary":true}],"active":true}'
+
+volumes:
+  org-config:
+  org-data:

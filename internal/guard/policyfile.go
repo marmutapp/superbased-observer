@@ -1,0 +1,627 @@
+package guard
+
+import (
+	"fmt"
+	"regexp"
+	"strings"
+
+	"github.com/BurntSushi/toml"
+
+	"github.com/marmutapp/superbased-observer/internal/policy"
+)
+
+// Policy-file parsing + matcher compilation (guard spec §4.4): the
+// declarative TOML rule format for user (~/.observer/guard-policy.toml)
+// and project (<root>/.observer/guard-policy.toml) layers. Matcher
+// vocabulary v1; CEL stays behind the Q1 v2 gate.
+//
+// Parsing is STRICT (unknown keys, unknown matcher fields, missing
+// required fields, invalid regexes are all errors) — `observer guard
+// lint` (G5) calls the same parser, and a policy file that parses
+// here is a policy file that loads. Go's regexp is RE2: linear-time,
+// no catastrophic backtracking class to lint for (a documented selling
+// point vs PCRE-based competitors).
+
+// Layer names (trust order is encoded in merge.go, not here).
+const (
+	layerUser    = "user"
+	layerProject = "project"
+	// layerOrg is the org policy-bundle layer (spec §14.2, G13) — the
+	// same TOML format as user/project files, delivered signed by the
+	// org server and merged as the strictness floor.
+	layerOrg = "org"
+)
+
+// policyFile is one parsed+compiled policy source.
+type policyFile struct {
+	layer     string
+	rules     []policy.Rule
+	overrides []rawOverride
+}
+
+// rawOverride is a parsed [[override]] entry, kept pre-merge so the
+// §4.6 one-way checks can compare against the catalog before any
+// engine sees it.
+type rawOverride struct {
+	RuleID   string
+	Decision policy.Decision
+	HasDec   bool
+	Enforced bool
+	Layer    string
+}
+
+// tomlPolicyFile is the on-disk shape.
+type tomlPolicyFile struct {
+	Rule     []tomlRule     `toml:"rule"`
+	Override []tomlOverride `toml:"override"`
+}
+
+// tomlRule is one [[rule]] entry (§4.4).
+type tomlRule struct {
+	ID        string       `toml:"id"`
+	Category  string       `toml:"category"`
+	Severity  string       `toml:"severity"`
+	Decision  string       `toml:"decision"`
+	Enforce   bool         `toml:"enforce"`
+	AppliesTo []string     `toml:"applies_to"`
+	Match     tomlMatchers `toml:"match"`
+}
+
+// tomlOverride is one [[override]] entry (§4.4).
+type tomlOverride struct {
+	Rule     string `toml:"rule"`
+	Decision string `toml:"decision"`
+	Enforce  bool   `toml:"enforce"`
+}
+
+// tomlMatchers is the §4.4 matcher vocabulary v1. Fields are AND-ed.
+// session_cost_usd_gt / repeat_count_gt match the G12 budget/anomaly
+// stamps (Event.SessionCostUSD / Event.RepeatCount); like
+// taint_source they imply no event kind on their own, so a rule using
+// only them must set applies_to explicitly.
+type tomlMatchers struct {
+	PathGlob           []string `toml:"path_glob"`
+	PathNot            []string `toml:"path_not"`
+	PathOutsideProject bool     `toml:"path_outside_project"`
+	PathSensitive      bool     `toml:"path_sensitive"`
+	CommandRegex       string   `toml:"command_regex"`
+	CommandBase        string   `toml:"command_base"`
+	ArgContains        string   `toml:"arg_contains"`
+	URLDomain          string   `toml:"url_domain"`
+	MCPServer          string   `toml:"mcp_server"`
+	MCPTool            string   `toml:"mcp_tool"`
+	EventKind          []string `toml:"event_kind"`
+	TaintSource        string   `toml:"taint_source"`
+	Sink               string   `toml:"sink"`
+	SessionCostUSDGt   float64  `toml:"session_cost_usd_gt"`
+	RepeatCountGt      int      `toml:"repeat_count_gt"`
+}
+
+// validEventKinds is the user-facing event_kind vocabulary.
+var validEventKinds = map[string]policy.EventKind{
+	"tool_call":     policy.KindToolCall,
+	"file_access":   policy.KindFileAccess,
+	"shell_exec":    policy.KindShellExec,
+	"mcp_call":      policy.KindMCPCall,
+	"api_request":   policy.KindAPIRequest,
+	"api_response":  policy.KindAPIResponse,
+	"config_change": policy.KindConfigChange,
+	"session_meta":  policy.KindSessionMeta,
+}
+
+// sink vocabulary v1 → (implied kinds, per-event condition). The
+// condition composes with the rule's other matchers.
+var validSinks = map[string]struct {
+	kinds []policy.EventKind
+	desc  string
+}{
+	"shell_exec":           {[]policy.EventKind{policy.KindShellExec}, "shell execution"},
+	"git_push":             {[]policy.EventKind{policy.KindShellExec}, "git push"},
+	"out_of_project_write": {[]policy.EventKind{policy.KindFileAccess, policy.KindConfigChange}, "out-of-project write"},
+	"mcp_call":             {[]policy.EventKind{policy.KindMCPCall}, "MCP call"},
+}
+
+// Lint strictly checks one policy file the way loading would: the
+// same parse + compile pass, PLUS a throwaway engine construction so
+// override targets resolve (an [[override]] on an unknown rule ID is
+// only detectable against the rule tables). layer is "user",
+// "project" or "org" — project and org files additionally get the
+// §4.6 one-way merge pass so relaxation attempts surface as problems
+// here instead of as silent load-time drops (org overrides are
+// escalate-only: the bundle is a strictness floor, and the server's
+// publish path lints with layer "org" so a relaxing bundle is caught
+// BEFORE it is signed). Returns nil when the file is clean.
+//
+// `observer guard lint` (G5) and `observer-org policy publish` (G13)
+// are the callers; a file that lints clean is a file that loads with
+// zero LoadIssues.
+func Lint(raw []byte, layer string) []string {
+	pf, err := parsePolicyFile(raw, layer)
+	if err != nil {
+		return []string{err.Error()}
+	}
+	var problems []string
+	var extra []policy.Rule
+	var overrides []policy.Override
+	switch layer {
+	case layerProject:
+		var mergeIssues []string
+		extra, overrides, mergeIssues = mergeLayers(nil, nil, pf)
+		problems = append(problems, mergeIssues...)
+	case layerOrg:
+		var mergeIssues []string
+		extra, overrides, mergeIssues = mergeLayers(pf, nil, nil)
+		problems = append(problems, mergeIssues...)
+	default:
+		extra, overrides, _ = mergeLayers(nil, pf, nil)
+	}
+	if _, err := policy.New(policy.Config{
+		ExtraRules: extra,
+		Overrides:  overrides,
+	}); err != nil {
+		problems = append(problems, err.Error())
+	}
+	return problems
+}
+
+// parsePolicyFile parses + compiles one policy source. Strict: any
+// problem is an error naming the offending entry.
+func parsePolicyFile(raw []byte, layer string) (*policyFile, error) {
+	var f tomlPolicyFile
+	meta, err := toml.Decode(string(raw), &f)
+	if err != nil {
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+	if undec := meta.Undecoded(); len(undec) > 0 {
+		keys := make([]string, 0, len(undec))
+		for _, k := range undec {
+			keys = append(keys, k.String())
+		}
+		return nil, fmt.Errorf("unknown keys: %s", strings.Join(keys, ", "))
+	}
+
+	pf := &policyFile{layer: layer}
+	seen := map[string]bool{}
+	for i := range f.Rule {
+		r, err := compileRule(&f.Rule[i], layer)
+		if err != nil {
+			return nil, fmt.Errorf("rule %d (%s): %w", i+1, f.Rule[i].ID, err)
+		}
+		if seen[r.ID] {
+			return nil, fmt.Errorf("rule %d: duplicate id %q", i+1, r.ID)
+		}
+		seen[r.ID] = true
+		pf.rules = append(pf.rules, r)
+	}
+	for i, ov := range f.Override {
+		if ov.Rule == "" {
+			return nil, fmt.Errorf("override %d: missing rule id", i+1)
+		}
+		ro := rawOverride{RuleID: ov.Rule, Enforced: ov.Enforce, Layer: layer}
+		if ov.Decision != "" {
+			d, err := policy.ParseDecision(ov.Decision)
+			if err != nil {
+				return nil, fmt.Errorf("override %d (%s): %w", i+1, ov.Rule, err)
+			}
+			ro.Decision, ro.HasDec = d, true
+		}
+		pf.overrides = append(pf.overrides, ro)
+	}
+	return pf, nil
+}
+
+// PolicyRuleRefs structurally parses raw as a §4.4 policy file and returns
+// the rule IDs it references: overrides = [[override]].rule targets (existing
+// rule IDs whose decisions the file escalates), declared = [[rule]].id
+// entries the file defines itself. It powers the org dashboard's §14.2
+// dry-run statistics (G14): override targets have server-side hit history,
+// newly declared matchers do not. The parse is deliberately LOOSE — no
+// matcher compilation, no unknown-key strictness — because every authoring
+// surface runs Lint alongside it; a structurally unparseable file returns
+// the parse error. Order follows file order; duplicates are preserved
+// (Lint reports them).
+func PolicyRuleRefs(raw []byte) (overrides, declared []string, err error) {
+	var f tomlPolicyFile
+	if _, err := toml.Decode(string(raw), &f); err != nil {
+		return nil, nil, fmt.Errorf("guard.PolicyRuleRefs: parse: %w", err)
+	}
+	for _, ov := range f.Override {
+		if ov.Rule != "" {
+			overrides = append(overrides, ov.Rule)
+		}
+	}
+	for _, r := range f.Rule {
+		if r.ID != "" {
+			declared = append(declared, r.ID)
+		}
+	}
+	return overrides, declared, nil
+}
+
+// compileRule turns one [[rule]] entry into a policy.Rule row.
+func compileRule(tr *tomlRule, layer string) (policy.Rule, error) {
+	var zero policy.Rule
+	if tr.ID == "" {
+		return zero, fmt.Errorf("missing id")
+	}
+	if policy.IsBuiltinRuleID(tr.ID) {
+		return zero, fmt.Errorf("id collides with built-in rule %s — use [[override]] to tune built-ins", tr.ID)
+	}
+	if tr.Category == "" {
+		return zero, fmt.Errorf("missing category (destructive|boundary|secrets|exfil|posture|mcp|taint|budget|anomaly)")
+	}
+	if tr.Decision == "" {
+		return zero, fmt.Errorf("missing decision (allow|flag|ask|deny)")
+	}
+	dec, err := policy.ParseDecision(tr.Decision)
+	if err != nil {
+		return zero, err
+	}
+	sev := policy.SeverityWarn
+	if tr.Severity != "" {
+		if sev, err = policy.ParseSeverity(tr.Severity); err != nil {
+			return zero, err
+		}
+	}
+	cmdScoped, evScoped, kinds, safe, err := compileMatchers(&tr.Match)
+	if err != nil {
+		return zero, err
+	}
+	if cmdScoped == nil && evScoped == nil {
+		return zero, fmt.Errorf("no matchers — the rule would never fire")
+	}
+	if cmdScoped != nil && evScoped != nil {
+		return zero, fmt.Errorf("cannot mix command-scoped (command_regex/command_base/arg_contains) and event-scoped matchers in one rule — split into two rules")
+	}
+
+	// applies_to: explicit list wins; otherwise the matchers imply it.
+	if len(tr.AppliesTo) > 0 {
+		kinds = kinds[:0]
+		for _, k := range tr.AppliesTo {
+			ek, ok := validEventKinds[k]
+			if !ok {
+				return zero, fmt.Errorf("unknown applies_to kind %q", k)
+			}
+			kinds = append(kinds, ek)
+		}
+	}
+	if len(kinds) == 0 {
+		return zero, fmt.Errorf("cannot infer applies_to from the matchers — set applies_to explicitly")
+	}
+
+	// Observe = min(decision, flag): observe mode records, never
+	// blocks/asks, unless the rule is per-rule-enforced (§4.1 — the
+	// engine then picks the Enforce column regardless of mode).
+	observe := dec
+	if observe > policy.DecisionFlag {
+		observe = policy.DecisionFlag
+	}
+	r := policy.Rule{
+		ID:        tr.ID,
+		Category:  policy.Category(tr.Category),
+		Severity:  sev,
+		AppliesTo: kinds,
+		Observe:   observe,
+		Enforce:   dec,
+		SafePat:   safe,
+		Doc:       layer + " rule " + tr.ID,
+		Source:    layer,
+		Enforced:  tr.Enforce,
+	}
+	r.Match = evScoped
+	r.MatchCmd = cmdScoped
+	return r, nil
+}
+
+// cmdCond / evCond are the per-condition closure shapes the compiled
+// matchers AND-combine.
+type (
+	cmdCond = func(*policy.MatchContext, *policy.Command) (bool, string)
+	evCond  = func(*policy.MatchContext) (bool, string)
+)
+
+// compileMatchers builds the matcher closures. Returns exactly one of
+// (cmdScoped, evScoped) non-nil — except when the rule mixes both
+// classes, in which case both are returned and the caller raises the
+// mixed-matcher error with the rule's context. kinds are the implied
+// event kinds; safe are the path_not exemptions.
+func compileMatchers(m *tomlMatchers) (cmdScoped policy.MatchCmdFn, evScoped policy.MatchFn, kinds []policy.EventKind, safe []policy.SafeFn, err error) {
+	cmdConds, err := compileCmdConds(m)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	evConds, kinds, err := compileEvConds(m)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	// path_not compiles into safe patterns (exempts THIS rule only —
+	// the engine's structural safe-pattern-first ordering applies).
+	if len(m.PathNot) > 0 {
+		nots := m.PathNot
+		safe = append(safe, func(ctx *policy.MatchContext, _ *policy.Command) bool {
+			if ctx.Path == "" {
+				return false
+			}
+			_, ok := policy.MatchAnyPathGlob(nots, ctx.Path, ctx.Cfg.Home)
+			return ok
+		})
+	}
+
+	switch {
+	case len(cmdConds) > 0 && len(evConds) > 0:
+		return andCmd(cmdConds), andEv(evConds), kinds, safe, nil
+	case len(cmdConds) > 0:
+		return andCmd(cmdConds), nil, appendKinds(kinds, policy.KindShellExec), safe, nil
+	case len(evConds) > 0:
+		return nil, andEv(evConds), kinds, safe, nil
+	default:
+		return nil, nil, kinds, safe, nil
+	}
+}
+
+// compileCmdConds builds the command-scoped condition list
+// (command_regex / command_base / arg_contains).
+func compileCmdConds(m *tomlMatchers) ([]cmdCond, error) {
+	var conds []cmdCond
+	if m.CommandRegex != "" {
+		re, err := regexp.Compile(m.CommandRegex)
+		if err != nil {
+			return nil, fmt.Errorf("command_regex: %w", err)
+		}
+		pat := m.CommandRegex
+		conds = append(conds, func(_ *policy.MatchContext, cmd *policy.Command) (bool, string) {
+			if re.MatchString(cmd.Raw) {
+				return true, "command matches " + pat
+			}
+			return false, ""
+		})
+	}
+	if m.CommandBase != "" {
+		base := strings.ToLower(m.CommandBase)
+		conds = append(conds, func(_ *policy.MatchContext, cmd *policy.Command) (bool, string) {
+			if cmd.Base == base {
+				return true, "command " + cmd.Base
+			}
+			return false, ""
+		})
+	}
+	if m.ArgContains != "" {
+		needle := m.ArgContains
+		conds = append(conds, func(_ *policy.MatchContext, cmd *policy.Command) (bool, string) {
+			for i := 1; i < len(cmd.Argv); i++ {
+				if strings.Contains(cmd.Argv[i], needle) {
+					return true, "argument contains " + needle
+				}
+			}
+			return false, ""
+		})
+	}
+	return conds, nil
+}
+
+// compileEvConds builds the event-scoped condition list (path_*, url,
+// mcp_*, taint_source, sink, event_kind) plus the kinds they imply.
+func compileEvConds(m *tomlMatchers) (conds []evCond, kinds []policy.EventKind, err error) {
+	addEv := func(f evCond, implied ...policy.EventKind) {
+		conds = append(conds, f)
+		kinds = appendKinds(kinds, implied...)
+	}
+	if len(m.PathGlob) > 0 {
+		globs := m.PathGlob
+		addEv(func(ctx *policy.MatchContext) (bool, string) {
+			if ctx.Path == "" {
+				return false, ""
+			}
+			if pat, ok := policy.MatchAnyPathGlob(globs, ctx.Path, ctx.Cfg.Home); ok {
+				return true, "path matches " + pat
+			}
+			return false, ""
+		}, policy.KindFileAccess, policy.KindConfigChange)
+	}
+	if m.PathOutsideProject {
+		addEv(policy.OutsideProjectPath, policy.KindFileAccess, policy.KindConfigChange)
+	}
+	if m.PathSensitive {
+		addEv(func(ctx *policy.MatchContext) (bool, string) {
+			if desc, ok := policy.SensitiveResolvedPath(ctx.Path, ctx.Cfg.Home); ok {
+				return true, desc
+			}
+			return false, ""
+		}, policy.KindFileAccess, policy.KindConfigChange)
+	}
+	if m.URLDomain != "" {
+		dom := strings.ToLower(m.URLDomain)
+		addEv(func(ctx *policy.MatchContext) (bool, string) {
+			if hostMatchesDomain(ctx.Event.Target, dom) {
+				return true, "URL host under " + dom
+			}
+			return false, ""
+		}, policy.KindToolCall, policy.KindAPIRequest)
+	}
+	if m.MCPServer != "" {
+		server := m.MCPServer
+		addEv(func(ctx *policy.MatchContext) (bool, string) {
+			if policy.MCPServerFromTarget(ctx.Event.Target) == server {
+				return true, "MCP server " + server
+			}
+			return false, ""
+		}, policy.KindMCPCall)
+	}
+	if m.MCPTool != "" {
+		tool := m.MCPTool
+		addEv(func(ctx *policy.MatchContext) (bool, string) {
+			if strings.HasSuffix(ctx.Event.Target, tool) {
+				return true, "MCP tool " + tool
+			}
+			return false, ""
+		}, policy.KindMCPCall)
+	}
+	if m.TaintSource != "" {
+		// A pure condition — implies no kind on its own (a
+		// taint_source-only rule must set applies_to or event_kind).
+		source := m.TaintSource
+		conds = append(conds, func(ctx *policy.MatchContext) (bool, string) {
+			if ctx.Event.Taint.HasSource(source) {
+				return true, "session tainted by " + source
+			}
+			return false, ""
+		})
+	}
+	if m.SessionCostUSDGt > 0 {
+		// G12 budget data: matches the guard-stamped spend-so-far.
+		// Pure condition — implies no kind on its own (a cost-only
+		// rule must set applies_to or event_kind). Strict-greater
+		// semantics; re-matches every stamped event while over the
+		// threshold (the built-in B-601 dedups its own records; user
+		// rules own their volume).
+		limit := m.SessionCostUSDGt
+		conds = append(conds, func(ctx *policy.MatchContext) (bool, string) {
+			if ctx.Event.SessionCostUSD > limit {
+				return true, fmt.Sprintf("session spend $%.2f > $%.2f", ctx.Event.SessionCostUSD, limit)
+			}
+			return false, ""
+		})
+	}
+	if m.RepeatCountGt > 0 {
+		// G12 anomaly data: matches the guard-stamped consecutive-
+		// identical run length. Pure condition — implies no kind on
+		// its own. Strict-greater semantics (the built-in A-610 fires
+		// on the crossing edge instead; documented difference).
+		limit := m.RepeatCountGt
+		conds = append(conds, func(ctx *policy.MatchContext) (bool, string) {
+			if ctx.Event.RepeatCount > limit {
+				return true, fmt.Sprintf("action repeated %d× consecutively (> %d)", ctx.Event.RepeatCount, limit)
+			}
+			return false, ""
+		})
+	}
+	if m.Sink != "" {
+		s, ok := validSinks[m.Sink]
+		if !ok {
+			return nil, nil, fmt.Errorf("unknown sink %q (shell_exec|git_push|out_of_project_write|mcp_call)", m.Sink)
+		}
+		sink := m.Sink
+		addEv(func(ctx *policy.MatchContext) (bool, string) {
+			return sinkCondition(ctx, sink, s.desc)
+		}, s.kinds...)
+	}
+	if len(m.EventKind) > 0 {
+		for _, k := range m.EventKind {
+			ek, ok := validEventKinds[k]
+			if !ok {
+				return nil, nil, fmt.Errorf("unknown event_kind %q", k)
+			}
+			kinds = appendKinds(kinds, ek)
+		}
+		want := m.EventKind
+		conds = append(conds, func(ctx *policy.MatchContext) (bool, string) {
+			for _, k := range want {
+				if validEventKinds[k] == ctx.Event.Kind {
+					return true, "event kind " + k
+				}
+			}
+			return false, ""
+		})
+	}
+	return conds, kinds, nil
+}
+
+// andCmd AND-combines command-scoped conditions; the detail strings
+// of all passing conditions join for the verdict reason.
+func andCmd(conds []cmdCond) policy.MatchCmdFn {
+	return func(ctx *policy.MatchContext, cmd *policy.Command) (bool, string) {
+		var details []string
+		for _, c := range conds {
+			hit, d := c(ctx, cmd)
+			if !hit {
+				return false, ""
+			}
+			details = append(details, d)
+		}
+		return true, strings.Join(details, "; ")
+	}
+}
+
+// andEv AND-combines event-scoped conditions.
+func andEv(conds []evCond) policy.MatchFn {
+	return func(ctx *policy.MatchContext) (bool, string) {
+		var details []string
+		for _, c := range conds {
+			hit, d := c(ctx)
+			if !hit {
+				return false, ""
+			}
+			details = append(details, d)
+		}
+		return true, strings.Join(details, "; ")
+	}
+}
+
+// sinkCondition evaluates the sink vocabulary against an event.
+func sinkCondition(ctx *policy.MatchContext, sink, desc string) (bool, string) {
+	switch sink {
+	case "shell_exec":
+		if ctx.Event.Kind == policy.KindShellExec {
+			return true, desc
+		}
+	case "git_push":
+		for i := range ctx.Cmds {
+			c := &ctx.Cmds[i]
+			if c.Base == "git" {
+				pos := c.Positionals()
+				if len(pos) > 0 && pos[0] == "push" {
+					return true, desc
+				}
+			}
+		}
+	case "out_of_project_write":
+		return policy.OutsideProjectWrite(ctx, desc)
+	case "mcp_call":
+		if ctx.Event.Kind == policy.KindMCPCall {
+			return true, desc
+		}
+	}
+	return false, ""
+}
+
+// hostMatchesDomain reports whether the target's URL host equals dom
+// or is a subdomain of it. Non-URL targets never match.
+func hostMatchesDomain(target, dom string) bool {
+	t := strings.ToLower(strings.TrimSpace(target))
+	i := strings.Index(t, "://")
+	if i < 0 {
+		return false
+	}
+	host := t[i+3:]
+	for _, cut := range []string{"/", "?", "#"} {
+		if j := strings.Index(host, cut); j >= 0 {
+			host = host[:j]
+		}
+	}
+	if j := strings.Index(host, "@"); j >= 0 {
+		host = host[j+1:]
+	}
+	if j := strings.LastIndex(host, ":"); j >= 0 && !strings.Contains(host[j:], "]") {
+		host = host[:j]
+	}
+	host = strings.TrimSuffix(host, ".")
+	return host == dom || strings.HasSuffix(host, "."+dom)
+}
+
+// appendKinds appends kinds not already present.
+func appendKinds(kinds []policy.EventKind, add ...policy.EventKind) []policy.EventKind {
+	for _, k := range add {
+		dup := false
+		for _, have := range kinds {
+			if have == k {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			kinds = append(kinds, k)
+		}
+	}
+	return kinds
+}
