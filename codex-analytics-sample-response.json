@@ -1,0 +1,77 @@
+{
+  "_README": "ILLUSTRATIVE sample payloads for the OpenAI Codex Rail-C analytics surfaces (native-console instance #2). These transcribe the DOCUMENTED schemas from the Phase-0 findings; the exact field paths + timestamp formats carry live-key residuals. LOCK against a real payload via scripts/codex-analytics-capture.sh before trusting the cost-merge. The codexanalytics parsers (surface_chatgpt.go / surface_openai.go) are written against these shapes. Anonymized; no real emails or ids.",
+  "chatgpt_enterprise_usage": {
+    "_endpoint": "GET https://api.chatgpt.com/v1/analytics/codex/workspaces/{workspace_id}/usage?start_time=&end_time=&group_by=day  (Authorization: Bearer; cost in CREDITS)",
+    "data": [
+      {
+        "start_time": "2026-05-01T00:00:00Z",
+        "end_time": "2026-05-02T00:00:00Z",
+        "user": { "email": "dev@example.com", "id": "wsu_abc123" },
+        "credits": 1234,
+        "threads": 12,
+        "turns": 48,
+        "tokens": { "text_input": 100000, "cached_input": 20000, "output": 5000 }
+      },
+      {
+        "start_time": "2026-05-01T00:00:00Z",
+        "end_time": "2026-05-02T00:00:00Z",
+        "user": { "id": "wsu_def456" },
+        "credits": 88,
+        "threads": 2,
+        "turns": 9,
+        "tokens": { "text_input": 4000, "cached_input": 0, "output": 300 }
+      }
+    ],
+    "has_more": false,
+    "next_page": null
+  },
+  "openai_org_usage_completions": {
+    "_endpoint": "GET https://api.openai.com/v1/organization/usage/completions?start_time=&end_time=&bucket_width=1d&group_by=user_id  (Unix seconds; Authorization: Bearer sk-admin…)",
+    "object": "page",
+    "data": [
+      {
+        "object": "bucket",
+        "start_time": 1777593600,
+        "end_time": 1777680000,
+        "results": [
+          {
+            "object": "organization.usage.completions.result",
+            "input_tokens": 141201,
+            "output_tokens": 9756,
+            "input_cached_tokens": 1024,
+            "num_model_requests": 470,
+            "user_id": "user_abc",
+            "model": null,
+            "project_id": null,
+            "api_key_id": null,
+            "batch": null
+          }
+        ]
+      }
+    ],
+    "has_more": false,
+    "next_page": null
+  },
+  "openai_org_costs": {
+    "_endpoint": "GET https://api.openai.com/v1/organization/costs?start_time=&end_time=&bucket_width=1d&group_by=user_id  (cost UNIT = DOLLARS, amount.value — NOT cents, NOT credits)",
+    "object": "page",
+    "data": [
+      {
+        "object": "bucket",
+        "start_time": 1777593600,
+        "end_time": 1777680000,
+        "results": [
+          {
+            "object": "organization.costs.result",
+            "amount": { "value": 0.13080438340307526, "currency": "usd" },
+            "line_item": null,
+            "user_id": "user_abc",
+            "project_id": null
+          }
+        ]
+      }
+    ],
+    "has_more": false,
+    "next_page": null
+  }
+}

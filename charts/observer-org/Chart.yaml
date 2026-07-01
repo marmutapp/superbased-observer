@@ -1,0 +1,24 @@
+apiVersion: v2
+name: observer-org
+description: |
+  SuperBased Observer org server — SAML SSO, SCIM provisioning, agent
+  enrolment, per-push signature verification, and org-wide rollups. The
+  customer-self-hosted counterpart to the solo-local `observer` agent.
+type: application
+# Chart version — bump on any chart change.
+version: 0.1.0
+# appVersion tracks the observer-org image shipped with this chart. The
+# deployment's image tag defaults to this when image.tag is left empty.
+appVersion: "1.7.0"
+home: https://github.com/marmutapp/superbased-observer
+sources:
+  - https://github.com/marmutapp/superbased-observer
+maintainers:
+  - name: Santosh Kathira
+    email: contact@superbased.app
+keywords:
+  - observability
+  - ai-coding-assistants
+  - saml
+  - scim
+  - org-visibility

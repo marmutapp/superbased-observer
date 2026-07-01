@@ -1,0 +1,49 @@
+--- PRAGMA journal_mode ---
+wal
+--- PRAGMA user_version ---
+0
+--- PRAGMA application_id ---
+0
+--- table list ---
+idx_schedule_executions_schedule|index
+idx_schedules_next_run|index
+sqlite_autoindex_schedule_executions_1|index
+sqlite_autoindex_schedules_1|index
+sqlite_autoindex_sessions_1|index
+schedule_executions|table
+schedules|table
+sessions|table
+sqlite_sequence|table
+subagent_spawn_queue|table
+--- sessions count + columns ---
+1
+0|session_id|TEXT|0||1
+1|source|TEXT|1||0
+2|pid|INTEGER|1||0
+3|started_at|TEXT|1||0
+4|ended_at|TEXT|0||0
+5|exit_code|INTEGER|0||0
+6|status|TEXT|1||0
+7|status_lock|INTEGER|1|0|0
+8|interactive|INTEGER|1||0
+9|provider|TEXT|1||0
+10|model|TEXT|1||0
+11|cwd|TEXT|1||0
+12|workspace_root|TEXT|1||0
+13|team_name|TEXT|0||0
+14|enable_tools|INTEGER|1||0
+15|enable_spawn|INTEGER|1||0
+16|enable_teams|INTEGER|1||0
+17|parent_session_id|TEXT|0||0
+18|parent_agent_id|TEXT|0||0
+19|agent_id|TEXT|0||0
+20|conversation_id|TEXT|0||0
+21|is_subagent|INTEGER|1|0|0
+22|prompt|TEXT|0||0
+23|metadata_json|TEXT|0||0
+24|transcript_path|TEXT|1|''|0
+25|hook_path|TEXT|1||0
+26|messages_path|TEXT|0||0
+27|updated_at|TEXT|1||0
+--- subagent_spawn_queue count ---
+0

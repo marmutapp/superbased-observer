@@ -1,0 +1,27 @@
+{
+  "name": "@superbased/observer-sdk",
+  "version": "0.1.0",
+  "description": "Thin SDK to send custom app / agent traces to SuperBased Observer via OTLP.",
+  "license": "Apache-2.0",
+  "author": "SuperBased <contact@superbased.app>",
+  "homepage": "https://superbased.app",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "keywords": ["observability", "opentelemetry", "llm", "agents", "tracing"],
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.52.0",
+    "@opentelemetry/resources": "^1.25.0",
+    "@opentelemetry/sdk-trace-node": "^1.25.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

@@ -1,0 +1,16 @@
+# Build outputs (CI populates these per release; never committed).
+dist/
+build/
+*.egg-info/
+*.whl
+
+# Staged binaries (CI populates _bin/ at wheel-build time).
+src/observer/_bin/observer
+src/observer/_bin/observer.exe
+src/observer/_bin/antigravity-bridge.exe
+
+# Python bytecode + venv junk.
+__pycache__/
+*.py[cod]
+.venv/
+venv/

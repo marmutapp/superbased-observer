@@ -1,0 +1,17 @@
+-- 053_codeintel_sites_recv_type.sql — W2 §4.1 (Go local-variable receiver
+-- type inference) of the code-intelligence module (internal/codeintel,
+-- docs/codeintel/resolution.md "Scoped resolution", ADR-0007).
+--
+-- recv_type carries the receiver TYPE NAME inferred at parse time for a
+-- method call on a local variable of a known same-package type — e.g.
+-- `x := NewFoo(); x.Bar()` records recv_type "Foo" on the x.Bar() site —
+-- so the scoped resolver can bind the call to Foo.Bar via byFQNPkg. It does
+-- NOT change target_name: the edge stays name-matched until the scoped pass
+-- upgrades it in place, so an unresolved inference is a no-op (no
+-- regression), faithful to the unambiguous-only rule.
+--
+-- NODE-LOCAL, same posture as 050/051/052: a bare type identifier, never a
+-- body. codeintel_sites is pinned in tests/invariant/privacy_test.go and is
+-- excluded from orgpush by construction (codeintel_* never enter
+-- internal/store/orgpush.go).
+ALTER TABLE codeintel_sites ADD COLUMN recv_type TEXT NOT NULL DEFAULT '';
