@@ -1,0 +1,32 @@
+name: Website Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'website/**'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Verification harness (Playwright + headless Chromium) lives at
+      # website/tools/ for arcade testing — DEV-ONLY. Strip it before
+      # `wrangler pages deploy` so the shoot.mjs / package.json / test
+      # files don't ship to superbased.app. node_modules/out/ are already
+      # .gitignored; this rm covers the tracked harness files too.
+      #
+      # website/docs-src/ (curated Markdown + nav.toml) and
+      # website/docs-tools/ (the Go generator) are likewise DEV-ONLY —
+      # only the RENDERED website/docs/** output is meant to deploy.
+      - name: Strip dev-only verification harness + docs sources
+        run: rm -rf website/tools website/docs-src website/docs-tools
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy website --project-name=superbased-website --branch=main

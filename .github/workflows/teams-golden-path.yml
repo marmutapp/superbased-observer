@@ -1,0 +1,166 @@
+# teams-golden-path.yml — end-to-end smoke for the Teams (org server)
+# flow. Brings up the dev compose stack, enrols an agent, generates a
+# fixed activity fixture, pushes it, and asserts the rows landed
+# server-side with the expected v1.8.0 shape (hashes shipped, raw
+# content withheld in the default metadata-only mode).
+#
+# Triggered on PRs touching:
+#   - internal/orgclient/**, internal/orgserver/**, internal/orgcontract/**
+#   - internal/store/orgpush*
+#   - cmd/observer-org/**, cmd/observer/org.go
+#   - deploy/observer-org/**
+# Plus a manual workflow_dispatch.
+#
+# The job catches three classes of regression that the existing unit
+# tests can't:
+#   - SAML / IdP wiring drift (Issue 5 of the 2026-06-02 teams test)
+#   - Wire-shape compat (v1.7.x raw push vs v1.8.x hash push)
+#   - Privacy seam re-introducing a raw column (the unit test already
+#     catches this; the smoke verifies the agent-server round-trip).
+
+name: teams-golden-path
+
+on:
+  pull_request:
+    paths:
+      - 'internal/orgclient/**'
+      - 'internal/orgserver/**'
+      - 'internal/orgcontract/**'
+      - 'internal/store/orgpush*'
+      - 'cmd/observer-org/**'
+      - 'cmd/observer/org.go'
+      - 'deploy/observer-org/**'
+  workflow_dispatch: {}
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+          cache: true
+
+      - name: install sqlite3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 jq
+
+      - name: build observer + observer-org
+        run: |
+          mkdir -p bin
+          go build -o bin/observer ./cmd/observer
+          go build -o bin/observer-org ./cmd/observer-org
+          chmod +x bin/observer bin/observer-org
+
+      - name: bring the dev stack up
+        run: |
+          docker compose -f deploy/observer-org/docker-compose.yaml up -d --build
+          # /healthz wait. The org server is the slowest to come up
+          # because it has to fetch the IdP metadata.
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8443/healthz | grep -q '"status":"ok"'; then
+              echo "org server ready"
+              exit_code=0
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://localhost:8443/healthz || (echo "org server did not become healthy"; exit 1)
+
+      - name: provision admin via scim + mint enrolment token
+        id: enrol
+        run: |
+          # POST a SCIM user → grab the id.
+          USER_ID=$(curl -fsS -X POST http://localhost:8443/scim/v2/Users \
+            -H 'Authorization: Bearer dev-scim-token-change-me' \
+            -H 'Content-Type: application/scim+json' \
+            -d '{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"userName":"smoke@example.com","emails":[{"value":"smoke@example.com","primary":true}],"active":true}' | jq -r .id)
+          echo "user_id=$USER_ID"
+
+          # Mint a token via docker exec (the same path the runbook documents).
+          TOKEN=$(docker compose -f deploy/observer-org/docker-compose.yaml exec -T org \
+            /usr/local/bin/observer-org new-enrolment-token --config /etc/observer-org/config.toml --user-id "$USER_ID" | grep '^token:' | awk '{print $2}')
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: enrol the agent + seed fixed activity
+        run: |
+          export HOME=/tmp/smoke-home
+          mkdir -p "$HOME/.observer"
+          cat > "$HOME/.observer/config.toml" <<'EOF'
+          [observer]
+          db_path = "/tmp/smoke-home/.observer/observer.db"
+
+          [org_client]
+          enabled = true
+
+          [org_client.share]
+          full_content = false
+          EOF
+          ./bin/observer enroll http://localhost:8443 ${{ steps.enrol.outputs.token }}
+
+          # Seed a known set of actions via direct SQL into the agent
+          # DB so we can verify the server-side dedup / row counts
+          # without depending on a real AI client.
+          sqlite3 "$HOME/.observer/observer.db" <<'EOF'
+          INSERT INTO projects (root_path, git_remote, created_at, root_path_hash, git_remote_hash)
+            VALUES ('/tmp/smoke/project', 'git@github.com:smoke/project.git', datetime('now'), 'aaa', 'bbb');
+          INSERT INTO sessions (id, project_id, tool, model, git_branch, started_at)
+            VALUES ('smoke-sess-1', last_insert_rowid(), 'claude-code', 'claude-opus-4-7', 'main', datetime('now'));
+          INSERT INTO actions (session_id, project_id, timestamp, action_type, target, target_hash,
+                               success, tool, source_file, source_file_hash, source_event_id)
+            VALUES ('smoke-sess-1', 1, datetime('now'), 'run_command',
+                    'rm -rf /tmp/secret-do-not-leak', 'ccc',
+                    1, 'claude-code', '/tmp/smoke/cc.jsonl', 'ddd', 'evt-smoke-1');
+          EOF
+
+      - name: push to the org server
+        run: |
+          export HOME=/tmp/smoke-home
+          ./bin/observer org push-now
+
+      - name: assert wire shape (metadata-only by default)
+        run: |
+          # Pull the org data dir (server.db + any WAL sidecars) out of
+          # the container. The runtime image is distroless — no shell,
+          # no cat — so `compose exec … cat` exits 127; `compose cp`
+          # rides the daemon's archive API and needs nothing in the
+          # image. Copy to a non-existent path so the dir lands at
+          # /tmp/orgdata directly (docker-cp nesting semantics).
+          docker compose -f deploy/observer-org/docker-compose.yaml cp org:/var/lib/observer-org /tmp/orgdata
+          DB=/tmp/orgdata/server.db
+          ls -la /tmp/orgdata
+
+          # 1. The action landed.
+          ROWS=$(sqlite3 "$DB" "SELECT COUNT(*) FROM actions WHERE source_event_id='evt-smoke-1'")
+          if [ "$ROWS" != "1" ]; then
+            echo "expected 1 action row, got $ROWS"; exit 1
+          fi
+
+          # 2. Privacy posture: the raw `target` MUST be empty (or NULL)
+          #    in metadata-only mode. The hash MUST be present.
+          TARGET=$(sqlite3 "$DB" "SELECT IFNULL(target,'NULL') FROM actions WHERE source_event_id='evt-smoke-1'")
+          TARGET_HASH=$(sqlite3 "$DB" "SELECT target_hash FROM actions WHERE source_event_id='evt-smoke-1'")
+          if [ "$TARGET" != "" ] && [ "$TARGET" != "NULL" ]; then
+            echo "leak: target should be empty/NULL in metadata-only mode, got: $TARGET"; exit 1
+          fi
+          if [ -z "$TARGET_HASH" ]; then
+            echo "missing target_hash on the wire"; exit 1
+          fi
+
+          # 3. Sanity: a secret-shaped string anywhere in the server DB
+          #    would indicate the leak regressed.
+          if sqlite3 "$DB" "SELECT * FROM actions" | grep -q "rm -rf /tmp/secret-do-not-leak"; then
+            echo "leak: command body present on server side"; exit 1
+          fi
+          echo "OK: smoke passed"
+
+      - name: dump server logs on failure
+        if: failure()
+        run: docker compose -f deploy/observer-org/docker-compose.yaml logs --tail=200 org idp
+
+      - name: bring the stack down
+        if: always()
+        run: docker compose -f deploy/observer-org/docker-compose.yaml down -v

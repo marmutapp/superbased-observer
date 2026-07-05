@@ -1,0 +1,101 @@
+# codex-safe recipe — for OpenAI's plain GPT models running under codex
+#
+# USE THIS WHEN you're driving the codex CLI with a model whose
+# identifier does NOT contain `-codex` (i.e. plain OpenAI GPT line):
+#
+#     gpt-5.4               gpt-5.4-mini             gpt-5.5
+#     gpt-5.4-nano          gpt-5                    gpt-4o
+#     gpt-4o-mini           gpt-4.1                  (etc.)
+#
+# DO NOT USE THIS for:
+#   * Anthropic / Claude models                  → use `claude-code`
+#   * OpenAI's `-codex` reasoning models
+#     (gpt-5.3-codex, gpt-5.4-codex,
+#      gpt-5-codex-agent, …)                     → use `codex-variant`
+#
+# Naming clarification: "safe" here means safe-to-compress (these
+# models tolerate logs trimming), NOT a safer-than-codex-variant
+# alternative. Both `codex-safe` and `codex-variant` are recipes for
+# the codex CLI; they differ in which model family they assume.
+#
+# Empirical validation (v4 compression A/B session,
+# docs/v4-codex-compression-recipe-and-issues.md):
+#   * gpt-5.4-mini × medium: −22% cost vs Anthropic-style default
+#   * gpt-5.4-mini × high:   −56% cost
+#   * gpt-5.4-mini × xhigh:  −19% cost
+#
+# Caveat (V7-26, 2026-06-01): a re-measurement on gpt-5.4 with an
+# apply_patch-heavy workload was inconclusive — the workload didn't
+# classify any tool_result as `Logs`, so the proxy was a functional
+# no-op. The −22%..−56% figures hold for Bash-heavy / log-emitting
+# workloads where the `Logs` classifier actually fires.
+#
+# Key differences from the Anthropic / Claude recipe:
+#   * compress_types = ["logs", "tools"] — JSON sentinel substitution
+#     destroys data values that codex relies on, triggering
+#     re-derivation cascades (V7-2). Logs dedup is the only
+#     content-preserving per-type compressor on codex today; the
+#     "tools" sentinel additionally trims tool-DEFINITION prose in
+#     the envelope (A6-adopted, see below) — it never touches
+#     tool_result bodies.
+#   * target_ratio 0.95 — codex re-pays cache_read on every turn for
+#     every dropped-message marker; a less aggressive budget pays for
+#     itself.
+#   * preserve_last_n 15 — codex's reactive style chews into recent
+#     context aggressively; keep more of it raw.
+#   * max_excerpt_bytes 16384 — codex re-reads in chunks if first
+#     chunk is too small; one big chunk is cheaper.
+#   * Expanded exclude_commands — outputs the agent will parse
+#     (rg/cat/head/verify scripts) must come through verbatim, or it
+#     re-runs them.
+
+[compression.shell]
+enabled = true
+exclude_commands = [
+    "curl",
+    "playwright",
+    "rg",
+    "ripgrep",
+    "grep",
+    "cat",
+    "type",
+    "Get-Content",
+    "head",
+    "tail",
+    "less",
+    "more",
+    "node verify",
+    "node test",
+    "node check",
+]
+
+[compression.indexing]
+enabled           = true
+max_excerpt_bytes = 16384
+
+[compression.conversation]
+enabled         = true
+mode            = "token"
+target_ratio    = 0.95
+preserve_last_n = 15
+compress_types  = ["logs", "tools"]
+# "tools" (the V7-21 sentinel) A/B-gated in by run A6 (2026-06-11,
+# n=7 control / n=9 candidate, hash-split via the experiments
+# feature): the trim fired on 117/117 candidate requests
+# (~845B/request of definition prose, deterministic + byte-stable so
+# OpenAI's implicit prompt cache keeps hitting), with task-completion
+# parity, +-0% turns, and no cache degradation. Effect scales with
+# envelope bulk — MCP-registered installs save far more than the
+# lean built-in-tools envelope measured. Record:
+# docs/plans/profile-content-refresh-ab-plan-2026-06-10.md §8.
+# Opt out by pinning compress_types = ["logs"] in a custom profile.
+
+[compression.conversation.logs]
+max_lines = 200
+head      = 100
+tail      = 100
+
+[compression.conversation.stash]
+enabled         = false
+threshold_bytes = 8192
+max_total_mb    = 1024

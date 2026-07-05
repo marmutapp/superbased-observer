@@ -1,0 +1,33 @@
+{
+  "days": 30,
+  "since": "\u003cTS\u003e",
+  "tools": [
+    {
+      "action_count": 3,
+      "failure_count": 1,
+      "first_seen": "\u003cTS\u003e",
+      "last_seen": "\u003cTS\u003e",
+      "session_count": 1,
+      "success_rate": 0.6666666666666667,
+      "tool": "claude-code"
+    },
+    {
+      "action_count": 2,
+      "failure_count": 0,
+      "first_seen": "\u003cTS\u003e",
+      "last_seen": "\u003cTS\u003e",
+      "session_count": 1,
+      "success_rate": 1,
+      "tool": "cursor"
+    },
+    {
+      "action_count": 2,
+      "failure_count": 0,
+      "first_seen": "\u003cTS\u003e",
+      "last_seen": "\u003cTS\u003e",
+      "session_count": 1,
+      "success_rate": 1,
+      "tool": "codex"
+    }
+  ]
+}

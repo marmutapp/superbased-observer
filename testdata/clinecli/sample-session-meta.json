@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "session_id": "1780701711502_0v8d2",
+  "source": "cli",
+  "pid": 42032,
+  "started_at": "2026-06-05T23:21:51.502Z",
+  "exit_code": null,
+  "status": "idle",
+  "interactive": true,
+  "provider": "cline",
+  "model": "deepseek/deepseek-v4-flash",
+  "cwd": "/home/dev/proj",
+  "workspace_root": "/home/dev/proj",
+  "team_name": "team-wTRMM",
+  "enable_tools": true,
+  "enable_spawn": true,
+  "enable_teams": true,
+  "prompt": "<user_input mode=\"act\">Hi</user_input>",
+  "metadata": {
+    "checkpoint": {
+      "latest": {
+        "ref": "4216139b6e4b654ddfe9280afa1f0ba4bfad9187",
+        "createdAt": 1780702104955,
+        "runCount": 2,
+        "kind": "commit"
+      },
+      "history": [
+        {
+          "ref": "14275866daf8e206262467f80e4e7f15a4e360f8",
+          "createdAt": 1780701724811,
+          "runCount": 1,
+          "kind": "stash"
+        },
+        {
+          "ref": "4216139b6e4b654ddfe9280afa1f0ba4bfad9187",
+          "createdAt": 1780702104955,
+          "runCount": 2,
+          "kind": "commit"
+        }
+      ]
+    },
+    "title": "Hi",
+    "totalCost": 0.0202472312,
+    "aggregatedAgentsCost": 0.0202472312,
+    "usage": {
+      "inputTokens": 286579,
+      "outputTokens": 711,
+      "cacheReadTokens": 146304,
+      "cacheWriteTokens": 0,
+      "totalCost": 0.0202472312
+    },
+    "aggregateUsage": {
+      "inputTokens": 286579,
+      "outputTokens": 711,
+      "cacheReadTokens": 146304,
+      "cacheWriteTokens": 0,
+      "totalCost": 0.0202472312
+    }
+  },
+  "messages_path": "/home/dev\\.cline\\data\\sessions\\1780701711502_0v8d2\\1780701711502_0v8d2.messages.json"
+}

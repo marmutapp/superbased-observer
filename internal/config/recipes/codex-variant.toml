@@ -1,0 +1,88 @@
+# codex-variant recipe — for OpenAI's *-codex reasoning model family
+#
+# USE THIS WHEN you're driving the codex CLI with a model whose
+# identifier contains `-codex` as a dash-delimited token:
+#
+#     gpt-5.3-codex          gpt-5.4-codex          gpt-5-codex-agent
+#     gpt-5.3-codex-mini     gpt-5-codex-fast       (etc.)
+#
+# DO NOT USE THIS for:
+#   * Anthropic / Claude models                  → use `claude-code`
+#   * Plain OpenAI GPT models (gpt-5.4, gpt-5.5,
+#     gpt-5.4-mini, gpt-4o, …) — i.e. the codex
+#     CLI running a non-`-codex` model           → use `codex-safe`
+#
+# Naming clarification: the word "variant" here refers to the *model
+# variant* (the `-codex` reasoning fork of GPT), NOT to a variant of
+# the codex CLI. Both `codex-variant` and `codex-safe` are recipes for
+# the codex CLI; they differ in which model family they assume.
+#
+# Why a dedicated recipe: OpenAI's reasoning-tuned coding line is
+# empirically more "reactive" than the standard mini/full GPT line —
+# it pays closer attention to tool_result content and treats any
+# post-hoc rewriting (even safe logs dedup) as a signal to re-verify.
+#
+# Empirical evidence from the v4 batch
+# (docs/v4-codex-compression-recipe-and-issues.md):
+#   * gpt-5.3-codex × medium: +5.6% with logs-only (≈ neutral)
+#   * gpt-5.3-codex × high:   +121% with logs-only (REGRESSION)
+#
+# So compression of any kind hurts; this recipe disables per-type
+# compression entirely and preserves nearly everything in the budget.
+# Conversation pipeline stays enabled so the SCRUBBER (secrets
+# redaction) still runs on the wire — the per-type compressors and
+# the budget enforcer just degenerate to no-ops.
+#
+# Shell + indexing trims stay on — they don't appear to hurt codex
+# variants (they trim raw shell stdout and file-read excerpts, never
+# tool_result envelopes that the variant model would distrust).
+#
+# The proxy emits a one-line warning at observer start (V7-2
+# mitigation) when it detects a `*-codex` model running with
+# non-empty compress_types — this recipe makes that warning silent.
+
+[compression.shell]
+enabled = true
+exclude_commands = [
+    "curl",
+    "playwright",
+    "rg",
+    "ripgrep",
+    "grep",
+    "cat",
+    "type",
+    "Get-Content",
+    "head",
+    "tail",
+    "less",
+    "more",
+    "node verify",
+    "node test",
+    "node check",
+]
+
+[compression.indexing]
+enabled           = true
+max_excerpt_bytes = 16384
+
+[compression.conversation]
+enabled         = true
+mode            = "token"
+target_ratio    = 0.99
+preserve_last_n = 50
+compress_types  = []
+# V7-19 + V7-21: this empty list correctly expresses "compress nothing
+# per type" — including envelope-level tool-definition trim, which
+# V7-21 also gates behind the "tools" sentinel. Pre-V7-21 tool-defs
+# trim ran unconditionally regardless of compress_types, costing
+# ~10% in re-marshal overhead on this recipe.
+
+[compression.conversation.logs]
+max_lines = 0
+head      = 0
+tail      = 0
+
+[compression.conversation.stash]
+enabled         = false
+threshold_bytes = 8192
+max_total_mb    = 1024

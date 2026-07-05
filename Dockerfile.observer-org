@@ -1,0 +1,50 @@
+# Multistage build for the SuperBased Observer org server (cmd/observer-org).
+#
+# The agent (cmd/observer) is NOT built here — this image is the
+# customer-self-hosted server only.
+
+# ---- build stage ----------------------------------------------------------
+FROM golang:1.25 AS build
+
+WORKDIR /src
+
+# Cache module downloads across rebuilds.
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+ARG VERSION=dev
+# CGO disabled: the SQLite driver is pure-Go (modernc.org/sqlite), so the
+# binary is fully static and runs on distroless/static.
+RUN CGO_ENABLED=0 GOOS=linux go build \
+        -ldflags="-s -w -X main.version=${VERSION}" \
+        -o /out/observer-org ./cmd/observer-org
+
+# Seed an empty data dir to carry nonroot ownership into the runtime image
+# (distroless has no shell, so the directory cannot be created with a RUN
+# there). See the COPY --chown below.
+RUN mkdir -p /seed/var/lib/observer-org
+
+# ---- runtime stage --------------------------------------------------------
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY --from=build /out/observer-org /usr/local/bin/observer-org
+
+# The server writes its SQLite DB under /var/lib/observer-org. distroless runs
+# as the nonroot user (uid/gid 65532); a fresh named or anonymous volume
+# mounted here inherits *this directory's* ownership, so it must be owned by
+# nonroot — otherwise the server cannot create server.db and dies at startup
+# with "unable to open database file" (SQLITE_CANTOPEN). This COPY must precede
+# the VOLUME instruction: filesystem changes to a path made *after* its VOLUME
+# declaration are discarded by the builder.
+COPY --from=build --chown=65532:65532 /seed/var/lib/observer-org /var/lib/observer-org
+
+# Config (read-only secrets + config.toml) and the server DB live in volumes.
+VOLUME ["/etc/observer-org", "/var/lib/observer-org"]
+
+EXPOSE 8443
+USER nonroot:nonroot
+
+ENTRYPOINT ["/usr/local/bin/observer-org"]
+CMD ["serve", "--config", "/etc/observer-org/config.toml"]

@@ -1,0 +1,8 @@
+# SDK build artifacts (sources + packaging are tracked; built output is not)
+**/node_modules/
+**/dist/
+**/__pycache__/
+**/*.egg-info/
+**/build/
+**/.venv/
+*.pyc

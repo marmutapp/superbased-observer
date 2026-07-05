@@ -1,0 +1,19 @@
+# oapi-codegen config for the org-dashboard server interface (M3).
+# std-http-server emits a ServerInterface for the dashboard-tagged operations
+# (/api/org/*); the hand-written handlers in internal/orgserver/dashboard
+# implement it (a compile-time `var _ gen.ServerInterface` is the routing
+# conformance gate). Response bodies resolve to internal/orgserver/rollup types
+# via x-go-type; request bodies generate inline. This package lives inside
+# orgserver/, so importing rollup + orgcontract respects the spec's
+# "nothing outside orgserver imports its subpackages" rule.
+package: gen
+output: internal/orgserver/dashboard/gen/server.gen.go
+generate:
+  models: true
+  std-http-server: true
+output-options:
+  # Keep all component schemas (incl. the documented BudgetAlert webhook
+  # payload, which no operation references) so they generate as usable types.
+  skip-prune: true
+  include-tags:
+    - dashboard
