@@ -1,0 +1,148 @@
+# Binaries
+bin/
+/observer
+/observer-org
+*.exe
+*.test
+*.out
+
+# But re-include the npm-package shim and platform-bin placeholder
+# files. The bin/ rule above hides Go build outputs everywhere; npm/
+# packages legitimately need a bin/ directory in source for the Node
+# shim and for .gitkeep placeholders that the release CI fills with
+# the cross-compiled binaries.
+!npm/observer/bin/
+!npm/observer/bin/observer.js
+!npm/observer-*/bin/
+!npm/observer-*/bin/.gitkeep
+
+# Same story for the VS Code extension: vscode/bin/ holds a .gitkeep
+# committed to source and gets populated per-target by the
+# vscode-package CI job. The bin/ rule above would otherwise strip
+# the directory from the tree.
+!vscode/bin/
+!vscode/bin/.gitkeep
+
+# Build artifacts
+dist/
+build/
+
+# Re-include committed React/Vite build outputs (the embedded /v2/
+# dashboard is shipped as part of the Go binary; web-build regenerates
+# these from web/ sources). Without these re-includes the global
+# dist/ rule above silently swallows the committed bundles.
+!web/dist
+!web/dist/**
+!internal/intelligence/dashboard/webapp/dist
+!internal/intelligence/dashboard/webapp/dist/**
+!web2/dist
+!web2/dist/**
+!internal/orgserver/dashboard/webapp/dist
+!internal/orgserver/dashboard/webapp/dist/**
+
+# React/Vite ephemeral state
+web/node_modules/
+web/.vite/
+web/*.log
+web2/node_modules/
+web2/.vite/
+web2/*.log
+
+# Arcade verification harness — Playwright + headless Chromium; dev-only.
+# website/tools/{shoot.mjs, package.json, README.md, test/*.mjs} are
+# tracked; everything heavy stays out of git AND out of the Cloudflare
+# Pages deploy (see .github/workflows/website-deploy.yml step that strips
+# website/tools/ before `wrangler pages deploy`).
+website/tools/node_modules/
+website/tools/out/
+website/tools/playwright-report/
+
+# Go
+*.o
+*.so
+*.dylib
+vendor/
+
+# Coverage
+coverage.txt
+coverage.html
+*.cover
+
+# IDE
+.idea/
+.vscode/
+# Re-include the VS Code extension's source-controlled launch/tasks
+# configs. The .vscode/ rule above globally hides editor scratch state
+# but vscode/.vscode/ is part of the extension's checked-in dev loop.
+!vscode/.vscode/
+!vscode/.vscode/**
+.claude/
+# Negation: keep .claude/ fixture trees under testdata/ tracked.
+# Required by TestSidechain_CrossReferencedFromSubagentFiles in
+# internal/adapter/cowork — the test walks
+# testdata/cowork/.../local_*/.claude/projects/*/subagents/agent-*.jsonl
+# and the blanket .claude/ ignore above silently excluded it,
+# turning CI red from v1.6.1 onward despite passing locally.
+!testdata/**/.claude/
+!testdata/**/.claude/**
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local databases / scratch
+*.db
+*.db-wal
+*.db-shm
+.observer/
+tmp/
+
+# Secrets / env
+.env
+.env.local
+
+# Internal docs — kept locally on the private repo for development
+# context, untracked from the public repo. The dashboard's runtime
+# walkthrough asset under internal/intelligence/dashboard/static/ is
+# unaffected. Exceptions re-included via negation patterns: docs/assets/
+# (README screenshots/infographics referenced from the public README and
+# the npm package page) and the customer-facing docs linked from those
+# READMEs — the Teams trio and docs/compression-modes.md.
+/AGENTS.md
+/CLAUDE.md
+/PROGRESS.md
+/kickstart-prompt.md
+/superbased-final-spec-v2.md
+/docs/*
+!/docs/assets/
+!/docs/teams-getting-started.md
+!/docs/teams-architecture.md
+!/docs/teams-operations.md
+!/docs/compression-modes.md
+!/docs/proxy-live-test-recipe.md
+!/docs/codex-shared-app-server-gotcha.md
+!/docs/codex-compression-recipe.md
+!/docs/mcp-get-file-reference.md
+!/docs/mcp-get-symbols-reference.md
+!/docs/mcp-get-relations-reference.md
+!/docs/mcp-retrieve-stashed-reference.md
+!/docs/recipes/
+!/docs/recipes/claude-code.toml
+!/docs/recipes/codex-safe.toml
+!/docs/recipes/codex-variant.toml
+!/docs/vscode-extension.md
+!/docs/vscode-extension-user-guide.md
+/scripts/release.sh
+
+# Marketing website + design source-of-truth — published from the
+# private repo's website-deploy.yml workflow to Cloudflare Pages
+# (superbased.app), not part of the public distribution surface.
+# Kept on the private repo for content edits; never lands on the
+# public mirror so the public repo stays focused on the binary +
+# package distribution. /design/ also holds the pitch deck + design
+# assets; /tmp/ is local scratch (screenshots etc.).
+/design/
+/tmp/
+/website/

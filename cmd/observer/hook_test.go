@@ -1,0 +1,1366 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/marmutapp/superbased-observer/internal/config"
+	"github.com/marmutapp/superbased-observer/internal/models"
+	"github.com/marmutapp/superbased-observer/internal/pidbridge"
+)
+
+func TestDecidePreToolRewrite(t *testing.T) {
+	bin := "/opt/observer"
+	shellOn := config.Default()
+	shellOn.Compression.Shell.Enabled = true
+	shellOn.Compression.Shell.ExcludeCommands = []string{"curl"}
+
+	shellOff := config.Default()
+	shellOff.Compression.Shell.Enabled = false
+
+	cases := []struct {
+		name       string
+		body       string
+		cfg        config.Config
+		cfgErr     error
+		binary     string
+		binErr     error
+		hostOS     string // runtime.GOOS of the hook process ("" => not Windows)
+		wantRW     bool
+		wantCmd    string
+		wantReason string
+	}{
+		{
+			name:       "bash rewrite",
+			body:       `{"tool_name":"Bash","tool_input":{"command":"git status"}}`,
+			cfg:        shellOn,
+			binary:     bin,
+			wantRW:     true,
+			wantCmd:    bin + " run -- git status",
+			wantReason: "ok",
+		},
+		{
+			name:       "non-bash tool ignored",
+			body:       `{"tool_name":"Read","tool_input":{"file_path":"foo.go"}}`,
+			cfg:        shellOn,
+			binary:     bin,
+			wantRW:     false,
+			wantReason: "",
+		},
+		{
+			name:       "empty command ignored",
+			body:       `{"tool_name":"Bash","tool_input":{"command":""}}`,
+			cfg:        shellOn,
+			binary:     bin,
+			wantRW:     false,
+			wantReason: "",
+		},
+		{
+			name:       "excluded command passthrough",
+			body:       `{"tool_name":"Bash","tool_input":{"command":"curl example.com"}}`,
+			cfg:        shellOn,
+			binary:     bin,
+			wantRW:     false,
+			wantReason: "not-rewritable",
+		},
+		{
+			name:       "piped command passthrough",
+			body:       `{"tool_name":"Bash","tool_input":{"command":"git log | head -5"}}`,
+			cfg:        shellOn,
+			binary:     bin,
+			wantRW:     false,
+			wantReason: "not-rewritable",
+		},
+		{
+			name:       "shell disabled passthrough",
+			body:       `{"tool_name":"Bash","tool_input":{"command":"git status"}}`,
+			cfg:        shellOff,
+			binary:     bin,
+			wantRW:     false,
+			wantReason: "shell-disabled",
+		},
+		{
+			name:       "config error passthrough",
+			body:       `{"tool_name":"Bash","tool_input":{"command":"git status"}}`,
+			cfg:        config.Config{},
+			cfgErr:     errors.New("load boom"),
+			binary:     bin,
+			wantRW:     false,
+			wantReason: "config-error",
+		},
+		{
+			name:       "binary lookup error passthrough",
+			body:       `{"tool_name":"Bash","tool_input":{"command":"git status"}}`,
+			cfg:        shellOn,
+			binary:     "",
+			binErr:     errors.New("no binary"),
+			wantRW:     false,
+			wantReason: "binary-lookup-error",
+		},
+		{
+			name:       "garbage payload tolerated",
+			body:       `not json`,
+			cfg:        shellOn,
+			binary:     bin,
+			wantRW:     false,
+			wantReason: "",
+		},
+		{
+			// Bridged hook: Linux observer binary, but the cwd is a Windows
+			// path → the shell that runs the rewrite is on Windows and can't
+			// exec the WSL observer path. Skip the rewrite.
+			name:       "cross-os bridged windows shell skips",
+			body:       `{"tool_name":"Bash","tool_input":{"command":"git status"},"cwd":"D:\\programsx\\superbased-observer"}`,
+			cfg:        shellOn,
+			binary:     bin,
+			hostOS:     "linux",
+			wantRW:     false,
+			wantReason: "cross-os-shell",
+		},
+		{
+			// Native Windows hook + Windows cwd: same OS-context, the
+			// rewrite's binary path is valid for the shell → proceed.
+			name:       "native windows shell rewrites",
+			body:       `{"tool_name":"Bash","tool_input":{"command":"git status"},"cwd":"D:\\programsx\\superbased-observer"}`,
+			cfg:        shellOn,
+			binary:     bin,
+			hostOS:     "windows",
+			wantRW:     true,
+			wantCmd:    bin + " run -- git status",
+			wantReason: "ok",
+		},
+		{
+			// WSL Claude Code working under /mnt/c: cwd is a POSIX path, so
+			// the hook and shell share the WSL filesystem → rewrite proceeds.
+			name:       "wsl shell in mnt path rewrites",
+			body:       `{"tool_name":"Bash","tool_input":{"command":"git status"},"cwd":"/mnt/c/Users/marmu/proj"}`,
+			cfg:        shellOn,
+			binary:     bin,
+			hostOS:     "linux",
+			wantRW:     true,
+			wantCmd:    bin + " run -- git status",
+			wantReason: "ok",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rw, cmd, reason := decidePreToolRewrite([]byte(tc.body), tc.cfg, tc.cfgErr, tc.binary, tc.binErr, tc.hostOS)
+			if rw != tc.wantRW {
+				t.Fatalf("rewrite: got %v want %v", rw, tc.wantRW)
+			}
+			if reason != tc.wantReason {
+				t.Fatalf("reason: got %q want %q", reason, tc.wantReason)
+			}
+			if rw && cmd != tc.wantCmd {
+				t.Fatalf("command: got %q want %q", cmd, tc.wantCmd)
+			}
+		})
+	}
+}
+
+func TestHandleClaudeCodePreToolAlwaysApproves(t *testing.T) {
+	// Even with bogus JSON the hook must reply approve so the host doesn't
+	// hang. This exercises the full handler wiring via config.Load against
+	// the real (possibly missing) config file — safe because Load returns
+	// defaults when the file doesn't exist.
+	stdin := strings.NewReader(`{"tool_name":"Read","tool_input":{"file_path":"x"}}`)
+	var stdout, stderr bytes.Buffer
+	handleClaudeCodePreTool(stdin, &stdout, &stderr, "claude-code:pre-tool", "")
+
+	var reply preToolReply
+	if err := json.Unmarshal(stdout.Bytes(), &reply); err != nil {
+		t.Fatalf("reply not JSON: %v — %q", err, stdout.String())
+	}
+	if reply.Decision != "approve" {
+		t.Fatalf("decision: got %q want approve", reply.Decision)
+	}
+	if !reply.Continue {
+		t.Fatal("continue should be true")
+	}
+	if reply.HookSpecificOutput != nil {
+		t.Fatal("Read tool should not carry an updatedInput")
+	}
+}
+
+func TestHandleClaudeCodePreToolEmptyPayload(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	handleClaudeCodePreTool(strings.NewReader(""), &stdout, &stderr, "claude-code:pre-tool", "")
+	var reply preToolReply
+	if err := json.Unmarshal(stdout.Bytes(), &reply); err != nil {
+		t.Fatalf("reply not JSON: %v", err)
+	}
+	if reply.Decision != "approve" {
+		t.Fatal("empty payload must still approve")
+	}
+}
+
+// ancestorsList returns a fake ancestors function that always yields
+// the given PIDs. Used by tests to avoid touching /proc.
+func ancestorsList(pids ...int) ancestorsFunc {
+	return func(int) []int { return pids }
+}
+
+func TestHandleClaudeCodeSessionStart_WritesBridge(t *testing.T) {
+	payload := `{"session_id":"s-123","cwd":"/repo","hook_event_name":"SessionStart","source":"startup"}`
+	var stdout, stderr bytes.Buffer
+	var captured pidbridge.Entry
+	var called int
+	writer := func(_ context.Context, e pidbridge.Entry) error {
+		called++
+		captured = e
+		return nil
+	}
+	handleClaudeCodeSessionStart(context.Background(), 4242, ancestorsList(4242),
+		strings.NewReader(payload), &stdout, &stderr,
+		"claude-code:session-start", writer)
+
+	// Must always approve.
+	var reply map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &reply); err != nil {
+		t.Fatalf("reply not JSON: %v — %q", err, stdout.String())
+	}
+	if reply["decision"] != "approve" {
+		t.Fatalf("decision: %v", reply["decision"])
+	}
+	if called != 1 {
+		t.Fatalf("writer called %d times, want 1", called)
+	}
+	if captured.PID != 4242 || captured.SessionID != "s-123" || captured.CWD != "/repo" || captured.Tool != "claude-code" {
+		t.Fatalf("entry: %+v", captured)
+	}
+}
+
+func TestHandleClaudeCodeSessionStart_WritesAllAncestors(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	var got []int
+	writer := func(_ context.Context, e pidbridge.Entry) error {
+		got = append(got, e.PID)
+		if e.SessionID != "s-multi" {
+			t.Errorf("session_id on pid=%d: %q", e.PID, e.SessionID)
+		}
+		return nil
+	}
+	// Simulates hook spawned off a short-lived worker (worker=999,
+	// claude-main=100). Both should land in the bridge so the
+	// resolver still finds claude-main after the worker exits.
+	handleClaudeCodeSessionStart(context.Background(), 999, ancestorsList(999, 100),
+		strings.NewReader(`{"session_id":"s-multi","cwd":"/repo"}`),
+		&stdout, &stderr, "claude-code:session-start", writer)
+	if len(got) != 2 || got[0] != 999 || got[1] != 100 {
+		t.Errorf("registered pids = %v, want [999 100]", got)
+	}
+}
+
+func TestHandleClaudeCodeSessionStart_NoAncestorsWarns(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	var called int
+	writer := func(_ context.Context, _ pidbridge.Entry) error {
+		called++
+		return nil
+	}
+	// Empty ancestor list simulates the "immediate parent is a shell"
+	// case — we never register shells, so there's nothing to do.
+	handleClaudeCodeSessionStart(context.Background(), 4242, ancestorsList(),
+		strings.NewReader(`{"session_id":"s"}`), &stdout, &stderr,
+		"claude-code:session-start", writer)
+	if called != 0 {
+		t.Errorf("writer called %d times, want 0 when ancestors is empty", called)
+	}
+	if !strings.Contains(stderr.String(), "no ancestor pids") {
+		t.Errorf("stderr should explain the empty ancestors: %q", stderr.String())
+	}
+}
+
+func TestHandleClaudeCodeSessionStart_NoSessionID(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	var called int
+	writer := func(_ context.Context, _ pidbridge.Entry) error {
+		called++
+		return nil
+	}
+	handleClaudeCodeSessionStart(context.Background(), 4242, ancestorsList(4242),
+		strings.NewReader(`{"cwd":"/x"}`), &stdout, &stderr,
+		"claude-code:session-start", writer)
+
+	var reply map[string]any
+	_ = json.Unmarshal(stdout.Bytes(), &reply)
+	if reply["decision"] != "approve" {
+		t.Fatal("must still approve without session_id")
+	}
+	if called != 0 {
+		t.Fatalf("writer called %d times, want 0 on missing session_id", called)
+	}
+	if !strings.Contains(stderr.String(), "no session_id") {
+		t.Errorf("stderr should mention missing session_id: %q", stderr.String())
+	}
+}
+
+func TestHandleClaudeCodeSessionStart_RefusesInitPID(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	var called int
+	writer := func(_ context.Context, _ pidbridge.Entry) error {
+		called++
+		return nil
+	}
+	// ppid=1 means we were reparented to init; don't register.
+	handleClaudeCodeSessionStart(context.Background(), 1, ancestorsList(1),
+		strings.NewReader(`{"session_id":"s"}`), &stdout, &stderr,
+		"claude-code:session-start", writer)
+	if called != 0 {
+		t.Fatalf("writer called %d times, want 0 for pid 1", called)
+	}
+}
+
+func TestHandleClaudeCodeSessionStart_WriterErrorStillApproves(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	writer := func(_ context.Context, _ pidbridge.Entry) error {
+		return errors.New("boom")
+	}
+	handleClaudeCodeSessionStart(context.Background(), 4242, ancestorsList(4242),
+		strings.NewReader(`{"session_id":"s"}`), &stdout, &stderr,
+		"claude-code:session-start", writer)
+
+	var reply map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &reply); err != nil {
+		t.Fatalf("reply not JSON: %v", err)
+	}
+	if reply["decision"] != "approve" {
+		t.Fatal("writer error must not block approval")
+	}
+	if !strings.Contains(stderr.String(), "pidbridge pid=4242: boom") {
+		t.Errorf("stderr should log writer error with pid: %q", stderr.String())
+	}
+}
+
+// writeFakeProc creates /proc/<pid>/{comm,status,cmdline} under base
+// so tests can exercise collectClaudeCodeAncestors without touching
+// /proc. cmdline is NUL-separated argv; empty cmdline omits the file
+// (mirrors a kernel thread).
+func writeFakeProc(t *testing.T, base string, pid int, comm string, ppid int, cmdline ...string) {
+	t.Helper()
+	d := filepath.Join(base, strconv.Itoa(pid))
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(d, "comm"), []byte(comm+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(d, "status"), []byte(fmt.Sprintf("Name:\t%s\nPPid:\t%d\n", comm, ppid)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if len(cmdline) > 0 {
+		var buf []byte
+		for _, a := range cmdline {
+			buf = append(buf, a...)
+			buf = append(buf, 0)
+		}
+		if err := os.WriteFile(filepath.Join(d, "cmdline"), buf, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestCollectClaudeCodeAncestors_CrossesBashDashCWrapper reproduces
+// the observed Claude Code hook-spawn shape: `bash -c 'observer hook
+// ...'`. The walker must skip the bash wrapper and reach the real
+// long-lived claude parent behind it.
+func TestCollectClaudeCodeAncestors_CrossesBashDashCWrapper(t *testing.T) {
+	procDir := t.TempDir()
+	// bash -c (wrapper, 200) -> claude (100) -> bash login shell (50)
+	writeFakeProc(t, procDir, 200, "bash", 100, "/bin/bash", "-c", "/path/to/observer hook claude-code session-start")
+	writeFakeProc(t, procDir, 100, "claude", 50, "claude")
+	writeFakeProc(t, procDir, 50, "bash", 1, "-bash")
+
+	got := collectClaudeCodeAncestors(200, procDir, 10)
+	want := []int{100}
+	if !equalInts(got, want) {
+		t.Errorf("got %v want %v (bash -c should be skipped, interactive bash should stop)", got, want)
+	}
+}
+
+// TestCollectClaudeCodeAncestors_InteractiveShellStartStops verifies
+// the manual-invocation case (user types the hook command directly in
+// their shell): we refuse to register an interactive shell.
+func TestCollectClaudeCodeAncestors_InteractiveShellStartStops(t *testing.T) {
+	procDir := t.TempDir()
+	writeFakeProc(t, procDir, 300, "bash", 1, "bash")
+	if got := collectClaudeCodeAncestors(300, procDir, 10); len(got) != 0 {
+		t.Errorf("interactive shell at start should return empty, got %v", got)
+	}
+}
+
+// TestCollectClaudeCodeAncestors_DeadStartPID verifies that when the
+// immediate parent has vanished (no /proc/<pid>/comm), we still
+// best-effort register startPID so we preserve the pre-fix floor
+// behaviour.
+func TestCollectClaudeCodeAncestors_DeadStartPID(t *testing.T) {
+	procDir := t.TempDir()
+	// no /proc entry for 999 — simulates a zombie reaped before we read.
+	got := collectClaudeCodeAncestors(999, procDir, 10)
+	want := []int{999}
+	if !equalInts(got, want) {
+		t.Errorf("got %v want %v (dead parent should still be registered)", got, want)
+	}
+}
+
+func TestCollectClaudeCodeAncestors_StopsAtShell(t *testing.T) {
+	procDir := t.TempDir()
+	// hook parent=200 (node worker) -> 100 (claude) -> 50 (bash)
+	writeFakeProc(t, procDir, 200, "node", 100)
+	writeFakeProc(t, procDir, 100, "claude", 50)
+	writeFakeProc(t, procDir, 50, "bash", 42)
+
+	got := collectClaudeCodeAncestors(200, procDir, 10)
+	want := []int{200, 100}
+	if !equalInts(got, want) {
+		t.Errorf("got %v want %v", got, want)
+	}
+}
+
+// TestCollectClaudeCodeAncestors_BridgedHookRegistersNothing
+// reproduces the wsl.exe-bridged hook shape (Windows AI tool + WSL
+// daemon, D17): the hook's WSL-side ancestry is relay processes with
+// comm "init" up to the distro init at pid 2. None of them is the AI
+// tool — registering them poisons the bridge for every later hookless
+// connection. The walk must stop at the first init-class ancestor and
+// register nothing.
+func TestCollectClaudeCodeAncestors_BridgedHookRegistersNothing(t *testing.T) {
+	procDir := t.TempDir()
+	// relay init (345777) -> session init (345776) -> distro init (2) -> 1
+	writeFakeProc(t, procDir, 345777, "init", 345776, "/init")
+	writeFakeProc(t, procDir, 345776, "init", 2, "/init")
+	writeFakeProc(t, procDir, 2, "init", 1, "/init")
+
+	if got := collectClaudeCodeAncestors(345777, procDir, 10); len(got) != 0 {
+		t.Errorf("bridged init chain should register nothing, got %v", got)
+	}
+}
+
+// TestCollectClaudeCodeAncestors_InitClassMidChainStops verifies a
+// real ancestor below an init-class process is still registered while
+// the init-class boundary (and everything above) is not — and that
+// pid<=2 is never registered even when its /proc entry is unreadable
+// (the dead-start best-effort floor must not apply to system pids).
+func TestCollectClaudeCodeAncestors_InitClassMidChainStops(t *testing.T) {
+	procDir := t.TempDir()
+	writeFakeProc(t, procDir, 400, "node", 300)
+	writeFakeProc(t, procDir, 300, "systemd", 1, "/usr/lib/systemd/systemd", "--user")
+
+	got := collectClaudeCodeAncestors(400, procDir, 10)
+	want := []int{400}
+	if !equalInts(got, want) {
+		t.Errorf("got %v want %v (systemd ancestor must not register)", got, want)
+	}
+
+	// startPID 2 with no /proc entry: no best-effort registration.
+	if got := collectClaudeCodeAncestors(2, t.TempDir(), 10); len(got) != 0 {
+		t.Errorf("pid 2 should never register, got %v", got)
+	}
+}
+
+func TestCollectClaudeCodeAncestors_StopsAtInit(t *testing.T) {
+	procDir := t.TempDir()
+	writeFakeProc(t, procDir, 300, "node", 200)
+	writeFakeProc(t, procDir, 200, "node", 100)
+	writeFakeProc(t, procDir, 100, "claude", 1)
+
+	got := collectClaudeCodeAncestors(300, procDir, 10)
+	want := []int{300, 200, 100}
+	if !equalInts(got, want) {
+		t.Errorf("got %v want %v", got, want)
+	}
+}
+
+func TestCollectClaudeCodeAncestors_CapsAtMaxDepth(t *testing.T) {
+	procDir := t.TempDir()
+	for i := 10; i > 0; i-- {
+		writeFakeProc(t, procDir, 1000+i, "node", 1000+i-1)
+	}
+	writeFakeProc(t, procDir, 1000, "node", 1)
+
+	got := collectClaudeCodeAncestors(1010, procDir, 3)
+	if len(got) != 3 {
+		t.Fatalf("expected len 3 got %d: %v", len(got), got)
+	}
+}
+
+func TestCollectClaudeCodeAncestors_MissingProcEntry(t *testing.T) {
+	procDir := t.TempDir()
+	writeFakeProc(t, procDir, 200, "node", 100)
+	// PID 100 intentionally absent — simulates the observed bug:
+	// immediate parent recorded, grandparent already dead.
+	got := collectClaudeCodeAncestors(200, procDir, 10)
+	want := []int{200}
+	if !equalInts(got, want) {
+		t.Errorf("got %v want %v", got, want)
+	}
+}
+
+func TestCollectClaudeCodeAncestors_StartPIDIsShell(t *testing.T) {
+	procDir := t.TempDir()
+	writeFakeProc(t, procDir, 80, "zsh", 1)
+	if got := collectClaudeCodeAncestors(80, procDir, 10); len(got) != 0 {
+		t.Errorf("shell at start should return empty, got %v", got)
+	}
+}
+
+func TestCollectClaudeCodeAncestors_InitOrBadStart(t *testing.T) {
+	if got := collectClaudeCodeAncestors(0, "/nonexistent", 10); len(got) != 0 {
+		t.Errorf("pid=0 should return empty, got %v", got)
+	}
+	if got := collectClaudeCodeAncestors(1, "/nonexistent", 10); len(got) != 0 {
+		t.Errorf("pid=1 should return empty, got %v", got)
+	}
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestBuildClaudeSessionEndEvent(t *testing.T) {
+	body := []byte(`{"session_id":"703fe8c5","cwd":"/home/u/repo","hook_event_name":"SessionEnd"}`)
+	ev, ok := buildClaudeSessionEndEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.SessionID != "703fe8c5" {
+		t.Errorf("SessionID=%q", ev.SessionID)
+	}
+	if ev.ActionType != models.ActionSessionEnd {
+		t.Errorf("ActionType=%q", ev.ActionType)
+	}
+	if ev.ProjectRoot != "/home/u/repo" {
+		t.Errorf("ProjectRoot=%q", ev.ProjectRoot)
+	}
+	if ev.SourceFile != "claude-code:hook" {
+		t.Errorf("SourceFile=%q", ev.SourceFile)
+	}
+	if !ev.Success {
+		t.Errorf("Success=false")
+	}
+}
+
+func TestBuildClaudeUserPromptSubmitEvent(t *testing.T) {
+	body := []byte(`{"session_id":"s1","cwd":"/r","permission_mode":"default","hook_event_name":"UserPromptSubmit","prompt":"How does main.go work?"}`)
+	ev, ok := buildClaudeUserPromptSubmitEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.ActionType != models.ActionUserPrompt {
+		t.Errorf("ActionType=%q", ev.ActionType)
+	}
+	if ev.RawToolInput != "How does main.go work?" {
+		t.Errorf("RawToolInput=%q", ev.RawToolInput)
+	}
+	if ev.Target != "How does main.go work?" {
+		t.Errorf("Target=%q", ev.Target)
+	}
+}
+
+func TestBuildClaudePostToolFailureEvent(t *testing.T) {
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"PostToolUseFailure","tool_name":"Agent","tool_input":{"prompt":"x"},"tool_use_id":"toolu_01","error":"WorktreeCreate hook failed: no successful output","is_interrupt":false,"duration_ms":25}`)
+	ev, ok := buildClaudePostToolFailureEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.ActionType != models.ActionToolFailure {
+		t.Errorf("ActionType=%q", ev.ActionType)
+	}
+	if ev.Success {
+		t.Errorf("Success should be false on failure")
+	}
+	if ev.RawToolName != "Agent" {
+		t.Errorf("RawToolName=%q", ev.RawToolName)
+	}
+	if ev.DurationMs != 25 {
+		t.Errorf("DurationMs=%d", ev.DurationMs)
+	}
+	if ev.ErrorMessage != "WorktreeCreate hook failed: no successful output" {
+		t.Errorf("ErrorMessage=%q", ev.ErrorMessage)
+	}
+	if ev.SourceEventID != "toolu_01:post_tool_failure" {
+		t.Errorf("SourceEventID=%q", ev.SourceEventID)
+	}
+}
+
+func TestBuildClaudePostToolFailureEvent_InterruptMarker(t *testing.T) {
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"PostToolUseFailure","tool_name":"Bash","tool_input":{},"tool_use_id":"toolu_02","error":"user cancelled","is_interrupt":true,"duration_ms":12000}`)
+	ev, ok := buildClaudePostToolFailureEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	// Migration 017: is_interrupt is a typed bool on
+	// metadata.is_interrupt, no longer lossy-encoded into ErrorMessage.
+	if ev.Metadata == nil || !ev.Metadata.IsInterrupt {
+		t.Fatalf("Metadata=%+v (want IsInterrupt=true)", ev.Metadata)
+	}
+	if ev.ErrorMessage != "user cancelled" {
+		t.Errorf("ErrorMessage=%q (want raw error, no [interrupt] prefix)", ev.ErrorMessage)
+	}
+}
+
+func TestBuildClaudeStopFailureEvent(t *testing.T) {
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"StopFailure","error":"unknown","last_assistant_message":"API Error: Stream idle timeout - partial response received"}`)
+	ev, ok := buildClaudeStopFailureEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.ActionType != models.ActionAPIError {
+		t.Errorf("ActionType=%q", ev.ActionType)
+	}
+	if ev.Target != "unknown" {
+		t.Errorf("Target=%q (want error class)", ev.Target)
+	}
+	if !strings.Contains(ev.ErrorMessage, "Stream idle timeout") {
+		t.Errorf("ErrorMessage=%q", ev.ErrorMessage)
+	}
+	if ev.Success {
+		t.Errorf("Success should be false")
+	}
+}
+
+func TestBuildClaudeSubagentStartEvent(t *testing.T) {
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"SubagentStart","agent_id":"a5fa617a","agent_type":"Explore","prompt":"find foo"}`)
+	ev, ok := buildClaudeSubagentStartEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.ActionType != models.ActionSubagentStart {
+		t.Errorf("ActionType=%q", ev.ActionType)
+	}
+	if ev.Target != "Explore" {
+		t.Errorf("Target=%q (want agent_type)", ev.Target)
+	}
+	if ev.RawToolName != "a5fa617a" {
+		t.Errorf("RawToolName=%q (want agent_id)", ev.RawToolName)
+	}
+	if !ev.IsSidechain {
+		t.Errorf("IsSidechain should be true")
+	}
+}
+
+func TestBuildClaudeSubagentStopEvent(t *testing.T) {
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"SubagentStop","agent_id":"ab0251a3","agent_type":"Explore","agent_transcript_path":"/p/sub.jsonl","last_assistant_message":"main.go line 79"}`)
+	ev, ok := buildClaudeSubagentStopEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.ActionType != models.ActionSubagentStop {
+		t.Errorf("ActionType=%q", ev.ActionType)
+	}
+	if ev.Target != "Explore" {
+		t.Errorf("Target=%q (want agent_type)", ev.Target)
+	}
+	// last_assistant_message must land in BOTH raw_tool_input
+	// (dashboard renders this) and ToolOutput (FTS5 index). Pre-fix
+	// it only went to ToolOutput, so the dashboard rendered the row
+	// as blank — verified live on a real session.
+	if ev.RawToolInput != "main.go line 79" {
+		t.Errorf("RawToolInput=%q (want last_assistant_message)", ev.RawToolInput)
+	}
+	if ev.ToolOutput != "main.go line 79" {
+		t.Errorf("ToolOutput=%q", ev.ToolOutput)
+	}
+	if !ev.IsSidechain {
+		t.Errorf("IsSidechain should be true")
+	}
+}
+
+// TestBuildClaudeSubagentStopEvent_EmptyShellSuppressed pins the
+// empty-shell suppression introduced after observing claude-code
+// firing SubagentStop with only agent_id + envelope (no agent_type,
+// no last_assistant_message, no agent_transcript_path). Verified
+// live: 11 of 12 historical rows on a real DB had this shape and
+// rendered as blank rows in the dashboard. Suppression returns
+// ok=false so the row is never inserted.
+func TestBuildClaudeSubagentStopEvent_EmptyShellSuppressed(t *testing.T) {
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"SubagentStop","agent_id":"a45e1c0090c7163fb"}`)
+	if _, ok := buildClaudeSubagentStopEvent(body); ok {
+		t.Errorf("expected ok=false for empty-shell SubagentStop (only agent_id), got ok=true")
+	}
+}
+
+// TestBuildClaudeSubagentStopEvent_FallbackTargetWhenAgentTypeEmpty
+// pins the dashboard-friendly fallback: when agent_type is empty
+// but last_assistant_message is non-empty, Target gets a preview
+// of the message so the listing isn't blank.
+func TestBuildClaudeSubagentStopEvent_FallbackTargetWhenAgentTypeEmpty(t *testing.T) {
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"SubagentStop","agent_id":"a1","last_assistant_message":"Found 3 occurrences across 2 files."}`)
+	ev, ok := buildClaudeSubagentStopEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.Target != "Found 3 occurrences across 2 files." {
+		t.Errorf("Target=%q (want preview of last_assistant_message)", ev.Target)
+	}
+	if ev.RawToolInput != "Found 3 occurrences across 2 files." {
+		t.Errorf("RawToolInput=%q", ev.RawToolInput)
+	}
+}
+
+// TestBuildClaudeSubagentStopEvent_FallbackTargetWhenOnlyTranscriptPath
+// covers the third fallback: just the transcript path (no
+// agent_type, no last_assistant_message). Target gets the path
+// basename so the row points at where the data lives.
+func TestBuildClaudeSubagentStopEvent_FallbackTargetWhenOnlyTranscriptPath(t *testing.T) {
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"SubagentStop","agent_id":"a1","agent_transcript_path":"/home/u/.claude/projects/p/abc/subagents/agent-x.jsonl"}`)
+	ev, ok := buildClaudeSubagentStopEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.Target != "agent-x.jsonl" {
+		t.Errorf("Target=%q (want transcript basename)", ev.Target)
+	}
+}
+
+// TestBuildClaudeStopEvent pins the field shape of the new claudecode.assistant_text
+// rows emitted from the Stop hook. Pre-v1.4.49 this dispatch fell through to
+// the generic approve-reply path, so the assistant's final message was lost.
+func TestBuildClaudeStopEvent(t *testing.T) {
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"Refactored the auth middleware and pushed the tests."}`)
+	ev, ok := buildClaudeStopEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.ActionType != models.ActionTaskComplete {
+		t.Errorf("ActionType=%q want %q", ev.ActionType, models.ActionTaskComplete)
+	}
+	if ev.RawToolName != "claudecode.assistant_text" {
+		t.Errorf("RawToolName=%q want claudecode.assistant_text", ev.RawToolName)
+	}
+	if ev.Target != "Refactored the auth middleware and pushed the tests." {
+		t.Errorf("Target=%q (want last_assistant_message preview)", ev.Target)
+	}
+	if ev.ToolOutput != "Refactored the auth middleware and pushed the tests." {
+		t.Errorf("ToolOutput=%q", ev.ToolOutput)
+	}
+	if ev.PrecedingReasoning != ev.Target {
+		t.Errorf("PrecedingReasoning should mirror Target")
+	}
+	if ev.SourceFile != "claude-code:hook" {
+		t.Errorf("SourceFile=%q want claude-code:hook", ev.SourceFile)
+	}
+	if ev.SessionID != "s1" {
+		t.Errorf("SessionID=%q", ev.SessionID)
+	}
+	// SourceEventID must embed a content hash so replayed captures dedupe
+	// via the (source_file, source_event_id) UPSERT path. The exact hash
+	// is implementation detail; assert only the prefix shape.
+	if !strings.HasPrefix(ev.SourceEventID, "s1:stop:") {
+		t.Errorf("SourceEventID=%q want prefix s1:stop:", ev.SourceEventID)
+	}
+	if ev.IsSidechain {
+		t.Errorf("IsSidechain must be false for top-level Stop (not a subagent)")
+	}
+}
+
+// TestBuildClaudeStopEvent_EmptySuppressed pins the empty-message
+// suppression: Stop fires on every turn-end including interruptions where
+// there's no model output. Empty/whitespace last_assistant_message returns
+// (zero, false) so the table doesn't accumulate marker-only rows.
+func TestBuildClaudeStopEvent_EmptySuppressed(t *testing.T) {
+	cases := []string{
+		`{"session_id":"s1","cwd":"/r","hook_event_name":"Stop"}`,
+		`{"session_id":"s1","cwd":"/r","hook_event_name":"Stop","last_assistant_message":""}`,
+		`{"session_id":"s1","cwd":"/r","hook_event_name":"Stop","last_assistant_message":"   "}`,
+	}
+	for i, body := range cases {
+		if _, ok := buildClaudeStopEvent([]byte(body)); ok {
+			t.Errorf("case[%d]: expected ok=false for empty last_assistant_message, got ok=true (body=%s)", i, body)
+		}
+	}
+}
+
+// TestBuildClaudeStopEvent_StableSourceEventID pins that replaying the same
+// envelope produces the same SourceEventID — required for the watcher's
+// at-least-once delivery semantics to dedupe via UPSERT instead of
+// inserting duplicate rows.
+func TestBuildClaudeStopEvent_StableSourceEventID(t *testing.T) {
+	body := []byte(`{"session_id":"s2","cwd":"/r","hook_event_name":"Stop","last_assistant_message":"Done."}`)
+	ev1, ok1 := buildClaudeStopEvent(body)
+	ev2, ok2 := buildClaudeStopEvent(body)
+	if !ok1 || !ok2 {
+		t.Fatalf("ok1=%v ok2=%v", ok1, ok2)
+	}
+	if ev1.SourceEventID != ev2.SourceEventID {
+		t.Errorf("SourceEventID drift across re-builds: %q vs %q", ev1.SourceEventID, ev2.SourceEventID)
+	}
+}
+
+func TestBuildClaudeNotificationEvent(t *testing.T) {
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"Notification","notification_type":"idle_prompt","message":"Claude is waiting for your input"}`)
+	ev, ok := buildClaudeNotificationEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.ActionType != models.ActionNotification {
+		t.Errorf("ActionType=%q", ev.ActionType)
+	}
+	if ev.Target != "idle_prompt" {
+		t.Errorf("Target=%q", ev.Target)
+	}
+	if !strings.Contains(ev.ErrorMessage, "waiting for your input") {
+		t.Errorf("ErrorMessage=%q", ev.ErrorMessage)
+	}
+}
+
+func TestBuildClaudeCwdChangedEvent_OldNewFields(t *testing.T) {
+	// Captured payload uses old_cwd / new_cwd (not previous_cwd as docs claim).
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"CwdChanged","old_cwd":"/home/u/old","new_cwd":"/tmp"}`)
+	ev, ok := buildClaudeCwdChangedEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.ActionType != models.ActionCwdChange {
+		t.Errorf("ActionType=%q", ev.ActionType)
+	}
+	if ev.Target != "/tmp" {
+		t.Errorf("Target=%q (want new_cwd)", ev.Target)
+	}
+	if ev.PrecedingReasoning != "/home/u/old" {
+		t.Errorf("PrecedingReasoning=%q (want old_cwd)", ev.PrecedingReasoning)
+	}
+}
+
+func TestBuildClaudeCwdChangedEvent_DocsField(t *testing.T) {
+	// previous_cwd is the docs field name; builder must accept both
+	// shapes for forward-compat across Claude Code releases.
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"CwdChanged","previous_cwd":"/old","new_cwd":"/new"}`)
+	ev, ok := buildClaudeCwdChangedEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.PrecedingReasoning != "/old" {
+		t.Errorf("PrecedingReasoning=%q (want previous_cwd)", ev.PrecedingReasoning)
+	}
+}
+
+func TestBuildClaudeSetupEvent(t *testing.T) {
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"Setup","trigger":"init"}`)
+	ev, ok := buildClaudeSetupEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.ActionType != models.ActionSetup {
+		t.Errorf("ActionType=%q", ev.ActionType)
+	}
+	if ev.Target != "init" {
+		t.Errorf("Target=%q (want trigger)", ev.Target)
+	}
+	if ev.SourceEventID != "s1:setup:init" {
+		t.Errorf("SourceEventID=%q (want session_id:setup:trigger)", ev.SourceEventID)
+	}
+}
+
+func TestBuildClaudeUserPromptExpansionEvent(t *testing.T) {
+	body := []byte(`{"session_id":"s1","cwd":"/r","permission_mode":"default","hook_event_name":"UserPromptExpansion","expansion_type":"slash_command","command_name":"review","command_args":"PR#42","command_source":"plugin","prompt":"/review PR#42"}`)
+	ev, ok := buildClaudeUserPromptExpansionEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.ActionType != models.ActionUserPromptExpansion {
+		t.Errorf("ActionType=%q", ev.ActionType)
+	}
+	if ev.Target != "review" {
+		t.Errorf("Target=%q (want command_name)", ev.Target)
+	}
+	if ev.RawToolName != "slash_command" {
+		t.Errorf("RawToolName=%q (want expansion_type)", ev.RawToolName)
+	}
+	if ev.RawToolInput != "/review PR#42" {
+		t.Errorf("RawToolInput=%q (want raw prompt)", ev.RawToolInput)
+	}
+	if !strings.Contains(ev.PrecedingReasoning, "command_source") || !strings.Contains(ev.PrecedingReasoning, "plugin") {
+		t.Errorf("PrecedingReasoning=%q (want command_source+command_args JSON)", ev.PrecedingReasoning)
+	}
+	// SourceEventID uses content hash so two distinct expansions in
+	// one session don't collide on ON CONFLICT UPDATE.
+	if !strings.HasPrefix(ev.SourceEventID, "s1:user_prompt_expansion:") {
+		t.Errorf("SourceEventID=%q (want session_id:user_prompt_expansion:hash)", ev.SourceEventID)
+	}
+}
+
+func TestBuildClaudePostToolBatchEvent(t *testing.T) {
+	body := []byte(`{"session_id":"s1","cwd":"/r","permission_mode":"default","hook_event_name":"PostToolBatch","tool_calls":[{"tool_name":"Read","tool_input":{"file_path":"/a.go"},"tool_use_id":"toolu_01","tool_response":"     1\tpackage a"},{"tool_name":"Grep","tool_input":{"pattern":"foo"},"tool_use_id":"toolu_02","tool_response":"a.go:5"}]}`)
+	ev, ok := buildClaudePostToolBatchEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.ActionType != models.ActionPostToolBatch {
+		t.Errorf("ActionType=%q", ev.ActionType)
+	}
+	if ev.Target != "2 tool call(s)" {
+		t.Errorf("Target=%q (want batch size)", ev.Target)
+	}
+	if ev.RawToolName != "Read" {
+		t.Errorf("RawToolName=%q (want first tool_name)", ev.RawToolName)
+	}
+	if !strings.Contains(ev.RawToolInput, `"Read"`) || !strings.Contains(ev.RawToolInput, `"Grep"`) {
+		t.Errorf("RawToolInput=%q (want tool_calls JSON)", ev.RawToolInput)
+	}
+}
+
+func TestBuildClaudePostToolBatchEvent_EmptyBatchSuppressed(t *testing.T) {
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"PostToolBatch","tool_calls":[]}`)
+	if _, ok := buildClaudePostToolBatchEvent(body); ok {
+		t.Error("expected ok=false for empty tool_calls batch")
+	}
+}
+
+func TestBuildClaudePermissionRequestEvent(t *testing.T) {
+	body := []byte(`{"session_id":"s1","cwd":"/r","permission_mode":"default","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"rm -rf node_modules"},"permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"rm -rf node_modules"}],"behavior":"allow","destination":"localSettings"}]}`)
+	ev, ok := buildClaudePermissionRequestEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.ActionType != models.ActionPermissionRequest {
+		t.Errorf("ActionType=%q", ev.ActionType)
+	}
+	if ev.Target != "Bash" {
+		t.Errorf("Target=%q (want tool_name)", ev.Target)
+	}
+	if !strings.Contains(ev.RawToolInput, "rm -rf node_modules") {
+		t.Errorf("RawToolInput=%q (want tool_input)", ev.RawToolInput)
+	}
+	if !strings.Contains(ev.PrecedingReasoning, "addRules") {
+		t.Errorf("PrecedingReasoning=%q (want permission_suggestions JSON)", ev.PrecedingReasoning)
+	}
+	if !ev.Success {
+		t.Errorf("Success=false; PermissionRequest is just a prompt — outcome lands on a sibling row")
+	}
+}
+
+func TestBuildClaudePermissionDeniedEvent(t *testing.T) {
+	body := []byte(`{"session_id":"s1","cwd":"/r","permission_mode":"auto","hook_event_name":"PermissionDenied","tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/build"},"tool_use_id":"toolu_01ABC","reason":"Auto mode denied: command targets a path outside the project"}`)
+	ev, ok := buildClaudePermissionDeniedEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.ActionType != models.ActionPermissionDenied {
+		t.Errorf("ActionType=%q", ev.ActionType)
+	}
+	if ev.Target != "Bash" {
+		t.Errorf("Target=%q (want tool_name)", ev.Target)
+	}
+	if ev.SourceEventID != "toolu_01ABC:permission_denied" {
+		t.Errorf("SourceEventID=%q (want tool_use_id:permission_denied)", ev.SourceEventID)
+	}
+	if !strings.Contains(ev.ErrorMessage, "Auto mode denied") {
+		t.Errorf("ErrorMessage=%q (want reason)", ev.ErrorMessage)
+	}
+	if ev.Success {
+		t.Errorf("Success should be false on denied")
+	}
+}
+
+func TestBuildClaudeInstructionsLoadedEvent(t *testing.T) {
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"InstructionsLoaded","file_path":"/r/CLAUDE.md","memory_type":"Project","load_reason":"session_start"}`)
+	ev, ok := buildClaudeInstructionsLoadedEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.ActionType != models.ActionInstructionsLoaded {
+		t.Errorf("ActionType=%q", ev.ActionType)
+	}
+	if ev.Target != "/r/CLAUDE.md" {
+		t.Errorf("Target=%q (want file_path)", ev.Target)
+	}
+	if ev.RawToolName != "Project" {
+		t.Errorf("RawToolName=%q (want memory_type)", ev.RawToolName)
+	}
+	if !strings.Contains(ev.RawToolInput, "session_start") {
+		t.Errorf("RawToolInput=%q (want load_reason in JSON)", ev.RawToolInput)
+	}
+	if ev.SourceEventID != "s1:instructions_loaded:/r/CLAUDE.md" {
+		t.Errorf("SourceEventID=%q (want session_id:instructions_loaded:file_path)", ev.SourceEventID)
+	}
+}
+
+func TestBuildClaudeInstructionsLoadedEvent_OptionalFields(t *testing.T) {
+	// path_glob_match loads carry globs + trigger_file_path; include
+	// loads carry parent_file_path. All must land in RawToolInput JSON.
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"InstructionsLoaded","file_path":"/r/skills/foo/CLAUDE.md","memory_type":"Local","load_reason":"path_glob_match","globs":["**/*.go"],"trigger_file_path":"/r/main.go"}`)
+	ev, ok := buildClaudeInstructionsLoadedEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	for _, want := range []string{"path_glob_match", "**/*.go", "/r/main.go"} {
+		if !strings.Contains(ev.RawToolInput, want) {
+			t.Errorf("RawToolInput=%q missing %q", ev.RawToolInput, want)
+		}
+	}
+}
+
+func TestBuildClaudeConfigChangeEvent(t *testing.T) {
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"ConfigChange","source":"project_settings","file_path":"/r/.claude/settings.json"}`)
+	ev, ok := buildClaudeConfigChangeEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.ActionType != models.ActionConfigChange {
+		t.Errorf("ActionType=%q", ev.ActionType)
+	}
+	if ev.Target != "/r/.claude/settings.json" {
+		t.Errorf("Target=%q (want file_path)", ev.Target)
+	}
+	if ev.RawToolName != "project_settings" {
+		t.Errorf("RawToolName=%q (want source)", ev.RawToolName)
+	}
+}
+
+func TestBuildClaudeConfigChangeEvent_SkillsSourceFallback(t *testing.T) {
+	// `skills` source has no file_path per docs; Target falls back to
+	// the source name so the dashboard listing isn't blank.
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"ConfigChange","source":"skills"}`)
+	ev, ok := buildClaudeConfigChangeEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.Target != "skills" {
+		t.Errorf("Target=%q (want source fallback)", ev.Target)
+	}
+}
+
+func TestBuildClaudeWorktreeRemoveEvent(t *testing.T) {
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"WorktreeRemove","worktree_path":"/home/u/.claude/worktrees/feature-auth"}`)
+	ev, ok := buildClaudeWorktreeRemoveEvent(body)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if ev.ActionType != models.ActionWorktreeRemove {
+		t.Errorf("ActionType=%q", ev.ActionType)
+	}
+	if ev.Target != "/home/u/.claude/worktrees/feature-auth" {
+		t.Errorf("Target=%q (want worktree_path)", ev.Target)
+	}
+	if ev.SourceEventID != "s1:worktree_remove:/home/u/.claude/worktrees/feature-auth" {
+		t.Errorf("SourceEventID=%q", ev.SourceEventID)
+	}
+}
+
+func TestBuildClaudeWorktreeCreateReply_DocumentedPayload(t *testing.T) {
+	t.Setenv("OBSERVER_CLAUDE_WORKTREE_ROOT", "")
+	// Stub HOME so the test is deterministic across hosts.
+	t.Setenv("HOME", "/home/testuser")
+	t.Setenv("USERPROFILE", "/home/testuser") // os.UserHomeDir reads USERPROFILE on Windows
+
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"WorktreeCreate","name":"feature-auth"}`)
+	worktreePath, ev, hasSession := buildClaudeWorktreeCreateReply(body)
+	if !hasSession {
+		t.Fatal("hasSession=false")
+	}
+	// ToSlash: the daemon emits these paths on Linux/WSL ('/'); on a
+	// Windows test host filepath.Join uses '\\'. The path COMPONENTS are
+	// the invariant, not the separator.
+	wantPath := "/home/testuser/.claude/worktrees/feature-auth"
+	if filepath.ToSlash(worktreePath) != wantPath {
+		t.Errorf("worktreePath=%q want %q", worktreePath, wantPath)
+	}
+	if ev.ActionType != models.ActionWorktreeCreate {
+		t.Errorf("ActionType=%q", ev.ActionType)
+	}
+	if ev.Target != "feature-auth" {
+		t.Errorf("Target=%q (want name)", ev.Target)
+	}
+	if filepath.ToSlash(ev.RawToolInput) != wantPath {
+		t.Errorf("RawToolInput=%q want echoed path", ev.RawToolInput)
+	}
+	if ev.SourceEventID != "s1:worktree_create:feature-auth" {
+		t.Errorf("SourceEventID=%q", ev.SourceEventID)
+	}
+}
+
+func TestBuildClaudeWorktreeCreateReply_EmptyNameSynthesizes(t *testing.T) {
+	t.Setenv("HOME", "/home/testuser")
+	t.Setenv("USERPROFILE", "/home/testuser") // os.UserHomeDir reads USERPROFILE on Windows
+	t.Setenv("OBSERVER_CLAUDE_WORKTREE_ROOT", "")
+
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"WorktreeCreate"}`)
+	worktreePath, ev, hasSession := buildClaudeWorktreeCreateReply(body)
+	if !hasSession {
+		t.Fatal("hasSession=false")
+	}
+	// Synthesized name has the "worktree-" prefix + base36 nanos.
+	if !strings.HasPrefix(ev.Target, "worktree-") {
+		t.Errorf("Target=%q (want worktree-<...> prefix)", ev.Target)
+	}
+	if !strings.HasPrefix(filepath.ToSlash(worktreePath), "/home/testuser/.claude/worktrees/worktree-") {
+		t.Errorf("worktreePath=%q (want default-root prefix + synthesized name)", worktreePath)
+	}
+}
+
+func TestBuildClaudeWorktreeCreateReply_EnvRootOverride(t *testing.T) {
+	t.Setenv("OBSERVER_CLAUDE_WORKTREE_ROOT", "/mnt/fast/wts")
+	t.Setenv("HOME", "/home/testuser")
+	t.Setenv("USERPROFILE", "/home/testuser") // os.UserHomeDir reads USERPROFILE on Windows
+
+	body := []byte(`{"session_id":"s1","cwd":"/r","hook_event_name":"WorktreeCreate","name":"feature-x"}`)
+	worktreePath, _, hasSession := buildClaudeWorktreeCreateReply(body)
+	if !hasSession {
+		t.Fatal("hasSession=false")
+	}
+	if filepath.ToSlash(worktreePath) != "/mnt/fast/wts/feature-x" {
+		t.Errorf("worktreePath=%q (want env-override root)", worktreePath)
+	}
+}
+
+func TestBuildClaudeWorktreeCreateReply_NoSessionIDStillEchosPath(t *testing.T) {
+	// Missing session_id must NOT cause an empty stdout reply —
+	// that would fail every Agent spawn. The path computation
+	// still runs; only the DB-write portion is skipped.
+	t.Setenv("HOME", "/home/testuser")
+	t.Setenv("USERPROFILE", "/home/testuser") // os.UserHomeDir reads USERPROFILE on Windows
+	t.Setenv("OBSERVER_CLAUDE_WORKTREE_ROOT", "")
+	body := []byte(`{"cwd":"/r","hook_event_name":"WorktreeCreate","name":"feature-y"}`)
+	worktreePath, _, hasSession := buildClaudeWorktreeCreateReply(body)
+	if hasSession {
+		t.Error("hasSession=true; want false when session_id missing")
+	}
+	if filepath.ToSlash(worktreePath) != "/home/testuser/.claude/worktrees/feature-y" {
+		t.Errorf("worktreePath=%q (want path computed even without session_id)", worktreePath)
+	}
+}
+
+// TestHandleClaudeCodeWorktreeCreate_AlwaysReplies pins the
+// invariant that no matter what's on stdin, observer's WorktreeCreate
+// handler writes a valid `{"hookSpecificOutput":{"worktreePath":...}}`
+// JSON to stdout. The DB write is best-effort (config path is
+// intentionally invalid here to force a config-load failure) — the
+// reply must still go out so Claude Code's Agent spawn doesn't fail.
+func TestHandleClaudeCodeWorktreeCreate_AlwaysReplies(t *testing.T) {
+	t.Setenv("HOME", "/home/testuser")
+	t.Setenv("USERPROFILE", "/home/testuser") // os.UserHomeDir reads USERPROFILE on Windows
+	t.Setenv("OBSERVER_CLAUDE_WORKTREE_ROOT", "")
+	var stdout, stderr bytes.Buffer
+	// A MALFORMED config (not merely a missing path) deterministically
+	// forces a config-load failure on every OS: a non-existent path is
+	// tolerated by the loader (it falls back to defaults), and on Windows
+	// the default '~' db_path then resolves via USERPROFILE and opens
+	// cleanly — so the missing-path variant produced no error there. This
+	// matches the test's stated intent ("force a config-load failure").
+	badCfg := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(badCfg, []byte("[observer\nthis is = = not valid toml"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	payload := `{"session_id":"s1","cwd":"/r","hook_event_name":"WorktreeCreate","name":"feature-z"}`
+	handleClaudeCodeWorktreeCreate(
+		context.Background(),
+		"claude-code:worktree-create",
+		badCfg,
+		strings.NewReader(payload),
+		&stdout, &stderr,
+	)
+	var reply struct {
+		HookSpecificOutput struct {
+			WorktreePath string `json:"worktreePath"`
+		} `json:"hookSpecificOutput"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &reply); err != nil {
+		t.Fatalf("stdout not JSON: %v — %q", err, stdout.String())
+	}
+	if filepath.ToSlash(reply.HookSpecificOutput.WorktreePath) != "/home/testuser/.claude/worktrees/feature-z" {
+		t.Errorf("worktreePath=%q", reply.HookSpecificOutput.WorktreePath)
+	}
+	// stderr should contain SOME error note (config or db) — the
+	// invalid config path triggers either a config-load failure or a
+	// downstream db-open failure depending on whether the loader
+	// falls back to defaults. Either way the handler logs and
+	// continues; the reply still goes out (asserted above).
+	got := stderr.String()
+	if !strings.Contains(got, "config") && !strings.Contains(got, "db") {
+		t.Errorf("expected stderr to mention config or db error; got: %q", got)
+	}
+}
+
+// TestBuildClaude_EnvelopePopulatesMetadata pins migration 017: the
+// permission_mode + effort.level fields ride on every Claude Code hook
+// payload's envelope, and every builder inherits them via baseToolEvent.
+// Pre-fix these fields were unparsed; post-fix they land on
+// ev.Metadata.{PermissionMode,EffortLevel}.
+func TestBuildClaude_EnvelopePopulatesMetadata(t *testing.T) {
+	cases := []struct {
+		name       string
+		body       []byte
+		build      claudeActionBuilder
+		wantPerm   string
+		wantEffort string
+	}{
+		{
+			name:       "user_prompt_with_permission_mode",
+			body:       []byte(`{"session_id":"s1","cwd":"/r","permission_mode":"plan","prompt":"hi"}`),
+			build:      buildClaudeUserPromptSubmitEvent,
+			wantPerm:   "plan",
+			wantEffort: "",
+		},
+		{
+			name:       "session_end_with_both",
+			body:       []byte(`{"session_id":"s1","cwd":"/r","permission_mode":"default","effort":{"level":"high"}}`),
+			build:      buildClaudeSessionEndEvent,
+			wantPerm:   "default",
+			wantEffort: "high",
+		},
+		{
+			name:       "notification_no_metadata_keeps_nil",
+			body:       []byte(`{"session_id":"s1","cwd":"/r","notification_type":"idle_prompt","message":"x"}`),
+			build:      buildClaudeNotificationEvent,
+			wantPerm:   "",
+			wantEffort: "",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ev, ok := c.build(c.body)
+			if !ok {
+				t.Fatal("ok=false")
+			}
+			if c.wantPerm == "" && c.wantEffort == "" {
+				if ev.Metadata != nil {
+					t.Errorf("Metadata=%+v; want nil for envelope without metadata", ev.Metadata)
+				}
+				return
+			}
+			if ev.Metadata == nil {
+				t.Fatalf("Metadata=nil; want PermissionMode=%q EffortLevel=%q",
+					c.wantPerm, c.wantEffort)
+			}
+			if ev.Metadata.PermissionMode != c.wantPerm {
+				t.Errorf("PermissionMode=%q want %q", ev.Metadata.PermissionMode, c.wantPerm)
+			}
+			if ev.Metadata.EffortLevel != c.wantEffort {
+				t.Errorf("EffortLevel=%q want %q", ev.Metadata.EffortLevel, c.wantEffort)
+			}
+		})
+	}
+}
+
+func TestBuildClaudeAllRejectMissingSessionID(t *testing.T) {
+	cases := map[string]claudeActionBuilder{
+		"SessionEnd":          buildClaudeSessionEndEvent,
+		"UserPromptSubmit":    buildClaudeUserPromptSubmitEvent,
+		"PostToolUseFailure":  buildClaudePostToolFailureEvent,
+		"StopFailure":         buildClaudeStopFailureEvent,
+		"SubagentStart":       buildClaudeSubagentStartEvent,
+		"SubagentStop":        buildClaudeSubagentStopEvent,
+		"Notification":        buildClaudeNotificationEvent,
+		"CwdChanged":          buildClaudeCwdChangedEvent,
+		"Setup":               buildClaudeSetupEvent,
+		"UserPromptExpansion": buildClaudeUserPromptExpansionEvent,
+		"PostToolBatch":       buildClaudePostToolBatchEvent,
+		"PermissionRequest":   buildClaudePermissionRequestEvent,
+		"PermissionDenied":    buildClaudePermissionDeniedEvent,
+		"InstructionsLoaded":  buildClaudeInstructionsLoadedEvent,
+		"ConfigChange":        buildClaudeConfigChangeEvent,
+		"WorktreeRemove":      buildClaudeWorktreeRemoveEvent,
+		"Stop":                buildClaudeStopEvent,
+	}
+	body := []byte(`{"cwd":"/r"}`)
+	for name, b := range cases {
+		if _, ok := b(body); ok {
+			t.Errorf("%s: built ok despite missing session_id", name)
+		}
+	}
+}
+
+// TestResolveHookMaxRuntime exercises the flag/env/default precedence.
+func TestResolveHookMaxRuntime(t *testing.T) {
+	cases := []struct {
+		name string
+		flag time.Duration
+		env  string
+		want time.Duration
+	}{
+		{"default when nothing set", 0, "", defaultHookMaxRuntime},
+		{"env wins over default", 0, "5s", 5 * time.Second},
+		{"flag wins over env", 7 * time.Second, "5s", 7 * time.Second},
+		{"flag wins over default", 4 * time.Second, "", 4 * time.Second},
+		{"bad env falls back to default", 0, "not-a-duration", defaultHookMaxRuntime},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveHookMaxRuntime(tc.flag, tc.env); got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestInstallHookWatchdogFiresOnExceededRuntime pins the V3-1 fix + the
+// fail-open hardening: when a hook runs past its budget, the watchdog
+// must fire promptly so the host AI tool isn't pinned — and it must exit
+// 0 (fail-OPEN), because a non-zero PreToolUse exit BLOCKS the tool. A
+// timeout is not a deny decision.
+func TestInstallHookWatchdogFiresOnExceededRuntime(t *testing.T) {
+	var stderr bytes.Buffer
+	exitCh := make(chan int, 1)
+	stop := installHookWatchdog(20*time.Millisecond, func(code int) {
+		exitCh <- code
+	}, &stderr)
+	defer stop()
+
+	select {
+	case code := <-exitCh:
+		if code != 0 {
+			t.Errorf("exit code = %d, want 0 (fail-open; non-zero would block the tool)", code)
+		}
+		if !strings.Contains(stderr.String(), "max-runtime") {
+			t.Errorf("stderr missing max-runtime message: %q", stderr.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchdog didn't fire within 2 s of a 20 ms budget")
+	}
+}
+
+// TestInstallHookWatchdogStopDisarmsTimer verifies the clean-exit path:
+// when the hook completes inside the budget, calling the returned stop
+// func must prevent the watchdog from firing afterwards.
+func TestInstallHookWatchdogStopDisarmsTimer(t *testing.T) {
+	var stderr bytes.Buffer
+	exitCh := make(chan int, 1)
+	stop := installHookWatchdog(20*time.Millisecond, func(code int) {
+		exitCh <- code
+	}, &stderr)
+	stop()
+
+	select {
+	case code := <-exitCh:
+		t.Errorf("watchdog fired after stop(): exit=%d", code)
+	case <-time.After(100 * time.Millisecond):
+		// expected: timer disarmed, no firing
+	}
+}
+
+// TestInstallHookWatchdogZeroRuntimeIsNoop is the escape hatch: a
+// non-positive budget disables the watchdog entirely (diagnostics only).
+func TestInstallHookWatchdogZeroRuntimeIsNoop(t *testing.T) {
+	var stderr bytes.Buffer
+	exitCh := make(chan int, 1)
+	stop := installHookWatchdog(0, func(code int) {
+		exitCh <- code
+	}, &stderr)
+	defer stop()
+
+	select {
+	case code := <-exitCh:
+		t.Errorf("watchdog fired despite zero budget: exit=%d", code)
+	case <-time.After(50 * time.Millisecond):
+		// expected
+	}
+}

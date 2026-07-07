@@ -1,0 +1,209 @@
+/* SuperBased Observer — Design Tokens
+ *
+ * Ported from design/tokens.css (the Claude-Design mockup).
+ * Tailwind reads these via tailwind.config.ts theme.extend.
+ * Switching `data-theme` on <html> flips the entire palette
+ * without dark: variants.
+ */
+
+:root,
+:root[data-theme="dark"] {
+  /* Surfaces — layered elevation, low to high */
+  --bg-0: #08090d;
+  --bg-1: #0e1018;
+  --bg-2: #14171f;
+  --bg-3: #1a1d27;
+  --bg-4: #21252f;
+  --bg-5: #2a2f3d;
+
+  /* Borders */
+  --line-1: #1c1f29;
+  --line-2: #262a36;
+  --line-3: #353a48;
+
+  /* Foreground */
+  --fg-0: #f5f7fb;
+  --fg-1: #e2e6ef;
+  --fg-2: #9aa2b2;
+  --fg-3: #6b7388;
+  --fg-4: #474d5e;
+
+  /* Brand */
+  --brand-from: #6199f0;
+  --brand-to: #8b5cf6;
+  --brand-grad: linear-gradient(135deg, var(--brand-from) 0%, var(--brand-to) 100%);
+  --brand-soft: rgba(139, 92, 246, 0.12);
+
+  /* Accent — primary interactive */
+  --accent: #7c9eff;
+  --on-accent: #0a0d18;
+  --accent-strong: #93b1ff;
+  --accent-soft: rgba(124, 158, 255, 0.1);
+  --accent-ring: rgba(124, 158, 255, 0.35);
+
+  /* Semantic */
+  --success: #34d399;
+  --success-soft: rgba(52, 211, 153, 0.12);
+  --warn: #fbbf24;
+  --warn-soft: rgba(251, 191, 36, 0.12);
+  --danger: #f87171;
+  --danger-soft: rgba(248, 113, 113, 0.12);
+  --info: #60a5fa;
+  --info-soft: rgba(96, 165, 250, 0.12);
+
+  /* Token bucket colors (4 Anthropic billing buckets) */
+  --tok-net: #60a5fa;
+  --tok-read: #a78bfa;
+  --tok-write: #fbbf24;
+  --tok-out: #f472b6;
+
+  /* Tool brand colors (consistent across every tab) */
+  --tool-claude-code: #f59e0b;
+  --tool-codex: #10b981;
+  --tool-cursor: #a855f7;
+  --tool-cline: #3b82f6;
+  --tool-copilot: #94a3b8;
+  --tool-copilot-cli: #0969da;
+  --tool-cowork: #ec4899;
+  --tool-antigravity: #14b8a6;
+  --tool-opencode: #f97316;
+  --tool-openclaw: #06b6d4;
+  --tool-pi: #84cc16;
+  --tool-gemini: #6366f1;
+  --tool-other: #64748b;
+
+  /* Action-type category colors */
+  --act-file: #60a5fa;
+  --act-cmd: #34d399;
+  --act-search: #a855f7;
+  --act-web: #14b8a6;
+  --act-meta: #94a3b8;
+  --act-fail: #f87171;
+  --act-agent: #ec4899;
+  --act-mcp: #fbbf24;
+  --act-user: #c084fc;
+
+  /* Pattern type colors */
+  --pat-hot: #fbbf24;
+  --pat-cochange: #60a5fa;
+  --pat-edittest: #34d399;
+  --pat-knowledge: #c084fc;
+  --pat-command: #06b6d4;
+
+  /* Reliability */
+  --rel-accurate: var(--success);
+  --rel-approximate: var(--warn);
+  --rel-unreliable: var(--danger);
+
+  /* Radius */
+  --r-1: 4px;
+  --r-2: 6px;
+  --r-3: 8px;
+  --r-4: 12px;
+  --r-pill: 999px;
+
+  /* Layout */
+  --sidebar-w: 220px;
+  --sidebar-w-collapsed: 56px;
+  --header-h: 52px;
+  --filterbar-h: 56px;
+
+  /* Shadow */
+  --shadow-1:
+    0 1px 0 rgba(255, 255, 255, 0.02) inset,
+    0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-2:
+    0 4px 16px rgba(0, 0, 0, 0.4),
+    0 1px 0 rgba(255, 255, 255, 0.02) inset;
+  --shadow-3:
+    0 16px 48px rgba(0, 0, 0, 0.55),
+    0 1px 0 rgba(255, 255, 255, 0.03) inset;
+  --shadow-drawer: -16px 0 48px rgba(0, 0, 0, 0.6);
+
+  /* Motion */
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --dur-fast: 120ms;
+  --dur: 200ms;
+}
+
+:root[data-theme="light"] {
+  --bg-0: #f4f5f9;
+  --bg-1: #ffffff;
+  --bg-2: #ffffff;
+  --bg-3: #f6f7fb;
+  --bg-4: #eef0f6;
+  --bg-5: #e2e6ef;
+
+  --line-1: #ebedf2;
+  --line-2: #dde0e8;
+  --line-3: #c1c6d2;
+
+  --fg-0: #0c0f15;
+  --fg-1: #1b1f28;
+  --fg-2: #56607a;
+  --fg-3: #828aa0;
+  --fg-4: #b3b9c7;
+
+  --brand-soft: rgba(139, 92, 246, 0.1);
+
+  --accent: #4763ed;
+  --accent-strong: #3850dd;
+  --accent-soft: rgba(71, 99, 237, 0.1);
+  --accent-ring: rgba(71, 99, 237, 0.25);
+  --on-accent: #ffffff;
+
+  --success: #10b981;
+  --success-soft: rgba(16, 185, 129, 0.1);
+  --warn: #d97706;
+  --warn-soft: rgba(217, 119, 6, 0.1);
+  --danger: #e53e3e;
+  --danger-soft: rgba(229, 62, 62, 0.1);
+  --info: #2563eb;
+  --info-soft: rgba(37, 99, 235, 0.1);
+
+  --tok-net: #2563eb;
+  --tok-read: #7c3aed;
+  --tok-write: #d97706;
+  --tok-out: #db2777;
+
+  --tool-claude-code: #d97706;
+  --tool-codex: #059669;
+  --tool-cursor: #7c3aed;
+  --tool-cline: #2563eb;
+  --tool-copilot: #64748b;
+  --tool-copilot-cli: #0550ae;
+  --tool-cowork: #db2777;
+  --tool-antigravity: #0d9488;
+  --tool-opencode: #ea580c;
+  --tool-openclaw: #0891b2;
+  --tool-pi: #65a30d;
+  --tool-gemini: #4f46e5;
+  --tool-other: #475569;
+
+  --act-file: #2563eb;
+  --act-cmd: #10b981;
+  --act-search: #7c3aed;
+  --act-web: #0d9488;
+  --act-meta: #64748b;
+  --act-fail: #e53e3e;
+  --act-agent: #db2777;
+  --act-mcp: #d97706;
+  --act-user: #9333ea;
+
+  --pat-hot: #d97706;
+  --pat-cochange: #2563eb;
+  --pat-edittest: #10b981;
+  --pat-knowledge: #9333ea;
+  --pat-command: #0891b2;
+
+  --shadow-1:
+    0 1px 0 rgba(0, 0, 0, 0.02),
+    0 1px 2px rgba(15, 23, 42, 0.04);
+  --shadow-2:
+    0 4px 16px rgba(15, 23, 42, 0.06),
+    0 1px 0 rgba(0, 0, 0, 0.02);
+  --shadow-3:
+    0 16px 48px rgba(15, 23, 42, 0.12),
+    0 1px 0 rgba(0, 0, 0, 0.02);
+  --shadow-drawer: -16px 0 48px rgba(15, 23, 42, 0.12);
+}

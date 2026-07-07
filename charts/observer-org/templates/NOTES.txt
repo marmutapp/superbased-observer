@@ -1,0 +1,29 @@
+observer-org {{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+The server listens on :{{ .Values.service.port }} (plain HTTP — terminate TLS
+upstream at your Ingress / load balancer).
+
+Next steps:
+{{- if not .Values.secrets.existingSecret }}
+
+  ⚠  secrets.existingSecret is NOT set. Create a Secret with these keys and
+     set secrets.existingSecret to its name, then upgrade:
+       bearer-signing.key  session.key  sp.crt  sp.key  scim-token
+{{- end }}
+
+  1. Point your SAML IdP at:   {{ .Values.config.externalURL }}/saml/metadata
+     (the SP entity ID is {{ .Values.config.saml.spEntityID }})
+  2. Configure SCIM in your IdP against:  {{ .Values.config.externalURL }}/scim/v2
+     using the bearer token from the scim-token secret key.
+  3. Designate org admins via config.dashboard.adminEmails (currently:
+     {{- if .Values.config.dashboard.adminEmails }} {{ join ", " .Values.config.dashboard.adminEmails }}{{- else }} none — no one can see the org dashboard until set{{- end }}).
+  4. Mint the first enrolment token:
+       kubectl exec deploy/{{ include "observer-org.fullname" . }} -- \
+         observer-org new-enrolment-token --config /etc/observer-org/config.toml
+  5. On a developer machine:  observer enroll <external-url> <token>
+
+Health check (in-cluster):
+  kubectl port-forward svc/{{ include "observer-org.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  curl -k https://localhost:{{ .Values.service.port }}/saml/metadata
+
+See docs/teams-getting-started.md and docs/teams-operations.md for the full runbook.

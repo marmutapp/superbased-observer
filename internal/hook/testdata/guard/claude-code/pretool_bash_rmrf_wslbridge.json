@@ -1,0 +1,11 @@
+{
+  "session_id": "fixture-cc-bridge-1",
+  "transcript_path": "C:\\Users\\dev\\.claude\\projects\\proj\\fixture-cc-bridge-1.jsonl",
+  "cwd": "C:\\Users\\dev\\proj",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "rm -rf ~",
+    "description": "clean everything (fired by Windows Claude Code, evaluated through the wsl.exe bridge)"
+  }
+}
