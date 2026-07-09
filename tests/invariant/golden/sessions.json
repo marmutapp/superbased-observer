@@ -1,0 +1,83 @@
+{
+  "days": 30,
+  "limit": 50,
+  "page": 1,
+  "page_ai_cost_usd": 0.0669,
+  "page_cost_usd": 0.0669,
+  "page_tool_cost_usd": 0,
+  "rows": [
+    {
+      "ai_cost_usd": 0.0188,
+      "cache_creation_1h_tokens": 0,
+      "cache_creation_tokens": 0,
+      "cache_read_tokens": 0,
+      "cost_reliability": "accurate",
+      "cost_usd": 0.0188,
+      "duration_seconds": 60,
+      "id": "sess-cdx-1",
+      "input_tokens": 900,
+      "last_seen_at": "\u003cTS\u003e",
+      "models": [
+        "gpt-5-codex"
+      ],
+      "output_tokens": 600,
+      "project": "/inv/project-beta",
+      "sidechain_action_count": 0,
+      "started_at": "\u003cTS\u003e",
+      "tool": "codex",
+      "tool_cost_usd": 0,
+      "total_actions": 2,
+      "total_tokens": 1500
+    },
+    {
+      "ai_cost_usd": 0.006,
+      "cache_creation_1h_tokens": 0,
+      "cache_creation_tokens": 0,
+      "cache_read_tokens": 0,
+      "cost_reliability": "unreliable",
+      "cost_usd": 0.006,
+      "duration_seconds": 60,
+      "id": "sess-cur-1",
+      "input_tokens": 500,
+      "last_seen_at": "\u003cTS\u003e",
+      "models": [
+        "claude-sonnet-4-5"
+      ],
+      "output_tokens": 300,
+      "project": "/inv/project-alpha",
+      "sidechain_action_count": 0,
+      "started_at": "\u003cTS\u003e",
+      "tool": "cursor",
+      "tool_cost_usd": 0,
+      "total_actions": 2,
+      "total_tokens": 800
+    },
+    {
+      "ai_cost_usd": 0.0421,
+      "cache_creation_1h_tokens": 0,
+      "cache_creation_tokens": 0,
+      "cache_read_tokens": 4000,
+      "cost_reliability": "accurate",
+      "cost_usd": 0.0421,
+      "duration_seconds": 120,
+      "id": "sess-cc-1",
+      "input_tokens": 1200,
+      "last_seen_at": "\u003cTS\u003e",
+      "models": [
+        "claude-opus-4-7"
+      ],
+      "output_tokens": 800,
+      "project": "/inv/project-alpha",
+      "sidechain_action_count": 0,
+      "started_at": "\u003cTS\u003e",
+      "tool": "claude-code",
+      "tool_cost_usd": 0,
+      "total_actions": 3,
+      "total_tokens": 6000
+    }
+  ],
+  "scored_count": 0,
+  "sort_by": "started_at",
+  "sort_dir": "desc",
+  "total": 3
+}

@@ -1,0 +1,117 @@
+/* Only the Latin subset — dashboard is en-US. Mirrors web/src/index.css
+ * so the embedded font assets match the primary dashboard. */
+@import "@fontsource/inter/latin-400.css";
+@import "@fontsource/inter/latin-500.css";
+@import "@fontsource/inter/latin-600.css";
+@import "@fontsource/inter/latin-700.css";
+@import "@fontsource/jetbrains-mono/latin-400.css";
+@import "@fontsource/jetbrains-mono/latin-500.css";
+@import "./styles/tokens.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-bg-0 text-fg-1 font-sans antialiased;
+    font-size: 13px;
+    line-height: 1.4;
+  }
+
+  code,
+  kbd,
+  samp,
+  pre {
+    @apply font-mono;
+  }
+}
+
+@keyframes shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+/* Indeterminate sweep for the DataTable loading stripe (mirror of web/). */
+@keyframes datatable-stripe {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(400%);
+  }
+}
+
+@layer utilities {
+  .animate-shimmer::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background-image: linear-gradient(
+      90deg,
+      rgba(255, 255, 255, 0) 0%,
+      rgba(255, 255, 255, 0.04) 50%,
+      rgba(255, 255, 255, 0) 100%
+    );
+    animation: shimmer 1.6s var(--ease) infinite;
+  }
+}
+
+/* ============================================================
+   Scrollbars — themed against the dashboard tokens (mirror of web/).
+   ============================================================ */
+* {
+  scrollbar-color: var(--line-3) transparent;
+  scrollbar-width: thin;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+  background: transparent;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--line-3);
+  border-radius: 999px;
+  border: 2px solid var(--bg-0);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--fg-3);
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ============================================================
+   Native form controls — themed <select> / <option> panels.
+   ============================================================ */
+select,
+option {
+  background-color: var(--bg-2);
+  color: var(--fg-1);
+}
+option {
+  padding: 4px 8px;
+}
+option:checked,
+option:hover {
+  background-color: var(--bg-3);
+  color: var(--fg-0);
+}
+input::placeholder,
+textarea::placeholder {
+  color: var(--fg-4);
+}

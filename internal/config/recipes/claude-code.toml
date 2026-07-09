@@ -1,0 +1,126 @@
+# claude-code recipe — for Anthropic Claude models via Claude Code
+#
+# USE THIS WHEN you're driving Claude Code (or any other client that
+# talks to Anthropic's Messages API) with an Anthropic model:
+#
+#     claude-sonnet-4-6     claude-opus-4-7     claude-haiku-4-5
+#     claude-opus-4-8       claude-sonnet-4-7   (or any claude-*)
+#
+# DO NOT USE THIS for:
+#   * OpenAI's `-codex` reasoning models
+#     (gpt-5.3-codex, gpt-5.4-codex, …)          → use `codex-variant`
+#   * Plain OpenAI GPT models running under
+#     the codex CLI (gpt-5.4, gpt-5.5, mini, …)  → use `codex-safe`
+#
+# This recipe is the empirically-best Claude Code default as of v1.7.23
+# (2026-06-01). It supersedes v1.7.22's `compress_types = []` passthrough.
+#
+# PLUS one operator-side environment variable in the launching
+# shell (NOT in this recipe — the recipe configures the proxy; this var
+# configures Claude Code's SDK):
+#
+#   export ENABLE_TOOL_SEARCH=true
+#
+# Without that env var, Claude Code's SDK disables `ToolSearch:optimistic`
+# deferred MCP loading whenever ANTHROPIC_BASE_URL is set (the proxy's
+# requirement), which eagerly inlines all registered MCP tool schemas
+# into every request — a ~+21K-token per-turn prefix penalty on this
+# reference rig. Setting ENABLE_TOOL_SEARCH=true re-enables ToolSearch
+# under a non-first-party base URL; observer's proxy is byte-passthrough
+# on `tool_reference` blocks, which satisfies the SDK's documented safety
+# condition for the override. See:
+#
+#   strings ~/.local/share/claude/versions/*/claude | grep ENABLE_TOOL_SEARCH
+#   docs/skills/observer-cost-tuning/references/why-toolsearch-disabled.md
+#
+# Empirical baseline (V7-22 binary 0a2b7900400f0674a0aad039ae6f40fd,
+# lumen-style refactor task, Claude Sonnet 4.6 via OAuth, n=4+4+8, salts):
+#
+#   OFF (no proxy):                      $1.148 / 15.0 turns  (CV 7.5%)
+#   B proxy, compress_types=[]:          $1.118 / 15.5 turns  (CV 9.1%)  −2.6%
+#   B proxy, ["json","logs","code"]:     $1.069 / 14.9 turns  (CV 7.6%)  −6.9%  ← this recipe
+#   B proxy, +stash enabled:             $1.349 / 16 turns (n=1 stopped) +17.5% ← stash BREAKS cache (V7-24)
+#
+# Full writeup: docs/v1.7.23-compression-savings-empirical-2026-06-01.md.
+
+[compression.shell]
+enabled          = true
+exclude_commands = ["curl", "playwright"]
+
+[compression.indexing]
+enabled           = true
+max_excerpt_bytes = 2048
+
+[compression.conversation]
+enabled         = true
+mode            = "cache_aware"
+target_ratio    = 0.85
+preserve_last_n = 5
+compress_types  = ["json", "logs", "code", "tools"]
+# V7-23 (2026-06-01): three per-type compressors enabled by default.
+# Re-measured on V7-22 binary at n=8 — produces -6.9% total cost vs
+# no-proxy (n=4 OFF baseline), zero tail outliers, CV 7.6% (tighter
+# than OFF's 7.5%). The V7-22 catastrophic regression that motivated
+# the v1.7.22 passthrough flip was on the V7-21 binary; V7-22's fixes
+# (V7-19 nil-trap + V7-21 tools-defs gate) closed enough of the
+# re-marshal pathway that the per-type compression no longer cascades
+# on V7-22+.
+#
+# A2 (2026-06-11): "tools" ADOPTED as the fourth default. The A/B run
+# (Opus 4.8, Claude Code 2.1.167, n=8/arm salted lumen-style
+# refactors, .tmp-verify/ab-a2 harness) measured -12.5% total cost on
+# valid samples vs this recipe without "tools" ($0.686 vs $0.784,
+# CV 12.8% vs 11.5%) with ZERO tools_changed cache events across 106
+# candidate turns — the trim is byte-stable across turns, so the
+# V7-21 re-marshal tax no longer exists on current binaries. Per-turn
+# cache-READ dropped ~32% (the trimmed tools block is part of the
+# cached prefix). Full record:
+# docs/plans/profile-content-refresh-ab-plan-2026-06-10.md §6.
+#
+# Why these four and not more:
+#   - "code" — the dominant Claude Code workload classifier (Read/Write
+#     tool_results of source files). CodeCompressor is content-preserving
+#     (only trim trailing whitespace, elide leading license headers, dedup
+#     consecutive identical lines). Yields ~5-15% on typical source.
+#   - "logs" — Grep / Glob / shell-output shapes. LogsCompressor head-tail
+#     truncates beyond max_lines=200 only; below threshold it's a no-op.
+#   - "json" — observer MCP tool_results are skipped (mcp__* guard); raw
+#     JSON tool_results from Claude Code itself are rare. Present for
+#     completeness; produces zero events on most workloads.
+#   - "tools" — V7-21 tool-definitions trim (description ≥3 paragraphs
+#     → first 2 + JSON-Schema `examples` strip; names/types/required/
+#     enum never touched). A2-adopted (above).
+#
+# "text" is OMITTED — TextCompressor head-tail elides middle content
+# (the v1.4.38 regression class). Bash output classifies as text on
+# this workload and would lose middle content.
+#
+# To opt out for niche workloads:
+#   compress_types = []                          # v1.7.22 passthrough (no per-type)
+#   compress_types = ["json", "logs", "code"]    # pre-A2 set (no tools trim)
+
+[compression.conversation.logs]
+max_lines = 200
+head      = 100
+tail      = 100
+
+# STASH — disabled by default. DO NOT ENABLE without independent A/B.
+# Stash replaces tool_result bodies with `[stashed: sha256:...]` markers
+# when post-per-type size > threshold_bytes. The model retrieves via the
+# `mcp__observer__retrieve_stashed` MCP tool. Lossless via round-trip.
+#
+# BUT — content replacement (marker substituted for body) changes the
+# request's prefix bytes versus what Anthropic cached before, which
+# breaks Anthropic's prefix cache. V7-24 (2026-06-01) n=1 measurement:
+# stash-enabled B1 cost $1.349 vs Plan A B1 $1.076 (+25.3%) with
+# cache_creation_input_tokens nearly doubled (81K vs 41K).
+# The MCP retrieval round-trip alone costs more than the bytes-on-the-
+# wire savings. Tracked for v1.8.x: either drop stash entirely or make
+# stash markers byte-stable across turns (so the cache prefix hash
+# matches when the same body is stashed in turn N and re-stashed in
+# turn N+1 — currently the marker contains a freshly-incremented
+# index, breaking byte-stability).
+[compression.conversation.stash]
+enabled         = false
+threshold_bytes = 8192
+max_total_mb    = 1024

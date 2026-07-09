@@ -1,0 +1,186 @@
+=== plugins.py — PluginContext class ===
+289:class PluginContext:
+290-    """Facade given to plugins so they can register tools and hooks."""
+291-
+292-    def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
+293-        self.manifest = manifest
+294-        self._manager = manager
+295-        # Lazy-built host-owned LLM facade — see ctx.llm property below.
+296-        self._llm: Any = None
+297-
+298-    # -- host-owned LLM access ----------------------------------------------
+299-
+300-    @property
+301-    def llm(self) -> Any:
+302-        """Return the plugin's :class:`agent.plugin_llm.PluginLlm` facade.
+303-
+304-        Lets trusted plugins run host-owned chat or structured completions
+305-        against the user's active model and auth without bringing their
+306-        own provider keys. Override capability (model, agent id, auth
+307-        profile) is fail-closed by default and gated through
+308-        ``plugins.entries.<plugin_id>.llm.*`` config keys.
+309-
+310-        See :mod:`agent.plugin_llm` for the full surface."""
+311-        if self._llm is None:
+312-            from agent.plugin_llm import PluginLlm
+313-            plugin_id = self.manifest.key or self.manifest.name
+314-            self._llm = PluginLlm(plugin_id=plugin_id)
+315-        return self._llm
+316-
+317-    # -- tool registration --------------------------------------------------
+318-
+319-    def register_tool(
+320-        self,
+321-        name: str,
+322-        toolset: str,
+323-        schema: dict,
+324-        handler: Callable,
+325-        check_fn: Callable | None = None,
+326-        requires_env: list | None = None,
+327-        is_async: bool = False,
+328-        description: str = "",
+329-        emoji: str = "",
+330-        override: bool = False,
+331-    ) -> None:
+332-        """Register a tool in the global registry **and** track it as plugin-provided.
+333-
+334-        Pass ``override=True`` to replace an existing built-in tool with the
+335-        same name (e.g. swap the default ``browser_navigate`` for a custom
+336-        CDP-backed implementation). Without it, attempting to register a name
+337-        already claimed by a different toolset is rejected.
+338-        """
+339-        from tools.registry import registry
+340-
+341-        registry.register(
+342-            name=name,
+343-            toolset=toolset,
+344-            schema=schema,
+345-            handler=handler,
+346-            check_fn=check_fn,
+347-            requires_env=requires_env,
+348-            is_async=is_async,
+349-            description=description,
+350-            emoji=emoji,
+351-            override=override,
+352-        )
+353-        self._manager._plugin_tool_names.add(name)
+354-        logger.debug(
+355-            "Plugin %s registered tool: %s%s",
+356-            self.manifest.name, name, " (override)" if override else "",
+357-        )
+358-
+359-    # -- message injection --------------------------------------------------
+360-
+361-    def inject_message(self, content: str, role: str = "user") -> bool:
+362-        """Inject a message into the active conversation.
+363-
+364-        If the agent is idle (waiting for user input), this starts a new turn.
+365-        If the agent is running, this interrupts and injects the message.
+366-
+367-        This enables plugins (e.g. remote control viewers, messaging bridges)
+368-        to send messages into the conversation from external sources.
+369-
+
+=== plugins.py — register_hook def ===
+936-        )
+937-
+938:    def register_hook(self, hook_name: str, callback: Callable) -> None:
+939-        """Register a lifecycle hook callback.
+940-
+941-        Unknown hook names produce a warning but are still stored so
+942-        forward-compatible plugins don't break.
+943-        """
+944-        if hook_name not in VALID_HOOKS:
+945-            logger.warning(
+946-                "Plugin '%s' registered unknown hook '%s' "
+947-                "(valid: %s)",
+948-                self.manifest.name,
+949-                hook_name,
+950-                ", ".join(sorted(VALID_HOOKS)),
+951-            )
+952-        self._manager._hooks.setdefault(hook_name, []).append(callback)
+953-        logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
+954-
+955-    # -- skill registration -------------------------------------------------
+956-
+957-    def register_skill(
+958-        self,
+959-        name: str,
+960-        path: Path,
+961-        description: str = "",
+962-    ) -> None:
+963-        """Register a read-only skill provided by this plugin.
+964-
+965-        The skill becomes resolvable as ``'<plugin_name>:<name>'`` via
+966-        ``skill_view()``.  It does **not** enter the flat
+967-        ``~/.hermes/skills/`` tree and is **not** listed in the system
+968-        prompt's ``<available_skills>`` index — plugin skills are
+
+=== plugins.py — invoke_hook def ===
+1535-    # -----------------------------------------------------------------------
+1536-
+1537:    def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
+1538-        """Call all registered callbacks for *hook_name*.
+1539-
+1540-        Each callback is wrapped in its own try/except so a misbehaving
+1541-        plugin cannot break the core agent loop.
+1542-
+1543-        Returns a list of non-``None`` return values from callbacks.
+1544-
+1545-        For ``pre_llm_call``, callbacks may return a dict describing
+1546-        context to inject into the current turn's user message::
+1547-
+1548-            {"context": "recalled text..."}
+1549-            "recalled text..."          # plain string, equivalent
+1550-
+1551-        Context is ALWAYS injected into the user message, never the
+1552-        system prompt.  This preserves the prompt cache prefix — the
+1553-        system prompt stays identical across turns so cached tokens
+1554-        are reused.  All injected context is ephemeral — never
+1555-        persisted to session DB.
+1556-        """
+1557-        kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+1558-        callbacks = self._hooks.get(hook_name, [])
+1559-        results: List[Any] = []
+1560-        for cb in callbacks:
+1561-            try:
+1562-                ret = cb(**kwargs)
+1563-                if ret is not None:
+1564-                    results.append(ret)
+1565-            except Exception as exc:
+1566-                logger.warning(
+1567-                    "Hook '%s' callback %s raised: %s",
+--
+1648-
+1649-
+1650:def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
+1651-    """Invoke a lifecycle hook on all loaded plugins.
+1652-
+1653-    Returns a list of non-``None`` return values from plugin callbacks.
+1654-    """
+1655-    return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+1656-
+1657-
+1658-def has_hook(hook_name: str) -> bool:
+1659-    """Return True when a hook has registered callbacks."""
+1660-    return get_plugin_manager().has_hook(hook_name)
+1661-
+1662-
+1663-_thread_tool_whitelist = threading.local()
+1664-
+1665-
+1666-def set_thread_tool_whitelist(
+1667-    allowed: Optional[Set[str]],
+1668-    deny_msg_fmt: str = "Tool '{tool_name}' denied: not in this thread's tool whitelist",
+1669-) -> None:
+1670-    _thread_tool_whitelist.allowed = allowed
+1671-    _thread_tool_whitelist.fmt = deny_msg_fmt
+1672-
+1673-
+1674-def clear_thread_tool_whitelist() -> None:
+1675-    _thread_tool_whitelist.allowed = None
+1676-
+1677-
+1678-def get_pre_tool_call_block_message(
+1679-    tool_name: str,
+1680-    args: Optional[Dict[str, Any]],

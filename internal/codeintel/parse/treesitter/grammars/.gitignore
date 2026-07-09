@@ -1,0 +1,4 @@
+# Raw grammar modules are build output (build.sh / wasi-sdk). Only the
+# zstd-compressed *.wasm.zst is committed + embedded (W1 relief valve,
+# ADR-0006). Regenerate the .wasm with build.sh; zstdpack.go produces the .zst.
+*.wasm

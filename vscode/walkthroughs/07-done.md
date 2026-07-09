@@ -1,0 +1,37 @@
+# You're set
+
+You've got Observer wired into VS Code end-to-end:
+
+- ✅ Binary verified via `Observer: Doctor`
+- ✅ Daemon mode chosen
+- ✅ Dashboard accessible inside the editor
+- ✅ Proxy env vars routable to your AI CLIs
+- ✅ Instruction files updatable from learnings with one click
+
+### Where to go next
+
+- **Full user guide** — `docs/vscode-extension-user-guide.md` in
+  the [repository](https://github.com/marmutapp/superbased-observer)
+  walks through daily workflows for each AI tool (Claude Code,
+  Cursor, Codex, Cline, Copilot).
+- **Reference docs** — `docs/vscode-extension.md` has the command
+  table, settings table, and the binary-resolution precedence.
+- **Dashboard Help drawer** — every chart and column has a
+  one-liner; click the `?` in the dashboard's top bar.
+- **Issues** — file at
+  [github.com/marmutapp/superbased-observer/issues](https://github.com/marmutapp/superbased-observer/issues).
+
+### Common follow-ups
+
+- `Observer: Refresh All Trees` — force-refresh the four sidebar
+  views (Today / Sessions / Discovery / Costs) without waiting for
+  the next poll.
+- `Observer: Stop Daemon` — only available in `managed`/`auto`
+  modes; SIGTERMs the extension-managed daemon with a 5 s grace
+  before SIGKILL.
+
+### Local-first
+
+Everything Observer captures stays on your machine. No telemetry,
+no outbound network calls except a first-install binary download
+from GitHub Releases when no `observer` is found locally.

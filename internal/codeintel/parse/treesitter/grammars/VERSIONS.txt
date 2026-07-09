@@ -1,0 +1,53 @@
+Embedded tree-sitter grammar provenance (regenerate with build.sh).
+
+Build toolchain:
+  wasi-sdk          33.0 (clang 22.1.0, target wasm32-wasip1)  -- no root; tarball
+  runtime host      github.com/tetratelabs/wazero v1.12.0       -- pure Go, CGO-free
+  build command     clang --target=wasm32-wasip1 -O2 -flto -mexec-model=reactor
+                    (tree-sitter core lib.c + grammar parser.c[+scanner.c] + extract.c)
+
+tree-sitter core    cbee4672665173d1702d836353ef7648dc2b2fac
+                    (lib/include api LANGUAGE_VERSION 15, MIN_COMPATIBLE 13;
+                     wasm_store.c excluded — TREE_SITTER_FEATURE_WASM undefined)
+
+Embed model (W1 relief valve, ADR-0006): build.sh emits raw codeintel_<lang>.wasm
+then zstd-compresses each to codeintel_<lang>.wasm.zst (zstdpack.go). Only the
+*.wasm.zst is committed + go:embed'd (decompressed in-memory at runtime); the
+raw *.wasm is gitignored build output.
+
+Grammars (one self-contained codeintel_<lang>.wasm.zst each):
+  rust          tree-sitter-rust        v0.24.2 (77a3747266f4d621d0757825e6b11edcbf991ca5)
+  typescript    tree-sitter-typescript  75b3874edb2dc714fb1fd77a32013d0f8699989f
+  tsx           tree-sitter-typescript  75b3874edb2dc714fb1fd77a32013d0f8699989f (tsx/)
+  python        tree-sitter-python      26855eabccb19c6abf499fbc5b8dc7cc9ab8bc64
+  javascript    tree-sitter-javascript  58404d8cf191d69f2674a8fd507bd5776f46cb11
+                (serves both .js and .jsx — the grammar parses JSX)
+  java          tree-sitter-java        v0.23.5
+  c             tree-sitter-c           v0.24.2
+  cpp           tree-sitter-cpp         v0.23.4
+  csharp        tree-sitter-c-sharp     v0.23.5  (grammar fn tree_sitter_c_sharp)
+  ruby          tree-sitter-ruby        v0.23.1
+  php           tree-sitter-php         v0.24.2  (php/ subdir — full PHP incl. HTML)
+  kotlin        fwcd/tree-sitter-kotlin            0.3.8
+  swift         alex-pinkus/tree-sitter-swift      0.7.3-with-generated-files (committed parser.c)
+  scala         tree-sitter-scala       v0.26.0
+  bash          tree-sitter-bash        v0.25.1
+  lua           tree-sitter-grammars/tree-sitter-lua  v0.5.0
+
+Module sizes (raw .wasm -> compressed .wasm.zst, the shipped/embedded bytes;
+SIZES_PLACEHOLDER — refreshed from the build's zstdpack report):
+  see docs/codeintel/benchmarks.md for the per-module size table; compressed
+  total is the budgeted figure (20 MB/binary — plan §7.2, enforced by
+  parse/treesitter/budget_test.go).
+
+The harness (extract.c) evaluates the standard text predicates #eq? / #not-eq?
+/ #any-of? / #not-any-of? itself (the low-level query cursor does not), so a
+query like the JS/Lua require() rule or the Ruby require/require_relative rule
+can gate on @capture text.
+
+Core tier (thorough calls): rust/typescript/tsx/python/javascript/jsx + java/
+c/cpp/csharp/ruby/php. Extended tier (S + best-effort calls): kotlin/swift/
+scala/bash/lua. Scala imports are intentionally not captured (flat per-segment
+path fields); bash has no import construct. Go is served exactly by goast (no
+wasm grammar). ALL 18 v1 languages now have exact spans. Adding another is
+data: see docs/codeintel/adding-a-language.md.

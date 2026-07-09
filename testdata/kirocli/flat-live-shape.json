@@ -1,0 +1,22 @@
+{
+  "session_id": "bbbbbbbb-2222-4524-95d0-000000000002",
+  "cwd": "/home/dev/project",
+  "created_at": "2026-07-09T10:01:00.000000000Z",
+  "updated_at": "2026-07-09T10:01:05.000000000Z",
+  "title": "quick summary",
+  "session_created_reason": "subagent",
+  "session_state": {
+    "version": "v1",
+    "conversation_metadata": {
+      "user_turn_start_request": null,
+      "last_request": null
+    },
+    "rts_model_state": {
+      "conversation_id": "bbbbbbbb-2222-4524-95d0-000000000002",
+      "model_info": { "model_id": "auto", "context_window_tokens": 200000 },
+      "context_usage_percentage": 1.0
+    },
+    "agent_name": "kiro_default",
+    "goal": null
+  }
+}

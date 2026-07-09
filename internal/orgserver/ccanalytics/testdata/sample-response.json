@@ -1,0 +1,100 @@
+{
+  "_comment": "Anonymized reference payload for the Claude Code Analytics API, transcribed verbatim from the official docs example at https://platform.claude.com/docs/en/build-with-claude/claude-code-analytics-api (response structure section), 2026-06-16. This is the documented shape, NOT a live capture — values are illustrative. A live capture against a real Admin key is still recommended to confirm field nullability and the multi_edit_tool / subscription-customer cases.",
+  "data": [
+    {
+      "date": "2025-09-01T00:00:00Z",
+      "actor": {
+        "type": "user_actor",
+        "email_address": "dev@acme.example"
+      },
+      "organization_id": "dc9f6c26-b22c-4831-8d01-0446bada88f1",
+      "customer_type": "api",
+      "terminal_type": "vscode",
+      "core_metrics": {
+        "num_sessions": 5,
+        "lines_of_code": {
+          "added": 1543,
+          "removed": 892
+        },
+        "commits_by_claude_code": 12,
+        "pull_requests_by_claude_code": 2
+      },
+      "tool_actions": {
+        "edit_tool": {
+          "accepted": 45,
+          "rejected": 5
+        },
+        "multi_edit_tool": {
+          "accepted": 12,
+          "rejected": 2
+        },
+        "write_tool": {
+          "accepted": 8,
+          "rejected": 1
+        },
+        "notebook_edit_tool": {
+          "accepted": 3,
+          "rejected": 0
+        }
+      },
+      "model_breakdown": [
+        {
+          "model": "claude-opus-4-7",
+          "tokens": {
+            "input": 100000,
+            "output": 35000,
+            "cache_read": 10000,
+            "cache_creation": 5000
+          },
+          "estimated_cost": {
+            "currency": "USD",
+            "amount": 1025
+          }
+        }
+      ]
+    },
+    {
+      "_comment": "Illustrative second row showing an api_actor (service/CI key) — no email_address, identified by api_key_name. This row has NO org-member email to join on.",
+      "date": "2025-09-01T00:00:00Z",
+      "actor": {
+        "type": "api_actor",
+        "api_key_name": "ci-runner-prod"
+      },
+      "organization_id": "dc9f6c26-b22c-4831-8d01-0446bada88f1",
+      "customer_type": "api",
+      "terminal_type": "tmux",
+      "core_metrics": {
+        "num_sessions": 2,
+        "lines_of_code": {
+          "added": 210,
+          "removed": 40
+        },
+        "commits_by_claude_code": 0,
+        "pull_requests_by_claude_code": 0
+      },
+      "tool_actions": {
+        "edit_tool": {
+          "accepted": 6,
+          "rejected": 1
+        }
+      },
+      "model_breakdown": [
+        {
+          "model": "claude-sonnet-4-5",
+          "tokens": {
+            "input": 22000,
+            "output": 4000,
+            "cache_read": 1500,
+            "cache_creation": 800
+          },
+          "estimated_cost": {
+            "currency": "USD",
+            "amount": 140
+          }
+        }
+      ]
+    }
+  ],
+  "has_more": false,
+  "next_page": null
+}
