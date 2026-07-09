@@ -1,0 +1,4 @@
+{"type":"user","uuid":"u-1","timestamp":"2026-07-09T04:54:27.199Z","message":{"role":"user","content":"first prompt"},"parentUuid":null,"isSidechain":false,"cwd":"/home/dev/proj","sessionId":"sess-mal","version":"1.0.40","gitBranch":"main"}
+{ this is not valid json at all ][
+
+{"type":"assistant","uuid":"u-2","timestamp":"2026-07-09T04:54:32.528Z","message":{"id":"chatcmpl-M","role":"assistant","model":"","content":[{"type":"text","text":"recovered assistant reply"}]},"parentUuid":"u-1","isSidechain":false,"cwd":"/home/dev/proj","sessionId":"sess-mal","version":"1.0.40","gitBranch":"main"}

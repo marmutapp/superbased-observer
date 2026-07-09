@@ -1,0 +1,4 @@
+{"ts": "2026-07-08T22:59:32.288Z", "src": "shell", "pid": 1000, "lvl": "info", "msg": "agent initialized"}
+{"ts": "2026-07-09T00:02:30.872Z", "src": "shell", "pid": 1000, "lvl": "info", "sid": "019f0000-0000-7000-8000-000000000001", "msg": "shell.turn.inference_done", "ctx": {"loop_index": 1, "model_elapsed_ms": 3382, "ttft_ms": 2133, "attempts": 1, "prompt_tokens": 12438, "cached_prompt_tokens": 11136, "completion_tokens": 96, "reasoning_tokens": 28, "tokens_per_sec": 142.5}}
+{"ts": "2026-07-09T00:02:51.860Z", "src": "shell", "pid": 1000, "lvl": "info", "sid": "019f0000-0000-7000-8000-000000000001", "msg": "shell.turn.inference_done", "ctx": {"loop_index": 2, "prompt_tokens": 26346, "cached_prompt_tokens": 25984, "completion_tokens": 154, "reasoning_tokens": 53}}
+{"ts": "2026-07-09T00:02:52.000Z", "src": "shell", "pid": 1000, "lvl": "info", "sid": "019f0000-0000-7000-8000-000000000001", "msg": "turn.complete", "ctx": {"ok": true}}

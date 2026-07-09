@@ -1,0 +1,46 @@
+=== plugin loader sources ===
+/home/marmu/.hermes/hermes-agent/hermes_cli/hooks.py
+/home/marmu/.hermes/hermes-agent/hermes_cli/plugins.py
+/home/marmu/.hermes/hermes-agent/hermes_cli/main.py
+/home/marmu/.hermes/hermes-agent/hermes_cli/config.py
+/home/marmu/.hermes/hermes-agent/hermes_cli/tips.py
+/home/marmu/.hermes/hermes-agent/tests/test_model_tools.py
+/home/marmu/.hermes/hermes-agent/tests/hermes_cli/test_hooks_cli.py
+/home/marmu/.hermes/hermes-agent/tests/hermes_cli/test_plugins.py
+/home/marmu/.hermes/hermes-agent/tests/test_transform_llm_output_hook.py
+/home/marmu/.hermes/hermes-agent/tests/run_agent/test_compression_boundary_hook.py
+=== plugin loader file (first match) ===
+Plugin loader candidate: /home/marmu/.hermes/hermes-agent/hermes_cli/plugins.py
+=== sample plugin layout (if any plugins are shipped) ===
+/home/marmu/.hermes/hermes-agent/tests/plugins
+/home/marmu/.hermes/hermes-agent/tests/fixtures/plugins
+/home/marmu/.hermes/hermes-agent/plugins
+/home/marmu/.hermes/hermes-agent/node_modules/prettier/plugins
+/home/marmu/.hermes/hermes-agent/node_modules/pretty-format/build/plugins
+=== built-in plugin manifest example ===
+/home/marmu/.hermes/hermes-agent/plugins/observability/nemo_relay/plugin.yaml
+/home/marmu/.hermes/hermes-agent/plugins/observability/langfuse/plugin.yaml
+/home/marmu/.hermes/hermes-agent/plugins/platforms/line/plugin.yaml
+/home/marmu/.hermes/hermes-agent/plugins/platforms/discord/plugin.yaml
+/home/marmu/.hermes/hermes-agent/plugins/platforms/teams/plugin.yaml
+/home/marmu/.hermes/hermes-agent/plugins/platforms/google_chat/plugin.yaml
+/home/marmu/.hermes/hermes-agent/plugins/platforms/mattermost/plugin.yaml
+/home/marmu/.hermes/hermes-agent/plugins/platforms/irc/plugin.yaml
+/home/marmu/.hermes/hermes-agent/plugins/platforms/simplex/plugin.yaml
+/home/marmu/.hermes/hermes-agent/plugins/platforms/ntfy/plugin.yaml
+=== check for hook event names used in source ===
+/home/marmu/.hermes/hermes-agent/hermes_cli/hooks.py
+/home/marmu/.hermes/hermes-agent/hermes_cli/plugins.py
+/home/marmu/.hermes/hermes-agent/hermes_cli/main.py
+/home/marmu/.hermes/hermes-agent/hermes_cli/config.py
+/home/marmu/.hermes/hermes-agent/hermes_cli/tips.py
+/home/marmu/.hermes/hermes-agent/tests/test_model_tools.py
+/home/marmu/.hermes/hermes-agent/tests/hermes_cli/test_dashboard_admin_endpoints.py
+/home/marmu/.hermes/hermes-agent/tests/hermes_cli/test_hooks_cli.py
+/home/marmu/.hermes/hermes-agent/tests/hermes_cli/test_plugins.py
+/home/marmu/.hermes/hermes-agent/tests/test_transform_llm_output_hook.py
+/home/marmu/.hermes/hermes-agent/tests/run_agent/test_tool_call_guardrail_runtime.py
+/home/marmu/.hermes/hermes-agent/tests/run_agent/test_commit_memory_session_context_engine.py
+/home/marmu/.hermes/hermes-agent/tests/run_agent/test_compression_boundary_hook.py
+/home/marmu/.hermes/hermes-agent/tests/run_agent/test_background_review_toolset_restriction.py
+/home/marmu/.hermes/hermes-agent/tests/run_agent/test_compression_feasibility.py

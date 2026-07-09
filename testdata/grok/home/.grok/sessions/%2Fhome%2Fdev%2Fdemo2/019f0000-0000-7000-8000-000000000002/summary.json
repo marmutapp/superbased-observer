@@ -1,0 +1,11 @@
+{
+  "info": {
+    "id": "019f0000-0000-7000-8000-000000000002",
+    "cwd": "/home/dev/demo2"
+  },
+  "current_model_id": "grok-4.5",
+  "git_root_dir": "/home/dev/demo2",
+  "head_branch": "main",
+  "reasoning_effort": "medium",
+  "agent_name": "grok-build"
+}

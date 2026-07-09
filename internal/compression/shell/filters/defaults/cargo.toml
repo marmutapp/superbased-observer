@@ -1,0 +1,34 @@
+# Default filter for `cargo`. Two specs ship side-by-side:
+#
+#   1. The generic `cargo` spec: drops `Fresh` cache-hit progress lines
+#      that cargo emits once per up-to-date crate (commonly the bulk of
+#      workspace build output) while keeping `Compiling`, `Finished`,
+#      and warning/error lines.
+#   2. A subcommand-targeted `cargo test` spec: parses the libtest
+#      NDJSON stream from `cargo test -- --format json` and emits a
+#      compact summary with per-failure detail. When the stream isn't
+#      libtest JSON (no `--format json` flag, or output was redirected
+#      mid-run) the rule falls back to verbatim emit so non-JSON
+#      cargo-test output passes through unchanged.
+
+[[filter]]
+command = "cargo"
+description = "drop cargo 'Fresh' cache-hit progress and squash blank lines"
+
+[[filter.rule]]
+type = "line_drop"
+pattern = '^\s*Fresh\s'
+comment = "crate already cached; no work performed"
+
+[[filter.rule]]
+type = "squash_whitespace"
+
+[[filter]]
+command = "cargo"
+subcommands = ["test"]
+description = "parse `cargo test -- --format json` NDJSON into a compact summary"
+
+[[filter.rule]]
+type = "format_parse"
+format = "cargo_test_json"
+comment = "libtest NDJSON; falls back to verbatim if stream isn't JSON"

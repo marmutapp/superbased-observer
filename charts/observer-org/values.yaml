@@ -1,0 +1,155 @@
+# Default values for the observer-org chart.
+# Every value is documented; see docs/teams-operations.md for the runbook.
+
+# observer-org is a stateful singleton: it owns one SQLite DB on a
+# persistent volume. Do NOT raise replicaCount above 1 — there is no
+# multi-writer story for the embedded SQLite store.
+replicaCount: 1
+
+image:
+  repository: ghcr.io/marmutapp/observer-org
+  pullPolicy: IfNotPresent
+  # Defaults to the chart's appVersion when empty. Override per release,
+  # e.g. tag: v1.7.0.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# ---------------------------------------------------------------------------
+# Secrets. The server reads its keys/certs from files. The recommended
+# pattern is to create the Secret out-of-band (from your secret manager /
+# sealed-secrets / external-secrets) and reference it here by name — secrets
+# never live in this values file or in git.
+#
+# The referenced Secret MUST contain these keys (each becomes a file under
+# /etc/observer-org/secrets/):
+#   bearer-signing.key   Ed25519 private key (PKCS#8 PEM) — signs agent bearers
+#   session.key          32 random bytes — HMAC dashboard session cookies
+#   sp.crt               SAML SP certificate (PEM)
+#   sp.key               SAML SP private key (PEM)
+#   scim-token           opaque SCIM bearer token (the IdP authenticates with it)
+secrets:
+  # Name of a pre-created Secret holding the five keys above. Required.
+  existingSecret: ""
+  # Mode the mounted secret files are created with (octal). The process runs
+  # as uid 65532 and the files are owned by the pod's fsGroup, so 0400 is read.
+  defaultMode: 0400
+
+# ---------------------------------------------------------------------------
+# Server config (rendered into /etc/observer-org/config.toml). Secret-file
+# paths are fixed to the in-pod mount and are not configurable here.
+config:
+  # Public URL the IdP and agents reach the server at. TLS is terminated
+  # upstream (Ingress / LB), so this is https even though the container
+  # listens on plain :8443.
+  externalURL: "https://observer-org.example.com"
+  # Days of org data retained server-side before pruning.
+  dataRetentionDays: 730
+  logLevel: "info"
+
+  saml:
+    spEntityID: "https://observer-org.example.com/saml/metadata"
+    # REQUIRED in practice — the SAML IdP metadata endpoint. The server
+    # fetches it at startup and fails fast if unreachable, so the example
+    # default must be replaced with your IdP's real metadata URL.
+    idpMetadataURL: "https://idp.example.com/saml/metadata"
+    # Maps IdP assertion attributes onto the user fields the server needs.
+    attributeMapping:
+      email: "email"
+      display_name: "displayName"
+      groups: "groups"
+
+  dashboard:
+    # Org admins — emails that resolve to the admin role. Everyone else is a
+    # member; team leads come from SCIM group membership (M3 role model).
+    adminEmails: []
+    budgetPollSeconds: 60
+
+  bearer:
+    defaultLifetimeDays: 90
+
+  enrolment:
+    defaultTokenLifetimeDays: 7
+
+# ---------------------------------------------------------------------------
+# Persistence for the server SQLite DB at /var/lib/observer-org.
+persistence:
+  enabled: true
+  # Leave empty to use the cluster default StorageClass.
+  storageClass: ""
+  accessMode: ReadWriteOnce
+  size: 8Gi
+  # Set to an existing PVC name to reuse a volume instead of provisioning.
+  existingClaim: ""
+
+# ---------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 8443
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: observer-org.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: observer-org-tls
+  #    hosts:
+  #      - observer-org.example.com
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+# Pod-level security context. The distroless image runs as nonroot uid/gid
+# 65532; fsGroup makes the persistent volume writable by that user.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level hardening. The server only writes to the data volume
+# (and /tmp, mounted as an emptyDir), so the root filesystem stays read-only.
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# TCP probes — the server has no documented health path; a successful
+# accept on :8443 means it is listening.
+livenessProbe:
+  tcpSocket:
+    port: 8443
+  initialDelaySeconds: 10
+  periodSeconds: 20
+readinessProbe:
+  tcpSocket:
+    port: 8443
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}

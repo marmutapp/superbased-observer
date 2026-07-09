@@ -1,0 +1,6 @@
+{"type": "metadata", "protocol_version": "1.4", "created_at": 1783578000000}
+{"type": "turn.prompt", "input": [{"type": "text", "text": "Research the codebase then summarize"}], "origin": {"kind": "user"}, "time": 1783578000500}
+{"type": "llm.request", "model": "gpt-4o", "modelAlias": "openai/gpt-4o", "time": 1783578000600}
+{"type": "context.append_loop_event", "event": {"type": "tool.call", "uuid": "call_spawn0001", "turnId": "0", "step": 1, "toolCallId": "call_spawn0001", "name": "Agent", "args": {"prompt": "Find all TODO comments"}, "description": "Delegating to researcher"}, "time": 1783578001000}
+{"type": "context.append_loop_event", "event": {"type": "tool.result", "parentUuid": "call_spawn0001", "toolCallId": "call_spawn0001", "result": {"output": "Found 3 TODOs."}}, "time": 1783578009000}
+{"type": "usage.record", "model": "openai/gpt-4o", "usage": {"inputOther": 2000, "output": 60, "inputCacheRead": 0, "inputCacheCreation": 0}, "usageScope": "turn", "time": 1783578009500}

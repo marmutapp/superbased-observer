@@ -1,0 +1,33 @@
+# Default filters for Docker. The generic filter squashes blank-line runs;
+# the `build` / `buildx` subcommand filter additionally strips BuildKit cache
+# markers and layer-completion timestamps, which dominate successful-build
+# output with zero signal for the reader.
+
+[[filter]]
+command = "docker"
+description = "collapse blank-line runs in docker output"
+[[filter.rule]]
+type = "squash_whitespace"
+
+[[filter]]
+command = "docker"
+subcommands = ["build", "buildx"]
+description = "drop BuildKit cache hits and layer-completion noise"
+
+[[filter.rule]]
+type = "line_drop"
+pattern = '^#\d+ CACHED'
+comment = "layers served from the BuildKit cache"
+
+[[filter.rule]]
+type = "line_drop"
+pattern = '^#\d+\s+DONE\s+\d+(\.\d+)?s'
+comment = "per-layer completion timestamps"
+
+[[filter.rule]]
+type = "line_drop"
+pattern = '^#\d+\s+sha256:'
+comment = "raw sha256 digest echoes"
+
+[[filter.rule]]
+type = "squash_whitespace"

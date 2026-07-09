@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "superbased-observer"
+dynamic = ["version"]
+description = "SuperBased Observer — capture, normalize, compress, and analyze AI coding tool activity across Claude Code, Codex, Cursor, Cline/Roo, and Copilot."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Santosh Kathira", email = "contact@superbased.app" }]
+requires-python = ">=3.8"
+keywords = [
+  "ai",
+  "observability",
+  "anthropic",
+  "openai",
+  "claude-code",
+  "codex",
+  "cursor",
+  "mcp",
+  "tokens",
+  "cost",
+]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "Intended Audience :: System Administrators",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development",
+  "Topic :: System :: Monitoring",
+]
+
+[project.urls]
+Homepage = "https://superbased.app/"
+Source = "https://github.com/marmutapp/superbased-observer"
+Documentation = "https://github.com/marmutapp/superbased-observer#readme"
+Issues = "https://github.com/marmutapp/superbased-observer/issues"
+Changelog = "https://github.com/marmutapp/superbased-observer/blob/main/CHANGELOG.md"
+
+[project.scripts]
+observer = "observer.__main__:main"
+
+[tool.hatch.version]
+path = "src/observer/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+# `packages` excludes _bin/ explicitly because hatchling's default
+# file-collection respects .gitignore — and our .gitignore lists the
+# staged binaries (observer, observer.exe, antigravity-bridge.exe)
+# to keep them out of source control. Without the explicit exclude,
+# hatchling would also process _bin/ through the gitignore filter,
+# which silently drops the binaries from the wheel (v1.7.25 footgun:
+# wheels uploaded at 24 KB without the binary).
+#
+# Instead, the binaries are pulled in via the `force-include` table
+# below, which bypasses gitignore. CI populates _bin/ at wheel-build
+# time per platform; locally, the smoke test must populate it the
+# same way.
+packages = ["src/observer"]
+exclude = ["src/observer/_bin"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/observer/_bin" = "observer/_bin"
