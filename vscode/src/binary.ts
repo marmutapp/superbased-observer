@@ -37,14 +37,19 @@ export async function resolveBinary(ctx: vscode.ExtensionContext): Promise<Resol
     return { path: fromSetting, version: await readVersion(fromSetting), source: 'setting' };
   }
 
-  const onPath = await which('observer');
-  if (onPath) {
-    return { path: onPath, version: await readVersion(onPath), source: 'path' };
-  }
-
+  // Prefer the bundled, version-matched binary before scanning PATH.
+  // `which` is only a fallback for installs that ship no bundled binary;
+  // running it on the activation hot path cost ~20s during VS Code startup
+  // (a ~N*M sequential stat scan starved by a saturated extension host).
+  // Users who deliberately want a different binary set `observer.binary.path`.
   const bundled = path.join(ctx.extensionPath, 'bin', exeName());
   if (await fileExists(bundled)) {
     return { path: bundled, version: await readVersion(bundled), source: 'bundled' };
+  }
+
+  const onPath = await which('observer');
+  if (onPath) {
+    return { path: onPath, version: await readVersion(onPath), source: 'path' };
   }
 
   return await downloadFromReleases(ctx);
