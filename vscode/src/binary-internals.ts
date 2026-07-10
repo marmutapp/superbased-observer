@@ -136,14 +136,20 @@ export async function which(
   const exts = isWin
     ? (env.PATHEXT || '.EXE;.CMD;.BAT;.COM').split(';').filter(Boolean)
     : [''];
+  // Build the candidate list in precedence order (PATH dir, then PATHEXT),
+  // then stat every candidate concurrently. The previous sequential
+  // `await fileExists` per candidate serialised ~N*M awaits; under a
+  // saturated event loop (VS Code startup) that stalled for seconds even
+  // though each stat is sub-millisecond. Concurrency removes the stall;
+  // the lowest-index hit still wins, so precedence is unchanged.
+  const candidates: string[] = [];
   for (const dir of pathEnv.split(path.delimiter)) {
     if (!dir) continue;
     for (const ext of exts) {
-      const candidate = path.join(dir, `${cmd}${ext}`);
-      if (await fileExists(candidate)) {
-        return candidate;
-      }
+      candidates.push(path.join(dir, `${cmd}${ext}`));
     }
   }
-  return undefined;
+  const hits = await Promise.all(candidates.map((c) => fileExists(c)));
+  const idx = hits.findIndex(Boolean);
+  return idx === -1 ? undefined : candidates[idx];
 }
