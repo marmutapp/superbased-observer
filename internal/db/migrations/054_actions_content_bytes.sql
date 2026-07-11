@@ -1,0 +1,14 @@
+-- 054: actions.content_bytes — authored-code byte count for the Output
+-- Composition (Verbosity) feature
+-- (docs/plans/output-composition-verbosity-plan-2026-06-30.md, §3.2/§5).
+--
+-- NODE-LOCAL analytics metadata: an INTEGER LENGTH (never content) of the
+-- code the model authored in this action — Write `content`, Edit
+-- `new_string`, MultiEdit Σ`new_string`, NotebookEdit `new_source`, or the
+-- `command` string for a run_command. Computed at ingest from the
+-- untruncated tool input, the content itself discarded. NULL on
+-- pre-feature rows and on actions that authored nothing (reads, searches,
+-- navigation). It is deliberately NOT added to the org-push seam
+-- (internal/store/orgpush.go::SelectUnpushedSince) — a per-action byte
+-- length stays node-local, like the verbosity rollup it feeds.
+ALTER TABLE actions ADD COLUMN content_bytes INTEGER;

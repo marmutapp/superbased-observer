@@ -1,0 +1,3 @@
+{"version":"v1","kind":"Prompt","data":{"message_id":"msg-user-0003","content":[{"kind":"text","data":"first"}],"meta":{"timestamp":1783600900}}}
+{"version":"v1","kind":"Prompt","data":{"message_id":"BROKEN
+{"version":"v1","kind":"AssistantMessage","data":{"message_id":"msg-asst-0003","content":[{"kind":"text","data":"ok"}]}}

@@ -1,0 +1,50 @@
+# Dev/compose config for the org server. Paths point at the in-container
+# locations the keygen init service populates. NOT for production — the
+# external_url is plain HTTP on localhost and the SCIM token is a known dev
+# value. A real deployment uses HTTPS (TLS terminated upstream), real SAML
+# IdP metadata, and secrets from a secret manager.
+
+[server]
+listen = ":8443"
+external_url = "http://localhost:8443"
+db_path = "/var/lib/observer-org/server.db"
+data_retention_days = 730
+session_key_path = "/etc/observer-org/session.key"
+log_level = "info"
+
+[saml]
+sp_entity_id = "http://localhost:8443/saml/metadata"
+sp_cert_path = "/etc/observer-org/saml/sp.crt"
+sp_key_path = "/etc/observer-org/saml/sp.key"
+# The org server fetches IdP metadata over the compose network from the
+# dev SimpleSAMLphp IdP.
+idp_metadata_url = "http://idp:8080/simplesaml/saml2/idp/metadata.php"
+attribute_mapping = { email = "email", display_name = "displayName", groups = "groups" }
+
+[scim]
+auth_token_path = "/etc/observer-org/scim/token"
+
+[bearer]
+signing_key_path = "/etc/observer-org/bearer/signing.key"
+default_lifetime_days = 90
+
+[enrolment]
+default_token_lifetime_days = 7
+
+[dashboard]
+# Dashboard admin allow-list. Any SAML-authenticated user whose email
+# matches (case-insensitive) sees the whole-org rollups; everyone else
+# is scoped to the teams they lead. Without this block, requireAdmin in
+# internal/orgserver/dashboard/api.go returns 403 on every /api/org/*
+# endpoint and the dashboard renders zeros.
+#
+# Section header MUST be [dashboard] — config.Config.Dashboard reads
+# `toml:"dashboard"`. The v1.8.2 first cut placed this under [org] and
+# TOML silently dropped it (N6 in docs/teams-test-regression-v1.8.2-
+# 2026-06-04.md); the server now also WARNs at startup when this list
+# is empty so a future misplacement is loud.
+#
+# The dev IdP (kristophjunge/test-saml-idp) ships user1@example.com as
+# its default login; observer-org quickstart provisions admin@example.com
+# via SCIM. Both are admins in the dev stack so either path renders data.
+admin_emails = ["user1@example.com", "admin@example.com"]

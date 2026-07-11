@@ -1,0 +1,6 @@
+{"type": "metadata", "protocol_version": "1.4", "created_at": 1783577000000}
+{"type": "turn.prompt", "input": [{"type": "text", "text": "Say hi"}], "origin": {"kind": "user"}, "time": 1783577000500}
+{"type": "llm.request", "model": "gpt-4o", "modelAlias": "openai/gpt-4o", "time": 1783577000600}
+this line is not valid json at all }{
+{"type": "context.append_loop_event", "event": {"type": "content.part", "uuid": "c2222222-0000-4000-8000-000000000002", "part": {"type": "text", "text": "Hi there."}}, "time": 1783577001000}
+{"type": "usage.record", "model": "openai/gpt-4o", "usage": {"inputOther": 300, "output": 5, "inputCacheRead": 0, "inputCacheCreation": 0}, "usageScope": "turn", "time": 1783577001200}

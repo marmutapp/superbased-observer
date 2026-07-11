@@ -1,0 +1,26 @@
+<!doctype html>
+<!--
+  SPDX-License-Identifier: Apache-2.0
+  Copyright (c) SuperBased. Part of SuperBased Observer.
+
+  Offscreen document (proposal §6.1). The correct MV3 placement for the
+  Tier-2 on-device NER model: the service worker has no DOM and is torn down
+  when idle, so heavy WASM/ONNX scanning cannot live there. This document is
+  created by the service worker with reasons DOM_PARSER + WORKERS and keeps
+  the model resident. It talks ONLY over chrome.runtime messaging.
+
+  Loaded as classic scripts (not modules) so tier1.js sets its global before
+  offscreen.js runs; offscreen.js itself dynamic-import()s the (operator-
+  vendored) Transformers.js build at runtime and degrades to Tier-1-only when
+  that build / the model weights are absent.
+-->
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>SuperBased Observer — redaction worker</title>
+  </head>
+  <body>
+    <script src="src/redact/tier1.js"></script>
+    <script src="src/redact/offscreen.js"></script>
+  </body>
+</html>

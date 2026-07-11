@@ -1,0 +1,125 @@
+{
+  "days": 30,
+  "group_by": "model",
+  "reliability": "unreliable",
+  "rows": [
+    {
+      "ai_cost_usd": 0.0421,
+      "compression": {
+        "compressed_bytes": 0,
+        "compressed_count": 0,
+        "cost_saved_usd_est": 0,
+        "cost_saved_usd_est_cache_read_tier": 0,
+        "cost_saved_usd_est_input_tier": 0,
+        "dropped_count": 0,
+        "marker_count": 0,
+        "original_bytes": 0,
+        "tokens_saved_est": 0,
+        "turns": 0
+      },
+      "cost_usd": 0.0421,
+      "key": "claude-opus-4-7",
+      "pricing_source": "exact",
+      "reliability": "accurate",
+      "source": "proxy",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_creation_1h": 0,
+        "cache_read": 4000,
+        "input": 1200,
+        "output": 800,
+        "reasoning": 0,
+        "web_search_requests": 0
+      },
+      "tool_cost_usd": 0,
+      "turn_count": 1
+    },
+    {
+      "ai_cost_usd": 0.0188,
+      "compression": {
+        "compressed_bytes": 0,
+        "compressed_count": 0,
+        "cost_saved_usd_est": 0,
+        "cost_saved_usd_est_cache_read_tier": 0,
+        "cost_saved_usd_est_input_tier": 0,
+        "dropped_count": 0,
+        "marker_count": 0,
+        "original_bytes": 0,
+        "tokens_saved_est": 0,
+        "turns": 0
+      },
+      "cost_usd": 0.0188,
+      "key": "gpt-5-codex",
+      "pricing_source": "exact",
+      "reliability": "accurate",
+      "source": "proxy",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_creation_1h": 0,
+        "cache_read": 0,
+        "input": 900,
+        "output": 600,
+        "reasoning": 0,
+        "web_search_requests": 0
+      },
+      "tool_cost_usd": 0,
+      "turn_count": 1
+    },
+    {
+      "ai_cost_usd": 0.006,
+      "compression": {
+        "compressed_bytes": 0,
+        "compressed_count": 0,
+        "cost_saved_usd_est": 0,
+        "cost_saved_usd_est_cache_read_tier": 0,
+        "cost_saved_usd_est_input_tier": 0,
+        "dropped_count": 0,
+        "marker_count": 0,
+        "original_bytes": 0,
+        "tokens_saved_est": 0,
+        "turns": 0
+      },
+      "cost_usd": 0.006,
+      "key": "claude-sonnet-4-5",
+      "pricing_source": "exact",
+      "reliability": "unreliable",
+      "source": "jsonl",
+      "tokens": {
+        "cache_creation": 0,
+        "cache_creation_1h": 0,
+        "cache_read": 0,
+        "input": 500,
+        "output": 300,
+        "reasoning": 0,
+        "web_search_requests": 0
+      },
+      "tool_cost_usd": 0,
+      "turn_count": 1
+    }
+  ],
+  "since": "\u003cTS\u003e",
+  "source": "auto",
+  "total_compression": {
+    "compressed_bytes": 0,
+    "compressed_count": 0,
+    "cost_saved_usd_est": 0,
+    "cost_saved_usd_est_cache_read_tier": 0,
+    "cost_saved_usd_est_input_tier": 0,
+    "dropped_count": 0,
+    "marker_count": 0,
+    "original_bytes": 0,
+    "tokens_saved_est": 0,
+    "turns": 0
+  },
+  "total_cost_usd": 0.0669,
+  "total_tokens": {
+    "cache_creation": 0,
+    "cache_creation_1h": 0,
+    "cache_read": 4000,
+    "input": 2600,
+    "output": 1700,
+    "reasoning": 0,
+    "web_search_requests": 0
+  },
+  "turn_count": 3
+}

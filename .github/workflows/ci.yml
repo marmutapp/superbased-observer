@@ -1,0 +1,190 @@
+# Continuous-integration gates — run on every PR + every push to
+# main. Catches frontend type errors, Go vet/test regressions, and
+# the "I forgot to run `make web-build` before committing" class of
+# bug that silently shipped pre-v1.6.0.
+#
+# Tagged-release builds are handled by npm-release.yml; this file is
+# the pre-merge / pre-tag safety net.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # ----------------------------------------------------------------
+  # React frontend gates: install, typecheck, build. Also asserts the
+  # committed embedded dist matches what a fresh build produces — if
+  # `web/src/` was edited without rerunning `make web-build`, this
+  # job fails with a clear actionable message. Without this gate the
+  # embedded bundle silently drifted from the React source.
+  # ----------------------------------------------------------------
+  frontend:
+    name: frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: npm ci
+        run: |
+          cd web
+          npm ci
+
+      - name: typecheck
+        run: |
+          cd web
+          npm run typecheck
+
+      - name: build
+        run: |
+          cd web
+          npm run build
+
+      - name: dist consistency check
+        # Mirrors `make web-build`'s second half: regenerates the
+        # embedded dir from web/dist and asserts it matches what's
+        # committed. If it doesn't, the dev edited web/src/ but
+        # forgot to commit the rebuilt bundle — a stale embed would
+        # ship on the next release.
+        run: |
+          set -euo pipefail
+          rm -rf internal/intelligence/dashboard/webapp/dist
+          mkdir -p internal/intelligence/dashboard/webapp/dist
+          cp -R web/dist/. internal/intelligence/dashboard/webapp/dist/
+          if ! git diff --quiet --exit-code internal/intelligence/dashboard/webapp/dist; then
+            echo "::error::Committed webapp/dist drifted from web/dist. Run \`make web-build\` and commit the result."
+            git diff --stat internal/intelligence/dashboard/webapp/dist | head -40
+            exit 1
+          fi
+          echo "embedded dist matches fresh build ✓"
+
+  # ----------------------------------------------------------------
+  # Go gates — vet, test, build. Pure-Go so no special toolchain
+  # beyond setup-go. Frontend build is independent (this job doesn't
+  # need a fresh dist to compile; the committed embed satisfies the
+  # //go:embed directive at compile time, even if it's stale for the
+  # purposes of the runtime UI).
+  # ----------------------------------------------------------------
+  go:
+    name: go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: vet
+        run: go vet ./...
+
+      - name: lint
+        # golangci-lint enforces the full .golangci.yml set — including
+        # gofumpt + goimports formatting, errorlint, gosec, gocritic, and
+        # gocyclo (threshold 30; see .golangci.yml for the documented
+        # pre-existing exclusions). Joined CI in Teams M5; the tree is clean.
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.64.8
+          # Build golangci-lint from source with the runner's Go (1.25 via
+          # setup-go/go.mod). The prebuilt v1.64.8 binary is compiled with
+          # go1.24 and refuses to run against a go.mod that targets 1.25
+          # ("language version used to build golangci-lint is lower than the
+          # targeted Go version"). goinstall sidesteps that mismatch.
+          install-mode: goinstall
+
+      - name: test
+        # -race catches the watcher / proxy concurrency bugs that
+        # otherwise slip past until live use.
+        run: go test -race ./...
+
+      - name: build
+        # `make build` skipped here — that target requires Node for
+        # web-build, which the frontend job already verified. This
+        # step exercises the Go compile path against the committed
+        # embedded dist.
+        run: |
+          mkdir -p bin
+          go build -trimpath -o bin/observer ./cmd/observer
+          GOOS=windows GOARCH=amd64 go build -trimpath -o bin/antigravity-bridge.exe ./cmd/antigravity-bridge
+          ls -l bin/
+
+  # ----------------------------------------------------------------
+  # Distribution README drift gate. The npm and PyPI READMEs share a
+  # large body (Per-AI-client setup through Configuration) sourced from
+  # docs/distribution/README-body.md. If a contributor edits one
+  # channel's README directly instead of the body file, this job fails
+  # with the diff and a "run `make sync-distribution-readmes`" hint.
+  # ----------------------------------------------------------------
+  distribution-readmes:
+    name: distribution README drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify
+        run: make verify-distribution-readmes
+
+  # ----------------------------------------------------------------
+  # Helm chart smoke (Teams M5). Lint + template the observer-org chart,
+  # then `helm install` it into an ephemeral kind cluster to prove the
+  # rendered manifests are accepted by a real API server and the release
+  # deploys. Pod readiness is NOT asserted: the server fetches its SAML
+  # IdP metadata at startup, so a Ready pod needs real secrets + a
+  # reachable IdP that the operator supplies. Here we verify the chart
+  # installs cleanly and the core objects are created.
+  # ----------------------------------------------------------------
+  helm:
+    name: helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.21.0
+
+      - name: Lint + template
+        run: |
+          set -euo pipefail
+          helm lint charts/observer-org -f charts/observer-org/ci/test-values.yaml
+          helm template obs charts/observer-org -f charts/observer-org/ci/test-values.yaml > /dev/null
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+
+      - name: Install into kind
+        run: |
+          set -euo pipefail
+          kubectl create namespace obs
+          # Placeholder secret so the required secrets.existingSecret
+          # resolves. Not valid key material — the pod won't reach Ready
+          # (no live IdP), but the release installs and every manifest is
+          # validated by the real API server.
+          kubectl create secret generic observer-org-secrets -n obs \
+            --from-literal=bearer-signing.key=placeholder \
+            --from-literal=session.key=placeholder \
+            --from-literal=sp.crt=placeholder \
+            --from-literal=sp.key=placeholder \
+            --from-literal=scim-token=placeholder
+          helm install obs charts/observer-org -n obs \
+            -f charts/observer-org/ci/test-values.yaml
+          echo "=== release status ==="
+          helm status obs -n obs
+          echo "=== objects ==="
+          kubectl get deploy,svc,pvc,cm,sa -n obs
+          kubectl get deploy/obs-observer-org -n obs
+          kubectl get svc/obs-observer-org -n obs
+          kubectl get pvc -n obs | grep -q obs-observer-org-data
+          echo "Helm chart installs cleanly ✓"

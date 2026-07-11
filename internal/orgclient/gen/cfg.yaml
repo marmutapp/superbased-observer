@@ -1,0 +1,18 @@
+# oapi-codegen config for the agent-side client stubs.
+# Regenerate via `make gen-openapi`; verified drift-free by
+# `make verify-openapi`. M0 generates compiling stubs only; the agent's
+# real enrolment/push logic (internal/orgclient) is implemented in M2.
+package: gen
+output: internal/orgclient/gen/client.gen.go
+generate:
+  models: true
+  client: true
+output-options:
+  # Prune to the agent protocol's schemas only. The agent must never import a
+  # server package (spec §2.4.4); without pruning, the M3 dashboard schemas
+  # (x-go-type to internal/orgserver/rollup) would generate here and pull the
+  # server's rollup package into the agent binary. Pruning drops them.
+  skip-prune: false
+  # The agent client only ever calls the agent protocol (enroll, push).
+  include-tags:
+    - agent

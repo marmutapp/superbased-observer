@@ -1,0 +1,727 @@
+{
+  "_note": "Anonymized live-capture reference of Charm Crush crush.db (2026-07-09, WSL Ubuntu + Windows 11). Absolute paths and free-text anonymized; token/cost numbers preserved verbatim. Crush timestamps are Unix SECONDS despite the schema comment claiming milliseconds.",
+  "wsl_oneshot": {
+    "sessions": [
+      {
+        "id": "4850fe44-c04e-4dff-ab81-c84357dbd3f2",
+        "title": "Create hello.txt and list files",
+        "message_count": 8,
+        "prompt_tokens": 8755,
+        "completion_tokens": 5,
+        "cost": 0.029801,
+        "updated_at": 1783571743,
+        "created_at": 1783571729
+      }
+    ],
+    "messages": [
+      {
+        "id": "459aed70-f859-4e1c-916d-0994e3e22b99",
+        "session_id": "4850fe44-c04e-4dff-ab81-c84357dbd3f2",
+        "role": "user",
+        "parts": [
+          {
+            "type": "text",
+            "data": {
+              "text": "Create a file hello.txt containing exactly: hello from crush. Then run ls."
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "stop",
+              "time": 0
+            }
+          }
+        ],
+        "model": "",
+        "provider": null,
+        "created_at": 1783571729,
+        "updated_at": 1783571729,
+        "finished_at": null
+      },
+      {
+        "id": "729bd64c-5101-4ee7-9c5c-624c76053b32",
+        "session_id": "4850fe44-c04e-4dff-ab81-c84357dbd3f2",
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "reasoning",
+            "data": {
+              "thinking": "",
+              "signature": "",
+              "thought_signature": "",
+              "tool_id": "",
+              "responses_data": null,
+              "started_at": 1783571733,
+              "finished_at": 1783571733
+            }
+          },
+          {
+            "type": "tool_call",
+            "data": {
+              "id": "call_R1OPAFJQ2y6sj8CokL3K5BgA",
+              "name": "ls",
+              "input": "{\"path\":\"/home/dev/project\",\"depth\":1}",
+              "provider_executed": false,
+              "finished": true
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "tool_use",
+              "time": 1783571734
+            }
+          }
+        ],
+        "model": "gpt-5.4",
+        "provider": "openai",
+        "created_at": 1783571729,
+        "updated_at": 1783571734,
+        "finished_at": 1783571734
+      },
+      {
+        "id": "e5aeebc4-667b-46a3-96eb-92778bcea4c2",
+        "session_id": "4850fe44-c04e-4dff-ab81-c84357dbd3f2",
+        "role": "tool",
+        "parts": [
+          {
+            "type": "tool_result",
+            "data": {
+              "tool_call_id": "call_R1OPAFJQ2y6sj8CokL3K5BgA",
+              "name": "ls",
+              "content": "\n- /home/dev/project/\n  - README.md\n",
+              "data": "",
+              "mime_type": "",
+              "metadata": "{\"number_of_files\":1,\"truncated\":false}",
+              "is_error": false
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "stop",
+              "time": 0
+            }
+          }
+        ],
+        "model": "",
+        "provider": null,
+        "created_at": 1783571734,
+        "updated_at": 1783571734,
+        "finished_at": null
+      },
+      {
+        "id": "e03995ba-b299-474c-8b24-a6701481b96e",
+        "session_id": "4850fe44-c04e-4dff-ab81-c84357dbd3f2",
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "reasoning",
+            "data": {
+              "thinking": "\n**Verifying file creation**\n\nI need to read the relevant context before I start editing. Since I\u2019m creating a new file, I wonder if I really need to check for something that doesn\u2019t exist? It makes sense to verify if the parent directory exists first \u2014 I think that\u2019s done already. Then, I\u2019ll write the file and after that, I\u2019ll run a command to list the files. It all feels a bit complex, but I\u2019ll manage!",
+              "signature": "",
+              "thought_signature": "",
+              "tool_id": "",
+              "responses_data": null,
+              "started_at": 1783571736,
+              "finished_at": 1783571737
+            }
+          },
+          {
+            "type": "tool_call",
+            "data": {
+              "id": "call_l6gBstf3eD90k9Uu7t1OKrUk",
+              "name": "write",
+              "input": "{\"file_path\":\"/home/dev/project/hello.txt\",\"content\":\"hello from crush\"}",
+              "provider_executed": false,
+              "finished": true
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "tool_use",
+              "time": 1783571739
+            }
+          }
+        ],
+        "model": "gpt-5.4",
+        "provider": "openai",
+        "created_at": 1783571734,
+        "updated_at": 1783571739,
+        "finished_at": 1783571739
+      },
+      {
+        "id": "ccdb28e9-e2df-4953-94ac-71a751d959cb",
+        "session_id": "4850fe44-c04e-4dff-ab81-c84357dbd3f2",
+        "role": "tool",
+        "parts": [
+          {
+            "type": "tool_result",
+            "data": {
+              "tool_call_id": "call_l6gBstf3eD90k9Uu7t1OKrUk",
+              "name": "write",
+              "content": "<result>\nFile successfully written: /home/dev/project/hello.txt\n</result>",
+              "data": "",
+              "mime_type": "",
+              "metadata": "{\"diff\":\"--- a/hello.txt\\n+++ b/hello.txt\\n@@ -0,0 +1 @@\\n+hello from crush\\n\\\\ No newline at end of file\\n\",\"additions\":1,\"removals\":0}",
+              "is_error": false
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "stop",
+              "time": 0
+            }
+          }
+        ],
+        "model": "",
+        "provider": null,
+        "created_at": 1783571739,
+        "updated_at": 1783571739,
+        "finished_at": null
+      },
+      {
+        "id": "56cc97cb-0802-408f-be40-39b6179a8339",
+        "session_id": "4850fe44-c04e-4dff-ab81-c84357dbd3f2",
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "tool_call",
+            "data": {
+              "id": "call_yWNez173OoKFurQ5uLjXraEl",
+              "name": "ls",
+              "input": "{\"path\":\"/home/dev/project\",\"depth\":1}",
+              "provider_executed": false,
+              "finished": true
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "tool_use",
+              "time": 1783571741
+            }
+          }
+        ],
+        "model": "gpt-5.4",
+        "provider": "openai",
+        "created_at": 1783571739,
+        "updated_at": 1783571741,
+        "finished_at": 1783571741
+      },
+      {
+        "id": "cf6153c2-e685-4fee-90f0-1092729ed0de",
+        "session_id": "4850fe44-c04e-4dff-ab81-c84357dbd3f2",
+        "role": "tool",
+        "parts": [
+          {
+            "type": "tool_result",
+            "data": {
+              "tool_call_id": "call_yWNez173OoKFurQ5uLjXraEl",
+              "name": "ls",
+              "content": "\n- /home/dev/project/\n  - README.md\n  - hello.txt\n",
+              "data": "",
+              "mime_type": "",
+              "metadata": "{\"number_of_files\":2,\"truncated\":false}",
+              "is_error": false
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "stop",
+              "time": 0
+            }
+          }
+        ],
+        "model": "",
+        "provider": null,
+        "created_at": 1783571741,
+        "updated_at": 1783571741,
+        "finished_at": null
+      },
+      {
+        "id": "0d0e7612-dfbb-4b39-b741-30221b8d7449",
+        "session_id": "4850fe44-c04e-4dff-ab81-c84357dbd3f2",
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "text",
+            "data": {
+              "text": "Done"
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "end_turn",
+              "time": 1783571743
+            }
+          }
+        ],
+        "model": "gpt-5.4",
+        "provider": "openai",
+        "created_at": 1783571741,
+        "updated_at": 1783571743,
+        "finished_at": 1783571743
+      }
+    ]
+  },
+  "windows_oneshot": {
+    "sessions": [
+      {
+        "id": "30bc155f-203e-446b-a4cc-bdb344af56f9",
+        "title": "Create hello.txt then run dir",
+        "message_count": 10,
+        "prompt_tokens": 8975,
+        "completion_tokens": 5,
+        "cost": 0.08627345,
+        "updated_at": 1783572212,
+        "created_at": 1783572197
+      }
+    ],
+    "messages": [
+      {
+        "id": "ee369993-4173-415b-8161-2ec804aa4675",
+        "session_id": "30bc155f-203e-446b-a4cc-bdb344af56f9",
+        "role": "user",
+        "parts": [
+          {
+            "type": "text",
+            "data": {
+              "text": "\n\nCreate a file hello.txt containing exactly: hello from crush win. Then run dir."
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "stop",
+              "time": 0
+            }
+          }
+        ],
+        "model": "",
+        "provider": null,
+        "created_at": 1783572197,
+        "updated_at": 1783572197,
+        "finished_at": null
+      },
+      {
+        "id": "9f4c39ba-d541-46da-b85c-7d781d31074f",
+        "session_id": "30bc155f-203e-446b-a4cc-bdb344af56f9",
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "reasoning",
+            "data": {
+              "thinking": "",
+              "signature": "",
+              "thought_signature": "",
+              "tool_id": "",
+              "responses_data": null,
+              "started_at": 1783572202,
+              "finished_at": 1783572202
+            }
+          },
+          {
+            "type": "tool_call",
+            "data": {
+              "id": "call_raIptIWwiWKiRGg4Xyk051Wp",
+              "name": "ls",
+              "input": "{\"path\":\"C:/home/dev/project\",\"depth\":1}",
+              "provider_executed": false,
+              "finished": true
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "tool_use",
+              "time": 1783572203
+            }
+          }
+        ],
+        "model": "gpt-5.4-mini",
+        "provider": "openai",
+        "created_at": 1783572197,
+        "updated_at": 1783572203,
+        "finished_at": 1783572203
+      },
+      {
+        "id": "955513d7-bc42-4a76-9295-6e7460a8f084",
+        "session_id": "30bc155f-203e-446b-a4cc-bdb344af56f9",
+        "role": "tool",
+        "parts": [
+          {
+            "type": "tool_result",
+            "data": {
+              "tool_call_id": "call_raIptIWwiWKiRGg4Xyk051Wp",
+              "name": "ls",
+              "content": "The directory tree is shown up to a depth of 1. Use a higher depth and a specific path to see more levels.\n\n- C:/home/dev/project/\n",
+              "data": "",
+              "mime_type": "",
+              "metadata": "{\"number_of_files\":0,\"truncated\":false}",
+              "is_error": false
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "stop",
+              "time": 0
+            }
+          }
+        ],
+        "model": "",
+        "provider": null,
+        "created_at": 1783572203,
+        "updated_at": 1783572203,
+        "finished_at": null
+      },
+      {
+        "id": "d3f44ef5-f82e-4df0-9c25-c7b762fb2d5b",
+        "session_id": "30bc155f-203e-446b-a4cc-bdb344af56f9",
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "tool_call",
+            "data": {
+              "id": "call_2Bat8MJFkfPp4katp1OEFGGy",
+              "name": "write",
+              "input": "{\"file_path\":\"C:/home/dev/project/hello.txt\",\"content\":\"hello from crush win\"}",
+              "provider_executed": false,
+              "finished": true
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "tool_use",
+              "time": 1783572205
+            }
+          }
+        ],
+        "model": "gpt-5.4-mini",
+        "provider": "openai",
+        "created_at": 1783572203,
+        "updated_at": 1783572205,
+        "finished_at": 1783572205
+      },
+      {
+        "id": "a4b0aa87-5f30-46d5-9a48-5333165f8b17",
+        "session_id": "30bc155f-203e-446b-a4cc-bdb344af56f9",
+        "role": "tool",
+        "parts": [
+          {
+            "type": "tool_result",
+            "data": {
+              "tool_call_id": "call_2Bat8MJFkfPp4katp1OEFGGy",
+              "name": "write",
+              "content": "<result>\nFile successfully written: C:/home/dev/project/hello.txt\n</result>",
+              "data": "",
+              "mime_type": "",
+              "metadata": "{\"diff\":\"--- a/C:/home/dev/project/hello.txt\\n+++ b/C:/home/dev/project/hello.txt\\n@@ -0,0 +1 @@\\n+hello from crush win\\n\\\\ No newline at end of file\\n\",\"additions\":1,\"removals\":0}",
+              "is_error": false
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "stop",
+              "time": 0
+            }
+          }
+        ],
+        "model": "",
+        "provider": null,
+        "created_at": 1783572205,
+        "updated_at": 1783572205,
+        "finished_at": null
+      },
+      {
+        "id": "d80f0fb6-1c2d-49a9-bc9a-4890ae68a40f",
+        "session_id": "30bc155f-203e-446b-a4cc-bdb344af56f9",
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "tool_call",
+            "data": {
+              "id": "call_IMRcshn5S60nD3V3Vo9pqJy0",
+              "name": "bash",
+              "input": "{\"command\":\"dir\",\"description\":\"List directory contents\",\"working_dir\":\"C:/home/dev/project\"}",
+              "provider_executed": false,
+              "finished": true
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "tool_use",
+              "time": 1783572207
+            }
+          }
+        ],
+        "model": "gpt-5.4-mini",
+        "provider": "openai",
+        "created_at": 1783572205,
+        "updated_at": 1783572207,
+        "finished_at": 1783572207
+      },
+      {
+        "id": "18b2a28d-a37e-496c-9bc5-efa905c4cff8",
+        "session_id": "30bc155f-203e-446b-a4cc-bdb344af56f9",
+        "role": "tool",
+        "parts": [
+          {
+            "type": "tool_result",
+            "data": {
+              "tool_call_id": "call_IMRcshn5S60nD3V3Vo9pqJy0",
+              "name": "bash",
+              "content": "\n\"dir\": executable file not found in $PATH\n\nExit code 127\n\n<cwd>/home/dev/project</cwd>",
+              "data": "",
+              "mime_type": "",
+              "metadata": "{\"start_time\":1783572207797,\"end_time\":1783572207898,\"output\":\"\\n\\\"dir\\\": executable file not found in $PATH\\n\\nExit code 127\",\"description\":\"List directory contents\",\"working_directory\":\"C:/home/dev/project\"}",
+              "is_error": false
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "stop",
+              "time": 0
+            }
+          }
+        ],
+        "model": "",
+        "provider": null,
+        "created_at": 1783572207,
+        "updated_at": 1783572207,
+        "finished_at": null
+      },
+      {
+        "id": "c8a1645c-76f5-49a6-9a94-4682e634f713",
+        "session_id": "30bc155f-203e-446b-a4cc-bdb344af56f9",
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "reasoning",
+            "data": {
+              "thinking": "\n**Considering command execution**\n\nI need to respond concisely. The user asked for a directory listing, but maybe that command isn\u2019t available. Since it's a bash on a cross-platform interpreter, I wonder if I can still create a file and run the directory command. \"dir\" is for Windows cmd, but bash uses \"ls.\" Hmm, could I try running \"cmd /c dir\"? It might work on Windows since the environment caused the command to fail. Let\u2019s see if that\u2019s a viable option!",
+              "signature": "",
+              "thought_signature": "",
+              "tool_id": "",
+              "responses_data": null,
+              "started_at": 1783572209,
+              "finished_at": 1783572210
+            }
+          },
+          {
+            "type": "tool_call",
+            "data": {
+              "id": "call_uBxmb5rtuVMnWS4AAKp8rH0i",
+              "name": "bash",
+              "input": "{\"command\":\"cmd /c dir\",\"description\":\"Run Windows dir\",\"working_dir\":\"C:/home/dev/project\"}",
+              "provider_executed": false,
+              "finished": true
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "tool_use",
+              "time": 1783572211
+            }
+          }
+        ],
+        "model": "gpt-5.4-mini",
+        "provider": "openai",
+        "created_at": 1783572207,
+        "updated_at": 1783572211,
+        "finished_at": 1783572211
+      },
+      {
+        "id": "8d0affc5-e68b-40f1-ae75-8c5a32d79b0a",
+        "session_id": "30bc155f-203e-446b-a4cc-bdb344af56f9",
+        "role": "tool",
+        "parts": [
+          {
+            "type": "tool_result",
+            "data": {
+              "tool_call_id": "call_uBxmb5rtuVMnWS4AAKp8rH0i",
+              "name": "bash",
+              "content": " Volume in drive C is OS\r\n Volume Serial Number is 6C11-9259\r\n\r\n Directory of C:\\Users\\dev\\project\r\n\r\n07/09/2026  10:13 AM    <DIR>          .\r\n07/09/2026  10:12 AM    <DIR>          ..\r\n07/09/2026  10:13 AM    <DIR>          .crush\r\n07/09/2026  10:13 AM                20 hello.txt\r\n               1 File(s)             20 bytes\r\n               3 Dir(s)  56,830,308,352 bytes free\r\n\n\n<cwd>/home/dev/project</cwd>",
+              "data": "",
+              "mime_type": "",
+              "metadata": "{\"start_time\":1783572211203,\"end_time\":1783572211303,\"output\":\" Volume in drive C is OS\\r\\n Volume Serial Number is 6C11-9259\\r\\n\\r\\n Directory of C:\\\\tmp\\\\project\\\\crush\\r\\n\\r\\n07/09/2026  10:13 AM    \\u003cDIR\\u003e          .\\r\\n07/09/2026  10:12 AM    \\u003cDIR\\u003e          ..\\r\\n07/09/2026  10:13 AM    \\u003cDIR\\u003e          .crush\\r\\n07/09/2026  10:13 AM                20 hello.txt\\r\\n               1 File(s)             20 bytes\\r\\n               3 Dir(s)  56,830,308,352 bytes free\\r\\n\",\"description\":\"Run Windows dir\",\"working_directory\":\"C:/home/dev/project\"}",
+              "is_error": false
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "stop",
+              "time": 0
+            }
+          }
+        ],
+        "model": "",
+        "provider": null,
+        "created_at": 1783572211,
+        "updated_at": 1783572211,
+        "finished_at": null
+      },
+      {
+        "id": "39aba8a3-0ad0-4bdf-b4e4-25219ab24e87",
+        "session_id": "30bc155f-203e-446b-a4cc-bdb344af56f9",
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "text",
+            "data": {
+              "text": "Done"
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "end_turn",
+              "time": 1783572212
+            }
+          }
+        ],
+        "model": "gpt-5.4-mini",
+        "provider": "openai",
+        "created_at": 1783572211,
+        "updated_at": 1783572212,
+        "finished_at": 1783572212
+      }
+    ]
+  },
+  "windows_failover": {
+    "sessions": [
+      {
+        "id": "d3e6c18f-7773-43bb-8540-0e9e2c5b594c",
+        "title": "Untitled Session",
+        "message_count": 4,
+        "prompt_tokens": 12059,
+        "completion_tokens": 49,
+        "cost": 0.017864249999999998,
+        "updated_at": 1783551014,
+        "created_at": 1783550948
+      }
+    ],
+    "messages": [
+      {
+        "id": "b234e623-88d3-4851-b999-dc6d98e53a1d",
+        "session_id": "d3e6c18f-7773-43bb-8540-0e9e2c5b594c",
+        "role": "user",
+        "parts": [
+          {
+            "type": "text",
+            "data": {
+              "text": "hi"
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "stop",
+              "time": 0
+            }
+          }
+        ],
+        "model": "",
+        "provider": null,
+        "created_at": 1783550948,
+        "updated_at": 1783550948,
+        "finished_at": null
+      },
+      {
+        "id": "b71a9394-d3b9-4545-bcd4-4d2cbf3503f1",
+        "session_id": "d3e6c18f-7773-43bb-8540-0e9e2c5b594c",
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "finish",
+            "data": {
+              "reason": "error",
+              "time": 1783550949,
+              "message": "Forbidden",
+              "details": "POST \"https://bedrock-runtime.us-east-1.amazonaws.com/v1/messages\": 403 Forbidden {\"Message\":\"User: arn:aws:iam::301522663708:user/salesagentai is not authorized to perform: bedrock:InvokeModelWithResponseStream on resource: arn:aws:bedrock:us-east-1:301522663708:inference-profile/us.anthropic.claude-sonnet-4-6 because no identity-based policy allows the bedrock:InvokeModelWithResponseStream action\"}"
+            }
+          }
+        ],
+        "model": "us.anthropic.claude-sonnet-4-6",
+        "provider": "bedrock",
+        "created_at": 1783550948,
+        "updated_at": 1783550949,
+        "finished_at": 1783550949
+      },
+      {
+        "id": "3c330378-5e33-4ad0-b7bb-89c65649110a",
+        "session_id": "d3e6c18f-7773-43bb-8540-0e9e2c5b594c",
+        "role": "user",
+        "parts": [
+          {
+            "type": "text",
+            "data": {
+              "text": "hi"
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "stop",
+              "time": 0
+            }
+          }
+        ],
+        "model": "",
+        "provider": null,
+        "created_at": 1783551012,
+        "updated_at": 1783551012,
+        "finished_at": null
+      },
+      {
+        "id": "db0e6670-017e-40ca-bc15-e9ed2c3730ab",
+        "session_id": "d3e6c18f-7773-43bb-8540-0e9e2c5b594c",
+        "role": "assistant",
+        "parts": [
+          {
+            "type": "reasoning",
+            "data": {
+              "thinking": "\n**Responding to greetings**\n\nThe user greeted me by saying hi twice, which is a warm and friendly start! I want to keep my response concise and pleasant, likely reflecting their greeting back to them. There's no need for any tools here, and I need to ensure my response stays within four lines. Keeping it brief while being engaging will be my goal. Let\u2019s craft a nice response!",
+              "signature": "",
+              "thought_signature": "",
+              "tool_id": "",
+              "responses_data": null,
+              "started_at": 1783551013,
+              "finished_at": 1783551014
+            }
+          },
+          {
+            "type": "text",
+            "data": {
+              "text": "Hi."
+            }
+          },
+          {
+            "type": "finish",
+            "data": {
+              "reason": "end_turn",
+              "time": 1783551014
+            }
+          }
+        ],
+        "model": "gpt-5.4-mini",
+        "provider": "openai",
+        "created_at": 1783551012,
+        "updated_at": 1783551014,
+        "finished_at": 1783551014
+      }
+    ]
+  }
+}

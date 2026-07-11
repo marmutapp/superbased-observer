@@ -1,0 +1,14 @@
+# Default filter for `pytest`. Drops verbose-mode `PASSED` markers (with or
+# without the trailing `[N%]` progress counter). Failures, warnings, captured
+# output, and the summary table are preserved.
+
+command = "pytest"
+description = "drop pytest verbose PASSED markers"
+
+[[rule]]
+type = "line_drop"
+pattern = '\sPASSED(\s+\[\s*\d+%\s*\])?\s*$'
+comment = "verbose-mode per-test pass markers"
+
+[[rule]]
+type = "squash_whitespace"

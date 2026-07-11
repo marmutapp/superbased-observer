@@ -1,0 +1,21 @@
+{
+  "createdAt": "2026-07-09T07:00:00.000Z",
+  "updatedAt": "2026-07-09T07:00:20.000Z",
+  "title": "Delegate a research task",
+  "isCustomTitle": false,
+  "agents": {
+    "main": {
+      "homedir": "/home/auzy/.kimi-code/sessions/wd_subagent_aabbccddeeff/session_44444444-4444-4444-8444-444444444444/agents/main",
+      "type": "main",
+      "parentAgentId": null
+    },
+    "researcher": {
+      "homedir": "/home/auzy/.kimi-code/sessions/wd_subagent_aabbccddeeff/session_44444444-4444-4444-8444-444444444444/agents/researcher",
+      "type": "sub",
+      "parentAgentId": "main"
+    }
+  },
+  "custom": {},
+  "workDir": "/home/auzy/demo-project",
+  "lastPrompt": "Research the codebase then summarize"
+}

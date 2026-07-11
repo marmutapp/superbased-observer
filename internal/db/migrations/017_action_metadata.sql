@@ -1,0 +1,35 @@
+-- 017_action_metadata.sql
+--
+-- Per-event metadata column for Claude Code + Codex hook payloads.
+--
+-- Pre-fix: the actions table has dedicated columns for the data
+-- adapters needed to surface up to v1.4.46 — duration_ms, success,
+-- error_message, raw_tool_name, raw_tool_input, etc. — but no place
+-- to land the per-event metadata both Claude Code and Codex hooks
+-- emit on every fire: permission_mode (default | bypass_permissions
+-- | plan), effort.level (Codex reasoning effort: minimal | low |
+-- medium | high), is_interrupt (user-cancelled vs genuine failure).
+-- The cursor + claude tier-1 capture in v1.4.45 surfaced these as
+-- present-in-payload-but-dropped-on-the-floor (the post_tool_failure
+-- builder lossy-encoded is_interrupt into ErrorMessage as
+-- "[interrupt] " prefix; Codex's PermissionMode field was parsed
+-- but never assigned).
+--
+-- Post-fix: one TEXT column on actions stores the JSON-marshaled
+-- ActionMetadata struct (permission_mode / effort_level /
+-- is_interrupt). Adapters opt in by setting ev.Metadata; rows
+-- without metadata leave the column NULL. App-layer JSON marshal/
+-- unmarshal — no SQLite JSON1 dependency, matching the existing
+-- sessions.metadata TEXT-treated-as-string precedent. The
+-- [interrupt] ErrorMessage hack goes away in this same release.
+--
+-- Backfill rule (in Go): on (source_file, source_event_id) conflict
+-- where existing metadata IS NULL but excluded.metadata is non-null,
+-- update — same shape as the duration_ms backfill behavior. Don't
+-- ever clobber a populated metadata blob.
+--
+-- No backfill for pre-migration rows: they leave metadata NULL and
+-- surface in queries as "we never had this metadata" — the right
+-- interpretation since the adapters didn't capture it before this
+-- release.
+ALTER TABLE actions ADD COLUMN metadata TEXT;
