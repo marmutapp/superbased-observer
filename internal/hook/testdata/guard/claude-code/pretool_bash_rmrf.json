@@ -1,0 +1,11 @@
+{
+  "session_id": "fixture-cc-1",
+  "transcript_path": "/home/dev/.claude/projects/proj/fixture-cc-1.jsonl",
+  "cwd": "/home/dev/proj",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "rm -rf ~",
+    "description": "clean everything"
+  }
+}

@@ -1,0 +1,173 @@
+{
+  "conversation_id": "cccccccc-3333-4f7f-860e-000000000003",
+  "next_message": null,
+  "history": [
+    {
+      "user": {
+        "additional_context": "",
+        "env_context": {
+          "env_state": {
+            "operating_system": "linux",
+            "current_working_directory": "/home/dev/project",
+            "environment_variables": []
+          }
+        },
+        "content": {
+          "Prompt": {
+            "prompt": "Create a file hello.txt containing exactly: hello from kiro. Then run ls."
+          }
+        },
+        "timestamp": "2026-07-09T10:00:16.195641701+05:30",
+        "images": null
+      },
+      "assistant": {
+        "ToolUse": {
+          "message_id": "msg-tooluse-0001",
+          "content": "",
+          "tool_uses": [
+            {
+              "id": "tooluse_AAAA0001",
+              "name": "fs_write",
+              "orig_name": "fs_write",
+              "args": {
+                "command": "create",
+                "path": "/home/dev/project/hello.txt",
+                "file_text": "hello from kiro"
+              }
+            }
+          ]
+        }
+      },
+      "request_metadata": {
+        "request_id": "req-0001",
+        "context_usage_percentage": 1.3338,
+        "message_id": "msg-tooluse-0001",
+        "request_start_timestamp_ms": 1783571416209,
+        "stream_end_timestamp_ms": 1783571419730,
+        "user_prompt_length": 233,
+        "response_size": 96,
+        "chat_conversation_type": "ToolUse",
+        "tool_use_ids_and_names": [["tooluse_AAAA0001", "fs_write"]],
+        "model_id": "auto",
+        "message_meta_tags": [],
+        "total_tokens": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "cache_read_input_tokens": null,
+        "cache_write_input_tokens": null
+      }
+    },
+    {
+      "user": {
+        "additional_context": "",
+        "env_context": {
+          "env_state": {
+            "operating_system": "linux",
+            "current_working_directory": "/home/dev/project",
+            "environment_variables": []
+          }
+        },
+        "content": {
+          "ToolUseResults": {
+            "tool_use_results": [
+              {
+                "tool_use_id": "tooluse_AAAA0001",
+                "content": [{ "Text": "" }],
+                "status": "Success"
+              }
+            ]
+          }
+        },
+        "timestamp": null,
+        "images": null
+      },
+      "assistant": {
+        "ToolUse": {
+          "message_id": "msg-tooluse-0002",
+          "content": "",
+          "tool_uses": [
+            {
+              "id": "tooluse_BBBB0002",
+              "name": "execute_bash",
+              "orig_name": "execute_bash",
+              "args": {
+                "command": "ls",
+                "working_dir": "/home/dev/project"
+              }
+            }
+          ]
+        }
+      },
+      "request_metadata": {
+        "request_id": "req-0002",
+        "context_usage_percentage": 1.3445001,
+        "message_id": "msg-tooluse-0002",
+        "request_start_timestamp_ms": 1783571419852,
+        "stream_end_timestamp_ms": 1783571422055,
+        "user_prompt_length": 0,
+        "response_size": 57,
+        "chat_conversation_type": "ToolUse",
+        "tool_use_ids_and_names": [["tooluse_BBBB0002", "execute_bash"]],
+        "model_id": "auto",
+        "message_meta_tags": [],
+        "total_tokens": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "cache_read_input_tokens": null,
+        "cache_write_input_tokens": null
+      }
+    },
+    {
+      "user": {
+        "additional_context": "",
+        "env_context": {
+          "env_state": {
+            "operating_system": "linux",
+            "current_working_directory": "/home/dev/project",
+            "environment_variables": []
+          }
+        },
+        "content": {
+          "ToolUseResults": {
+            "tool_use_results": [
+              {
+                "tool_use_id": "tooluse_BBBB0002",
+                "content": [
+                  { "Json": { "exit_status": "0", "stdout": "README.md\nhello.txt\n", "stderr": "" } }
+                ],
+                "status": "Success"
+              }
+            ]
+          }
+        },
+        "timestamp": null,
+        "images": null
+      },
+      "assistant": {
+        "Response": {
+          "message_id": "msg-response-0003",
+          "content": "Done. `hello.txt` is created alongside `README.md` in the current directory."
+        }
+      },
+      "request_metadata": {
+        "request_id": "req-0003",
+        "context_usage_percentage": 1.3503001,
+        "message_id": "msg-response-0003",
+        "request_start_timestamp_ms": 1783571422175,
+        "stream_end_timestamp_ms": 1783571424336,
+        "user_prompt_length": 0,
+        "response_size": 76,
+        "chat_conversation_type": "NotToolUse",
+        "tool_use_ids_and_names": [],
+        "model_id": "auto",
+        "message_meta_tags": [],
+        "total_tokens": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "cache_read_input_tokens": null,
+        "cache_write_input_tokens": null
+      }
+    }
+  ],
+  "valid_history_range": [0, 2]
+}

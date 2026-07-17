@@ -1,0 +1,60 @@
+{
+  "manifest_version": 3,
+  "name": "SuperBased Observer — Browser Capture",
+  "version": "1.20.0",
+  "description": "Opt-in, passive observability of your own AI chatbot web usage (ChatGPT, Claude, Perplexity, Gemini, Copilot). Captures per-turn metadata + estimated tokens locally; nothing leaves your machine except to your local observer daemon.",
+  "minimum_chrome_version": "111",
+  "permissions": [
+    "storage",
+    "nativeMessaging",
+    "scripting",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://claude.ai/*",
+    "https://www.perplexity.ai/*",
+    "https://perplexity.ai/*",
+    "https://gemini.google.com/*",
+    "https://copilot.microsoft.com/*"
+  ],
+  "background": {
+    "service_worker": "src/service-worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://claude.ai/*",
+        "https://www.perplexity.ai/*",
+        "https://perplexity.ai/*",
+        "https://gemini.google.com/*",
+        "https://copilot.microsoft.com/*"
+      ],
+      "js": [
+        "src/redact/tier1.js",
+        "src/parsers.js",
+        "src/content-main.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://claude.ai/*",
+        "https://www.perplexity.ai/*",
+        "https://perplexity.ai/*",
+        "https://gemini.google.com/*",
+        "https://copilot.microsoft.com/*"
+      ],
+      "js": [
+        "src/redact/tier1.js",
+        "src/content-isolated.js"
+      ],
+      "run_at": "document_start",
+      "world": "ISOLATED"
+    }
+  ]
+}

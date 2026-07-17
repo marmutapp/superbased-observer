@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "collected_at": "2026-07-11T20:34:40Z",
+  "note": "drift manifest — collection only; NO measured results here",
+  "observer": {
+    "binary_path": "/home/marmutapp/superbased-observer/bin/observer",
+    "binary_sha256": "c7071fd6365cc4d5b424f41a52022cf6c804b12b5d735cad1128f90931fd0433",
+    "version": "observer version dev"
+  },
+  "harness": {
+    "git_commit": "2e3a8ea4",
+    "arms_config_sha256": "9e0d8e048888d48ccd02d5c1925dabd84d718a9930e7e75f31450e3c66df72cc",
+    "corpus_manifest_sha256": "892e4afbbb5f5cb33e7d53af8d90801d11640d89ccb906fa7114541474b66bdb"
+  },
+  "pricing": {
+    "source_file": "internal/intelligence/cost/pricing.go",
+    "source_sha256": "bcbff0b703fdbb8b3440138d31b5d3b5094fef1cf8406d345d0154e0b1c31f69",
+    "as_of": "2026-04",
+    "explicit_version": null,
+    "open_item": "no pricing-table version constant yet (plan §7 Q11)"
+  },
+  "model": {
+    "snapshot_id": null,
+    "returned_model": null,
+    "note": "filled by the result extractor from api_turns at run time (§3.4)"
+  },
+  "environment": {
+    "os": "Linux",
+    "arch": "x86_64",
+    "container_image": null
+  }
+}

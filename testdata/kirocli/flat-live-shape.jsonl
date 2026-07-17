@@ -1,0 +1,2 @@
+{"version":"v1","kind":"Prompt","data":{"message_id":"msg-user-0002","content":[{"kind":"text","data":"quick summary of this project"}],"meta":{"timestamp":1783600860}}}
+{"version":"v1","kind":"AssistantMessage","data":{"message_id":"msg-asst-0002","content":[{"kind":"text","data":"It is a Go tool."}]}}

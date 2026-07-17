@@ -1,0 +1,41 @@
+# task.toml — frozen benchmark task definition (declarative; NO results).
+#
+# Phase 0 scaffolding: NEVER executed by the harness in Phase 0. A live
+# run only becomes possible after the Phase 0a pilot + pre-registration
+# freeze (§3.0/§6).
+#
+# Self-contained (no external deps): plain bash. Language: shell/config.
+# Task type: logic/off-by-one fix. Expected session length: SHORT.
+
+schema = 1
+id = "shell-sum-range-fix"
+stratum = "representative"
+title = "Fix an off-by-one in a small bash script so the checker passes"
+
+selected_because = "everyday shell off-by-one fix with a clean, deterministic checker; representative of a SHORT single-file fix turn, chosen independently of any compressor"
+firing_independent = true
+
+[workspace]
+kind = "local"
+
+[prompt]
+# Strict, verbatim, IDENTICAL across arms. Salt (§3.2) appended by the
+# harness at run time.
+text = """
+`sum_range.sh` should print the sum of the integers 1..N inclusive, but
+it is off by one. Run `bash check.sh` to see the failures, then make the
+smallest fix to `sum_range.sh` so the checker passes. Keep the loop-based
+computation; do not hardcode results and do not edit `check.sh`.
+"""
+
+[success]
+# Machine-checkable completion gate. Exit 0 = all checker cases pass. Run
+# in the workspace copy AFTER the agent finishes. NOT executed in Phase 0.
+command = "bash check.sh"
+
+[[assertions]]
+id = "fixed-in-script-not-checker"
+kind = "semantic"
+script = "assertions/semantic.sh"
+weight = 1.0
+description = "sum_range.sh still computes the sum with a loop (not hardcoded) and check.sh is unchanged"

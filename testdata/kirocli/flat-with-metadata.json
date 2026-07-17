@@ -1,0 +1,58 @@
+{
+  "session_id": "aaaaaaaa-1111-4524-95d0-000000000001",
+  "cwd": "/home/dev/project",
+  "created_at": "2026-07-09T04:31:17.091312031Z",
+  "updated_at": "2026-07-09T04:31:25.266988400Z",
+  "title": "Reply READY",
+  "session_created_reason": "subagent",
+  "session_state": {
+    "version": "v1",
+    "conversation_metadata": {
+      "user_turn_metadatas": [
+        {
+          "loop_id": {
+            "agent_id": { "name": "kiro_default", "parent_id": null, "rand": null },
+            "rand": 3672917773
+          },
+          "message_ids": [
+            "msg-user-0001",
+            "msg-asst-0001"
+          ],
+          "total_request_count": 1,
+          "number_of_cycles": 0,
+          "builtin_tool_uses": 0,
+          "turn_duration": { "secs": 2, "nanos": 823502724 },
+          "end_reason": "UserTurnEnd",
+          "end_timestamp": "2026-07-09T04:31:25.256562407Z",
+          "input_token_count": 0,
+          "output_token_count": 0,
+          "context_usage_percentage": 1.2360001,
+          "metering_usage": [
+            { "value": 0.029355055555555554, "unit": "credit", "unitPlural": "credits" }
+          ],
+          "user_prompt_length": 51
+        }
+      ],
+      "user_turn_start_request": null,
+      "last_request": null
+    },
+    "rts_model_state": {
+      "conversation_id": "aaaaaaaa-1111-4524-95d0-000000000001",
+      "model_info": { "model_id": "auto", "context_window_tokens": 200000 },
+      "context_usage_percentage": 1.2360001
+    },
+    "permissions": {
+      "filesystem": {
+        "allowed_read_paths": ["/home/dev/project"],
+        "allowed_write_paths": [],
+        "denied_read_paths": [],
+        "denied_write_paths": []
+      },
+      "trusted_tools": [],
+      "denied_tools": [],
+      "allowed_commands": []
+    },
+    "agent_name": "kiro_default",
+    "goal": null
+  }
+}

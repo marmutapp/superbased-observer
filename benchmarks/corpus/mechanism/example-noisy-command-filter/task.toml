@@ -1,0 +1,43 @@
+# task.toml — MECHANISM-POSITIVE stress task (declarative; NO results).
+#
+# Stratum M (§3.7): engineered so a specific compressor — here the
+# shell-output filter (internal/compression/shell via `observer run`) —
+# fires HARD. Mechanism-stratum tasks demonstrate MECHANICS only and are
+# labelled "stress case". They are NEVER headline-eligible; headline
+# numbers come only from Stratum R (§3.7, R12 guard).
+#
+# Self-contained: workspace/generate_noise.sh emits a large, deterministic,
+# secret-free log. No external repo.
+
+schema = 1
+id = "example-noisy-command-filter"
+stratum = "mechanism"
+title = "Find the single failing line in a very noisy command log"
+
+selected_because = "engineered high-volume clean-then-one-failure output; the shell filter fires hard here by design"
+# Mechanism tasks are firing-DEPENDENT by construction; must be false so
+# the guard that keeps them out of the headline can key on it.
+firing_independent = false
+
+[workspace]
+kind = "local"
+
+[prompt]
+text = """
+Run `bash generate_noise.sh` and read its output. Exactly one line
+reports a failure. Report that failing line verbatim and the line number
+it appeared on. Do not summarize the rest of the output.
+"""
+
+[success]
+# Completion gate: the agent's final answer file must name the planted
+# failing token. Placeholder command; wired to the real answer-capture
+# path in Phase 1. NOT executed in Phase 0.
+command = "grep -q 'FAILURE_MARKER_7F3A' ANSWER.txt"
+
+[[assertions]]
+id = "correct-failing-line"
+kind = "semantic"
+script = "assertions/semantic.sh"
+weight = 1.0
+description = "the agent identified the planted failing line and its line number, not a hallucinated one"

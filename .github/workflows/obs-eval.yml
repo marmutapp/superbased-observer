@@ -1,0 +1,55 @@
+# obs eval regression gate (plan §8) — a TEMPLATE workflow teams copy into
+# their own repo to fail CI when an agent's quality regresses, the analog of
+# Langfuse's experiment-action / LangSmith pytest.
+#
+# It is workflow_dispatch (manual / callable) rather than on:[pull_request]
+# because a meaningful run needs YOUR captured trajectories: point `db` at an
+# observer.db (an uploaded artifact, a checked-in fixture, or one produced by a
+# replay step) that already holds a dataset built with
+# `observer eval dataset create-from-traces`. `observer eval run --fail-under`
+# exits non-zero on regression, which fails the job.
+name: obs-eval
+
+on:
+  workflow_dispatch:
+    inputs:
+      db:
+        description: "Path to the observer.db holding the dataset"
+        required: true
+        default: "observer.db"
+      dataset:
+        description: "Dataset name to score"
+        required: true
+      scorers:
+        description: "Comma-separated scorer specs (e.g. non_empty,json_valid,latency_under:ms=4000)"
+        required: true
+        default: "non_empty"
+      fail_under:
+        description: "Fail when pass rate is below this (0..1)"
+        required: true
+        default: "0.9"
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Build observer
+        run: go build -o bin/observer ./cmd/observer
+      - name: Run eval gate
+        run: |
+          SCORER_ARGS=""
+          IFS=',' read -ra SPECS <<< "${{ inputs.scorers }}"
+          for s in "${SPECS[@]}"; do
+            SCORER_ARGS="$SCORER_ARGS --scorer $s"
+          done
+          # A minimal config enabling the subsystem so the obs schema + eval
+          # plane are available against the supplied db.
+          printf '[observer]\ndb_path = "%s"\n[observability]\nenabled = true\n' "${{ inputs.db }}" > eval.config.toml
+          ./bin/observer eval run "${{ inputs.dataset }}" \
+            --config eval.config.toml \
+            $SCORER_ARGS \
+            --fail-under "${{ inputs.fail_under }}"

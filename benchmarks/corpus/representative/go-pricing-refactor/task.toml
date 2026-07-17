@@ -1,0 +1,51 @@
+# task.toml — frozen benchmark task definition (declarative; NO results).
+#
+# Phase 0 scaffolding: NEVER executed by the harness in Phase 0. A live
+# run only becomes possible after the Phase 0a pilot + pre-registration
+# freeze (§3.0/§6).
+#
+# Self-contained (no external repo): a single-package Go module (stdlib
+# only). Language: Go. Task type: refactor-with-tests (remove duplication,
+# keep the suite green). Expected session length: LONG.
+#
+# NOTE on the guard: the tests are GREEN at task start, so `go test` alone
+# cannot detect a no-op arm. The semantic assertion is what enforces the
+# refactor actually happened (the rounding divisor collapses to one site);
+# a "did nothing" arm passes the completion gate but FAILS the assertion —
+# exactly criterion #3 (a cheaper/worse arm must be detectable, §3.6).
+
+schema = 1
+id = "go-pricing-refactor"
+stratum = "representative"
+title = "Remove duplicated tax-rounding logic while keeping the tests green"
+
+selected_because = "common refactor-with-tests turn: collapse duplicated arithmetic behind one helper without changing behavior; representative of a LONG understand-then-restructure session, chosen independently of any compressor"
+firing_independent = true
+
+[workspace]
+kind = "local"
+
+[prompt]
+# Strict, verbatim, IDENTICAL across arms. Salt (§3.2) appended by the
+# harness at run time.
+text = """
+`priceWithTax` and `bulkPriceWithTax` in `pricing.go` both inline the same
+"add tax then round to the nearest cent" arithmetic. Extract that
+duplicated computation into a single helper and call it from both
+functions, without changing behavior. Run `go test ./...` and keep it
+green throughout. Do not edit `pricing_test.go`, do not delete either
+function, and do not add new files.
+"""
+
+[success]
+# Machine-checkable completion gate. Exit 0 = the suite is (still) green.
+# Green at start, so this gate alone does NOT prove the refactor happened
+# — the semantic assertion below does. NOT executed in Phase 0.
+command = "go test ./..."
+
+[[assertions]]
+id = "duplication-removed"
+kind = "patch-diff"
+script = "assertions/semantic.sh"
+weight = 1.0
+description = "the rounding divisor now appears once (duplication collapsed), both functions and the unedited test survive, no new files"

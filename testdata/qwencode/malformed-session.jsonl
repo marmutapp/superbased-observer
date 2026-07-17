@@ -1,0 +1,4 @@
+{"sessionId": "dddddddd-1111-2222-3333-777777777777", "version": "0.19.8", "cwd": "/home/dev/proj", "gitBranch": "main", "uuid": "m0", "parentUuid": null, "timestamp": "2026-07-09T06:00:00.000Z", "type": "user", "message": {"role": "user", "parts": [{"text": "first prompt"}]}}
+{ this is not valid json at all >>>
+
+{"sessionId": "dddddddd-1111-2222-3333-777777777777", "version": "0.19.8", "cwd": "/home/dev/proj", "gitBranch": "main", "uuid": "m1", "parentUuid": "m0", "timestamp": "2026-07-09T06:00:05.000Z", "type": "assistant", "model": "gpt-4o", "message": {"role": "model", "parts": [{"text": "recovered after the bad line"}]}}
