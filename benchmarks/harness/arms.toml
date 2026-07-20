@@ -1,0 +1,99 @@
+# arms.toml — declarative harness protocol config (arms / pairs / blocks).
+#
+# PROTOCOL KNOBS ONLY. No measured number ever lives here. This file is
+# read by run.sh --dry-run to validate + enumerate the plan, and (in a
+# later phase, after the Phase 0a gate) to drive the blocked-pair runner.
+#
+# This example is scaffolded for the FIRST headline candidate: the
+# tool-defs-trim card (§2, plan Phase 2 step 8). A2's legacy −12.5% is a
+# dated footnote, NOT a headline (§Review-delta 5); this config drives a
+# NEW measurement.
+
+schema = 1
+
+[protocol]
+# Pre-registration doc that must EXIST and be frozen before a live run
+# (§3.0). run.sh refuses a live run if this file is missing.
+prereg = "preregistration/tool-defs-trim-2026-07-11.md"
+
+# Minimum practically-important effect: smallest whole-task est.-cost
+# delta worth a public claim (§3.0). Smaller ⇒ "inconclusive", published
+# verbatim. Threshold pending operator sign-off (§7 Q5).
+mpie_pct = 5.0
+power = 0.80
+two_sided = true
+
+# Block count is COMPUTED from the Phase 0a pilot per-pair variance
+# (§3.1). 0 = "not yet powered". A live run REFUSES while blocks = 0;
+# --dry-run treats 0 as expected in Phase 0.
+blocks = 0
+
+# Cache regime this run reports (§3.3): cold | warm | mid-session.
+# "cache-safe" claims are scoped to warm steady state only.
+cache_regime = "warm"
+inter_turn_delay_s = 0        # fixed relative to the recorded cache TTL
+warmup_turns_excluded = 0     # declared before results (§3.3)
+
+# Multi-window discipline (§3.3): run randomized blocks across several
+# times of day and >= 2 calendar days. These are declared targets, not
+# results.
+min_calendar_days = 2
+
+[corpus]
+# Headline runs use the representative stratum ONLY (§3.7). Mechanism
+# tasks are driven by their own Phase 1 mechanism harness, not here.
+stratum = "representative"
+# The representative stratum (§3.7): a headline number spans these tasks —
+# multiple languages (Go/JS/shell), task types (build fix, test fix,
+# feature add, refactor-with-tests), and session lengths (short→long) —
+# so the card generalizes across realistic turns, not one hand-picked task.
+# Single-line array: the harness's minimal flat-TOML reader parses one-line
+# arrays only (see harness/lib/common.sh::toml_array).
+tasks = ["example-go-build-fix", "js-median-test-fix", "shell-sum-range-fix", "go-brackets-feature-add", "go-pricing-refactor"]
+
+[pairing]
+# Blocked replicate pairs (§3.2): each block runs arm A and arm B as a
+# matched pair; order randomized WITHIN each block; analysis is on paired
+# deltas so block-level (time, load) variance cancels.
+randomize_within_pair = true
+seed_source = "block-index"   # documented determinism source for the shuffle
+
+# --- Arms -------------------------------------------------------------
+# Each [[arm]] is one side of the matched pair. Salts are documented,
+# fixed-length, semantically-inert, and EQUAL in size across A and B
+# within a pair (so the salt is not itself a confound, §3.2). Cache
+# namespaces isolate arms so each gets its own cold cache (§3.2).
+
+[[arm]]
+id = "A-control"
+tool = "claude-code"
+compression = "off"
+# MEMORY constraint: Claude Code under ANTHROPIC_BASE_URL eager-inlines
+# MCP schemas unless ENABLE_TOOL_SEARCH=true. Every CC arm MUST declare
+# it or the measurement is rig error (R7).
+env = ["ENABLE_TOOL_SEARCH=true"]
+salt_bytes = 64
+cache_namespace = "ns-a"
+
+[[arm]]
+id = "B-toolsdefs-trim"
+tool = "claude-code"
+compression = "tools-trim"    # the "tools" sentinel (envelope tools field)
+env = ["ENABLE_TOOL_SEARCH=true"]
+salt_bytes = 64               # equal to A within the pair
+cache_namespace = "ns-b"
+
+# --- Codex example (commented; a separate card/run) -------------------
+# Codex arms carry their own memory constraints: `codex exec` defaults
+# read-only, so a task that edits needs -s workspace-write; add
+# --skip-git-repo-check; and give each arm a SEQUENTIAL, distinct
+# CODEX_HOME so their configs/caches don't collide.
+#
+# [[arm]]
+# id = "A-codex-control"
+# tool = "codex"
+# compression = "off"
+# env = ["CODEX_HOME=/tmp/bench-codex-a"]
+# exec_flags = ["-s", "workspace-write", "--skip-git-repo-check"]
+# salt_bytes = 64
+# cache_namespace = "ns-a"

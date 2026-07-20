@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "superbased-observer-sdk"
+version = "0.1.0"
+description = "Thin SDK to send custom app / agent traces to SuperBased Observer via OTLP."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "SuperBased", email = "contact@superbased.app" }]
+keywords = ["observability", "opentelemetry", "llm", "agents", "tracing"]
+dependencies = [
+  "opentelemetry-api>=1.20",
+  "opentelemetry-sdk>=1.20",
+  "opentelemetry-exporter-otlp-proto-http>=1.20",
+]
+
+# Optional framework auto-instrumentation via the Arize OpenInference
+# instrumentors — install the extra, then call the instrumentor after init().
+[project.optional-dependencies]
+langchain = ["openinference-instrumentation-langchain"]
+llama-index = ["openinference-instrumentation-llama-index"]
+crewai = ["openinference-instrumentation-crewai"]
+openai = ["openinference-instrumentation-openai"]
+
+[project.urls]
+Homepage = "https://superbased.app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["superbased"]

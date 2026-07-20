@@ -1,0 +1,32 @@
+-- 072_terminal_run_end_reason.sql — add a DURABLE end-reason to terminal_run so
+-- the resilient-attach rediscovery gate can tell a graceful daemon shutdown
+-- apart from a natural child exit WITHOUT depending on the ended_at write race
+-- (resilient-default-on-attach plan, review finding H2).
+--
+-- WHY a distinct reason column instead of leaning on ended_at:
+--   * A graceful daemon restart kills the PTYs (Manager.Shutdown) and the async
+--     OnExit → EndRunByHandle races the DB close, so ended_at may or may not be
+--     recorded before shutdown. Gating auto-resume on `ended_at IS NULL` is
+--     therefore nondeterministic. A durable reason stamped SYNCHRONOUSLY from
+--     the shutdown path (before the PTYs are killed) makes the verdict
+--     deterministic regardless of that race.
+--   * Semantics (written by internal/store/termrun.go + cmd/observer's
+--     terminal stack):
+--       ''               — still running (or crashed with no record).
+--       'child_exit'     — natural exit recorded via EndRunByHandle. NOT
+--                          resumable-by-restart.
+--       'daemon_shutdown'— stamped for every live attach run at graceful
+--                          daemon shutdown, BEFORE the PTYs are killed. IS
+--                          resumable-by-restart (ended_at may still be set
+--                          afterwards by a racing OnExit — the reason wins).
+--       'resumed'        — the orphan row was superseded by a successful
+--                          auto-resume spawn, so it can't be offered again
+--                          across a later restart.
+--
+-- NODE-LOCAL: terminal_run never leaves the machine (pinned by
+-- tests/invariant/privacy_test.go's forbidden-table sentinel + the
+-- SelectUnpushedSince end-to-end assertion, and excluded from
+-- internal/store/orgpush.go by construction). Adding a column touches no wire
+-- shape — no paired orgserver migration exists, same posture as the base table.
+
+ALTER TABLE terminal_run ADD COLUMN end_reason TEXT NOT NULL DEFAULT '';

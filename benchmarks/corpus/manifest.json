@@ -1,0 +1,62 @@
+{
+  "schema": 1,
+  "generated_by": "benchmarks/corpus/hash-corpus.sh",
+  "note": "content hashes only; NO measured results live in this file",
+  "tasks": [
+    {
+      "id": "example-go-build-fix",
+      "stratum": "representative",
+      "path": "corpus/representative/example-go-build-fix",
+      "frozen": true,
+      "hash": "25814c06ade87253a14cda189f2a111331f07427c1a99abd7e09996d211f0800"
+    }
+    ,
+    {
+      "id": "go-brackets-feature-add",
+      "stratum": "representative",
+      "path": "corpus/representative/go-brackets-feature-add",
+      "frozen": true,
+      "hash": "9be4ea86c502d893f831d8cb99a59b3b1da233054784828017a3fcfa478aff25"
+    }
+    ,
+    {
+      "id": "go-pricing-refactor",
+      "stratum": "representative",
+      "path": "corpus/representative/go-pricing-refactor",
+      "frozen": true,
+      "hash": "72d9f572acfd1232d3306d07d1c9777b1fd0ab3d13faac14b3ea36bb8226622f"
+    }
+    ,
+    {
+      "id": "js-median-test-fix",
+      "stratum": "representative",
+      "path": "corpus/representative/js-median-test-fix",
+      "frozen": true,
+      "hash": "40715a9b5cb994ff58214aec0aa12579adbfbe965143e017af25c7c39282ab96"
+    }
+    ,
+    {
+      "id": "shell-sum-range-fix",
+      "stratum": "representative",
+      "path": "corpus/representative/shell-sum-range-fix",
+      "frozen": true,
+      "hash": "4118b45b2c14ef6f4a5d0a75e72c1cb4c668417ae9dbf90f88e122f22cb6d0ae"
+    }
+    ,
+    {
+      "id": "example-noisy-command-filter",
+      "stratum": "mechanism",
+      "path": "corpus/mechanism/example-noisy-command-filter",
+      "frozen": true,
+      "hash": "91806f1a0318ba55e8446d779f7c0a9042bf9401e40b0b131de671af663d897b"
+    }
+    ,
+    {
+      "id": "lumen",
+      "stratum": "mechanism",
+      "path": "corpus/mechanism/lumen",
+      "frozen": false,
+      "hash": null
+    }
+  ]
+}

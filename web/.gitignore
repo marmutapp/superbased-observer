@@ -1,0 +1,5 @@
+# Playwright mobile-view verification harness — captured artifacts, not source.
+e2e/shots/
+test-results/
+playwright-report/
+.last-run.json

@@ -1,0 +1,15 @@
+{
+  "info": {
+    "id": "019f0000-0000-7000-8000-000000000001",
+    "cwd": "/home/dev/demo"
+  },
+  "session_summary": "Read the README",
+  "current_model_id": "grok-4.5",
+  "git_root_dir": "/home/dev/demo/",
+  "head_commit": "0000000000000000000000000000000000000000",
+  "head_branch": "main",
+  "request_id": "p-0001",
+  "agent_name": "grok-build-plan",
+  "reasoning_effort": "high",
+  "chat_format_version": 1
+}

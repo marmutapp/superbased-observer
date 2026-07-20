@@ -1,0 +1,16 @@
+{
+  "createdAt": "2026-07-09T06:10:00.000Z",
+  "updatedAt": "2026-07-09T06:10:12.000Z",
+  "title": "Inspect the Windows project",
+  "isCustomTitle": false,
+  "agents": {
+    "main": {
+      "homedir": "C:/Users/auzy_/.kimi-code/sessions/wd_winproj_ffee00112233/session_22222222-2222-4222-8222-222222222222/agents/main",
+      "type": "main",
+      "parentAgentId": null
+    }
+  },
+  "custom": {},
+  "workDir": "C:/Users/auzy_/winproj",
+  "lastPrompt": "Read the README"
+}

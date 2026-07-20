@@ -1,0 +1,70 @@
+# coding-corpus-v1 — worked benchmark spec (codex-first v1).
+#
+# A small, pinned public-repo corpus across a {codex × model} matrix. Pins refs
+# up front, pre-registers a primary outcome + non-inferiority margin, and bounds
+# real spend with per-attempt/per-run caps. Run it DRY first:
+#
+#   observer benchmark run testdata/benchmark/coding-corpus-v1.toml
+#
+# then, only when you've reviewed the estimate, spend:
+#
+#   observer benchmark run testdata/benchmark/coding-corpus-v1.toml --confirm-spend
+#
+# NOTE: pin the model ids to what your codex auth actually serves — ChatGPT-auth
+# codex accounts serve the gpt-5.x-codex / gpt-5.6-sol family, NOT gpt-5.1 (an
+# unsupported model 400s every cell, honestly recorded as model_fail).
+
+name = "coding-corpus-v1"
+repeats = 5
+
+[budget]
+  max_total_usd      = 15.0   # hard cap for the whole matrix
+  max_cell_usd       = 0.75   # per-attempt cap
+  max_turns_per_cell = 40
+  max_wall_sec_cell  = 900
+  require_confirm    = true
+  judge_budget_usd   = 0.0    # no llm_judge in this corpus
+
+[retry]
+  infra_retries = 2           # clone/setup only; model failures are never retried
+
+[analysis]
+  baseline_config       = "codex-sol"
+  noninferiority_margin  = 0.10   # a candidate within 10 success-rate points is "not worse"
+  min_sample            = 5
+
+[[tasks]]
+  id = "express-lifecycle-summary"
+  repo = "https://github.com/expressjs/express.git"
+  ref  = "980d881e3b023db079de60477a2588a91f046ca5"
+  prompt = "Summarize the Express request lifecycle with concrete file:line references to the middleware chain and app.handle."
+  # Echo-proof (audit P0.9 / #1): the prompt already contains "middleware" and
+  # "app.handle", so scoring on those passed a bare prompt echo. Require tokens
+  # a CORRECT answer with real file:line references must contain but the prompt
+  # does NOT — Express's router source dir + the Layer abstraction.
+  [tasks.success]
+    scorer = "contains_all"
+    values = ["lib/router", "layer"]
+
+[[tasks]]
+  id = "lodash-chunk-doc"
+  repo = "https://github.com/lodash/lodash.git"
+  ref  = "8a26eba0d1ffd48e9e58e895f9c67b5e0da2b3aa"
+  prompt = "Describe what _.chunk does and name the source file it is defined in."
+  # Echo-proof (audit P0.9 / #1): "chunk" is already in the prompt. Require the
+  # actual source file name ("chunk.js") plus a functional-description token
+  # ("array") — a correct answer names the file and says _.chunk splits an
+  # array; neither token appears in the prompt, so an echo cannot pass.
+  [tasks.success]
+    scorer = "contains_all"
+    values = ["chunk.js", "array"]
+
+[[configs]]
+  id = "codex-sol"
+  harness = "codex"
+  model = "gpt-5.6-sol"
+
+[[configs]]
+  id = "codex-mini"
+  harness = "codex"
+  model = "gpt-5.6-sol-mini"

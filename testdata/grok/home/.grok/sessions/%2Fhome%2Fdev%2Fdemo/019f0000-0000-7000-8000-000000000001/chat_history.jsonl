@@ -1,0 +1,6 @@
+{"type": "system", "content": "You are Grok 4.5 released by xAI."}
+{"type": "user", "content": [{"type": "text", "text": "<user_query>\nRead the README. My token is sk-livedemoKEY0123456789abcd keep it safe.\n</user_query>"}]}
+{"type": "user", "content": [{"type": "text", "text": "<system-reminder>\nSkills available: docx\n</system-reminder>"}], "synthetic_reason": "skills"}
+{"type": "reasoning", "id": "rs-0001", "summary": [{"type": "summary_text", "text": "I should read the README file first."}], "status": "completed"}
+{"type": "assistant", "content": "I'll read the README for you.", "tool_calls": [{"id": "call-abc-0", "name": "read_file", "arguments": "{\"target_file\":\"/home/dev/demo/README.md\"}"}], "model_id": "grok-4.5", "model_fingerprint": "fp_demo", "reasoning_effort": "high"}
+{"type": "tool_result", "tool_call_id": "call-abc-0", "content": "# Demo\nHello world"}

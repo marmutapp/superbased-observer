@@ -1,0 +1,31 @@
+{
+  "sessionId": "00000000-1111-2222-3333-444444444444",
+  "projectHash": "abcdef0123456789",
+  "startTime": "2026-04-01T10:00:00.000Z",
+  "messages": [
+    {
+      "id": "msg-user-1",
+      "role": "user",
+      "timestamp": "2026-04-01T10:00:01.000Z",
+      "cwd": "/tmp/example-project",
+      "content": [{"type": "text", "text": "list the files in this directory"}]
+    },
+    {
+      "id": "msg-model-1",
+      "role": "gemini",
+      "timestamp": "2026-04-01T10:00:02.500Z",
+      "model": "gemini-2.5-pro",
+      "content": [
+        {"type": "thought", "thought": "User wants a directory listing. Use list_files."},
+        {"type": "functionCall", "functionCall": {"id": "call-1", "name": "list_files", "args": {"path": "."}}}
+      ],
+      "tokens": {"input": 1234, "output": 89, "thoughtsTokenCount": 12, "total": 1335}
+    },
+    {
+      "id": "msg-tool-1",
+      "role": "tool",
+      "timestamp": "2026-04-01T10:00:03.000Z",
+      "content": [{"type": "functionResponse", "functionResponse": {"id": "call-1", "name": "list_files", "response": {"output": "main.go\nREADME.md\n"}}}]
+    }
+  ]
+}
