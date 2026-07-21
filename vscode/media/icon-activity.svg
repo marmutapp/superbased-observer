@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- SuperBased S-mark, monochrome for the activity bar.
+       VS Code renders activity-bar icons in the theme's
+       activityBar.foreground (currentColor), with reduced alpha
+       on inactive containers. The fill="currentColor" attribute is
+       what gives VS Code permission to tint it. -->
+  <rect x="2" y="2" width="20" height="20" rx="4" fill="none" stroke="currentColor" stroke-width="1.4"/>
+  <text x="12" y="17" text-anchor="middle" font-family="system-ui,-apple-system,sans-serif" font-size="14" font-weight="800" fill="currentColor">S</text>
+</svg>

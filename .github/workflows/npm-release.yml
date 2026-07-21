@@ -1,0 +1,1298 @@
+# Release the observer Go binary as 6 npm packages + 5 PyPI wheels
+# whenever a v* tag is pushed. Same binaries, two distribution
+# channels — version numbers kept in lock-step.
+#
+# Flow:
+#   0. frontend job          — npm ci + npm run build inside web/.
+#                              Uploads web/dist as an artifact so the 5
+#                              platform binaries embed the SAME bundle
+#                              (build-once, ship-everywhere). Prior to
+#                              this job the workflow trusted whatever
+#                              `internal/intelligence/dashboard/webapp/
+#                              dist/` had been committed — a dev who
+#                              tagged without running `make web-build`
+#                              shipped a stale React bundle.
+#   1. build job (matrix x5) — cross-compile each binary against the
+#                              fresh dist; linux variants additionally
+#                              cross-compile `antigravity-bridge.exe`
+#                              (Windows amd64) into the same bin/ dir
+#                              so npm-installed observer-on-WSL2 finds
+#                              the bridge next to the observer binary
+#                              (locateBridgeBinary's exe-dir lookup).
+#                              Uploads the whole bin/ folder per
+#                              platform.
+#   2. publish job           — pulls every platform's bin/ folder,
+#                              drops it into npm/observer-<plat>/bin/,
+#                              stamps the version into every
+#                              package.json, npm-publishes the 5
+#                              platform packages, then publishes the
+#                              main shim last so its
+#                              optionalDependencies resolve.
+#   3. publish-to-pypi job   — pulls every platform's bin/ folder,
+#                              drops it into pypi/observer/src/observer/
+#                              _bin/, stamps the version into the
+#                              package's __init__.py, builds a wheel
+#                              via hatchling (python -m build), retags
+#                              the wheel from py3-none-any to its
+#                              platform tag (manylinux2014_*, macosx_*,
+#                              win_amd64) via `python -m wheel tags`,
+#                              and uploads all 5 wheels to PyPI via
+#                              pypa/gh-action-pypi-publish. Includes a
+#                              CI guard that fails the job if any wheel
+#                              is missing its binary (v1.7.25 footgun:
+#                              hatchling silently dropped the binary
+#                              because .gitignore listed it; fix is the
+#                              force-include block + this size check).
+#                              Runs in parallel with publish (only
+#                              needs build).
+#   4. release job           — creates a GitHub Release on the private
+#                              repo using the matching CHANGELOG.md
+#                              section as the body. Useful as a
+#                              maintainer-side changelog browser.
+#   5. public_release job    — creates a GitHub Release on the PUBLIC
+#                              repo (marmutapp/superbased-observer)
+#                              with per-platform binary archives +
+#                              SHA256SUMS attached. Runs in parallel
+#                              with publish (only needs build), so
+#                              direct downloads land independent of
+#                              npm publish success. Waits for the v*
+#                              tag to exist on the public repo —
+#                              scripts/release.sh public <version>
+#                              pushes it as part of the maintainer's
+#                              `release.sh full <version>` invocation.
+#
+# Auth:
+#   - NPM_TOKEN_OBSERVER  npm token scoped to @superbased/observer*.
+#     See https://docs.npmjs.com/about-access-tokens.
+#   - PYPI_TOKEN_OBSERVER PyPI API token scoped to the
+#     superbased-observer project. Upload-only; cannot yank or delete.
+#     Yanking a broken release requires the maintainer to log in at
+#     https://pypi.org/manage/project/superbased-observer/releases/
+#     and use the web UI. See docs/pypi-release-process.md.
+#   - PUBLIC_REPO_TOKEN   fine-grained PAT with `contents: write` on
+#     marmutapp/superbased-observer (the public repo). Used by the
+#     public_release job to create the GH Release with binary assets.
+#     Must be set BEFORE the first tag that uses this flow lands —
+#     missing-token failures surface as a 404 from `gh release create`.
+
+name: npm-release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Re-pushed-tag defense. Per feedback_npm_release_workflow_double_fire,
+# the workflow steady-state single-fires on `push: tags: v*`; the v1.7.23
+# double-fire was a re-pushed tag, not the workflow itself. This block
+# serialises the runs (second push of the same tag waits for the first
+# to finish) so the second instance doesn't race on artifact uploads /
+# npm publish / vsce publish. cancel-in-progress is false because once
+# any publish step starts, killing it mid-stream risks half-published
+# state on a registry. The vscode-preflight job below catches the
+# actual republish attempt with a fast, loud failure.
+concurrency:
+  group: npm-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # GH Release step needs write to create the release.
+
+jobs:
+  # ----------------------------------------------------------------
+  # Build the React frontend once, upload as artifact. All 5 binary
+  # jobs download the same artifact so they embed identical bundles.
+  # ----------------------------------------------------------------
+  frontend:
+    name: build frontend
+    # Gate the entire pipeline to the private repo. The orphan tree
+    # pushed to the public repo includes .github/workflows/ (because
+    # PRIVATE_ONLY_PATHS in scripts/release.sh doesn't list it — and
+    # there's value in publishing the workflow source for transparency),
+    # so the v* tag push to public:main also fires this workflow on
+    # the public repo. The public repo has no NPM_TOKEN_OBSERVER (and
+    # shouldn't — npm publish belongs to the maintainer), so the
+    # publish job would error with ENEEDAUTH. Beyond auth, the whole
+    # cross-compile + publish + release pipeline is wasted work on the
+    # public side (the private run already produces every artifact).
+    # Gating frontend skips it on the public repo; every other job
+    # chains via `needs: frontend` transitively, so they all skip too.
+    if: github.repository == 'marmutapp/superbased-observer-private'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install + build webapp
+        run: |
+          cd web
+          npm ci
+          npm run build
+          ls -l dist/
+          # Sanity: index.html must reference the freshly-hashed
+          # bundle. If Vite produced an empty dist (silent error)
+          # we want to fail loudly rather than embed an empty FS.
+          test -f dist/index.html
+          grep -qE 'assets/index-[A-Za-z0-9_-]+\.js' dist/index.html
+
+      - name: Upload web/dist
+        uses: actions/upload-artifact@v5
+        with:
+          name: web-dist
+          path: web/dist/
+          retention-days: 7
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------
+  # Build the 5 platform binaries in parallel. Each binary embeds the
+  # web-dist artifact built in the frontend job above.
+  # ----------------------------------------------------------------
+  build:
+    name: build ${{ matrix.target }}
+    needs: frontend
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: linux-x64
+            goos: linux
+            goarch: amd64
+            ext: ''
+            include_bridge: true
+          - target: linux-arm64
+            goos: linux
+            goarch: arm64
+            ext: ''
+            include_bridge: true
+          - target: darwin-x64
+            goos: darwin
+            goarch: amd64
+            ext: ''
+            include_bridge: false
+          - target: darwin-arm64
+            goos: darwin
+            goarch: arm64
+            ext: ''
+            include_bridge: false
+          - target: win32-x64
+            goos: windows
+            goarch: amd64
+            ext: '.exe'
+            include_bridge: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download web/dist
+        uses: actions/download-artifact@v6
+        with:
+          name: web-dist
+          path: web/dist/
+
+      - name: Sync embed dir from web/dist
+        # The Go binary embeds internal/intelligence/dashboard/webapp/
+        # dist/ via //go:embed; web/dist is the build output. Mirror
+        # the layout `make web-build` produces locally.
+        run: |
+          set -euo pipefail
+          rm -rf internal/intelligence/dashboard/webapp/dist
+          mkdir -p internal/intelligence/dashboard/webapp/dist
+          cp -R web/dist/. internal/intelligence/dashboard/webapp/dist/
+          ls -l internal/intelligence/dashboard/webapp/dist/
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Cross-compile observer
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'  # pure-Go thanks to modernc.org/sqlite
+        run: |
+          # Strip the leading 'v' from the tag (v1.2.3 -> 1.2.3) so the
+          # binary's `observer --version` matches the npm package version.
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p npm/observer-${{ matrix.target }}/bin
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+            -o npm/observer-${{ matrix.target }}/bin/observer${{ matrix.ext }} \
+            ./cmd/observer
+          # Make the unix binary executable. Windows .exe is fine as-is.
+          if [ -z "${{ matrix.ext }}" ]; then
+            chmod +x npm/observer-${{ matrix.target }}/bin/observer
+          fi
+          ls -l npm/observer-${{ matrix.target }}/bin/
+          # Sanity-check the embedded version inline on the linux-x64
+          # build (the runner OS) — fail the job if it doesn't match.
+          if [ "${{ matrix.target }}" = "linux-x64" ]; then
+            EMBEDDED=$(./npm/observer-linux-x64/bin/observer --version 2>&1 | head -1 | awk '{print $NF}')
+            if [ "$EMBEDDED" != "$VERSION" ]; then
+              echo "::error::version mismatch: --version reports '$EMBEDDED' want '$VERSION'"
+              exit 1
+            fi
+            echo "embedded version: $EMBEDDED ✓"
+          fi
+
+      - name: Cross-compile observer-org
+        # The org server (cmd/observer-org) ships separately from the
+        # agent: its own per-platform binary (Teams M5), uploaded under
+        # a distinct artifact name so the public_release + provenance
+        # jobs can pick it up without disturbing the observer bin/ tree.
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'  # pure-Go thanks to modernc.org/sqlite
+        run: |
+          set -euo pipefail
+          # Same version stamp as observer — cmd/observer-org has a
+          # `var version` stamped via -X main.version=.
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p orgbin/observer-org-${{ matrix.target }}
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+            -o orgbin/observer-org-${{ matrix.target }}/observer-org${{ matrix.ext }} \
+            ./cmd/observer-org
+          if [ -z "${{ matrix.ext }}" ]; then
+            chmod +x orgbin/observer-org-${{ matrix.target }}/observer-org
+          fi
+          ls -l orgbin/observer-org-${{ matrix.target }}/
+
+      - name: Cross-compile antigravity-bridge.exe
+        # WSL2-on-Windows linux installs need the Windows-side helper
+        # binary that runs under powershell.exe to bridge the WSL→
+        # Windows-localhost network gap when calling Antigravity's
+        # local language_server gRPC API. Pre-CI this binary was a
+        # `make build` afterthought on the maintainer's box; shipping
+        # it inside the linux-* npm packages means WSL2 users no
+        # longer have to clone + build to use the Antigravity adapter.
+        # Always Windows amd64 — observer's locateBridgeBinary looks
+        # for it next to the observer executable.
+        if: matrix.include_bridge
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: |
+          go build -trimpath -ldflags="-s -w" \
+            -o npm/observer-${{ matrix.target }}/bin/antigravity-bridge.exe \
+            ./cmd/antigravity-bridge
+          ls -l npm/observer-${{ matrix.target }}/bin/
+
+      - name: Upload bin/ folder
+        # Upload the whole bin/ dir (not just observer) so the linux
+        # variants' antigravity-bridge.exe rides along. The publish
+        # job re-hydrates by copying the entire artifact tree back
+        # into npm/observer-<plat>/bin/.
+        uses: actions/upload-artifact@v5
+        with:
+          name: observer-${{ matrix.target }}
+          path: npm/observer-${{ matrix.target }}/bin/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload observer-org binary
+        # Separate artifact (observer-org-<plat>) so the org server
+        # binary never lands in the npm packages — only the public
+        # release archives + SLSA provenance subjects consume it.
+        uses: actions/upload-artifact@v5
+        with:
+          name: observer-org-${{ matrix.target }}
+          path: orgbin/observer-org-${{ matrix.target }}/
+          retention-days: 7
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------
+  # SBOMs (Teams M5). Generate a CycloneDX SBOM per binary and upload
+  # them as a single `sboms` artifact for attachment to the public
+  # release. Only the linux-x64 binaries are catalogued: syft reads
+  # the Go module table embedded in the binary, which is identical
+  # across GOOS/GOARCH targets, so one platform's SBOM describes the
+  # dependency graph for all of them.
+  # ----------------------------------------------------------------
+  sbom:
+    name: SBOMs
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download linux-x64 observer binary
+        uses: actions/download-artifact@v6
+        with:
+          name: observer-linux-x64
+          path: sbom-in/observer
+
+      - name: Download linux-x64 observer-org binary
+        uses: actions/download-artifact@v6
+        with:
+          name: observer-org-linux-x64
+          path: sbom-in/observer-org
+
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Generate CycloneDX SBOMs
+        run: |
+          set -euo pipefail
+          mkdir -p sboms
+          syft "sbom-in/observer/observer" -o cyclonedx-json > sboms/observer.cdx.json
+          syft "sbom-in/observer-org/observer-org" -o cyclonedx-json > sboms/observer-org.cdx.json
+          ls -l sboms/
+
+      - name: Upload SBOMs
+        uses: actions/upload-artifact@v5
+        with:
+          name: sboms
+          path: sboms/
+          retention-days: 7
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------
+  # Docker image (Teams M5). Build the observer-org server image from
+  # Dockerfile.observer-org, push it to ghcr.io under the marmutapp
+  # org using the private repo's GITHUB_TOKEN, then keyless-sign it
+  # with cosign BY DIGEST (immutable reference; signing a mutable tag
+  # is a TOCTOU footgun). The image digest is exposed as a job output
+  # so downstream steps / docs can reference the exact pushed image.
+  # ----------------------------------------------------------------
+  docker_image:
+    name: Docker image (observer-org)
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.observer-org
+          push: true
+          tags: ghcr.io/marmutapp/observer-org:${{ github.ref_name }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image by digest (keyless)
+        # Keyless OIDC signing — no long-lived keys; the signature is
+        # bound to this workflow's identity. Verifiable later with
+        # `cosign verify ... --certificate-identity-regexp ...`.
+        run: |
+          cosign sign --yes "ghcr.io/marmutapp/observer-org@${{ steps.push.outputs.digest }}"
+
+  # ----------------------------------------------------------------
+  # Hashes (Teams M5). Compute the base64-encoded sha256sum subject
+  # lines over the observer + observer-org per-platform binaries. This
+  # feeds the SLSA generator's `base64-subjects` input. Kept in a
+  # small dedicated job so the build matrix stays untouched.
+  # ----------------------------------------------------------------
+  hashes:
+    name: Compute SLSA subjects
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - name: Download all binaries
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+
+      - name: Compute base64-subjects
+        id: hash
+        run: |
+          set -euo pipefail
+          # sha256sum over every observer + observer-org per-platform
+          # binary, then base64-encode the combined sums file as the
+          # SLSA generator expects (one "<sha256>  <name>" line each).
+          (
+            cd artifacts
+            sha256sum \
+              observer-*/observer observer-*/observer.exe \
+              observer-org-*/observer-org observer-org-*/observer-org.exe \
+              2>/dev/null || true
+          ) > sums.txt
+          # Fail loudly if nothing matched (artifact layout changed).
+          if [ ! -s sums.txt ]; then
+            echo "::error::no binaries matched for SLSA subjects"
+            exit 1
+          fi
+          echo "=== subjects ==="
+          cat sums.txt
+          echo "hashes=$(base64 -w0 sums.txt)" >> "$GITHUB_OUTPUT"
+
+  # ----------------------------------------------------------------
+  # SLSA Level 3 provenance (Teams M5). The official reusable generator
+  # produces a signed in-toto attestation over the binary subjects.
+  #
+  # The build runs on the PRIVATE repo, so by default the generator
+  # halts — it refuses to record a private repo's name in the public
+  # Rekor transparency log. `private-repository: true` overrides that.
+  # The builder identity (…/superbased-observer-private) is already
+  # disclosed in this release's cosign-verify instructions, so the Rekor
+  # entry exposes nothing new. (This was the v1.7.0 release failure: the
+  # generator's `final` job exited 27 because the generate step halted on
+  # the private-repo guard — no provenance was produced.)
+  #
+  # `upload-assets: false`: the generator attaches assets to the release
+  # on the repo it runs on (private), but consumers get the PUBLIC
+  # release. So we keep the provenance as a workflow artifact and the
+  # public_release job below copies the .intoto.jsonl onto the PUBLIC
+  # GitHub Release, next to the binaries it attests. Verifiable with
+  # slsa-verifier --source-uri github.com/marmutapp/superbased-observer-private.
+  # ----------------------------------------------------------------
+  provenance:
+    needs: [build, hashes]
+    permissions:
+      actions: read    # read the workflow run for provenance metadata
+      id-token: write  # keyless signing of the attestation
+      contents: write  # required by the reusable generator's API
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: "${{ needs.hashes.outputs.hashes }}"
+      # Produce the provenance as a workflow artifact; public_release
+      # attaches it to the PUBLIC release (where the binaries live).
+      upload-assets: false
+      # The build runs on the private repo — override the generator's
+      # private-repo Rekor guard (builder identity already public via cosign).
+      private-repository: true
+
+  # ----------------------------------------------------------------
+  # Publish all 6 packages from a single job after every binary is
+  # built. Sequential publish so a failure mid-flight is recoverable
+  # (idempotent — npm rejects re-publishing the same version, so just
+  # re-run from where it stopped).
+  # ----------------------------------------------------------------
+  publish:
+    name: publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          # Node 22 is the active LTS; v20 emits a deprecation warning
+          # on every workflow run. The publish job only invokes `npm
+          # publish` so it's Node-version-insensitive — bumping clears
+          # the warning at zero risk.
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Resolve version
+        id: version
+        run: |
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all platform bin/ folders
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+
+      - name: Place binaries in their package directories
+        run: |
+          set -euo pipefail
+          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+            mkdir -p "npm/observer-${target}/bin"
+            # The artifact contains the whole bin/ tree — observer +
+            # (for linux variants) antigravity-bridge.exe. cp -R
+            # preserves both.
+            cp -R "artifacts/observer-${target}/." "npm/observer-${target}/bin/"
+            # Make unix binaries executable.
+            if [ "${target}" != "win32-x64" ]; then
+              chmod +x "npm/observer-${target}/bin/observer"
+            fi
+          done
+          # Sanity print before publish so the workflow log shows
+          # exactly which binaries were packaged.
+          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+            echo "=== npm/observer-${target}/bin/ ==="
+            ls -l "npm/observer-${target}/bin/"
+          done
+
+      - name: Stamp release version into every package.json
+        run: ./scripts/sync-npm-version.sh "${GITHUB_REF_NAME}"
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN_OBSERVER }}
+        run: |
+          set -euo pipefail
+          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+            (cd "npm/observer-${target}" && npm publish --access public)
+          done
+
+      - name: Publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN_OBSERVER }}
+        run: |
+          # Main goes last so its optionalDependencies resolve cleanly
+          # for any user installing the moment after this step finishes.
+          cd npm/observer && npm publish --access public
+
+      - name: Summary
+        run: |
+          {
+            echo "## npm-release ${GITHUB_REF_NAME} published"
+            echo ""
+            echo "Six packages updated:"
+            echo "- \`@superbased/observer@${GITHUB_REF_NAME#v}\`"
+            for t in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+              echo "- \`@superbased/observer-${t}@${GITHUB_REF_NAME#v}\`"
+            done
+            echo ""
+            echo "linux-x64 + linux-arm64 packages include \`antigravity-bridge.exe\` for WSL2 users."
+            echo ""
+            echo "Smoke test:"
+            echo '```bash'
+            echo "npm install -g @superbased/observer@${GITHUB_REF_NAME#v}"
+            echo "observer --version"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ----------------------------------------------------------------
+  # PyPI release. Builds 5 per-platform wheels (each bundling its
+  # platform's prebuilt binary) and uploads them with PYPI_TOKEN_OBSERVER.
+  # Runs in parallel with the npm `publish` job — both consume the
+  # same `observer-${target}` artifacts the `build` matrix produced.
+  #
+  # Why per-platform wheels (and no sdist):
+  #   - pip's wheel-tag selector picks the matching wheel at install
+  #     time; no postinstall download, no Go toolchain on the user
+  #     machine
+  #   - sdist would either ship a placeholder (broken `pip install`)
+  #     or download-at-install (breaks --no-index / offline / hash
+  #     verification)
+  #   - This is the same pattern ruff / uv / polars use
+  # ----------------------------------------------------------------
+  publish-to-pypi:
+    name: publish to PyPI
+    if: github.repository == 'marmutapp/superbased-observer-private'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      # Defend against re-pushed-tag double-fires. `skip-existing`
+      # below is the runtime defense; this is the gate-level one.
+      group: pypi-publish-${{ github.ref_name }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade build hatchling wheel
+
+      - name: Download all platform bin/ artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts/
+
+      - name: Build 5 platform wheels
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${REF_NAME#v}"
+          mkdir -p dist
+
+          # <go-target>:<wheel-platform-tag>. The artifact name format
+          # is `observer-${target}`. Contents are the WHOLE bin/ folder
+          # (observer{,.exe} + antigravity-bridge.exe on linux-*).
+          # Copy everything into _bin/ so locateBridgeBinary() still
+          # finds the helper exe next to observer.
+          for arm in \
+              "linux-x64:manylinux2014_x86_64" \
+              "linux-arm64:manylinux2014_aarch64" \
+              "darwin-x64:macosx_10_15_x86_64" \
+              "darwin-arm64:macosx_11_0_arm64" \
+              "win32-x64:win_amd64"; do
+            IFS=":" read -r tgt plat <<<"$arm"
+            echo "::group::Building wheel for ${tgt} (tag: ${plat})"
+            rm -rf pypi/observer/dist pypi/observer/src/observer/_bin
+            mkdir -p pypi/observer/src/observer/_bin
+            cp -a "artifacts/observer-${tgt}/." pypi/observer/src/observer/_bin/
+            # download-artifact strips the execute bit; re-add for
+            # non-Windows wheels. Windows wheels ship .exe so no chmod.
+            if [ "${tgt}" != "win32-x64" ]; then
+              chmod +x pypi/observer/src/observer/_bin/observer
+            fi
+            cp LICENSE pypi/observer/LICENSE
+            # Stamp the release version into __init__.py — hatchling
+            # reads __version__ from there at wheel-build time.
+            printf '__version__ = "%s"\n' "${VERSION}" \
+                > pypi/observer/src/observer/__init__.py
+            python -m build --wheel --outdir pypi/observer/dist pypi/observer/
+            wheel_file=$(ls pypi/observer/dist/*-any.whl | head -n1)
+            # Retag from py3-none-any -> py3-none-${plat}. Each per-
+            # platform wheel ends up with a distinct filename so PyPI
+            # accepts all 5 under the same version.
+            python -m wheel tags --remove \
+                --python-tag py3 --abi-tag none \
+                --platform-tag "${plat}" "${wheel_file}"
+            retagged=$(ls pypi/observer/dist/*.whl | head -n1)
+            # Guard against the v1.7.25 footgun: hatchling silently
+            # dropping the binary because .gitignore excluded it.
+            # Unzip the retagged wheel and assert _bin/observer{,.exe}
+            # is present and > 1 MB (real binaries are ~45 MB; the
+            # broken-empty wheel was 24 KB).
+            exe_path="observer/_bin/observer"
+            if [ "${tgt}" = "win32-x64" ]; then
+              exe_path="observer/_bin/observer.exe"
+            fi
+            actual_size=$(python -c "import zipfile,sys; z=zipfile.ZipFile(sys.argv[1]); i=z.getinfo(sys.argv[2]); print(i.file_size)" "${retagged}" "${exe_path}")
+            if [ "${actual_size}" -lt 1000000 ]; then
+              echo "::error::wheel for ${tgt} missing binary: ${exe_path} is ${actual_size} bytes (< 1MB)"
+              exit 1
+            fi
+            echo "wheel for ${tgt}: ${exe_path} = ${actual_size} bytes ✓"
+            mv pypi/observer/dist/*.whl dist/
+            echo "::endgroup::"
+          done
+
+          echo "=== dist/ ==="
+          ls -la dist/
+
+      - name: Upload wheels to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_TOKEN_OBSERVER }}
+          packages-dir: dist/
+          # Idempotent against re-pushed tags. Without this, a
+          # concurrency-bypassing re-run would fail with HTTP 400
+          # "File already exists" — `skip-existing: true` makes that
+          # a no-op instead.
+          skip-existing: true
+
+      - name: Summary
+        run: |
+          {
+            echo "## PyPI ${GITHUB_REF_NAME} published"
+            echo ""
+            echo "5 platform wheels uploaded to PyPI:"
+            for arm in \
+                "linux-x64:manylinux2014_x86_64" \
+                "linux-arm64:manylinux2014_aarch64" \
+                "darwin-x64:macosx_10_15_x86_64" \
+                "darwin-arm64:macosx_11_0_arm64" \
+                "win32-x64:win_amd64"; do
+              IFS=":" read -r tgt plat <<<"$arm"
+              echo "- \`superbased_observer-${GITHUB_REF_NAME#v}-py3-none-${plat}.whl\` (${tgt})"
+            done
+            echo ""
+            echo "Smoke test:"
+            echo '```bash'
+            echo "pip install superbased-observer==${GITHUB_REF_NAME#v}"
+            echo "observer --version"
+            echo '```'
+            echo ""
+            echo "Project page: https://pypi.org/project/superbased-observer/"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ----------------------------------------------------------------
+  # VS Code extension matrix package step. Cross-builds 5 platform-
+  # tagged .vsix archives from the existing `build` job's binary
+  # artifacts (one archive per supported platform — the activated
+  # extension downloads the same binary at runtime anyway, but the
+  # per-target VSIX pre-bundles it so first-launch is offline-
+  # friendly).
+  #
+  # Skip gate: the entire job pair (vscode-package + vscode-publish)
+  # is gated on the presence of the VSCE_PAT secret. When unset
+  # (the steady state until the operator has finished the one-time
+  # Marketplace publisher setup), both jobs no-op so a v1.7.27+
+  # release still passes CI. See docs/vscode-extension-tracker.md
+  # M6 for the gating rationale.
+  # ----------------------------------------------------------------
+  # ----------------------------------------------------------------
+  # Marketplace pre-flight: query the Marketplace for the version we're
+  # about to publish BEFORE running the 5-shard vscode-package matrix
+  # and the vscode-publish step. If the version already exists, fail
+  # fast with the remediation hint (bump vscode/package.json + retag),
+  # so we don't burn ~25 min of CI on a doomed run.
+  #
+  # Belt-and-braces around G8 (the v1.8.0 manifest stamp gotcha); the
+  # in-job sync-npm-version.sh step already prevents the failure mode
+  # in normal flow, but this catches re-pushed tags and any future
+  # case where the stamp script doesn't fully cover the version.
+  # ----------------------------------------------------------------
+  vscode-preflight:
+    name: VS Code Marketplace pre-flight
+    needs: build
+    if: ${{ ! cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check VSCE_PAT presence
+        id: gate
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          if [ -z "${VSCE_PAT:-}" ]; then
+            echo "::notice::VSCE_PAT not set — skipping Marketplace pre-flight (one-time publisher setup pending)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.gate.outputs.skip == 'false'
+        with:
+          node-version: '22'
+
+      - name: Assert tag version not yet published
+        if: steps.gate.outputs.skip == 'false'
+        env:
+          TAG: ${{ github.ref_name }}
+        # vsce show is an unauthenticated query against the public
+        # Marketplace API — no PAT required. Strips the leading 'v'
+        # off the tag (e.g. v1.8.2 → 1.8.2) and asserts the version
+        # is NOT in the listed Marketplace history. A match means
+        # we'd hit "already exists" at publish time; fail loudly here
+        # instead of after 25 min of matrix builds + the publish step.
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          echo "Checking Marketplace for superbased.superbased-observer@${version}…"
+          versions_json=$(npx --yes @vscode/vsce show superbased.superbased-observer --json 2>/dev/null || echo '{}')
+          if echo "$versions_json" | python3 -c "
+          import json, sys
+          target = sys.argv[1]
+          payload = sys.stdin.read().strip()
+          data = json.loads(payload) if payload else {}
+          versions = {v.get('version') for v in data.get('versions', []) if isinstance(v, dict)}
+          sys.exit(0 if target in versions else 1)
+          " "$version"; then
+            echo "::error::Marketplace already has superbased.superbased-observer@${version}; cannot republish."
+            echo "  Bump vscode/package.json (sync-npm-version.sh v<next>) AND re-push the tag."
+            echo "  See docs/vscode-marketplace-publish-process.md §G5 (no-republish-same-version)."
+            exit 1
+          fi
+          echo "Marketplace clear: ${version} is not yet published. Safe to proceed."
+
+  vscode-package:
+    name: VSIX package ${{ matrix.target }}
+    needs: [build, vscode-preflight]
+    if: ${{ ! cancelled() }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            vsce_target: linux-x64
+            ext: ''
+          - target: linux-arm64
+            vsce_target: linux-arm64
+            ext: ''
+          - target: darwin-x64
+            vsce_target: darwin-x64
+            ext: ''
+          - target: darwin-arm64
+            vsce_target: darwin-arm64
+            ext: ''
+          - target: win32-x64
+            vsce_target: win32-x64
+            ext: '.exe'
+    steps:
+      - name: Check VSCE_PAT presence (skip rest of job if unset)
+        id: gate
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          if [ -z "${VSCE_PAT:-}" ]; then
+            echo "::notice::VSCE_PAT not set — skipping VSIX matrix build for ${{ matrix.target }} (one-time Marketplace publisher setup pending)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v5
+        if: steps.gate.outputs.skip == 'false'
+
+      - uses: actions/setup-node@v4
+        if: steps.gate.outputs.skip == 'false'
+        with:
+          node-version: '22'
+
+      - name: Download observer binary artifact
+        if: steps.gate.outputs.skip == 'false'
+        uses: actions/download-artifact@v6
+        with:
+          name: observer-${{ matrix.target }}
+          path: vscode/bin/
+
+      - name: Set executable bit on bundled binary
+        if: steps.gate.outputs.skip == 'false' && matrix.ext == ''
+        run: chmod +x vscode/bin/observer
+
+      - name: npm ci
+        if: steps.gate.outputs.skip == 'false'
+        working-directory: vscode
+        run: npm ci
+
+      - name: Stamp release version into vscode/package.json
+        # Runs BEFORE the vsce package step so the manifest version
+        # matches the release tag. sync-npm-version.sh handles
+        # vscode/package.json too (alongside the npm packages), but
+        # the npm-publish job runs in parallel — we have to stamp
+        # here in the vscode job before vsce package reads the
+        # manifest. Without this the v1.8.0 release shipped VSIXes
+        # tagged v1.7.28 and Marketplace publish failed with
+        # "already exists".
+        if: steps.gate.outputs.skip == 'false'
+        run: ./scripts/sync-npm-version.sh "${GITHUB_REF_NAME}"
+
+      - name: Build extension bundle
+        if: steps.gate.outputs.skip == 'false'
+        working-directory: vscode
+        run: npm run build
+
+      - name: vsce package --target
+        if: steps.gate.outputs.skip == 'false'
+        working-directory: vscode
+        run: |
+          set -euo pipefail
+          npx --yes vsce package \
+            --target ${{ matrix.vsce_target }} \
+            --out "../superbased-observer-${{ matrix.vsce_target }}-${GITHUB_REF_NAME}.vsix"
+          ls -lh "../superbased-observer-${{ matrix.vsce_target }}-${GITHUB_REF_NAME}.vsix"
+
+      - name: Upload VSIX
+        if: steps.gate.outputs.skip == 'false'
+        uses: actions/upload-artifact@v5
+        with:
+          name: vsix-${{ matrix.vsce_target }}
+          path: superbased-observer-${{ matrix.vsce_target }}-*.vsix
+          retention-days: 7
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------
+  # VS Code Marketplace + Open VSX publish step. Pulls the 5 VSIXes
+  # produced by vscode-package and pushes each to both registries.
+  # OVSX publish is `continue-on-error: true` (its queue is
+  # occasionally slow + a stuck OVSX submission must not fail the
+  # release).
+  #
+  # Same VSCE_PAT skip gate as vscode-package — when the secret is
+  # absent the job no-ops with a notice. OVSX_PAT independently
+  # gates the OVSX step; when absent only Marketplace runs.
+  # ----------------------------------------------------------------
+  vscode-publish:
+    name: VS Code Marketplace + Open VSX publish
+    needs: vscode-package
+    if: ${{ ! cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check VSCE_PAT presence
+        id: gate
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          if [ -z "${VSCE_PAT:-}" ]; then
+            echo "::notice::VSCE_PAT not set — skipping Marketplace + OVSX publish (one-time Marketplace publisher setup pending)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.gate.outputs.skip == 'false'
+        with:
+          node-version: '22'
+
+      - name: Download all VSIX artifacts
+        if: steps.gate.outputs.skip == 'false'
+        uses: actions/download-artifact@v6
+        with:
+          pattern: vsix-*
+          merge-multiple: true
+
+      - name: List downloaded VSIXes
+        if: steps.gate.outputs.skip == 'false'
+        run: ls -lh ./*.vsix
+
+      - name: Publish to VS Code Marketplace
+        if: steps.gate.outputs.skip == 'false'
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          set -euo pipefail
+          for vsix in ./superbased-observer-*.vsix; do
+            echo "Publishing $vsix"
+            npx --yes vsce publish --packagePath "$vsix"
+          done
+
+      - name: Publish to Open VSX
+        if: steps.gate.outputs.skip == 'false' && env.OVSX_PAT != ''
+        continue-on-error: true
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: |
+          set -euo pipefail
+          for vsix in ./superbased-observer-*.vsix; do
+            echo "Publishing $vsix to Open VSX"
+            npx --yes ovsx publish "$vsix"
+          done
+
+      - name: Step summary
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          {
+            echo "## VS Code extension published"
+            echo ""
+            echo "Marketplace: \`superbased.superbased-observer@${GITHUB_REF_NAME#v}\`"
+            echo ""
+            echo "Verify with:"
+            echo '```bash'
+            echo "npx vsce show superbased.superbased-observer"
+            echo "npx ovsx get superbased.superbased-observer"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ----------------------------------------------------------------
+  # GitHub Release on the private repo. The body is the CHANGELOG
+  # section matching the tag — pulls everything between
+  # "## [<version>] —" and the next "## [" so the release page
+  # mirrors what landed in CHANGELOG.md. Public repo is orphan +
+  # force-pushed so its Releases tab isn't a fit; this is for the
+  # maintainer-side changelog browser.
+  # ----------------------------------------------------------------
+  release:
+    name: GitHub Release
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Extract CHANGELOG section
+        id: changelog
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          # awk pulls everything between the matching version header
+          # and the next "## [" header (exclusive). Header form is
+          # "## [1.2.3] — 2026-05-17".
+          BODY=$(awk -v v="$VERSION" '
+            /^## \[/ {
+              if (in_section) exit
+              if ($0 ~ "^## \\[" v "\\]") { in_section = 1; next }
+            }
+            in_section { print }
+          ' CHANGELOG.md)
+          if [ -z "$BODY" ]; then
+            echo "::warning::CHANGELOG.md has no section for v${VERSION}; release body will be empty"
+            BODY="(no changelog entry for v${VERSION} — check CHANGELOG.md)"
+          fi
+          # GH Actions multiline output via heredoc:
+          {
+            echo "body<<CHANGELOG_EOF"
+            echo "$BODY"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: ${{ steps.changelog.outputs.body }}
+          draft: false
+          prerelease: false
+
+  # ----------------------------------------------------------------
+  # Public repo GitHub Release with per-platform binary archives.
+  # Runs in parallel with publish (only needs build) so direct
+  # downloaders aren't blocked on npm-publish quirks. Waits for the
+  # public tag to exist — scripts/release.sh public <version> pushes
+  # it ~30s after this workflow's trigger.
+  # ----------------------------------------------------------------
+  public_release:
+    name: Public Release (binaries)
+    # Also needs `sbom` so the observer.cdx.json / observer-org.cdx.json
+    # artifacts exist when this job downloads everything into artifacts/,
+    # and `provenance` so the SLSA .intoto.jsonl artifact is present to
+    # attach to the public release (the release advertises SLSA L3, so a
+    # missing attestation must fail the job — see the staging step below).
+    needs: [build, sbom, provenance]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download all platform bin/ folders
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+
+      - name: Wait for v* tag on public repo
+        run: |
+          # scripts/release.sh public <version> force-pushes the same
+          # tag to the public remote right after the private push that
+          # triggered this workflow. The build job typically takes
+          # 2–3 min; the public tag push is sub-30s, so under normal
+          # `release.sh full` flows the tag is already there. The
+          # poll is for the edge case where the public push lags
+          # (e.g. operator ran `release.sh tag` then `release.sh
+          # public` separately with a delay between).
+          #
+          # Uses unauthenticated curl rather than `gh api` because the
+          # public repo's ref endpoint is readable anonymously — and
+          # because the workflow's gh CLI inherits empty GH_TOKEN when
+          # PUBLIC_REPO_TOKEN isn't set yet (first-time setup), which
+          # makes gh fail with 401 instead of falling back to public
+          # access. The original gh-based wait silenced 401s through
+          # `--silent 2>/dev/null` and looked indistinguishable from
+          # "tag not yet pushed" — the v1.6.19 first-time release hit
+          # exactly this misdiagnosis.
+          set -euo pipefail
+          URL="https://api.github.com/repos/marmutapp/superbased-observer/git/ref/tags/${GITHUB_REF_NAME}"
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            STATUS=$(curl -sS -o /dev/null -w '%{http_code}' "$URL" || echo "000")
+            case "$STATUS" in
+              200)
+                echo "Public tag ${GITHUB_REF_NAME} exists ✓"
+                exit 0
+                ;;
+              404)
+                echo "[$i/12] Waiting 10s for public tag ${GITHUB_REF_NAME}... (404)"
+                ;;
+              403)
+                # Rate-limited (anonymous quota: 60 req/hr/IP). Sleep
+                # the recommended backoff and keep trying — at 12
+                # attempts × 10s this is highly unlikely.
+                echo "[$i/12] Rate-limited (HTTP 403); backing off 10s"
+                ;;
+              *)
+                # Network blip, DNS hiccup, or unexpected upstream
+                # response. Surface but keep polling.
+                echo "[$i/12] Unexpected HTTP $STATUS from $URL; retrying"
+                ;;
+            esac
+            sleep 10
+          done
+          echo "::error::Public tag ${GITHUB_REF_NAME} not present after 120s. Run \`scripts/release.sh public ${GITHUB_REF_NAME}\` locally, then re-run this job."
+          exit 1
+
+      - name: Sanity-check PUBLIC_REPO_TOKEN is set
+        env:
+          PUBLIC_REPO_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
+        run: |
+          # Fail fast with a clear message when the PAT isn't set.
+          # Without this, the `Create / update public GitHub Release`
+          # step below would error with `gh: HTTP 404` (cross-repo
+          # write rejected as a 404 to avoid leaking repo existence),
+          # which is harder to diagnose than "secret not set".
+          set -euo pipefail
+          if [ -z "${PUBLIC_REPO_TOKEN:-}" ]; then
+            echo "::error::PUBLIC_REPO_TOKEN secret is not set on this repo. See docs/release-runbook.md '#### Required CI secret: PUBLIC_REPO_TOKEN' for setup. Until set, this job fails fast; the rest of the npm-release pipeline (npm publish, private GH Release) is unaffected."
+            exit 1
+          fi
+          echo "PUBLIC_REPO_TOKEN is set ✓"
+
+      - name: Build per-platform archives + SHA256SUMS
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          mkdir -p release-assets
+
+          # Linux + Darwin: tar.gz preserves the executable bit
+          # (chmod +x set in the build job rides along). Windows:
+          # zip is the conventional Windows artifact format.
+          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            tar -czf "release-assets/observer-${VERSION}-${target}.tar.gz" \
+              -C "artifacts/observer-${target}" .
+          done
+          (cd "artifacts/observer-win32-x64" && \
+              zip -r "$GITHUB_WORKSPACE/release-assets/observer-${VERSION}-win32-x64.zip" .)
+
+          # Org server (observer-org) per-platform archives (Teams M5),
+          # built the same way from the observer-org-<plat> artifacts.
+          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            tar -czf "release-assets/observer-org-${VERSION}-${target}.tar.gz" \
+              -C "artifacts/observer-org-${target}" .
+          done
+          (cd "artifacts/observer-org-win32-x64" && \
+              zip -r "$GITHUB_WORKSPACE/release-assets/observer-org-${VERSION}-win32-x64.zip" .)
+
+          # SBOMs (Teams M5) ride along to the release; copy them next
+          # to the archives so the upload globs and SHA256SUMS pick
+          # them up.
+          cp artifacts/sboms/observer.cdx.json release-assets/
+          cp artifacts/sboms/observer-org.cdx.json release-assets/
+
+          # SHA256SUMS — verifiable via `shasum -a 256 -c SHA256SUMS`
+          # or `sha256sum -c SHA256SUMS` from inside the downloads dir.
+          (cd release-assets && sha256sum *.tar.gz *.zip *.cdx.json > SHA256SUMS)
+
+          echo "=== release-assets/ ==="
+          ls -lh release-assets/
+          echo "=== SHA256SUMS ==="
+          cat release-assets/SHA256SUMS
+
+      - name: Stage SLSA provenance for the public release
+        run: |
+          # The provenance job runs with upload-assets:false, so the
+          # signed .intoto.jsonl arrives as a workflow artifact and was
+          # pulled into artifacts/ by the download step above. Copy it
+          # next to the binaries it attests. The release notes advertise
+          # SLSA L3, so a missing attestation is a hard failure rather
+          # than a silent ship-without-provenance (the v1.7.0 footgun).
+          # Deliberately NOT added to SHA256SUMS — provenance attests the
+          # binaries; it isn't itself one of the checksummed artifacts.
+          set -euo pipefail
+          # -type f is load-bearing: download-artifact extracts each
+          # artifact into a DIRECTORY named after it (artifacts/
+          # multiple.intoto.jsonl/), with the real file inside. Without
+          # -type f, find matches the directory first and the cp below
+          # fails with "omitting directory" (the v1.7.1 footgun).
+          prov=$(find artifacts -type f -name '*.intoto.jsonl' | head -1)
+          if [ -z "$prov" ]; then
+            echo "::error::No *.intoto.jsonl provenance artifact found under artifacts/. The provenance job must succeed with upload-assets:false (artifact) before this job runs."
+            exit 1
+          fi
+          cp "$prov" "release-assets/$(basename "$prov")"
+          echo "Staged provenance: $(basename "$prov")"
+
+      - name: Compose release body
+        id: changelog
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Identical extraction logic to the private 'release' job.
+          BODY=$(awk -v v="$VERSION" '
+            /^## \[/ {
+              if (in_section) exit
+              if ($0 ~ "^## \\[" v "\\]") { in_section = 1; next }
+            }
+            in_section { print }
+          ' CHANGELOG.md)
+          if [ -z "$BODY" ]; then
+            BODY="(no changelog entry for v${VERSION})"
+          fi
+          # Append a Downloads section so visitors know what's
+          # attached + how to verify + that npm is the alternative.
+          {
+            echo "$BODY"
+            echo ""
+            echo "---"
+            echo ""
+            echo "### Downloads"
+            echo ""
+            echo "Pre-built binaries for each supported platform are attached below. Linux variants bundle \`antigravity-bridge.exe\` next to the observer binary for WSL2 users of the Antigravity adapter."
+            echo ""
+            echo "| Platform | Asset |"
+            echo "|---|---|"
+            echo "| Linux x86_64 | \`observer-${GITHUB_REF_NAME}-linux-x64.tar.gz\` |"
+            echo "| Linux arm64 | \`observer-${GITHUB_REF_NAME}-linux-arm64.tar.gz\` |"
+            echo "| macOS x86_64 (Intel) | \`observer-${GITHUB_REF_NAME}-darwin-x64.tar.gz\` |"
+            echo "| macOS arm64 (Apple Silicon) | \`observer-${GITHUB_REF_NAME}-darwin-arm64.tar.gz\` |"
+            echo "| Windows x86_64 | \`observer-${GITHUB_REF_NAME}-win32-x64.zip\` |"
+            echo ""
+            echo "Verify with \`sha256sum -c SHA256SUMS\` (or \`shasum -a 256 -c SHA256SUMS\` on macOS) from the directory containing the downloads."
+            echo ""
+            echo "Also available via npm: \`npm install -g @superbased/observer@${VERSION}\`"
+            echo ""
+            echo "### Org server (Docker)"
+            echo ""
+            echo "The self-hosted org server ships as a Docker image and as per-platform \`observer-org-${GITHUB_REF_NAME}-*\` archives (attached below)."
+            echo ""
+            echo '```bash'
+            echo "docker pull ghcr.io/marmutapp/observer-org:${GITHUB_REF_NAME}"
+            echo '```'
+            echo ""
+            echo "The image is keyless-signed with cosign. Verify it:"
+            echo ""
+            echo '```bash'
+            echo "cosign verify ghcr.io/marmutapp/observer-org:${GITHUB_REF_NAME} \\"
+            echo "  --certificate-identity-regexp 'https://github.com/marmutapp/superbased-observer-private/.*' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo '```'
+            echo ""
+            echo "### Supply chain"
+            echo ""
+            echo "CycloneDX SBOMs are attached: \`observer.cdx.json\` and \`observer-org.cdx.json\`."
+            echo ""
+            echo "SLSA Level 3 build provenance for the binaries is attached below as a \`*.intoto.jsonl\` attestation. The build runs on the private origin repo, so pass that as the source when verifying an extracted binary with [slsa-verifier](https://github.com/slsa-framework/slsa-verifier) **v2.7.0 or newer** (older versions fail with \`unexpected tlog entry type: expected intoto:0.0.2, got dsse:0.0.1\`):"
+            echo ""
+            echo '```bash'
+            echo "slsa-verifier verify-artifact ./observer \\"
+            echo "  --provenance-path *.intoto.jsonl \\"
+            echo "  --source-uri github.com/marmutapp/superbased-observer-private"
+            echo '```'
+          } > release-body.md
+          echo "Wrote release-body.md ($(wc -l < release-body.md) lines)"
+
+      - name: Create / update public GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Use --clobber-via-recreate semantics: if a release for this
+          # tag already exists (e.g. a prior CI run was retried), edit
+          # the existing release rather than failing with "already
+          # exists". `gh release create --notes-file ...` errors on
+          # existing tag; switch to view-or-create.
+          if gh release view "${GITHUB_REF_NAME}" --repo marmutapp/superbased-observer >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists on public repo — updating body + re-uploading assets"
+            gh release edit "${GITHUB_REF_NAME}" \
+              --repo marmutapp/superbased-observer \
+              --notes-file release-body.md
+            gh release upload "${GITHUB_REF_NAME}" \
+              --repo marmutapp/superbased-observer \
+              --clobber \
+              release-assets/*.tar.gz \
+              release-assets/*.zip \
+              release-assets/*.cdx.json \
+              release-assets/*.intoto.jsonl \
+              release-assets/SHA256SUMS
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo marmutapp/superbased-observer \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file release-body.md \
+              release-assets/*.tar.gz \
+              release-assets/*.zip \
+              release-assets/*.cdx.json \
+              release-assets/*.intoto.jsonl \
+              release-assets/SHA256SUMS
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "## Public release ${GITHUB_REF_NAME} published"
+            echo ""
+            echo "[Release page](https://github.com/marmutapp/superbased-observer/releases/tag/${GITHUB_REF_NAME})"
+            echo ""
+            echo "Assets attached:"
+            echo '```'
+            ls -lh release-assets/
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

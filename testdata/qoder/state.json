@@ -1,0 +1,15 @@
+{
+  "sessionId": "5d51bc6a-0000-0000-0000-000000000001",
+  "revision": 2,
+  "createdAt": "2026-07-09T04:54:32.454Z",
+  "updatedAt": "2026-07-09T04:54:37.311Z",
+  "data": {},
+  "items": {
+    "s0": {
+      "c": "2026-07-09T04:54:32.454Z",
+      "u": "2026-07-09T04:54:37.311Z",
+      "n": "STUB_NONCE_TRUNCATED",
+      "p": "STUB_ENCRYPTED_BLOB_TRUNCATED=="
+    }
+  }
+}

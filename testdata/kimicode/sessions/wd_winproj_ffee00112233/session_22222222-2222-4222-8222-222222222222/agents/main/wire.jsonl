@@ -1,0 +1,8 @@
+{"type": "metadata", "protocol_version": "1.4", "created_at": 1783576200000}
+{"type": "turn.prompt", "input": [{"type": "text", "text": "Read the README"}], "origin": {"kind": "user"}, "time": 1783576200500}
+{"type": "llm.request", "kind": "loop", "provider": "openai", "model": "gpt-4o", "modelAlias": "openai/gpt-4o", "maxTokens": 16384, "time": 1783576200600}
+{"type": "context.append_loop_event", "event": {"type": "step.begin", "uuid": "b1111111-0000-4000-8000-000000000001", "turnId": "0", "step": 1}, "time": 1783576200700}
+{"type": "context.append_loop_event", "event": {"type": "tool.call", "uuid": "call_winRead0001", "turnId": "0", "step": 1, "toolCallId": "call_winRead0001", "name": "Read", "args": {"path": "README.md"}, "description": "Reading README.md", "display": {"kind": "file_io", "operation": "read", "path": "C:/Users/auzy_/winproj/README.md", "cwd": "C:/Users/auzy_/winproj"}}, "time": 1783576201000}
+{"type": "context.append_loop_event", "event": {"type": "tool.result", "parentUuid": "call_winRead0001", "toolCallId": "call_winRead0001", "result": {"output": "# winproj\nA sample project.\n"}}, "time": 1783576201200}
+{"type": "context.append_loop_event", "event": {"type": "step.end", "uuid": "b1111111-0000-4000-8000-000000000001", "turnId": "0", "step": 1, "usage": {"inputOther": 1200, "output": 40, "inputCacheRead": 0, "inputCacheCreation": 0}, "finishReason": "end_turn", "messageId": "chatcmpl-winexample01"}, "time": 1783576205000}
+{"type": "usage.record", "model": "openai/gpt-4o", "usage": {"inputOther": 1200, "output": 40, "inputCacheRead": 0, "inputCacheCreation": 0}, "usageScope": "turn", "time": 1783576205050}

@@ -1,0 +1,61 @@
+# task.toml — frozen benchmark task definition (declarative; NO results).
+#
+# Phase 0 scaffolding: this file is NEVER executed by the harness in
+# Phase 0. It declares the frozen workspace, the strict prompt, the
+# machine-checkable completion gate, and the semantic quality-guard
+# assertions (§3.6). A live run only becomes possible after the Phase 0a
+# pilot + pre-registration freeze (§3.0/§6).
+#
+# This task is deliberately SELF-CONTAINED (no external repo): the
+# workspace/ dir below is the entire frozen snapshot. Real
+# representative tasks that need external repos use [workspace] kind =
+# "git-snapshot" with a pinned commit + archive checksum (see
+# corpus/README.md "Freezing a task").
+
+schema = 1
+id = "example-go-build-fix"
+stratum = "representative"
+title = "Fix a single Go build error, minimally"
+
+# Selection provenance. Representative-stratum inclusion criteria are
+# frozen in corpus/README.md BEFORE any measured run (§3.7). This field
+# records WHY the task qualifies, for audit.
+selected_because = "small clean-output build fix; representative of a common short refactor turn"
+
+# Was this task selected independently of whether any compressor fires?
+# Headline (Stratum R) tasks MUST be true here (§3.7, R12 guard).
+firing_independent = true
+
+[workspace]
+# How the frozen workspace is materialized.
+#   local        — the ./workspace dir in this task folder is the whole
+#                  snapshot (self-contained, committed).
+#   git-snapshot — a pinned external repo restored by the freeze
+#                  procedure; NOT committed wholesale (commit + archive
+#                  checksum recorded here, see corpus/README.md).
+kind = "local"
+
+[prompt]
+# The strict, verbatim prompt handed to the agent. IDENTICAL across all
+# arms. The arm-specific, semantically-inert salt (§3.2) is appended by
+# the harness at run time — never written here.
+text = """
+This Go module fails to build. Run `go build ./...`, read the error, and
+make the smallest change that fixes the build without altering the
+program's intended behavior. Do not add new files or reformat unrelated
+code.
+"""
+
+[success]
+# Machine-checkable completion gate. Exit 0 = complete. Run in the task
+# workspace copy AFTER the agent finishes. NOT executed in Phase 0.
+command = "go build ./..."
+
+[[assertions]]
+# Semantic assertions beyond binary completion (quality guard, §3.6). A
+# cheaper arm that passes `go build` but butchers the code is a FAIL.
+id = "minimal-diff"
+kind = "patch-diff"
+script = "assertions/semantic.sh"
+weight = 1.0
+description = "the fix touches only main.go and does not delete or rewrite the greet() contract"

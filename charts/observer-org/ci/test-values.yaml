@@ -1,0 +1,13 @@
+# Minimal values that satisfy the chart's required inputs so `helm lint`,
+# `helm template`, and the kind-cluster CI smoke render without prompting.
+# NOT a production config — the secret and IdP URL are placeholders.
+secrets:
+  existingSecret: observer-org-secrets
+config:
+  externalURL: "https://observer-org.ci.test"
+  saml:
+    spEntityID: "https://observer-org.ci.test/saml/metadata"
+    idpMetadataURL: "https://idp.ci.test/saml/metadata"
+  dashboard:
+    adminEmails:
+      - admin@ci.test

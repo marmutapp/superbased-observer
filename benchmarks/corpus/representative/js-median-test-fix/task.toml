@@ -1,0 +1,45 @@
+# task.toml — frozen benchmark task definition (declarative; NO results).
+#
+# Phase 0 scaffolding: NEVER executed by the harness in Phase 0. Declares
+# the frozen workspace, the strict prompt, the machine-checkable
+# completion gate, and the semantic quality-guard assertions (§3.6). A
+# live run only becomes possible after the Phase 0a pilot + pre-
+# registration freeze (§3.0/§6).
+#
+# Self-contained (no external repo, no npm deps): plain Node built-in
+# `node:test` + `node:assert`. Language: JavaScript/Node. Task type: test
+# fix (failing suite → source bug). Expected session length: MEDIUM.
+
+schema = 1
+id = "js-median-test-fix"
+stratum = "representative"
+title = "Make a failing Node test suite pass by fixing the source, not the test"
+
+selected_because = "common JS/Node test-fix turn: a correct suite exposes a source bug; representative of a medium-length debug-and-fix session, chosen independently of any compressor"
+firing_independent = true
+
+[workspace]
+kind = "local"
+
+[prompt]
+# Strict, verbatim, IDENTICAL across arms. The semantically-inert per-arm
+# salt (§3.2) is appended by the harness at run time — never here.
+text = """
+The test suite in this directory fails. Run `node --test`, read the
+failing assertions, and fix the bug in `median.js` so every test passes.
+The tests are correct — do not edit, weaken, or delete any test, and do
+not add new files. Change only what is necessary in `median.js`.
+"""
+
+[success]
+# Machine-checkable completion gate. Exit 0 = complete. `node --test`
+# exits non-zero while any test fails. Run in the workspace copy AFTER the
+# agent finishes. NOT executed in Phase 0.
+command = "node --test"
+
+[[assertions]]
+id = "fix-source-not-test"
+kind = "semantic"
+script = "assertions/semantic.sh"
+weight = 1.0
+description = "the even-length median case is fixed in median.js while the test suite (incl. the 2.5 expectation) and the median() export contract survive; no new files"

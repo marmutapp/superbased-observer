@@ -1,0 +1,2 @@
+{"version":"v1","kind":"Prompt","data":{"message_id":"msg-user-0001","content":[{"kind":"text","data":"Reply with exactly the word READY. My key is sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa keep it secret."}],"meta":{"timestamp":1783571482}}}
+{"version":"v1","kind":"AssistantMessage","data":{"message_id":"msg-asst-0001","content":[{"kind":"text","data":"READY"}]}}

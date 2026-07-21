@@ -1,0 +1,45 @@
+# task.toml — frozen benchmark task definition (declarative; NO results).
+#
+# Phase 0 scaffolding: NEVER executed by the harness in Phase 0. A live
+# run only becomes possible after the Phase 0a pilot + pre-registration
+# freeze (§3.0/§6).
+#
+# Self-contained (no external repo): a single-package Go module (stdlib
+# only). Language: Go. Task type: small feature add (implement a stub to
+# pass a provided test). Expected session length: MEDIUM.
+
+schema = 1
+id = "go-brackets-feature-add"
+stratum = "representative"
+title = "Implement a bracket-balance checker to pass a provided table test"
+
+selected_because = "common feature-add turn: implement a stubbed function against a correct table test; representative of a MEDIUM implement-then-verify session, chosen independently of any compressor"
+firing_independent = true
+
+[workspace]
+kind = "local"
+
+[prompt]
+# Strict, verbatim, IDENTICAL across arms. Salt (§3.2) appended by the
+# harness at run time.
+text = """
+`IsBalanced` in `brackets.go` is a stub that always returns false, so the
+table test fails. Run `go test ./...`, then implement `IsBalanced` so it
+correctly reports whether the brackets (), [], and {} in the input are
+matched and nested. Implement it in `brackets.go`; keep the exported
+signature `func IsBalanced(s string) bool`; do not edit `brackets_test.go`
+and do not add new files.
+"""
+
+[success]
+# Machine-checkable completion gate. Exit 0 = all table cases pass.
+# `go test ./...` exits non-zero while the stub is in place. NOT executed
+# in Phase 0.
+command = "go test ./..."
+
+[[assertions]]
+id = "real-implementation"
+kind = "semantic"
+script = "assertions/semantic.sh"
+weight = 1.0
+description = "IsBalanced keeps its signature, is implemented with a real scan (not a constant return), and the test file is unchanged with no new files"
