@@ -50,7 +50,7 @@
 #                              section as the body. Useful as a
 #                              maintainer-side changelog browser.
 #   5. public_release job    — creates a GitHub Release on the PUBLIC
-#                              repo (marmutapp/superbased-observer)
+#                              repo (superbasedapp/observer)
 #                              with per-platform binary archives +
 #                              SHA256SUMS attached. Runs in parallel
 #                              with publish (only needs build), so
@@ -70,7 +70,7 @@
 #     https://pypi.org/manage/project/superbased-observer/releases/
 #     and use the web UI. See docs/pypi-release-process.md.
 #   - PUBLIC_REPO_TOKEN   fine-grained PAT with `contents: write` on
-#     marmutapp/superbased-observer (the public repo). Used by the
+#     superbasedapp/observer (the public repo). Used by the
 #     public_release job to create the GH Release with binary assets.
 #     Must be set BEFORE the first tag that uses this flow lands —
 #     missing-token failures surface as a 404 from `gh release create`.
@@ -1072,7 +1072,7 @@ jobs:
           # "tag not yet pushed" — the v1.6.19 first-time release hit
           # exactly this misdiagnosis.
           set -euo pipefail
-          URL="https://api.github.com/repos/marmutapp/superbased-observer/git/ref/tags/${GITHUB_REF_NAME}"
+          URL="https://api.github.com/repos/superbasedapp/observer/git/ref/tags/${GITHUB_REF_NAME}"
           for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
             STATUS=$(curl -sS -o /dev/null -w '%{http_code}' "$URL" || echo "000")
             case "$STATUS" in
@@ -1259,13 +1259,13 @@ jobs:
           # the existing release rather than failing with "already
           # exists". `gh release create --notes-file ...` errors on
           # existing tag; switch to view-or-create.
-          if gh release view "${GITHUB_REF_NAME}" --repo marmutapp/superbased-observer >/dev/null 2>&1; then
+          if gh release view "${GITHUB_REF_NAME}" --repo superbasedapp/observer >/dev/null 2>&1; then
             echo "Release ${GITHUB_REF_NAME} already exists on public repo — updating body + re-uploading assets"
             gh release edit "${GITHUB_REF_NAME}" \
-              --repo marmutapp/superbased-observer \
+              --repo superbasedapp/observer \
               --notes-file release-body.md
             gh release upload "${GITHUB_REF_NAME}" \
-              --repo marmutapp/superbased-observer \
+              --repo superbasedapp/observer \
               --clobber \
               release-assets/*.tar.gz \
               release-assets/*.zip \
@@ -1274,7 +1274,7 @@ jobs:
               release-assets/SHA256SUMS
           else
             gh release create "${GITHUB_REF_NAME}" \
-              --repo marmutapp/superbased-observer \
+              --repo superbasedapp/observer \
               --title "${GITHUB_REF_NAME}" \
               --notes-file release-body.md \
               release-assets/*.tar.gz \
@@ -1289,7 +1289,7 @@ jobs:
           {
             echo "## Public release ${GITHUB_REF_NAME} published"
             echo ""
-            echo "[Release page](https://github.com/marmutapp/superbased-observer/releases/tag/${GITHUB_REF_NAME})"
+            echo "[Release page](https://github.com/superbasedapp/observer/releases/tag/${GITHUB_REF_NAME})"
             echo ""
             echo "Assets attached:"
             echo '```'

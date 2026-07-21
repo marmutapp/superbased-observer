@@ -25,7 +25,7 @@ def _report_missing(path: Path) -> NoReturn:
         "This usually means the installed wheel is for a different\n"
         "platform than the one Python is running on. Re-install with:\n"
         "  pip install --force-reinstall superbased-observer\n"
-        "or report at https://github.com/marmutapp/superbased-observer/issues\n"
+        "or report at https://github.com/superbasedapp/observer/issues\n"
     )
     raise SystemExit(1)
 

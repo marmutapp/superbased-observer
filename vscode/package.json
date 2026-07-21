@@ -6,15 +6,15 @@
   "publisher": "superbased",
   "license": "Apache-2.0",
   "author": "Santosh Kathira <contact@superbased.app>",
-  "homepage": "https://github.com/marmutapp/superbased-observer",
+  "homepage": "https://github.com/superbasedapp/observer",
   "repository": {
     "type": "git",
-    "url": "https://github.com/marmutapp/superbased-observer"
+    "url": "https://github.com/superbasedapp/observer"
   },
   "bugs": {
-    "url": "https://github.com/marmutapp/superbased-observer/issues"
+    "url": "https://github.com/superbasedapp/observer/issues"
   },
-  "qna": "https://github.com/marmutapp/superbased-observer/discussions",
+  "qna": "https://github.com/superbasedapp/observer/discussions",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -240,7 +240,7 @@
               "markdown": "walkthroughs/07-done.md"
             },
             "completionEvents": [
-              "onLink:https://github.com/marmutapp/superbased-observer/blob/main/docs/vscode-extension-user-guide.md"
+              "onLink:https://github.com/superbasedapp/observer/blob/main/docs/vscode-extension-user-guide.md"
             ]
           }
         ]

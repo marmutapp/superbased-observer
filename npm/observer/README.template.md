@@ -2,7 +2,7 @@
 
 [![npm](https://img.shields.io/npm/v/@superbased/observer.svg)](https://www.npmjs.com/package/@superbased/observer)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
-[![Platforms: Linux • macOS • Windows](https://img.shields.io/badge/platforms-linux%20%7C%20macos%20%7C%20windows-blue.svg)](https://github.com/marmutapp/superbased-observer)
+[![Platforms: Linux • macOS • Windows](https://img.shields.io/badge/platforms-linux%20%7C%20macos%20%7C%20windows-blue.svg)](https://github.com/superbasedapp/observer)
 [![Website](https://img.shields.io/badge/homepage-superbased.app-2EC4B6.svg)](https://superbased.app/)
 
 **Homepage:** [https://superbased.app/](https://superbased.app/)
@@ -26,11 +26,11 @@ an optional team rollup server. Plane A is general LLM-app
 observability — admin-server-first: OTLP trace/span capture, evals,
 and an LLM-as-judge input-admission guardrail for an application you
 host. Most installs only ever use Plane B; see the [main
-repo](https://github.com/marmutapp/superbased-observer#readme) for
+repo](https://github.com/superbasedapp/observer#readme) for
 the full two-plane explainer.
 
 <p align="center">
-  <img src="https://github.com/marmutapp/superbased-observer/raw/main/docs/assets/infographics/one-local-path.png" alt="One local path for AI coding activity" width="780">
+  <img src="https://github.com/superbasedapp/observer/raw/main/docs/assets/infographics/one-local-path.png" alt="One local path for AI coding activity" width="780">
 </p>
 
 # Table of contents
@@ -96,7 +96,7 @@ matching your machine downloads. No postinstall network calls, no
 compile step.
 
 If your platform isn't listed, build from source — instructions in
-the [main repo](https://github.com/marmutapp/superbased-observer).
+the [main repo](https://github.com/superbasedapp/observer).
 
 
 ## Five-minute quickstart
@@ -286,7 +286,7 @@ The full privacy statement — what observer stores, what it reads,
 what it never stores, the explicit list of outbound-network call sites
 gated behind config, and how to verify "no telemetry" yourself with
 `grep`, `strings`, and a network-namespaced shell — lives in
-[`PRIVACY.md`](https://github.com/marmutapp/superbased-observer/blob/main/PRIVACY.md).
+[`PRIVACY.md`](https://github.com/superbasedapp/observer/blob/main/PRIVACY.md).
 
 Operational shorthand:
 
@@ -306,10 +306,10 @@ Operational shorthand:
 
 ## Source, contributing, license
 
-- **Source**: https://github.com/marmutapp/superbased-observer
+- **Source**: https://github.com/superbasedapp/observer
 - **Specification**: `superbased-final-spec-v2.md` in the repo
-- **Issues**: https://github.com/marmutapp/superbased-observer/issues
-- **License**: [Apache 2.0](https://github.com/marmutapp/superbased-observer/blob/main/LICENSE)
+- **Issues**: https://github.com/superbasedapp/observer/issues
+- **License**: [Apache 2.0](https://github.com/superbasedapp/observer/blob/main/LICENSE)
 - **Author**: Santosh Kathira <contact@superbased.app>
 
 This npm package is a thin Node.js shim that resolves the right

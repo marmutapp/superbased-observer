@@ -5,7 +5,7 @@
   "homepage": "https://superbased.app/",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/marmutapp/superbased-observer.git"
+    "url": "git+https://github.com/superbasedapp/observer.git"
   },
   "license": "Apache-2.0",
   "author": "Santosh Kathira <contact@superbased.app>",

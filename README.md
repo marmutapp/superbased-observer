@@ -173,7 +173,7 @@ observer --version
 ### Via direct download (pre-built per-platform archive)
 
 Each tagged release attaches per-platform archives to the
-[Releases page](https://github.com/marmutapp/superbased-observer/releases),
+[Releases page](https://github.com/superbasedapp/observer/releases),
 verifiable against the published `SHA256SUMS`:
 
 | Asset | Platform | Contents |
@@ -189,8 +189,8 @@ verifiable against the published `SHA256SUMS`:
 # Linux x64 example — substitute your platform + version.
 VERSION=v1.6.21
 PLAT=linux-x64
-curl -L -O https://github.com/marmutapp/superbased-observer/releases/download/$VERSION/observer-$VERSION-$PLAT.tar.gz
-curl -L -O https://github.com/marmutapp/superbased-observer/releases/download/$VERSION/SHA256SUMS
+curl -L -O https://github.com/superbasedapp/observer/releases/download/$VERSION/observer-$VERSION-$PLAT.tar.gz
+curl -L -O https://github.com/superbasedapp/observer/releases/download/$VERSION/SHA256SUMS
 shasum -a 256 -c SHA256SUMS --ignore-missing
 tar -xzf observer-$VERSION-$PLAT.tar.gz
 ./observer --version
@@ -1056,8 +1056,8 @@ on-disk size, so silent data loss has a visible signal.
 ## Build from source
 
 ```bash
-git clone https://github.com/marmutapp/superbased-observer
-cd superbased-observer
+git clone https://github.com/superbasedapp/observer
+cd observer
 make build        # builds bin/observer + bin/antigravity-bridge.exe
 make test         # full test suite (race detector enabled)
 make all          # fmt + vet + lint + test + build

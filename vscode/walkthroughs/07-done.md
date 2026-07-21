@@ -11,7 +11,7 @@ You've got Observer wired into VS Code end-to-end:
 ### Where to go next
 
 - **Full user guide** — `docs/vscode-extension-user-guide.md` in
-  the [repository](https://github.com/marmutapp/superbased-observer)
+  the [repository](https://github.com/superbasedapp/observer)
   walks through daily workflows for each AI tool (Claude Code,
   Cursor, Codex, Cline, Copilot).
 - **Reference docs** — `docs/vscode-extension.md` has the command
@@ -19,7 +19,7 @@ You've got Observer wired into VS Code end-to-end:
 - **Dashboard Help drawer** — every chart and column has a
   one-liner; click the `?` in the dashboard's top bar.
 - **Issues** — file at
-  [github.com/marmutapp/superbased-observer/issues](https://github.com/marmutapp/superbased-observer/issues).
+  [github.com/superbasedapp/observer/issues](https://github.com/superbasedapp/observer/issues).
 
 ### Common follow-ups
 

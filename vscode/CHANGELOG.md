@@ -32,7 +32,7 @@ and the golden-path CI smoke).
   `<picture>` URLs in this README don't get path-rewritten by
   Marketplace when the README lives in a subfolder (`vscode/`, not
   the repo root). Switched to absolute
-  `raw.githubusercontent.com/marmutapp/superbased-observer/main/…`
+  `raw.githubusercontent.com/superbasedapp/observer/main/…`
   URLs.
 
 ### Changed

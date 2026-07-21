@@ -38,10 +38,10 @@ binary at build time via `go:embed`.
   — install + quickstart + dashboard tour + MCP tools + compression
   mechanisms + cost math + glossary + CLI reference + configuration +
   troubleshooting + privacy + license.
-- [Source repository](https://github.com/marmutapp/superbased-observer)
+- [Source repository](https://github.com/superbasedapp/observer)
   — Go source, contributor docs, full spec.
 
 ## License
 
 Apache 2.0. See
-[LICENSE](https://github.com/marmutapp/superbased-observer/blob/main/LICENSE).
+[LICENSE](https://github.com/superbasedapp/observer/blob/main/LICENSE).

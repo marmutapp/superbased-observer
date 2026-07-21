@@ -6,7 +6,7 @@
 
 Use GitHub's private vulnerability reporting instead:
 
-1. Go to the [Security tab](https://github.com/marmutapp/superbased-observer/security) on this repository.
+1. Go to the [Security tab](https://github.com/superbasedapp/observer/security) on this repository.
 2. Click **"Report a vulnerability"**.
 
 This opens a private advisory thread visible only to you and the

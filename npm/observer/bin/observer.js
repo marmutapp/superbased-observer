@@ -26,7 +26,7 @@ function reportUnsupported(key) {
     '@superbased/observer: no prebuilt binary for ' + key + '.\n' +
     'Supported: ' + Object.keys(PLATFORM_PACKAGES).join(', ') + '.\n' +
     'If you need a different platform, file an issue at\n' +
-    '  https://github.com/marmutapp/superbased-observer/issues\n'
+    '  https://github.com/superbasedapp/observer/issues\n'
   );
   process.exit(1);
 }

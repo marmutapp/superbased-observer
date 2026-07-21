@@ -6640,7 +6640,7 @@ realizing the PAT secret was missing.
 **What this ship changes:**
 
 - `Wait for v* tag on public repo` step now uses **unauthenticated
-  curl** against `api.github.com/repos/marmutapp/superbased-observer/git/ref/tags/<tag>`.
+  curl** against `api.github.com/repos/superbasedapp/observer/git/ref/tags/<tag>`.
   The public repo's ref endpoint is readable anonymously, so the wait
   doesn't need a PAT. The step explicitly switches on HTTP status:
   200 → success, 404 → keep polling (expected during the wait
@@ -6673,7 +6673,7 @@ users who don't want to install via npm can `curl` the right archive
 for their architecture. Builds on the existing cross-compile pipeline
 that already produces the 5 platform binaries for npm — same
 artifacts, now also surfaced as tarball/zip downloads on
-`github.com/marmutapp/superbased-observer/releases`.
+`github.com/superbasedapp/observer/releases`.
 
 **What ships per release:**
 
@@ -6699,7 +6699,7 @@ artifacts, now also surfaced as tarball/zip downloads on
   for the v* tag to exist on the public repo (polls up to 2 min),
   bundles each platform's `bin/` folder into a tarball or zip,
   computes `SHA256SUMS`, and calls `gh release create --repo
-  marmutapp/superbased-observer`. Idempotent on retry — uses
+  superbasedapp/observer`. Idempotent on retry — uses
   `gh release edit` + `gh release upload --clobber` if the release
   already exists.
 - New repo secret on the private repo: `PUBLIC_REPO_TOKEN`. Fine-
@@ -8119,14 +8119,14 @@ sweep. Both READMEs reference images under `docs/assets/`:
   244, 259) — 12 relative-path image refs (`docs/assets/...`).
 - `npm/observer/README.md` (lines 14, 168, 250, 268, 290, 308, 322,
   352, 364, 382, 405) — 11 absolute-URL refs
-  (`https://github.com/marmutapp/superbased-observer/raw/main/docs/assets/...`).
+  (`https://github.com/superbasedapp/observer/raw/main/docs/assets/...`).
 
 Both 404 on the public repo because `docs/` doesn't exist there.
 Empirically confirmed:
 
 ```
 $ curl -s -o /dev/null -w "%{http_code}\n" \
-  https://github.com/marmutapp/superbased-observer/raw/main/docs/assets/screenshots/01-overview.png
+  https://github.com/superbasedapp/observer/raw/main/docs/assets/screenshots/01-overview.png
 404
 ```
 

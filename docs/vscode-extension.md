@@ -41,7 +41,7 @@ codium --install-extension superbased.superbased-observer
 
 Per-platform `.vsix` archives ride along with every observer release;
 grab the matching one from the
-[Releases page](https://github.com/marmutapp/superbased-observer/releases)
+[Releases page](https://github.com/superbasedapp/observer/releases)
 and install via `code --install-extension <file>.vsix`.
 
 ## What it does
@@ -129,7 +129,7 @@ against, so the download URL always resolves.
 ## Source
 
 The extension lives at `vscode/` in the
-[main repository](https://github.com/marmutapp/superbased-observer).
+[main repository](https://github.com/superbasedapp/observer).
 Build locally with:
 
 ```bash

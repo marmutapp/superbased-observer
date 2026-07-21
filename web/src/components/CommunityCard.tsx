@@ -12,7 +12,7 @@ import { Obs } from "@/components/Obs";
 // accent) rather than a chart shell — it's a persistent footer-style card, not
 // a data panel, so it is not dismissable.
 
-const REPO = "https://github.com/marmutapp/superbased-observer";
+const REPO = "https://github.com/superbasedapp/observer";
 const ISSUES = `${REPO}/issues`;
 const SITE = "https://superbased.app/";
 const CONTACT = "contact@superbased.app";

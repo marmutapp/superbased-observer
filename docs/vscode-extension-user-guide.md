@@ -475,7 +475,7 @@ The extension is **strictly local-first**:
 - **No outbound network calls** at runtime. The only network
   traffic the extension ever generates is the first-install
   binary download from
-  `github.com/marmutapp/superbased-observer/releases/…` when no
+  `github.com/superbasedapp/observer/releases/…` when no
   `observer` binary is found on your machine. After that, all
   communication is to `127.0.0.1:<dashboard.port>` on your
   workspace host.
@@ -491,14 +491,14 @@ The extension is **strictly local-first**:
 
 The same guarantees apply to the binary itself — Observer is
 Apache-2.0 and the source for everything captured + computed is in
-the [main repository](https://github.com/marmutapp/superbased-observer).
+the [main repository](https://github.com/superbasedapp/observer).
 
 ---
 
 ## Getting help
 
-- **Issues** — [github.com/marmutapp/superbased-observer/issues](https://github.com/marmutapp/superbased-observer/issues)
-- **Discussions** — [github.com/marmutapp/superbased-observer/discussions](https://github.com/marmutapp/superbased-observer/discussions)
+- **Issues** — [github.com/superbasedapp/observer/issues](https://github.com/superbasedapp/observer/issues)
+- **Discussions** — [github.com/superbasedapp/observer/discussions](https://github.com/superbasedapp/observer/discussions)
 - **Output channel** — `View → Output → Observer` shows everything
   the extension is doing. Include the relevant excerpt when filing
   bugs.

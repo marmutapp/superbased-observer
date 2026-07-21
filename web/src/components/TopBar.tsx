@@ -233,7 +233,7 @@ function LastActivity({ iso }: { iso?: string }) {
 function UpdateAvailablePill({ current }: { current?: string }) {
   const latest = useLatestVersion();
   if (!isUpdateAvailable(current, latest)) return null;
-  const href = `https://github.com/marmutapp/superbased-observer/releases/tag/v${latest}`;
+  const href = `https://github.com/superbasedapp/observer/releases/tag/v${latest}`;
   return (
     <Tooltip
       content={

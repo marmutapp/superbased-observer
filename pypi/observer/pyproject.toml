@@ -50,10 +50,10 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://superbased.app/"
-Source = "https://github.com/marmutapp/superbased-observer"
-Documentation = "https://github.com/marmutapp/superbased-observer#readme"
-Issues = "https://github.com/marmutapp/superbased-observer/issues"
-Changelog = "https://github.com/marmutapp/superbased-observer/blob/main/CHANGELOG.md"
+Source = "https://github.com/superbasedapp/observer"
+Documentation = "https://github.com/superbasedapp/observer#readme"
+Issues = "https://github.com/superbasedapp/observer/issues"
+Changelog = "https://github.com/superbasedapp/observer/blob/main/CHANGELOG.md"
 
 [project.scripts]
 observer = "observer.__main__:main"

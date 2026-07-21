@@ -30,7 +30,7 @@ export interface ResolvedBinary {
 // EXTENSION_VERSION is stamped at build time via esbuild --define.
 declare const EXTENSION_VERSION: string;
 
-const RELEASE_BASE = 'https://github.com/marmutapp/superbased-observer/releases/download';
+const RELEASE_BASE = 'https://github.com/superbasedapp/observer/releases/download';
 
 export async function resolveBinary(ctx: vscode.ExtensionContext): Promise<ResolvedBinary> {
   const config = vscode.workspace.getConfiguration('observer');
@@ -195,7 +195,7 @@ async function downloadFromReleases(ctx: vscode.ExtensionContext): Promise<Resol
     }
     if (choice === 'Open Issue') {
       vscode.env.openExternal(
-        vscode.Uri.parse('https://github.com/marmutapp/superbased-observer/issues/new'),
+        vscode.Uri.parse('https://github.com/superbasedapp/observer/issues/new'),
       );
     }
     throw err;

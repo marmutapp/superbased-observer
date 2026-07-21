@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/marmutapp/superbased-observer/main/vscode/media/logo-light.png">
-    <img src="https://raw.githubusercontent.com/marmutapp/superbased-observer/main/vscode/media/logo-dark.png" alt="SuperBased" height="80">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/superbasedapp/observer/main/vscode/media/logo-light.png">
+    <img src="https://raw.githubusercontent.com/superbasedapp/observer/main/vscode/media/logo-dark.png" alt="SuperBased" height="80">
   </picture>
 </p>
 
@@ -162,7 +162,7 @@ Open the command palette (`Ctrl+Shift+P` / `⌘⇧P`) and type **Observer:**
 browser extension that today installs unpacked only — not yet in the
 Chrome Web Store.
 
-Full integration details in the [user guide](https://github.com/marmutapp/superbased-observer/blob/main/docs/vscode-extension-user-guide.md#per-ai-tool-integration).
+Full integration details in the [user guide](https://github.com/superbasedapp/observer/blob/main/docs/vscode-extension-user-guide.md#per-ai-tool-integration).
 
 ---
 
@@ -185,20 +185,20 @@ Full integration details in the [user guide](https://github.com/marmutapp/superb
 
 ## 📖 Going deeper
 
-- **[User Guide](https://github.com/marmutapp/superbased-observer/blob/main/docs/vscode-extension-user-guide.md)** —
+- **[User Guide](https://github.com/superbasedapp/observer/blob/main/docs/vscode-extension-user-guide.md)** —
   long-form walkthrough: daily workflow, per-AI-tool integration,
   customisation recipes, troubleshooting.
-- **[Reference Docs](https://github.com/marmutapp/superbased-observer/blob/main/docs/vscode-extension.md)** —
+- **[Reference Docs](https://github.com/superbasedapp/observer/blob/main/docs/vscode-extension.md)** —
   full command + settings reference + compatibility matrix.
-- **[GitHub](https://github.com/marmutapp/superbased-observer)** —
+- **[GitHub](https://github.com/superbasedapp/observer)** —
   source, issues, releases.
 
 ---
 
 ## 💬 Help
 
-- **Issues**: [github.com/marmutapp/superbased-observer/issues](https://github.com/marmutapp/superbased-observer/issues)
-- **Discussions**: [github.com/marmutapp/superbased-observer/discussions](https://github.com/marmutapp/superbased-observer/discussions)
+- **Issues**: [github.com/superbasedapp/observer/issues](https://github.com/superbasedapp/observer/issues)
+- **Discussions**: [github.com/superbasedapp/observer/discussions](https://github.com/superbasedapp/observer/discussions)
 - **Output channel**: `View → Output → Observer` shows everything the
   extension is doing — include the relevant excerpt when filing bugs.
 

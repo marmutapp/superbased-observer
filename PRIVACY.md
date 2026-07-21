@@ -160,10 +160,10 @@ default destination.
 
 ## Source-of-truth and verification
 
-- Source code: https://github.com/marmutapp/superbased-observer
+- Source code: https://github.com/superbasedapp/observer
 - npm package: https://www.npmjs.com/package/@superbased/observer
 - SLSA provenance: attached as `multiple.intoto.jsonl` to each
-  [public GitHub release](https://github.com/marmutapp/superbased-observer/releases),
+  [public GitHub release](https://github.com/superbasedapp/observer/releases),
   verifiable with [`slsa-verifier`](https://github.com/slsa-framework/slsa-verifier)
   (`v2.7.0+` required for private-builder support).
 - SBOMs: `observer.cdx.json` + `observer-org.cdx.json` attached to
@@ -174,7 +174,7 @@ default destination.
 If you find behavior that contradicts anything on this page — a
 network call we didn't list, a code path that stores something we
 said it doesn't — file an issue at
-https://github.com/marmutapp/superbased-observer/issues with the
+https://github.com/superbasedapp/observer/issues with the
 tag `privacy`, or email `contact@superbased.app`.
 
 We treat any unintentional collection as a bug, not a feature.

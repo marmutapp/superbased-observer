@@ -487,7 +487,7 @@ function CrossToolEmpty() {
             </a>
           </Tooltip>
           <a
-            href="https://github.com/marmutapp/superbased-observer/blob/main/docs/mcp.md"
+            href="https://superbased.app/docs/guides/mcp-server"
             target="_blank"
             rel="noreferrer"
             className="flex h-7 items-center gap-1.5 rounded-2 border border-accent/40 bg-accent-soft px-3 text-[11px] font-medium text-accent hover:bg-accent-soft/80"
