@@ -1,0 +1,65 @@
+name: Adapter request
+description: Request support for a new AI coding tool.
+title: "[Adapter]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Observer supports 26 AI coding tools today via per-tool
+        adapters. If yours isn't one of them, this form helps us
+        (or you!) scope a new adapter. See CONTRIBUTING.md if you'd
+        like to build it yourself — adapter contributions are
+        especially welcome.
+  - type: input
+    id: tool-name
+    attributes:
+      label: Tool name + vendor
+      placeholder: e.g. "Foo CLI" by Foo Inc.
+    validations:
+      required: true
+  - type: input
+    id: log-location
+    attributes:
+      label: Where does it store session logs?
+      description: A file path or directory, if you know it (e.g. ~/.foo/sessions/). Leave blank if unknown.
+  - type: dropdown
+    id: has-tokens
+    attributes:
+      label: Do the local logs contain token counts?
+      options:
+        - "Yes"
+        - "No"
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: docs-link
+    attributes:
+      label: Link(s) to the tool's own docs
+  - type: dropdown
+    id: fixtures
+    attributes:
+      label: Would you be willing to share sanitized session-log fixtures?
+      description: Anonymized, secret-free samples make building and testing an adapter much faster.
+      options:
+        - "Yes"
+        - "No"
+        - Maybe, ask me
+    validations:
+      required: true
+  - type: dropdown
+    id: test-branch
+    attributes:
+      label: Would you be willing to test a branch against your real setup?
+      options:
+        - "Yes"
+        - "No"
+        - Maybe, ask me
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else worth knowing?
+      description: Quirks, known limitations, how the tool is typically installed/run.

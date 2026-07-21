@@ -1,0 +1,75 @@
+name: Cost / token discrepancy
+description: Observer's reported cost or token counts don't match what you expected.
+title: "[Cost]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Cost accuracy is core to what Observer does — the more detail
+        on the actual numbers, the faster we can find the gap.
+  - type: input
+    id: version
+    attributes:
+      label: Observer version
+      placeholder: v1.22.0
+    validations:
+      required: true
+  - type: input
+    id: ai-tool
+    attributes:
+      label: Affected AI tool + version
+      placeholder: e.g. Claude Code 1.x, Codex CLI 0.130
+    validations:
+      required: true
+  - type: input
+    id: provider-model
+    attributes:
+      label: Provider + model
+      placeholder: e.g. Anthropic, claude-sonnet-4-5
+    validations:
+      required: true
+  - type: dropdown
+    id: capture-mode
+    attributes:
+      label: Capture mode
+      description: Was the session routed through Observer's API proxy, or captured from logs/hooks only?
+      options:
+        - Proxy-routed
+        - Logs + hooks only
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: What Observer reported
+      description: Token counts and/or dollar cost, as shown in the dashboard/CLI.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: The numbers you believe are correct, and why.
+    validations:
+      required: true
+  - type: dropdown
+    id: expected-source
+    attributes:
+      label: Where did the "expected" numbers come from?
+      options:
+        - Provider's own console/dashboard
+        - Provider's invoice/billing page
+        - Another Observer view (dashboard vs CLI vs MCP disagree)
+        - Manual calculation
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant session ID, logs, or screenshots
+      description: >
+        Please review for secrets or paths before pasting — scrubbing
+        is best-effort.

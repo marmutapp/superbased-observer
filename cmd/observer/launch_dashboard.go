@@ -74,9 +74,11 @@ func newSpawnAuditSink(database *sql.DB, kind string) func(runID, tool, handle s
 	}
 }
 
-// applyTerminalBounds maps the [terminal] knobs onto the termsession Options
-// (0/empty leaves the termsession default). IdleTimeout is validated at config
-// load, so a parse failure here is only a defensive log.
+// applyTerminalBounds maps the [terminal] knobs onto the termsession Options.
+// IdleTimeout "0"/empty maps to 0 = idle reaping DISABLED (the seeded config
+// default — live sessions stay until their child exits); a positive duration
+// opts back into reaping. It is validated at config load, so a parse failure
+// here is only a defensive log.
 func applyTerminalBounds(opts *termsession.Options, tc config.TerminalConfig, logger *slog.Logger) {
 	opts.MaxConcurrent = tc.MaxConcurrent
 	opts.RingBytes = tc.RingBytes
@@ -99,6 +101,21 @@ func terminalLaunchPolicy(tc config.TerminalConfig) termsvc.Policy {
 		AllowedTools:        tc.Launch.AllowedTools,
 		AllowedProjectRoots: tc.Launch.AllowedProjectRoots,
 	}
+}
+
+// SetTerminalLimits live-applies the dashboard-editable [terminal] concurrency
+// cap + idle-reap timeout onto the PTY manager with no restart. It satisfies the
+// OPTIONAL interface the /api/terminal/limits verb type-asserts on the dashboard
+// LaunchManager seam (the dashboard never widens LaunchManager for this — the
+// dozens of test fakes must stay compiling; a fake lacking this method makes the
+// verb report restart_required). Nil-safe: a nil adapter or nil manager is a
+// no-op, so the assertion succeeding but the manager being absent degrades to
+// "persisted, live-apply skipped" rather than panicking.
+func (a *launchManagerAdapter) SetTerminalLimits(maxConcurrent int, idleTimeout time.Duration) {
+	if a == nil || a.mgr == nil {
+		return
+	}
+	a.mgr.SetLimits(maxConcurrent, idleTimeout)
 }
 
 // --- dashboard.LaunchManager implementation ---

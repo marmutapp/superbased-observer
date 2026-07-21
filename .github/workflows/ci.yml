@@ -107,11 +107,15 @@ jobs:
 
       - name: test
         # -race catches the watcher / proxy concurrency bugs that
-        # otherwise slip past until live use. -timeout 25m: the
+        # otherwise slip past until live use. -timeout 40m: the
         # intelligence/dashboard suite exceeds go test's default 10m
         # per-binary timeout under -race on CI runners (observed
-        # 2026-07-11, first full test run after the lint debt cleared).
-        run: go test -race -timeout 25m ./...
+        # 2026-07-11; raised 25m→40m 2026-07-21 after the v1.22.0 suite
+        # blew 25m twice — no deadlock, the package is just large: every
+        # newTestServer runs the full migration chain, so the binary
+        # scales with test count × migrations on 2-core runners. The
+        # real fix is a template-DB copy in newTestServer.)
+        run: go test -race -timeout 40m ./...
 
       - name: build
         # `make build` skipped here — that target requires Node for

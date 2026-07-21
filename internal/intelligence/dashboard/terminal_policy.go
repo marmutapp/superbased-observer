@@ -57,6 +57,11 @@ func (s *Server) handleTerminalPolicyGet(w http.ResponseWriter, r *http.Request)
 		"allow_fresh_agent":     false,
 		"allowed_tools":         []string{},
 		"allowed_project_roots": []string{},
+		// Runtime bounds (read-only here; written by the live-applying
+		// /api/terminal/limits verb). Surfaced from this same GET so the UI has
+		// both the current values and the confirm token from one fetch.
+		"max_concurrent": 0,
+		"idle_timeout":   "",
 		// The launchable set the picker MUST source from (plan §E) — resolved
 		// from the capability registry (dispatch on capability shape, never a
 		// hardcoded tool list).
@@ -76,6 +81,8 @@ func (s *Server) handleTerminalPolicyGet(w http.ResponseWriter, r *http.Request)
 		if cfg.Terminal.Launch.AllowedProjectRoots != nil {
 			resp["allowed_project_roots"] = cfg.Terminal.Launch.AllowedProjectRoots
 		}
+		resp["max_concurrent"] = cfg.Terminal.MaxConcurrent
+		resp["idle_timeout"] = cfg.Terminal.IdleTimeout
 	}
 	writeJSON(w, resp)
 }

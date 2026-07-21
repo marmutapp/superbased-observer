@@ -530,6 +530,159 @@ func TestIdleReaper(t *testing.T) {
 	}
 }
 
+// TestIdleReapDisabledByDefault pins the continuity default: with no
+// IdleTimeout configured (zero value), a live session with NO PTY I/O for a
+// day is NOT reaped — an interactive agent idling at its prompt produces zero
+// I/O for hours, and killing it reads as data loss ("the session ended but its
+// exit status could not be determined"). Reaping is the opt-in, not the
+// default. Exit-linger reaping of EXITED sessions is unaffected
+// (TestExitLingerThenReap).
+func TestIdleReapDisabledByDefault(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	nowP := &atomicTime{}
+	nowP.set(base)
+	sp := &fakeSpawner{}
+	m := NewManager(Options{
+		Spawner:      sp,
+		ReapInterval: time.Hour,
+		Now:          nowP.get,
+		// IdleTimeout deliberately unset: <=0 = never idle-reap.
+	})
+	t.Cleanup(m.Shutdown)
+
+	tok, _ := m.Create(validSpec())
+	f := sp.last()
+
+	nowP.set(base.Add(24 * time.Hour))
+	m.reapOnce(nowP.get())
+
+	select {
+	case <-f.killed:
+		t.Fatal("a live idle session was killed with idle reaping disabled (the default)")
+	default:
+	}
+	if _, err := m.Subscribe(tok); err != nil {
+		t.Errorf("idle session no longer subscribable after 24h: %v", err)
+	}
+}
+
+// TestSetLimitsMaxConcurrent covers the concurrency-cap half of the
+// live-apply contract: raising admits more Creates, lowering below the live
+// count refuses NEW Creates but never kills existing sessions, and a
+// non-positive value falls back to defaultMaxConcurrent (so a persisted "0"
+// can never install a zero gate that refuses every Create).
+func TestSetLimitsMaxConcurrent(t *testing.T) {
+	cases := []struct {
+		name    string
+		set     int
+		wantCap int
+	}{
+		{"raise", 12, 12},
+		{"lower", 2, 2},
+		{"zero falls back to default", 0, defaultMaxConcurrent},
+		{"negative falls back to default", -5, defaultMaxConcurrent},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestManager(t, &fakeSpawner{}, time.Now)
+			m.SetLimits(tc.set, 0)
+			m.mu.Lock()
+			got := m.maxConcurrent
+			m.mu.Unlock()
+			if got != tc.wantCap {
+				t.Fatalf("maxConcurrent = %d, want %d", got, tc.wantCap)
+			}
+		})
+	}
+}
+
+// TestSetLimitsLowerDoesNotKillLive pins the "future Creates only" contract:
+// lowering maxConcurrent below the live session count refuses the NEXT Create
+// (Create is the sole capacity gate) but leaves every existing session alive
+// and subscribable.
+func TestSetLimitsLowerDoesNotKillLive(t *testing.T) {
+	sp := &fakeSpawner{}
+	m := newTestManager(t, sp, time.Now)
+	var toks []string
+	for i := 0; i < 3; i++ {
+		tok, err := m.Create(validSpec())
+		if err != nil {
+			t.Fatalf("Create %d: %v", i, err)
+		}
+		toks = append(toks, tok)
+	}
+	// Drop the cap below the 3 live sessions.
+	m.SetLimits(2, 0)
+	// A new Create is refused …
+	if _, err := m.Create(validSpec()); !errors.Is(err, ErrTooManySessions) {
+		t.Fatalf("Create over lowered cap err = %v, want ErrTooManySessions", err)
+	}
+	// … but every existing session is still alive.
+	for i, tok := range toks {
+		if _, err := m.Subscribe(tok); err != nil {
+			t.Errorf("live session %d killed by lowered cap: %v", i, err)
+		}
+	}
+}
+
+// TestSetLimitsIdleTimeout drives the idle-reap half through the fake clock:
+// enable → a session past the timeout is reaped; disable (<=0) → a session is
+// NOT reaped even a day later; re-enable → reaping resumes. Mirrors
+// TestIdleReaper / TestIdleReapDisabledByDefault but flips the timeout LIVE via
+// SetLimits instead of at construction.
+func TestSetLimitsIdleTimeout(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	nowP := &atomicTime{}
+	nowP.set(base)
+	sp := &fakeSpawner{}
+	m := NewManager(Options{
+		Spawner:      sp,
+		ReapInterval: time.Hour, // the background reaper never fires mid-test
+		Now:          nowP.get,
+		// IdleTimeout deliberately unset: reaping starts DISABLED.
+	})
+	t.Cleanup(m.Shutdown)
+
+	// Enable idle reaping live.
+	m.SetLimits(0, 10*time.Minute) // maxConcurrent 0 → default fallback, unrelated here
+	tok, _ := m.Create(validSpec())
+	f := sp.last()
+	nowP.set(base.Add(11 * time.Minute))
+	m.reapOnce(nowP.get())
+	select {
+	case <-f.killed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("enabled idle timeout did not reap the idle session")
+	}
+	if _, err := m.Subscribe(tok); !errors.Is(err, ErrNotFound) {
+		t.Errorf("reaped session still subscribable: %v", err)
+	}
+
+	// Disable idle reaping live; a fresh session survives a day of idle.
+	m.SetLimits(0, 0)
+	tok2, _ := m.Create(validSpec())
+	f2 := sp.last()
+	nowP.set(base.Add(48 * time.Hour))
+	m.reapOnce(nowP.get())
+	select {
+	case <-f2.killed:
+		t.Fatal("idle session killed after idle reaping was disabled live")
+	default:
+	}
+	if _, err := m.Subscribe(tok2); err != nil {
+		t.Errorf("session no longer subscribable after disable: %v", err)
+	}
+
+	// Re-enable; the now-long-idle session is reaped on the next tick.
+	m.SetLimits(0, 5*time.Minute)
+	m.reapOnce(nowP.get())
+	select {
+	case <-f2.killed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("re-enabled idle timeout did not reap the long-idle session")
+	}
+}
+
 func TestExitLingerThenReap(t *testing.T) {
 	base := time.Unix(1_700_000_000, 0)
 	nowP := &atomicTime{}

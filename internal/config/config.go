@@ -1031,8 +1031,14 @@ type TerminalConfig struct {
 	// Terminal Workspace grid; the termsession zero-value fallback stays 4).
 	// 0 falls back to the termsession default.
 	MaxConcurrent int `toml:"max_concurrent"`
-	// IdleTimeout reaps a terminal whose PTY has seen no I/O for this long
-	// (Go duration string, e.g. "30m"). Empty uses the termsession default.
+	// IdleTimeout, when set to a positive Go duration (e.g. "30m"), reaps a
+	// terminal whose PTY has seen no I/O for that long. "0" or empty — the
+	// DEFAULT — disables idle reaping: a live session stays available (and on
+	// the dashboard) until its child exits or it is explicitly closed. An
+	// interactive agent idling at its prompt produces zero PTY I/O for hours;
+	// reaping it kills the operator's session mid-thought ("the session ended
+	// but its exit status could not be determined"), so continuity is the
+	// default and reaping is the opt-in.
 	IdleTimeout string `toml:"idle_timeout"`
 	// RingBytes bounds each session's raw replay ring (default 262144). 0 uses
 	// the termsession default.
@@ -2630,7 +2636,7 @@ func Default() Config {
 		Terminal: TerminalConfig{
 			Enabled:        true,
 			MaxConcurrent:  9,
-			IdleTimeout:    "30m",
+			IdleTimeout:    "0", // never idle-reap live sessions (continuity default)
 			RingBytes:      262144,
 			MaxSubscribers: 8,
 			Status:         TerminalStatusConfig{Enabled: true},
@@ -3260,8 +3266,15 @@ func validateTerminal(c TerminalConfig) error {
 		return errors.New("config: terminal.ring_bytes must be >= 0")
 	}
 	if strings.TrimSpace(c.IdleTimeout) != "" {
-		if _, err := time.ParseDuration(c.IdleTimeout); err != nil {
+		d, err := time.ParseDuration(c.IdleTimeout)
+		if err != nil {
 			return fmt.Errorf("config: terminal.idle_timeout %q is not a valid duration: %w", c.IdleTimeout, err)
+		}
+		// A negative duration would silently mean "disabled" everywhere it is
+		// consumed; require the honest spelling ("0") instead of persisting a
+		// value that reads like a timeout but never fires.
+		if d < 0 {
+			return fmt.Errorf("config: terminal.idle_timeout %q must not be negative (use \"0\" to disable idle reaping)", c.IdleTimeout)
 		}
 	}
 	return nil

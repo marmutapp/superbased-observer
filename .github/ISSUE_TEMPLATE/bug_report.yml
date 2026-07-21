@@ -1,0 +1,80 @@
+name: Bug report
+description: Something isn't working the way it should.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Before filing,
+        please check open issues and Discussions for an existing
+        report.
+
+        If this is a security vulnerability, please stop and use
+        private reporting instead (see SECURITY.md) — don't file it
+        here.
+  - type: input
+    id: version
+    attributes:
+      label: Observer version
+      description: Output of `observer --version`
+      placeholder: v1.22.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install-channel
+    attributes:
+      label: Install channel
+      options:
+        - npm
+        - PyPI
+        - VS Code extension
+        - Release binary (GitHub Releases)
+        - Built from source
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - WSL
+    validations:
+      required: true
+  - type: input
+    id: ai-tool
+    attributes:
+      label: Affected AI tool + version
+      description: e.g. Claude Code 1.x, Codex CLI 0.130, Cursor 3.x — leave blank if not tool-specific.
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What actually happened?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: As specific as you can — commands run, config used, order of operations.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or output
+      description: >
+        Observer scrubs known secret patterns from what it captures, but
+        that's best-effort — please review pasted output yourself for
+        API keys, tokens, or local file paths you don't want public
+        before submitting.
+      render: shell

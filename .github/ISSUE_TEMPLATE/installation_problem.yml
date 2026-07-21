@@ -1,0 +1,75 @@
+name: Installation problem
+description: Observer won't install, won't start, or fails on first run.
+title: "[Install]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For install and first-run problems — package manager errors,
+        binary won't launch, `observer init`/`observer start` failing,
+        permission errors, etc.
+  - type: input
+    id: version
+    attributes:
+      label: Observer version (or version you tried to install)
+      placeholder: v1.22.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install-channel
+    attributes:
+      label: Install channel
+      options:
+        - npm
+        - PyPI
+        - VS Code extension
+        - Release binary (GitHub Releases)
+        - Built from source
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - WSL
+    validations:
+      required: true
+  - type: input
+    id: os-details
+    attributes:
+      label: OS version / distro / architecture
+      placeholder: e.g. Ubuntu 24.04 on WSL2, macOS 15 arm64, Windows 11 x64
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command(s) you ran
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What actually happened?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Full error output
+      description: >
+        Please review this for secrets or local paths before pasting —
+        Observer's scrubbing doesn't apply to raw install-tool output.
+      render: shell
+    validations:
+      required: true

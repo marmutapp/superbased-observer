@@ -66,7 +66,6 @@ var (
 // Default lifecycle bounds. All overridable via Options.
 const (
 	defaultMaxConcurrent   = 4
-	defaultIdleTimeout     = 30 * time.Minute
 	defaultExitLinger      = 30 * time.Second
 	defaultReapInterval    = 10 * time.Second
 	defaultMaxSubscribers  = 8
@@ -86,14 +85,22 @@ type Options struct {
 	// A slow/malicious viewer is drop-oldest degraded, never a PTY stall; this
 	// bound caps the fan-out breadth so a flood of viewers can't exhaust memory.
 	MaxSubscribers int
-	// IdleTimeout reaps a session whose PTY has seen no I/O for this long
-	// (default 30m). Any output or keystroke resets the clock.
+	// IdleTimeout, when > 0, reaps a session whose PTY has seen no I/O for
+	// this long (any output or keystroke resets the clock). <= 0 — the
+	// DEFAULT — disables idle reaping entirely: a live session stays
+	// available until its child exits or it is explicitly closed. An
+	// interactive agent sitting at its prompt produces zero PTY I/O for
+	// hours; killing it for that reads as data loss, so continuity is the
+	// default and reaping is the opt-in.
 	IdleTimeout time.Duration
-	// WriterLeaseIdle revokes a writer lease with no Write/Resize for this long
-	// (default 5m), refreshed on each successful write (§4.α.2c).
+	// WriterLeaseIdle revokes a REMOTE writer lease with no Write/Resize for
+	// this long (default 5m), refreshed on each successful write (§4.α.2c).
+	// Local leases (the native wrapper, the loopback dashboard seat) are
+	// exempt — see reapOnce.
 	WriterLeaseIdle time.Duration
-	// WriterLeaseMax is the hard cap on a writer lease's lifetime (default 30m)
-	// after which the holder must re-acquire (fresh capability + confirm).
+	// WriterLeaseMax is the hard cap on a REMOTE writer lease's lifetime
+	// (default 30m) after which the holder must re-acquire (fresh capability
+	// + confirm). Local leases are exempt — see reapOnce.
 	WriterLeaseMax time.Duration
 	// ExitLinger keeps an exited session in the registry this long after
 	// the process ends, so a still-attached (or reconnecting) client can
@@ -249,9 +256,8 @@ func NewManager(opts Options) *Manager {
 	if m.maxSubscribers <= 0 {
 		m.maxSubscribers = defaultMaxSubscribers
 	}
-	if m.idleTimeout <= 0 {
-		m.idleTimeout = defaultIdleTimeout
-	}
+	// idleTimeout <= 0 stays as-is: idle reaping DISABLED (the default —
+	// continuity over resource reclamation for live interactive sessions).
 	if m.writerLeaseIdle <= 0 {
 		m.writerLeaseIdle = defaultWriterLeaseIdle
 	}
@@ -1339,6 +1345,28 @@ func (m *Manager) reapLoop(interval time.Duration) {
 	}
 }
 
+// SetLimits live-applies the two dashboard-editable [terminal] bounds — the
+// concurrency cap and the idle-reap timeout — under m.mu, with NO restart. It
+// applies to FUTURE work only: maxConcurrent gates the next Create (Create is
+// the sole capacity gate, so lowering it below the live session count NEVER
+// kills existing sessions — it only refuses new ones until the count drops);
+// idleTimeout is read by the next reap tick. maxConcurrent <= 0 falls back to
+// defaultMaxConcurrent — the SAME zero-value fallback NewManager applies — so a
+// persisted "0" config (meaning "use the seed default") can never install a
+// zero gate that would refuse EVERY Create (len(sessions)+pending >= 0 is
+// always true). idleTimeout is applied exactly as given: <= 0 disables idle
+// reaping (the continuity default — a live session stays until its child exits
+// or an explicit close), a positive duration opts into reaping.
+func (m *Manager) SetLimits(maxConcurrent int, idleTimeout time.Duration) {
+	if maxConcurrent <= 0 {
+		maxConcurrent = defaultMaxConcurrent
+	}
+	m.mu.Lock()
+	m.maxConcurrent = maxConcurrent
+	m.idleTimeout = idleTimeout
+	m.mu.Unlock()
+}
+
 // reapOnce terminates sessions that are idle past IdleTimeout or exited
 // past ExitLinger, and revokes writer leases past their idle / hard-cap
 // lifetime (§4.α.2c). Split from the ticker so tests drive it deterministically.
@@ -1348,8 +1376,14 @@ func (m *Manager) reapOnce(now time.Time) {
 	var expire []*Session
 	for h, s := range m.sessions {
 		// Writer-lease lifetime sweep (independent of session reaping).
+		// REMOTE leases only: the idle/hard-cap lifetimes are §4.α.2c
+		// security bounds on a remote device's write authority. A LOCAL
+		// lease (the native wrapper's seat, the loopback dashboard) is the
+		// owner at the keyboard — idle-expiring it silently killed input in
+		// long-lived attach sessions ("keys stop working after 5 idle
+		// minutes"), which is continuity breakage, not defence.
 		s.writeMu.Lock()
-		if l := s.lease; l != nil {
+		if l := s.lease; l != nil && l.kind != termlease.HolderLocal {
 			idleOver := now.Sub(time.Unix(0, l.lastWrite.Load())) > s.writerIdle
 			hardOver := now.Sub(time.Unix(0, l.createdAt)) > s.writerMax
 			if idleOver || hardOver {
@@ -1364,7 +1398,9 @@ func (m *Manager) reapOnce(now time.Time) {
 			}
 			continue
 		}
-		if now.Sub(time.Unix(0, s.lastAct.Load())) > m.idleTimeout {
+		// Idle reaping is opt-in (idleTimeout > 0). Disabled — the default —
+		// a live session stays until its child exits or an explicit close.
+		if m.idleTimeout > 0 && now.Sub(time.Unix(0, s.lastAct.Load())) > m.idleTimeout {
 			kill = append(kill, h)
 		}
 	}

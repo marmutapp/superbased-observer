@@ -703,6 +703,10 @@ func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[st
 	// allowed_project_roots block. The runs history is a metadata-only View read.
 	reg("/api/terminal/policy", L, s.handleTerminalPolicy)
 	reg("/api/terminal/runs", V, s.handleTerminalRuns)
+	// Runtime bounds (max_concurrent / idle_timeout) — a Local write that
+	// live-applies to the PTY manager with no restart, unlike the start-captured
+	// launch policy above.
+	reg("/api/terminal/limits", L, s.handleTerminalLimits)
 	// ExtraRoutes lets a separable subsystem (e.g. internal/obs) register its
 	// own /api/* handlers WITHOUT this package importing it (decision D4). Each
 	// MUST carry a Capability; New() rejects an unclassified ExtraRoute when a

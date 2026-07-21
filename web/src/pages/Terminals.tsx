@@ -72,6 +72,10 @@ type TerminalPolicy = {
   allowed_project_roots: string[];
   launchable_tools: string[];
   restart_required_on_save: boolean;
+  // Runtime bounds — live-applied by POST /api/terminal/limits (no restart),
+  // read-only on this GET.
+  max_concurrent: number;
+  idle_timeout: string;
 };
 
 type RunRow = {
@@ -171,11 +175,22 @@ export function TerminalsPage() {
   // mismatched root is rejected there, not here).
   const [projects, setProjects] = useState<ProjectRow[]>([]);
 
+  // Runtime-bounds editor state (POST /api/terminal/limits — live-applied).
+  // max_concurrent is kept as a string so the input can be transiently empty;
+  // idle_timeout is a free-text Go duration ("0" = never).
+  const [maxConcurrent, setMaxConcurrent] = useState("");
+  const [idleTimeout, setIdleTimeout] = useState("");
+  const [limitsBusy, setLimitsBusy] = useState(false);
+  const [limitsErr, setLimitsErr] = useState<string | null>(null);
+  const [limitsMsg, setLimitsMsg] = useState<string | null>(null);
+
   useEffect(() => {
     if (p) {
       setAllowFresh(p.allow_fresh_agent);
       setTools(p.allowed_tools ?? []);
       setRoots(p.allowed_project_roots ?? []);
+      setMaxConcurrent(String(p.max_concurrent ?? 0));
+      setIdleTimeout(p.idle_timeout ?? "");
     }
   }, [p]);
 
@@ -247,6 +262,50 @@ export function TerminalsPage() {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function saveLimits() {
+    if (!confirmToken) {
+      setLimitsErr("No confirm token — reload the page.");
+      return;
+    }
+    // Client-side sanity only: a non-negative integer. The server owns
+    // duration validation and surfaces its own message.
+    const trimmed = maxConcurrent.trim();
+    const n = Number(trimmed);
+    if (trimmed === "" || !Number.isInteger(n) || n < 0) {
+      setLimitsErr("Max concurrent must be a non-negative whole number.");
+      return;
+    }
+    setLimitsBusy(true);
+    setLimitsErr(null);
+    setLimitsMsg(null);
+    // Send only the fields that changed from the loaded policy.
+    const body: { max_concurrent?: number; idle_timeout?: string } = {};
+    if (n !== (p?.max_concurrent ?? 0)) body.max_concurrent = n;
+    if (idleTimeout.trim() !== (p?.idle_timeout ?? "")) {
+      body.idle_timeout = idleTimeout.trim();
+    }
+    if (body.max_concurrent === undefined && body.idle_timeout === undefined) {
+      setLimitsMsg("No changes.");
+      setLimitsBusy(false);
+      return;
+    }
+    try {
+      const res = await postConfirmJSON<{ restart_required: boolean }>(
+        "/api/terminal/limits",
+        confirmToken,
+        body,
+      );
+      setLimitsMsg(
+        res.restart_required ? "Saved — restart required." : "Applied live.",
+      );
+      policy.reload();
+    } catch (e) {
+      setLimitsErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLimitsBusy(false);
     }
   }
 
@@ -507,6 +566,72 @@ export function TerminalsPage() {
                 Takes effect on the next daemon restart (the policy is read at start-up).
               </span>
             )}
+          </div>
+        </div>
+      </ChartShell>
+
+      {/* Terminal limits — the two runtime bounds live-applied to the PTY
+          manager (POST /api/terminal/limits). Unlike the launch policy above,
+          these bind immediately (no restart). Owner-local write. */}
+      <ChartShell
+        title="Terminal limits"
+        sub="How many terminals can run at once, and when to reap idle ones. Applied live — no restart."
+      >
+        <div className="space-y-3">
+          <div className="flex flex-col gap-1">
+            <label className="text-[12px] font-medium text-fg-1">
+              Max concurrent terminals
+            </label>
+            <input
+              type="number"
+              min={0}
+              step={1}
+              value={maxConcurrent}
+              disabled={!p?.config_writable}
+              onChange={(e) => setMaxConcurrent(e.target.value)}
+              className="w-32 rounded-2 border border-line-2 bg-bg-1 px-2 py-1 text-[12px] text-fg-1 disabled:opacity-50"
+            />
+            <p className="text-[11px] text-fg-3">
+              How many embedded/attach terminals can run at once. The Workspace
+              grid is sized for 9.
+            </p>
+          </div>
+
+          <div className="flex flex-col gap-1">
+            <label className="text-[12px] font-medium text-fg-1">
+              Idle timeout
+            </label>
+            <input
+              type="text"
+              value={idleTimeout}
+              placeholder="0"
+              disabled={!p?.config_writable}
+              onChange={(e) => setIdleTimeout(e.target.value)}
+              className="w-32 rounded-2 border border-line-2 bg-bg-1 px-2 py-1 text-[12px] text-fg-1 disabled:opacity-50"
+            />
+            <p className="text-[11px] text-fg-3">
+              0 = never (default): live sessions stay until the agent exits. Set
+              a Go duration (e.g. 30m, 2h) to reap terminals with no I/O for that
+              long.
+            </p>
+          </div>
+
+          {limitsErr && (
+            <div className="rounded-2 border border-danger/40 bg-danger/10 px-3 py-2 text-[12px] text-danger">
+              {limitsErr}
+            </div>
+          )}
+
+          <div className="flex items-center gap-3 pt-1">
+            <button
+              type="button"
+              disabled={limitsBusy || !p?.config_writable}
+              onClick={saveLimits}
+              className="rounded-2 border border-accent/50 bg-accent/15 px-3 py-1 text-[12px] text-accent hover:bg-accent/25 disabled:opacity-50"
+            >
+              {limitsBusy ? "saving…" : "Save limits"}
+            </button>
+            {limitsMsg && <span className="text-[11px] text-ok">{limitsMsg}</span>}
           </div>
         </div>
       </ChartShell>

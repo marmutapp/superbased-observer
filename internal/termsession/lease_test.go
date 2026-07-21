@@ -559,8 +559,9 @@ func TestSlowSubscriberDropsOldestNeverStalls(t *testing.T) {
 	}
 }
 
-// TestWriterLeaseIdleExpiry proves the reaper revokes a writer lease past its
-// idle lifetime (§4.α.2c).
+// TestWriterLeaseIdleExpiry proves the reaper revokes a REMOTE writer lease
+// past its idle lifetime (§4.α.2c). The lifetimes are remote-authority
+// security bounds — local leases are exempt (see the exemption test below).
 func TestWriterLeaseIdleExpiry(t *testing.T) {
 	base := time.Unix(1_700_000_000, 0)
 	nowP := &atomicTime{}
@@ -576,16 +577,16 @@ func TestWriterLeaseIdleExpiry(t *testing.T) {
 	t.Cleanup(m.Shutdown)
 	tok, _ := m.Create(validSpec())
 
-	l, err := m.AcquireWriterLocal(tok)
+	l, err := m.AcquireWriterRemote(tok, remoteGrant(t, tok, "device-x"))
 	if err != nil {
-		t.Fatalf("AcquireWriterLocal: %v", err)
+		t.Fatalf("AcquireWriterRemote: %v", err)
 	}
 	nowP.set(base.Add(6 * time.Minute)) // past idle
 	m.reapOnce(nowP.get())
 	select {
 	case <-l.Revoked():
 	case <-time.After(2 * time.Second):
-		t.Fatal("idle writer lease not revoked by reaper")
+		t.Fatal("idle remote writer lease not revoked by reaper")
 	}
 	if _, werr := l.Write([]byte("x")); !errors.Is(werr, ErrNotWriter) {
 		t.Fatalf("expired-lease Write = %v, want ErrNotWriter", werr)
@@ -593,7 +594,7 @@ func TestWriterLeaseIdleExpiry(t *testing.T) {
 }
 
 // TestWriterLeaseHardCapExpiry proves the hard-cap revokes even a
-// continuously-written lease (§4.α.2c).
+// continuously-written REMOTE lease (§4.α.2c).
 func TestWriterLeaseHardCapExpiry(t *testing.T) {
 	base := time.Unix(1_700_000_000, 0)
 	nowP := &atomicTime{}
@@ -608,7 +609,10 @@ func TestWriterLeaseHardCapExpiry(t *testing.T) {
 	})
 	t.Cleanup(m.Shutdown)
 	tok, _ := m.Create(validSpec())
-	l, _ := m.AcquireWriterLocal(tok)
+	l, err := m.AcquireWriterRemote(tok, remoteGrant(t, tok, "device-x"))
+	if err != nil {
+		t.Fatalf("AcquireWriterRemote: %v", err)
+	}
 
 	// Keep it "active" but push past the hard cap.
 	nowP.set(base.Add(20 * time.Minute))
@@ -618,7 +622,44 @@ func TestWriterLeaseHardCapExpiry(t *testing.T) {
 	select {
 	case <-l.Revoked():
 	case <-time.After(2 * time.Second):
-		t.Fatal("hard-capped writer lease not revoked")
+		t.Fatal("hard-capped remote writer lease not revoked")
+	}
+}
+
+// TestLocalWriterLeaseExemptFromLifetimeSweep pins the continuity half of the
+// §4.α.2c scoping: a LOCAL lease (the native wrapper's seat, the loopback
+// dashboard) never idle-expires and never hits the hard cap — the operator at
+// the keyboard keeps write authority across hours of idle. Idle-expiring it
+// silently killed input in long-lived attach sessions.
+func TestLocalWriterLeaseExemptFromLifetimeSweep(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	nowP := &atomicTime{}
+	nowP.set(base)
+	sp := &fakeSpawner{}
+	m := NewManager(Options{
+		Spawner:         sp,
+		ReapInterval:    time.Hour,
+		WriterLeaseIdle: 5 * time.Minute,
+		WriterLeaseMax:  30 * time.Minute,
+		Now:             nowP.get,
+	})
+	t.Cleanup(m.Shutdown)
+	tok, _ := m.Create(validSpec())
+	l, err := m.AcquireWriterLocal(tok)
+	if err != nil {
+		t.Fatalf("AcquireWriterLocal: %v", err)
+	}
+
+	// Way past both the idle lifetime and the hard cap.
+	nowP.set(base.Add(24 * time.Hour))
+	m.reapOnce(nowP.get())
+	select {
+	case <-l.Revoked():
+		t.Fatal("local writer lease was revoked by the lifetime sweep — locals are exempt")
+	default:
+	}
+	if _, werr := l.Write([]byte("x")); werr != nil {
+		t.Fatalf("local lease Write after 24h idle = %v, want success", werr)
 	}
 }
 

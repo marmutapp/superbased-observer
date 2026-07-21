@@ -175,6 +175,7 @@ var expectedClassification = map[string]string{
 	"/api/suggestions/state":                  "L",
 	"/api/terminal/":                          "V",
 	"/api/terminal/launch":                    "X",
+	"/api/terminal/limits":                    "L",
 	"/api/terminal/policy":                    "L",
 	"/api/terminal/runs":                      "V",
 	"/api/terminal/sessions":                  "V",
@@ -273,6 +274,7 @@ var mutationRoutes = []string{
 	"/api/suggestions/state",
 	"/api/tools/launch",
 	"/api/terminal/launch",
+	"/api/terminal/limits",
 	"/api/terminal/policy",
 }
 

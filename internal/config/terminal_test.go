@@ -21,7 +21,9 @@ func TestTerminalDefaults(t *testing.T) {
 	if len(c.Terminal.Launch.AllowedTools) != 0 || len(c.Terminal.Launch.AllowedProjectRoots) != 0 {
 		t.Error("fresh-launch allow-lists must default empty (deny-all)")
 	}
-	if c.Terminal.MaxConcurrent != 9 || c.Terminal.IdleTimeout != "30m" {
+	// IdleTimeout "0" = idle reaping DISABLED by default (continuity):
+	// a live session stays until its child exits or an explicit close.
+	if c.Terminal.MaxConcurrent != 9 || c.Terminal.IdleTimeout != "0" {
 		t.Errorf("terminal bounds = %+v", c.Terminal)
 	}
 }
@@ -180,6 +182,7 @@ func TestTerminalValidation(t *testing.T) {
 		{"negative max_concurrent", func(c *Config) { c.Terminal.MaxConcurrent = -1 }, true},
 		{"negative ring_bytes", func(c *Config) { c.Terminal.RingBytes = -1 }, true},
 		{"bad idle_timeout", func(c *Config) { c.Terminal.IdleTimeout = "not-a-duration" }, true},
+		{"negative idle_timeout", func(c *Config) { c.Terminal.IdleTimeout = "-5m" }, true},
 		{"empty idle_timeout ok", func(c *Config) { c.Terminal.IdleTimeout = "" }, false},
 	}
 	for _, tc := range tests {
