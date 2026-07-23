@@ -23,7 +23,7 @@ let statusBar: StatusBarController | undefined;
 let cacheStatusBar: StatusBarController | undefined;
 
 export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
-  output.appendLine('Observer extension activating');
+  output.appendLine('SuperBased extension activating');
   try {
     const bin = await resolveBinary(ctx);
     output.appendLine(
@@ -86,13 +86,13 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     output.appendLine(`Activation failed: ${message}`);
-    void vscode.window.showErrorMessage(`Observer: ${message}`);
+    void vscode.window.showErrorMessage(`SuperBased: ${message}`);
     throw err;
   }
 }
 
 export function deactivate(): void {
-  output.appendLine('Observer extension deactivating');
+  output.appendLine('SuperBased extension deactivating');
   statusBar?.dispose();
   statusBar = undefined;
   cacheStatusBar?.dispose();

@@ -17,7 +17,7 @@
 
 **Claude Code cost tracking. Cursor token usage. Codex spend.
 AI coding agent observability — one local tool, proxy-accurate.**
-SuperBased Observer captures, normalizes, and analyzes every AI
+SuperBased captures, normalizes, and analyzes every AI
 coding tool call across **26 adapters** — Claude Code, Codex, Cursor,
 Cline + Cline CLI, GitHub Copilot (VS Code) + Copilot CLI, Gemini CLI,
 OpenCode, Google Antigravity, Cowork, Nous Research's Hermes Agent,
@@ -160,7 +160,7 @@ server for org-wide spend visibility. The same binary also ships
 **Plane A: general LLM-app observability**, admin-server-first — OTLP
 trace/span capture, evals, and an LLM-as-judge input-admission
 guardrail for an application *you* host, whose end users route
-through Observer. Most installs only ever touch Plane B; Plane A is
+through SuperBased. Most installs only ever touch Plane B; Plane A is
 opt-in and unrelated to your own coding-agent traffic. Full explainer:
 [superbased.app/docs/getting-started/two-planes](https://superbased.app/docs/getting-started/two-planes).
 
@@ -216,7 +216,7 @@ table below is the full per-client reference.
 | **OpenCode** ([opencode.ai](https://opencode.ai/)) | (no proxy yet)                     | SQLite — actual install path is `~/.local/share/opencode/opencode.db` (XDG). Captures **token counts + model + cost** per assistant message from OpenCode's InfoData (`tokens.input/output/reasoning/cache.{read,write}` + `cost`); **subtask** parts → `spawn_subagent` actions; **todo** table → `todo_update` actions; tool-name coverage extended to webfetch/websearch/task/todowrite/todoread/multiedit. Tagged `Source=jsonl, Reliability=approximate`. |
 | **OpenClaw** ([openclaw.ai](https://openclaw.ai/)) | (no proxy yet)                     | JSONL + sqlite — `~/.openclaw/tasks/runs.sqlite` + `~/.openclaw/agents/<agent>/sessions/sessions.json` |
 | **Pi** ([pi.dev](https://pi.dev/)) | (no proxy yet)                                       | JSONL — `~/.pi/agent/sessions/--<path>--/*.jsonl` (per upstream `docs/session-format.md` v3). Captures user / assistant / toolResult / `bashExecution` message roles; `usage.cost.total` → per-message USD; terminal `stopReason` (stop/length/error/aborted) → `task_complete` with `success=false` for failures (mid-turn `toolUse` is correctly skipped); `thinking` blocks surface as preceding reasoning. Tagged `Source=jsonl, Reliability=approximate`. |
-| **Google Antigravity** | (no proxy yet) | Encrypted protobuf — `~/.gemini/antigravity/conversations/*.pb` (Linux-native) and the matching Windows-side path on WSL2. Observer ships a per-OS Chromium-pattern `oscrypt` key fetcher (macOS Keychain / libsecret / DPAPI / WSL2-via-PowerShell helper) and a multi-cipher try-loop for local decryption. Sessions whose ciphers don't validate locally fall back to the language_server's `GetCascadeTrajectory` gRPC endpoint via a built-in helper (`antigravity-bridge.exe` on WSL2 / native gRPC elsewhere) — extracts model + per-turn token counts + Tier 0–6 ToolEvents (file views, artifact edits/writes, user prompts, assistant text, run_command terminal snapshots, structured plan steps, final summaries). State index + per-conversation title/workspace URI read from `state.vscdb` + `state.vscdb.backup`. Tagged `Source=jsonl, Reliability=approximate`. |
+| **Google Antigravity** | (no proxy yet) | Encrypted protobuf — `~/.gemini/antigravity/conversations/*.pb` (Linux-native) and the matching Windows-side path on WSL2. SuperBased ships a per-OS Chromium-pattern `oscrypt` key fetcher (macOS Keychain / libsecret / DPAPI / WSL2-via-PowerShell helper) and a multi-cipher try-loop for local decryption. Sessions whose ciphers don't validate locally fall back to the language_server's `GetCascadeTrajectory` gRPC endpoint via a built-in helper (`antigravity-bridge.exe` on WSL2 / native gRPC elsewhere) — extracts model + per-turn token counts + Tier 0–6 ToolEvents (file views, artifact edits/writes, user prompts, assistant text, run_command terminal snapshots, structured plan steps, final summaries). State index + per-conversation title/workspace URI read from `state.vscdb` + `state.vscdb.backup`. Tagged `Source=jsonl, Reliability=approximate`. |
 | **Kilo Code IDE extension (legacy)** | (no proxy yet) | JSON — `<vsCodeGlobalStorage>/kilocode.kilo-code/tasks/<taskId>/api_conversation_history.json`. The legacy Kilo extension is a Cline + Roo Code fork and shares the Cline parser; emitted rows are re-tagged `Tool="kilo-code"` so dashboard rollups don't blur Kilo activity into Cline. Tagged `Source=jsonl, Reliability=approximate`. |
 | **Kilo Code CLI (current)**     | (no proxy route yet — base-URL env vars are not honored; a project-scoped `kilo.json` provider `baseURL` override reaches the proxy, but the Gateway provider's model-catalog calls share that base URL and have no upstream there — see `docs/kilo-code-adapter.md`) | SQLite — `~/.local/share/kilo/kilo.db` on every OS (Kilo intentionally mirrors XDG; Windows does NOT use `%APPDATA%`). The new `@kilocode/cli` (npm) is a fork of sst/opencode and uses the same `message`/`part`/`todo` tables shape with Kilo additions (`project`, `workspace`, `event`, `session_message`, `account`, `permission`, `session_share`). Captures **token counts + model + cost** per assistant message from `message.data.tokens = {total, input, output, reasoning, cache: {read, write}}`. Tool name coverage inherits OpenCode's surface (`read` → `read_file`, `bash` → `run_command`, `websearch` → `web_search`, etc.). Tagged `Source=jsonl, Reliability=approximate`. |
 | **Gemini CLI** | (no proxy yet) | JSONL or single-object JSON — `~/.gemini/tmp/<hash>/chats/session-*.{json,jsonl}`. Dual-format dispatch: legacy single-object JSON (size-based cursor, cline-style) and proposed JSONL event records (byte-offset cursor, issue [#15292](https://github.com/google-gemini/gemini-cli/issues/15292)). Action mapping covers `read_file` / `write_file` / `edit_file` / `run_command` / `search_files` / `web_fetch` and arbitrary MCP tool calls. Project root falls back through tool-call `cwd` → `~/.gemini/history/<hash>/.git/config` worktree pointer → synthetic `[gemini-cli:<hash>]` key (promoted via ON CONFLICT DO UPDATE on `sessions.project_id` once a future scan supplies a real cwd). Tagged `Source=jsonl, Reliability=approximate`. |
@@ -234,10 +234,10 @@ Pi / OpenCode / OpenClaw / Antigravity / Gemini CLI / Hermes / Kilo Code / Kilo 
 (provider-reported usage that hasn't been reconciled against an
 upstream invoice).
 
-For **Codex specifically**, Observer currently has two practical support modes:
+For **Codex specifically**, SuperBased currently has two practical support modes:
 
-- `Proxy + JSONL`: Codex is routed through `OPENAI_BASE_URL=http://127.0.0.1:8820/v1` and Observer can link proxy turns to the session, so live compression metrics are available.
-- `JSONL only`: Observer can still recover sessions, actions, and approximate token counts from `~/.codex/sessions`, but live proxy compression is currently not available when Codex is logged in with a ChatGPT plan on the local machine.
+- `Proxy + JSONL`: Codex is routed through `OPENAI_BASE_URL=http://127.0.0.1:8820/v1` and SuperBased can link proxy turns to the session, so live compression metrics are available.
+- `JSONL only`: SuperBased can still recover sessions, actions, and approximate token counts from `~/.codex/sessions`, but live proxy compression is currently not available when Codex is logged in with a ChatGPT plan on the local machine.
 
 ## Architecture in detail
 

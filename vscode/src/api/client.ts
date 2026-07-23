@@ -86,7 +86,7 @@ export class Client {
   private async get<T>(pathAndQuery: string): Promise<T> {
     const res = await this.fetchWithTimeout(this.url(pathAndQuery), { method: 'GET' });
     if (!res.ok) {
-      throw new Error(`Observer API ${pathAndQuery} → HTTP ${res.status} ${res.statusText}`);
+      throw new Error(`SuperBased API ${pathAndQuery} → HTTP ${res.status} ${res.statusText}`);
     }
     return (await res.json()) as T;
   }

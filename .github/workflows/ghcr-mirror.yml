@@ -1,0 +1,66 @@
+# One-time / on-demand backfill: mirror observer-org container images from the
+# old marmutapp namespace to the new superbasedapp namespace after the GitHub
+# org transfer. The release pipeline (npm-release.yml) already publishes NEW
+# tags to ghcr.io/superbasedapp/observer-org; this workflow copies PRE-TRANSFER
+# tags so `docker pull ghcr.io/superbasedapp/observer-org:<old-tag>` resolves.
+#
+# Manual only (workflow_dispatch). Requires the GHCR_PUSH_TOKEN secret: a
+# classic PAT with read:packages (source, marmutapp) + write:packages
+# (destination, superbasedapp). Uses `crane copy` (registry-to-registry, no
+# local pull). No-ops with a notice when the secret is absent.
+name: GHCR mirror (observer-org backfill)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: "Comma-separated tags to mirror (e.g. v1.22.0,v1.21.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  mirror:
+    name: Mirror tags marmutapp -> superbasedapp
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check GHCR_PUSH_TOKEN presence (skip job if unset)
+        id: gate
+        env:
+          GHCR_PW: ${{ secrets.GHCR_PUSH_TOKEN }}
+        run: |
+          if [ -z "${GHCR_PW:-}" ]; then
+            echo "::notice::GHCR_PUSH_TOKEN not set — nothing to mirror (secret setup pending)."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install crane
+        if: steps.gate.outputs.present == 'true'
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Log in to ghcr.io
+        if: steps.gate.outputs.present == 'true'
+        env:
+          GHCR_PW: ${{ secrets.GHCR_PUSH_TOKEN }}
+        run: echo "$GHCR_PW" | crane auth login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Copy tags
+        if: steps.gate.outputs.present == 'true'
+        env:
+          TAGS: ${{ inputs.tags }}
+        run: |
+          SRC=ghcr.io/marmutapp/observer-org
+          DST=ghcr.io/superbasedapp/observer-org
+          IFS=',' read -ra LIST <<< "$TAGS"
+          for t in "${LIST[@]}"; do
+            tag="$(echo "$t" | xargs)"   # trim whitespace
+            [ -z "$tag" ] && continue
+            echo "::group::mirror $tag"
+            crane copy "$SRC:$tag" "$DST:$tag"
+            echo "::endgroup::"
+          done

@@ -1,7 +1,7 @@
 // CodeLens provider for CLAUDE.md / AGENTS.md / .cursorrules.
 //
 // Surfaces two actions at the top of each file:
-//   - "Refresh from Observer learnings" (observer suggest --apply)
+//   - "Refresh from SuperBased learnings" (observer suggest --apply)
 //   - "Preview suggestions"             (observer suggest, default dry-run)
 
 import * as vscode from 'vscode';
@@ -20,7 +20,7 @@ export class InstructionFilesCodeLensProvider implements vscode.CodeLensProvider
     const range = new vscode.Range(0, 0, 0, 0);
     return [
       new vscode.CodeLens(range, {
-        title: '$(sync) Refresh from Observer learnings',
+        title: '$(sync) Refresh from SuperBased learnings',
         command: 'observer.refreshInstructions',
         arguments: [document.uri, target],
         tooltip:

@@ -66,11 +66,15 @@ function isPermittedRoot(path: string, allowedRoots: string[]): boolean {
 
 type Props = {
   onClose: () => void;
-  /** Called with the minted handle + tool once a fresh launch succeeds. */
-  onLaunched: (handle: string, tool: string) => void;
+  /**
+   * Called with the minted handle + tool once a fresh launch succeeds. The
+   * third arg (review finding 8) reports whether the launch was given a project
+   * root, so the dock enables Files/Git without a reload. Absence ≡ false.
+   */
+  onLaunched: (handle: string, tool: string, hasProjectRoot?: boolean) => void;
 };
 
-type FreshLaunchResponse = { token: string; tool: string; subcommand: string };
+type FreshLaunchResponse = { token: string; tool: string; subcommand: string; has_project_root?: boolean };
 
 export function NewTerminalDialog({ onClose, onLaunched }: Props) {
   const [tools, setTools] = useState<string[]>([]);
@@ -194,7 +198,7 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
           }),
         },
       );
-      onLaunched(r.token, r.tool || tool);
+      onLaunched(r.token, r.tool || tool, r.has_project_root);
     } catch (e) {
       // Swap the raw server body for actionable guidance on the two known
       // policy gates — the remote allow_terminal 403 and the allowed_project_roots
@@ -279,9 +283,9 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
         >
           <option
             value=""
-            title="No project root: the fresh agent runs in the Observer daemon's own working directory (where observer start / observer dashboard was launched from)."
+            title="No project root: the fresh agent runs in the SuperBased daemon's own working directory (where observer start / observer dashboard was launched from)."
           >
-            Agent's default directory (where Observer runs)
+            Agent's default directory (where SuperBased runs)
           </option>
           {permittedRoots.length > 0 && (
             <optgroup label="Permitted">
@@ -311,7 +315,7 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
         {noAllowList && projects.length > 0 && (
           <p className="mt-1 text-[10.5px] leading-relaxed text-fg-3">
             No project roots are allow-listed, so only the agent's default
-            directory can launch — that's the Observer daemon's own working
+            directory can launch — that's the SuperBased daemon's own working
             directory (where <code className="font-mono">observer start</code> ran).
             Add roots under{" "}
             <code className="font-mono">[terminal.launch].allowed_project_roots</code>{" "}

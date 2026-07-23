@@ -9,7 +9,7 @@
 
 **Claude Code cost tracking. Cursor token usage. Codex spend.
 AI coding agent observability — one local tool, proxy-accurate.**
-SuperBased Observer captures, normalizes, and analyzes every AI
+SuperBased captures, normalizes, and analyzes every AI
 coding tool call across **26 adapters** — Claude Code, Codex, Cursor,
 Cline + Cline CLI, GitHub Copilot (VS Code) + Copilot CLI, Gemini CLI,
 OpenCode, Google Antigravity, Cowork, Nous Research's Hermes Agent,

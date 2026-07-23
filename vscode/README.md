@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-<h1 align="center">SuperBased Observer for VS Code</h1>
+<h1 align="center">SuperBased for VS Code</h1>
 
 <p align="center">
   <strong>See what your AI coding tools are doing — locally, in your editor.</strong>
@@ -35,7 +35,7 @@ from GitHub Releases) or uses one you've installed elsewhere
 
 Open the command palette (`Ctrl+Shift+P` / `⌘⇧P`) and run:
 
-> **`Observer: Doctor`**
+> **`SuperBased: Doctor`**
 
 A terminal opens with a health-check. All four lines should show ✅.
 If anything fails, the error tells you what to fix.
@@ -64,7 +64,7 @@ Keep that terminal open. The extension attaches to it automatically.
 
 ### 4. Open the dashboard
 
-> **`Observer: Open Dashboard`**
+> **`SuperBased: Open Dashboard`**
 
 Or **click the spend indicator in the bottom-right status bar**
 (`$(graph) $0.00` until your AI tools generate activity).
@@ -86,7 +86,7 @@ linked to your real captured activity:
 
 Open a terminal in VS Code. **Click the down-arrow next to the
 `+`** in the terminal panel → choose **"AI Coding Tool
-(Observer-proxied)"**. The new terminal already has
+(SuperBased-proxied)"**. The new terminal already has
 `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, and `ENABLE_TOOL_SEARCH=true`
 exported.
 
@@ -108,12 +108,12 @@ session shows up in the dashboard with **accurate** token counts
 |---|---|---|
 | **Status bar** | Today's spend at a glance, polled every 60s. Hover for delta vs yesterday, top model, burn rate, month projection. | Bottom-right corner. Click → open dashboard. |
 | **Sidebar** | Four trees — **Today**, **Sessions**, **Discovery**, **Costs (7d)** — refreshed automatically. | Click the SuperBased icon in the activity bar (left rail). |
-| **Dashboard webview** | The full React analytics SPA in an editor tab. Same surface as `http://127.0.0.1:8081/`. | `Observer: Open Dashboard` or status-bar click. |
+| **Dashboard webview** | The full React analytics SPA in an editor tab. Same surface as `http://127.0.0.1:8081/`. | `SuperBased: Open Dashboard` or status-bar click. |
 | **File freshness** | Small dot in the file explorer next to files your AI tools touched in the last 24h. Hover shows last-read-by, edit count, stale re-reads flagged. | Just open a file — visible immediately. |
 | **Notifications** | Budget breach (80% of monthly cap) + watcher-lag warnings. Deduped so they don't nag. | Automatic. Tunable thresholds in settings. |
-| **Terminal profile** | "AI Coding Tool (Observer-proxied)" — pre-exports proxy env vars so AI CLIs launched from it route through observer. | Terminal panel → dropdown next to `+` → pick the profile. |
-| **Instruction-file CodeLens** | "Refresh from Observer learnings" + "Preview suggestions" on `CLAUDE.md` / `AGENTS.md` / `.cursorrules`. Auto-updates the file from your captured patterns. | Open one of those three files — appears at the top. |
-| **Get Started walkthrough** | 7-step interactive tour. | Help → Welcome → "Get Started with SuperBased Observer". |
+| **Terminal profile** | "AI Coding Tool (SuperBased-proxied)" — pre-exports proxy env vars so AI CLIs launched from it route through observer. | Terminal panel → dropdown next to `+` → pick the profile. |
+| **Instruction-file CodeLens** | "Refresh from SuperBased learnings" + "Preview suggestions" on `CLAUDE.md` / `AGENTS.md` / `.cursorrules`. Auto-updates the file from your captured patterns. | Open one of those three files — appears at the top. |
+| **Get Started walkthrough** | 7-step interactive tour. | Help → Welcome → "Get Started with SuperBased". |
 
 ---
 
@@ -131,15 +131,15 @@ session shows up in the dashboard with **accurate** token counts
 
 ## 🎛️ Common commands
 
-Open the command palette (`Ctrl+Shift+P` / `⌘⇧P`) and type **Observer:**
+Open the command palette (`Ctrl+Shift+P` / `⌘⇧P`) and type **SuperBased:**
 
 | Command | Use it when |
 |---|---|
-| `Observer: Open Dashboard` | You want to see your metrics. |
-| `Observer: Doctor` | Something seems off — health-check the install. |
-| `Observer: Start Daemon` | You picked `managed` or `auto` mode and need to (re)start. |
-| `Observer: Copy Proxy Env Vars` | You want to set up proxy routing in an existing terminal. |
-| `Observer: Refresh All Trees` | The sidebar feels stale. |
+| `SuperBased: Open Dashboard` | You want to see your metrics. |
+| `SuperBased: Doctor` | Something seems off — health-check the install. |
+| `SuperBased: Start Daemon` | You picked `managed` or `auto` mode and need to (re)start. |
+| `SuperBased: Copy Proxy Env Vars` | You want to set up proxy routing in an existing terminal. |
+| `SuperBased: Refresh All Trees` | The sidebar feels stale. |
 
 ---
 
@@ -199,7 +199,7 @@ Full integration details in the [user guide](https://github.com/superbasedapp/ob
 
 - **Issues**: [github.com/superbasedapp/observer/issues](https://github.com/superbasedapp/observer/issues)
 - **Discussions**: [github.com/superbasedapp/observer/discussions](https://github.com/superbasedapp/observer/discussions)
-- **Output channel**: `View → Output → Observer` shows everything the
+- **Output channel**: `View → Output → SuperBased` shows everything the
   extension is doing — include the relevant excerpt when filing bugs.
 
 ---

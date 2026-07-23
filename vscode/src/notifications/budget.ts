@@ -55,7 +55,7 @@ export class BudgetNotifier implements vscode.Disposable {
       const today = new Date().toISOString().slice(0, 10);
       await this.ctx.globalState.update(STATE_KEY, today);
       const msg =
-        `Observer: monthly budget at ${decision.pct!.toFixed(0)}% ` +
+        `SuperBased: monthly budget at ${decision.pct!.toFixed(0)}% ` +
         `(${formatUSD(decision.toDateUsd ?? 0)} / ${formatUSD(decision.budgetUsd!)}).`;
       const choice = await vscode.window.showWarningMessage(msg, 'Open Dashboard', 'Dismiss');
       if (choice === 'Open Dashboard') {

@@ -65,11 +65,12 @@ func buildRemoteController(cfg config.Config, database *sql.DB) dashboard.Remote
 		standingHash = strings.TrimSpace(string(b))
 	}
 	return dashboard.NewRemoteController(dashboard.RemoteOptions{
-		HashedSecret:      hash,
-		AllowedHosts:      hosts,
-		RateLimitPerMin:   cfg.Remote.RateLimitPerMin,
-		AllowTerminal:     cfg.Remote.AllowTerminal,
-		AllowTerminalView: cfg.Remote.AllowTerminalView,
+		HashedSecret:                hash,
+		AllowedHosts:                hosts,
+		RateLimitPerMin:             cfg.Remote.RateLimitPerMin,
+		AllowTerminal:               cfg.Remote.AllowTerminal,
+		AllowTerminalView:           cfg.Remote.AllowTerminalView,
+		AllowRemoteTerminalTakeover: cfg.Remote.AllowRemoteTerminalTakeover,
 
 		StandingTerminalSecretHash: standingHash,
 		StandingTerminalEnabled:    cfg.Remote.AllowStandingTerminalControl,

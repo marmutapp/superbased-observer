@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -196,6 +197,65 @@ func TestAllowTerminalViewManageVerb(t *testing.T) {
 // gate (which reads AllowTerminalView() via a type assertion, never Ready()).
 func newViewController(allowView bool) RemoteController {
 	return NewRemoteController(RemoteOptions{AllowTerminalView: allowView})
+}
+
+// TestAllowTerminalViewGatesAttachAndResumeSubscriptions names and pins the
+// independent read gate for both remote-sensitive run kinds. The default false
+// refuses before SubscribeRemote; true permits a read-only subscription. It
+// does not grant writer control.
+func TestAllowTerminalViewGatesAttachAndResumeSubscriptions(t *testing.T) {
+	for _, kind := range []string{"attach", "resume"} {
+		for _, allow := range []bool{false, true} {
+			name := kind + "/allow_terminal_view=" + strconv.FormatBool(allow)
+			t.Run(name, func(t *testing.T) {
+				handle := strings.ToUpper(kind) + "-SENSITIVE"
+				lm := newRecordingLaunchManager(nil)
+				lm.attachHandles = map[string]bool{handle: true}
+				t.Cleanup(func() { close(lm.sub.release) })
+				database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = database.Close() })
+				s, err := New(Options{DB: database, LaunchManager: lm, Remote: newViewController(allow)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				ts := remoteExposedWSServer(t, s)
+				t.Cleanup(ts.Close)
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				c, _, dialErr := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/ws/launch/"+handle, &websocket.DialOptions{
+					HTTPHeader: http.Header{"Origin": {ts.URL}},
+				})
+				if c != nil {
+					defer c.CloseNow()
+				}
+				if allow {
+					if dialErr != nil {
+						t.Fatalf("allow_terminal_view=true dial: %v", dialErr)
+					}
+					deadline := time.Now().Add(time.Second)
+					for lm.subscribeRemoteCalls.Load() == 0 && time.Now().Before(deadline) {
+						time.Sleep(10 * time.Millisecond)
+					}
+					if lm.subscribeRemoteCalls.Load() != 1 {
+						t.Fatalf("SubscribeRemote calls = %d, want 1", lm.subscribeRemoteCalls.Load())
+					}
+				} else {
+					if dialErr == nil {
+						_, _, dialErr = c.Read(ctx)
+					}
+					if dialErr == nil {
+						t.Fatal("allow_terminal_view=false remote-sensitive subscription stayed open")
+					}
+					if lm.subscribeRemoteCalls.Load() != 0 {
+						t.Fatalf("gate-off reached SubscribeRemote %d times", lm.subscribeRemoteCalls.Load())
+					}
+				}
+			})
+		}
+	}
 }
 
 // TestRemoteViewAttachDeniedWhenViewOff pins that a controller present but with

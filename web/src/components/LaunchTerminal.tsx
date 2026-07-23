@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { isRemoteView } from "@/lib/remote";
 import { pushToast } from "@/components/Toast";
+import { useCompanionRegistry } from "@/components/primitives/companion";
 import {
   STANDING_REMEMBER_RISK,
-  STANDING_REVOKED_MSG,
+  type TerminalControlDenialReason,
   forgetStandingSecret,
   getStoredStandingSecret,
   storeStandingSecret,
+  terminalControlDenialMessage,
 } from "@/lib/remoteTerminal";
 
 // LaunchTerminal renders the embedded web terminal for a launched session
@@ -48,9 +50,41 @@ type Props = {
    * Absent for already-docked tiles and non-workspace hosts.
    */
   onAddToGrid?: () => void;
+  /**
+   * Open the per-terminal project panel (read-only file tree / git view).
+   * Wired by the host (TerminalHost / grid tile); the panel itself is owned by
+   * LaunchDockProvider. Header-button only — no effect on the ws bridge.
+   */
+  onOpenFiles?: () => void;
+  onOpenGit?: () => void;
+  /**
+   * Register/unregister the paste-into-terminal callback for this token while
+   * this seat is live + write-capable. The callback routes text through xterm's
+   * OWN paste pipeline (`term.paste`) — identical to a manual Ctrl+V — so
+   * bracketed-paste mode neutralizes shell metacharacters exactly as a real
+   * clipboard paste does. The provider routes it to the token's project panel,
+   * which shows its paste items only when a callback is registered (read-only
+   * viewers register none).
+   */
+  registerPaste?: (fn: ((text: string) => void) | null) => void;
+  /**
+   * False when the run has no resolved project root — the Files/Git buttons
+   * render disabled with an honest title. Absent → treated as false.
+   */
+  projectPanelEnabled?: boolean;
 };
 
 export type Status = "connecting" | "open" | "exited" | "error";
+
+// isLiveStatus is the single predicate for "is this token still live?" — i.e.
+// its project can still be browsed and it can still be docked/paste-targeted. A
+// policy-rejected/errored socket ("error") is just as dead as an "exited" one
+// (P2-3): both must gate the project panel off, close an open panel, and revoke
+// the paste writer. Undefined/"connecting" count as live (optimistic, matching
+// the pre-existing disabled-gate semantics).
+export function isLiveStatus(s: Status | undefined): boolean {
+  return s !== "exited" && s !== "error";
+}
 
 // keyboardApi returns the (Chromium-only) Keyboard Lock API surface without
 // leaning on lib.dom types that don't yet declare `navigator.keyboard`.
@@ -101,7 +135,12 @@ export function LaunchTerminal({
   expanded,
   fill,
   onAddToGrid,
+  onOpenFiles,
+  onOpenGit,
+  registerPaste,
+  projectPanelEnabled,
 }: Props) {
+  const companion = useCompanionRegistry();
   const hostRef = useRef<HTMLDivElement | null>(null);
   // Mirrors `expanded` for the ws handlers (closure-stable): only the
   // currently-expanded floating panel may steal focus on socket open — a
@@ -131,6 +170,13 @@ export function LaunchTerminal({
   const canWrite = control === "local" || control === "writer";
   const canWriteRef = useRef(canWrite);
   canWriteRef.current = canWrite;
+  // Live status mirror read by the registered paste callback (P2-2): between an
+  // exit/error frame flipping `status` and the effect cleanup that unregisters
+  // the callback, a stale callback could still term.paste(). This ref is updated
+  // synchronously every render so the callback can reject the moment the seat is
+  // no longer "open".
+  const statusRef = useRef(status);
+  statusRef.current = status;
   // Acquire-control form state. The capability + confirm are held ONLY in these
   // inputs, cleared the instant the frame is sent — never persisted, never put
   // in a URL/query (§8.1 #5).
@@ -152,15 +198,24 @@ export function LaunchTerminal({
   // Default OFF: remembering the secret in localStorage is an explicit opt-in
   // (it is the risky part — the secret then lives in this browser).
   const [rememberStanding, setRememberStanding] = useState(false);
-  // standingAttemptRef marks that the in-flight acquire used a standing secret,
-  // so a control_denied can clear the stored secret (rather than blaming a
-  // one-time capability) and show the revoked/rotated fallback message.
+  // standingAttemptRef marks that the in-flight acquire used a standing secret.
+  // Only an explicit reason:"auth" denial may then clear the stored secret and
+  // show the revoked/rotated fallback; policy/lifecycle denials preserve it.
   const standingAttemptRef = useRef(false);
   // wasRevokedRef tracks whether THIS seat has lost control at least once, so a
   // later control_granted reads as REGAINING control (fire the "you have
   // control" toast) rather than a first-ever acquire (silent). Part of the
   // §6-decision-5 "silent takeover + visible toast in both seats" contract.
   const wasRevokedRef = useRef(false);
+  // Highest generation observed on control_granted, plus whether this seat
+  // still holds that live grant. A revoke for an older generation can arrive
+  // after a rapid takeover → re-acquire grant; ignoring it keeps the display
+  // aligned with the server's already-correct live writer lease.
+  const latestGrantedGenRef = useRef(0);
+  const hasLiveGrantRef = useRef(false);
+  // The server identifies the requester that superseded this lease so both
+  // local and remote seats can describe the handoff accurately.
+  const [revokedBy, setRevokedBy] = useState<"local" | "remote" | null>(null);
   // sawActivityRef records whether this socket ever delivered real session
   // activity — an "exit" control frame OR any terminal output byte. It gates the
   // Jump-in race UX (P2-4): the server closes /ws/launch/<handle> with a
@@ -200,6 +255,12 @@ export function LaunchTerminal({
     cols: number;
   } | null>(null);
   const initialDimsRef = useRef<{ rows: number; cols: number } | null>(null);
+  // A read-only viewer's target display geometry = the writer's CURRENT PTY
+  // dims (the pty_size frame carries both current rows/cols AND initial_*; we
+  // prefer current so a writer that resized after launch is reflected, not the
+  // stale launch geometry). Distinct from initialDimsRef, which the writer's
+  // "original" size-mode legitimately re-pins to the LAUNCH dims.
+  const writerGeomRef = useRef<{ rows: number; cols: number } | null>(null);
   // Hoisted so the size-mode buttons (outside the setup effect) can refit.
   const fitRef = useRef<import("@xterm/addon-fit").FitAddon | null>(null);
 
@@ -209,6 +270,10 @@ export function LaunchTerminal({
   // Assigned each render so the long-lived onData/onMouseDown closures can call
   // the latest version (wsRef is stable; this only needs a live target).
   const reacquireLocalRef = useRef<() => void>(() => {});
+  // Presentation-only downscale for a read-only remote viewer (Change 2b): set
+  // inside the setup effect, called from the control-sync effect below so a
+  // grant/revoke recomputes the scale without re-running the whole effect.
+  const applyViewerScaleRef = useRef<() => void>(() => {});
 
   // ── Feature C: focus mode (fullscreen + Keyboard Lock, Chromium-only) ─
   const [focusMode, setFocusMode] = useState(false);
@@ -252,6 +317,77 @@ export function LaunchTerminal({
       term.open(hostRef.current);
       termRef.current = term;
 
+      // STT/dictation note: no paste bridge lives here — none is needed. The
+      // real defect was xterm swallowing plain Ctrl+V (mapped to \x16 and the
+      // keydown cancelled), so the browser paste never fired and dictation
+      // tools’ delayed fallback paste delivered a stale clipboard. The fix is
+      // in the custom key handler below (return false for the paste combos):
+      // the native paste then fires immediately and xterm’s own paste handler
+      // forwards the clipboard, which still holds the transcription at that
+      // instant — exactly like any regular input field.
+
+      // Change 2b — presentation-only downscale for a read-only remote viewer.
+      // A viewer renders the WRITER's PTY geometry (e.g. 120 cols); on a narrow
+      // phone that overflows the container and is clipped by the root's
+      // overflow-hidden. A viewer MUST NOT fit()/resize() the PTY (that reflows
+      // the writer's TUI), so instead we visually scale the GRID (.xterm-screen)
+      // down to the container width with transform-origin top-left. Writers
+      // (local or granted remote) keep the untouched fit() path — this resets
+      // any transform for them.
+      const applyViewerScale = () => {
+        const host = hostRef.current;
+        if (!host) return;
+        const xtermEl = host.querySelector<HTMLElement>(".xterm");
+        if (!xtermEl) return;
+        // Scale the GRID element, not the .xterm root: the root is a block that
+        // fills the host (offsetWidth == host width), so measuring/scaling it
+        // yields k≈1 and never shrinks an over-wide grid. .xterm-screen carries
+        // the true cols×cellWidth pixel width. Fall back to the root only if the
+        // screen layer isn't mounted yet.
+        const screenEl = xtermEl.querySelector<HTMLElement>(".xterm-screen");
+        const scaleEl = screenEl ?? xtermEl;
+        // Not a read-only viewer → clear any prior scale and defer to fit().
+        if (!(isRemote && !canWriteRef.current)) {
+          scaleEl.style.transform = "";
+          scaleEl.style.transformOrigin = "";
+          // Clear any transform a prior seat left on the other element too.
+          xtermEl.style.transform = "";
+          xtermEl.style.transformOrigin = "";
+          return;
+        }
+        // Render at the WRITER's CURRENT geometry (not the viewer's own
+        // host-fitted size) so a 120-col writer TUI doesn't rewrap/scroll inside
+        // a phone-sized 40-col viewer terminal. This is a CLIENT-DISPLAY-ONLY
+        // resize — it never reaches the PTY (no sendResize/sendResizeNow here),
+        // so it cannot reflow the writer's session.
+        const writerDims = writerGeomRef.current ?? initialDimsRef.current;
+        if (
+          writerDims &&
+          writerDims.cols > 0 &&
+          writerDims.rows > 0 &&
+          termRef.current &&
+          (termRef.current.cols !== writerDims.cols ||
+            termRef.current.rows !== writerDims.rows)
+        ) {
+          try {
+            termRef.current.resize(writerDims.cols, writerDims.rows);
+          } catch {
+            /* ignore */
+          }
+        }
+        const cs = getComputedStyle(host);
+        const padX =
+          (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0);
+        const avail = host.clientWidth - padX;
+        const rendered = scaleEl.offsetWidth; // layout width, unaffected by transform
+        if (avail <= 0 || rendered <= 0) return;
+        let k = avail / rendered;
+        if (k > 1) k = 1; // presentation-only downscale; never upscale
+        scaleEl.style.transformOrigin = "top left";
+        scaleEl.style.transform = k < 1 ? `scale(${k})` : "";
+      };
+      applyViewerScaleRef.current = applyViewerScale;
+
       // Feature C1: route modified key combos to the TUI instead of the
       // browser/page where interception is possible; keep copy/paste native.
       term.attachCustomKeyEventHandler((e) => {
@@ -284,8 +420,19 @@ export function LaunchTerminal({
         ) {
           return false;
         }
-        // Paste rides the hidden textarea — leave it entirely alone.
-        if (e.key === "v" || e.key === "V") return true;
+        // Paste MUST bypass xterm's key processing entirely (return false):
+        // xterm maps plain Ctrl+V to the control byte \x16 and CANCELS the
+        // keydown (Keyboard.ts keyCode 86 → _keyDown cancel), so the browser
+        // paste never fires. That silently ate the primary paste of
+        // STT/dictation tools (Wispr Flow injects Ctrl+V; its eventual
+        // Shift+Insert-style fallback pasted only AFTER the tool had restored
+        // the previous clipboard — delivering the OLD clipboard, the
+        // 2026-07-22/23 bug). Returning false skips xterm's handling and no
+        // cancel happens, so Ctrl+V / Ctrl+Shift+V / Cmd+V all become the
+        // browser's native immediate paste, which xterm's own paste handler
+        // forwards to the PTY. Cost: a literal ^V can no longer be typed —
+        // same trade-off as VS Code's integrated terminal on Windows.
+        if (e.key === "v" || e.key === "V") return false;
         // Browser-reserved combos (Ctrl/Cmd-W/T/N): in a normal tab the browser
         // acts no matter what we do — return FALSE so xterm doesn't ALSO
         // transmit the sequence before the tab closes. Under an active focus-
@@ -330,12 +477,23 @@ export function LaunchTerminal({
       ws.onopen = () => {
         if (disposed) return;
         setStatus("open");
-        try {
-          fit?.fit();
-        } catch {
-          /* ignore */
+        // A read-only remote viewer must NEVER fit()/resize the PTY — only a
+        // writer tracks the container via fit() (Change 2b). The viewer's
+        // display geometry instead follows the writer's own dims once the
+        // pty_size frame arrives (applyViewerScale, below).
+        if (!(isRemote && !canWriteRef.current)) {
+          try {
+            fit?.fit();
+          } catch {
+            /* ignore */
+          }
+          sendResize();
         }
-        sendResize();
+        // Initial size frame: a read-only viewer scales to fit rather than
+        // riding the fit() geometry (Change 2b). The writer geometry may not
+        // be known yet — the pty_size handler below re-triggers this once it
+        // arrives.
+        applyViewerScale();
         if (expandedRef.current) term?.focus();
         // Standing-access auto-acquire (§B): on a remote device with a stored
         // standing secret, present it ONCE now (confirm empty — the server
@@ -365,14 +523,19 @@ export function LaunchTerminal({
               cols?: number;
               initial_rows?: number;
               initial_cols?: number;
+              gen?: number;
+              by?: "local" | "remote";
+              reason?: TerminalControlDenialReason;
             };
             if (m.t === "exit") {
               sawActivityRef.current = true;
               setExitCode(typeof m.code === "number" ? m.code : 0);
               setStatus("exited");
             } else if (m.t === "pty_size") {
-              // Feature A: the server's one-shot geometry frame. Record the
-              // native terminal's launch-time dims (may be 0/unknown).
+              // Feature A / Feature 2: the server's geometry frame (sent on open
+              // and re-sent on each control transition). It carries BOTH the
+              // writer's CURRENT dims (rows/cols) and the LAUNCH dims
+              // (initial_rows/initial_cols) — each may be 0/unknown.
               const ir = m.initial_rows;
               const ic = m.initial_cols;
               if (typeof ir === "number" && typeof ic === "number" && ir > 0 && ic > 0) {
@@ -387,11 +550,49 @@ export function LaunchTerminal({
                   } catch {
                     /* ignore */
                   }
-                  sendResizeNow(ir, ic);
+                  // A read-only viewer must never push a resize to the PTY
+                  // (that's a writer-only operation) — but it still resizes
+                  // its own display below, via applyViewerScale.
+                  if (!(isRemote && !canWriteRef.current)) {
+                    sendResizeNow(ir, ic);
+                  }
                 }
               }
+              // Track the writer's CURRENT geometry for the viewer downscale,
+              // preferring the live rows/cols over the launch dims so a writer
+              // that resized after launch is reflected (not the stale launch
+              // size). Falls back to initial when current is absent/zero.
+              const cr = typeof m.rows === "number" && m.rows > 0 ? m.rows : ir;
+              const cc = typeof m.cols === "number" && m.cols > 0 ? m.cols : ic;
+              if (
+                typeof cr === "number" &&
+                typeof cc === "number" &&
+                cr > 0 &&
+                cc > 0
+              ) {
+                writerGeomRef.current = { rows: cr, cols: cc };
+              }
+              // The writer's geometry is now known — recompute the viewer
+              // downscale (Change 2b). onopen ran before this frame arrived, so
+              // this is the actual trigger that renders a viewer at the writer's
+              // size.
+              applyViewerScale();
             } else if (m.t === "control_granted") {
+              const grantGen =
+                typeof m.gen === "number" &&
+                Number.isSafeInteger(m.gen) &&
+                m.gen > 0
+                  ? m.gen
+                  : 0;
+              if (grantGen > 0) {
+                latestGrantedGenRef.current = Math.max(
+                  latestGrantedGenRef.current,
+                  grantGen,
+                );
+                hasLiveGrantRef.current = true;
+              }
               standingAttemptRef.current = false;
+              setRevokedBy(null);
               // Regaining control after a prior revoke → surface it in this
               // seat (§6 decision 5). A first-ever acquire stays silent.
               if (wasRevokedRef.current) {
@@ -425,30 +626,54 @@ export function LaunchTerminal({
                 sendResize();
               }
             } else if (m.t === "control_denied") {
-              if (standingAttemptRef.current) {
+              hasLiveGrantRef.current = false;
+              const usedStanding = standingAttemptRef.current;
+              standingAttemptRef.current = false;
+              if (m.reason === "auth" && usedStanding) {
                 // A stored/entered standing secret was rejected — it was revoked
                 // or rotated. Clear it and fall back to the one-time flow with an
                 // honest message. We do NOT retry (one attempt per socket open).
-                standingAttemptRef.current = false;
                 forgetStandingSecret();
                 setStandingStored(false);
-                setControl("denied");
-                setAcqErr(STANDING_REVOKED_MSG);
-              } else {
-                setControl("denied");
-                setAcqErr("Control was denied — the capability or confirm code was wrong or already used. Ask the owner to approve again.");
               }
+              setControl("denied");
+              setAcqErr(terminalControlDenialMessage(m.reason, usedStanding));
             } else if (m.t === "control_revoked") {
+              const revokeGen =
+                typeof m.gen === "number" &&
+                Number.isSafeInteger(m.gen) &&
+                m.gen > 0
+                  ? m.gen
+                  : 0;
+              // Equality is the revoke of the currently granted lease and must
+              // demote. Only a STRICTLY older generation is stale; missing gen
+              // keeps the legacy demotion behaviour.
+              if (
+                hasLiveGrantRef.current &&
+                revokeGen > 0 &&
+                revokeGen < latestGrantedGenRef.current
+              ) {
+                return;
+              }
+              hasLiveGrantRef.current = false;
               // Taken over by another viewer, the owner/admin, OR — new daemon
               // feature — the NATIVE terminal reclaiming its own session (fires
               // for LOCAL seats too now). Input stops; toast it in this seat (§6
               // decision 5) and arm the regain toast for the next grant. A local
               // seat can take it back with a click/keystroke (Feature B).
               wasRevokedRef.current = true;
+              const by = m.by === "local" || m.by === "remote" ? m.by : null;
+              setRevokedBy(by);
               pushToast(
                 isRemote
-                  ? "Terminal control passed to another viewer"
-                  : "The native terminal reclaimed control",
+                  ? by === "local"
+                    ? "The owner took terminal control"
+                    : by === "remote"
+                      ? "Another remote device took terminal control"
+                      : "Terminal control ended"
+                  : by === "remote"
+                    ? "A remote device took terminal control"
+                    : "The native terminal reclaimed control",
                 "warn",
               );
               setControl("revoked");
@@ -508,6 +733,18 @@ export function LaunchTerminal({
       // mode is pinned to "original" (Feature A), in which case every RO tick is
       // inert so the fixed geometry never gets refit out from under the TUI.
       ro = new ResizeObserver(() => {
+        // A read-only remote viewer must NOT fit()/resize the PTY (it would
+        // reflow the writer's TUI mid-stream). Recompute the presentation-only
+        // downscale instead (Change 2b) — checked BEFORE the "original"-mode
+        // early return, because a viewer never rides the fixed-geometry fit
+        // path, so it must still re-scale on rotate/resize even while a stale
+        // "original" size mode is pinned from a prior writer seat.
+        if (isRemote && !canWriteRef.current) {
+          applyViewerScale();
+          return;
+        }
+        // Writer, size mode pinned to "original" (Feature A): every RO tick is
+        // inert so the fixed geometry never gets refit out from under the TUI.
         if (sizeModeRef.current === "original") return;
         try {
           fit?.fit();
@@ -553,6 +790,15 @@ export function LaunchTerminal({
     if (canWrite && expanded) term.focus();
   }, [canWrite, expanded, isRemote]);
 
+  // Recompute the read-only-viewer downscale (Change 2b) whenever control or
+  // visibility flips: a grant/revoke changes viewer↔writer, and expanding
+  // relays out the host. A frame later so xterm has settled the new geometry.
+  // For a writer this call is a no-op that clears any leftover transform.
+  useEffect(() => {
+    const id = requestAnimationFrame(() => applyViewerScaleRef.current());
+    return () => cancelAnimationFrame(id);
+  }, [canWrite, expanded, isRemote]);
+
   // acquireControl sends the §4.δ acquire-writer frame with the owner-conveyed
   // capability + confirm over the ALREADY-open, cookie-authed, Origin-checked
   // websocket — the only channel that carries them (never a URL/query/header).
@@ -581,7 +827,8 @@ export function LaunchTerminal({
   // If "Remember on this device" is checked, the secret is persisted to
   // localStorage so control survives future refreshes (see the risk copy). The
   // input is cleared immediately either way. standingAttemptRef is set so a
-  // rejection clears the (possibly just-stored) secret and shows the fallback.
+  // genuine credential rejection can clear the (possibly just-stored) secret;
+  // non-auth denials leave it intact.
   function acquireStanding() {
     const ws = wsRef.current;
     const secret = standingInput.trim();
@@ -637,11 +884,50 @@ export function LaunchTerminal({
       const root = rootRef.current;
       const target = e.target as Node | null;
       if (!root || !target || root.contains(target)) return;
+      // Focus landing inside a registered terminal-companion surface (a
+      // floating project panel or its context menu) is legitimate coexistence,
+      // not a stealer — leave it. Membership is tested against the provider's
+      // set of EXACT registered root nodes (not a self-asserted selector any
+      // element could spoof). The trap keeps redirecting every other outside
+      // focus.
+      if (companion?.contains(target)) return;
       termRef.current?.focus();
     };
     document.addEventListener("focusin", onFocusIn, true);
     return () => document.removeEventListener("focusin", onFocusIn, true);
-  }, [expanded]);
+  }, [expanded, companion]);
+
+  // Register the paste-into-terminal callback while this seat is live AND
+  // write-capable. A read-only viewer registers nothing, so a project panel
+  // structurally hides its paste items. The callback re-checks canWrite at call
+  // time so a mid-flight revoke can't leak bytes.
+  useEffect(() => {
+    if (!registerPaste) return;
+    if (status !== "open" || !canWrite) {
+      registerPaste(null);
+      return;
+    }
+    registerPaste((text) => {
+      // Route paste through xterm's OWN paste pipeline — IDENTICAL to a manual
+      // Ctrl+V. term.paste triggers the same onData → ws.send path (so the
+      // canWriteRef + ws-open gating in that handler still applies) AND wraps
+      // the text in bracketed-paste markers (ESC[200~…ESC[201~) when the
+      // running app enabled that mode — which is exactly what neutralizes shell
+      // metacharacters in real shells. We deliberately do NOT hand-quote for a
+      // guessed shell: that matches Ctrl+V semantics.
+      //
+      // Caveat (documented, intentional): cmd.exe has no bracketed paste, so on
+      // a raw cmd.exe prompt a metachar path is literal-but-unquoted — the same
+      // result a manual paste gives — and it never auto-executes because
+      // control bytes (incl. newline) were already stripped in sanitizePastePath.
+      // Gate on the LIVE status too, not just canWriteRef (P2-2): a stale
+      // callback firing after an exit/error frame but before this effect's
+      // cleanup must not paste into a dead seat.
+      if (statusRef.current !== "open" || !canWriteRef.current) return;
+      termRef.current?.paste(text);
+    });
+    return () => registerPaste(null);
+  }, [status, canWrite, registerPaste]);
 
   // Bubble lifecycle status up to the dock (drives the pill state and the
   // beforeunload guard). Idempotent — safe to fire on every status change.
@@ -702,9 +988,10 @@ export function LaunchTerminal({
   }
 
   // reacquireLocal (Feature B) re-takes the writer lease for a LOCAL seat after
-  // the native terminal reclaimed control. The loopback path auto-grants on
-  // connect; re-acquire mirrors that by sending an acquire-writer frame with an
-  // empty capability (the server routes a loopback seat's request without one).
+  // native reclaim or an authenticated remote takeover. The loopback path
+  // auto-grants on connect; re-acquire mirrors that with an acquire-writer frame
+  // carrying an empty capability (the server routes a loopback request without
+  // one).
   reacquireLocalRef.current = () => {
     const ws = wsRef.current;
     if (isRemote || !ws || ws.readyState !== WebSocket.OPEN) return;
@@ -778,8 +1065,8 @@ export function LaunchTerminal({
           : "flex h-[60vh] min-h-[360px] flex-col overflow-hidden rounded-2 border bg-[#0b0b0f]"
       }
     >
-      <div className="flex items-center justify-between gap-2 border-b border-white/10 bg-[#14141a] px-3 py-1.5">
-        <span className="flex items-center gap-2 text-[11px] text-fg-2">
+      <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 border-b border-white/10 bg-[#14141a] px-3 py-1.5">
+        <span className="flex min-w-0 flex-wrap items-center gap-2 text-[11px] text-fg-2">
           <span className="font-mono text-fg-1">{tool}</span>
           <StatusPill status={status} exitCode={exitCode} />
           {errMsg && (
@@ -788,7 +1075,37 @@ export function LaunchTerminal({
             </span>
           )}
         </span>
-        <span className="flex items-center gap-1">
+        <span className="flex flex-wrap items-center justify-end gap-1">
+          {/* Project panel: read-only file tree + git view rooted at this
+              terminal's project root. Disabled (honest title) when the run has
+              no resolved root. Header buttons only — the panel is provider-owned
+              and this never touches the ws bridge. */}
+          {onOpenFiles && (
+            <ProjectPanelButton
+              label="▤ Files"
+              enabled={!!projectPanelEnabled && isLiveStatus(status)}
+              onClick={onOpenFiles}
+              enabledTitle="Browse this project's files"
+              disabledTitle={
+                !isLiveStatus(status)
+                  ? "This session is no longer running — its project can no longer be browsed"
+                  : undefined
+              }
+            />
+          )}
+          {onOpenGit && (
+            <ProjectPanelButton
+              label="⎇ Git"
+              enabled={!!projectPanelEnabled && isLiveStatus(status)}
+              onClick={onOpenGit}
+              enabledTitle="Show this project's git status, changes, and history"
+              disabledTitle={
+                !isLiveStatus(status)
+                  ? "This session is no longer running — its project can no longer be browsed"
+                  : undefined
+              }
+            />
+          )}
           {/* Feature A: size-mode control. Resizing is a writer capability, so
               this hides for read-only remote viewers (mirrors the RemoteControlBar
               gating) and honest-disables when the original geometry is unknown. */}
@@ -866,6 +1183,7 @@ export function LaunchTerminal({
           onConfirm={setConfirmInput}
           onAcquire={acquireControl}
           acqErr={acqErr}
+          revokedBy={revokedBy}
           standingStored={standingStored}
           standingInput={standingInput}
           rememberStanding={rememberStanding}
@@ -875,7 +1193,7 @@ export function LaunchTerminal({
           onForgetStanding={forgetStandingDevice}
         />
       )}
-      {/* Feature B: local seat whose lease the native terminal reclaimed. */}
+      {/* Feature B: local seat demoted by native reclaim or remote takeover. */}
       {!isRemote && control === "revoked" && (
         <button
           type="button"
@@ -886,7 +1204,9 @@ export function LaunchTerminal({
             read-only
           </span>
           <span>
-            Control returned to the native terminal — click to take back.
+            {revokedBy === "remote"
+              ? "A remote device took control — click to take back."
+              : "Control returned to the native terminal — click to take back."}
           </span>
         </button>
       )}
@@ -897,7 +1217,7 @@ export function LaunchTerminal({
       )}
       <div
         ref={hostRef}
-        className="min-h-0 flex-1 p-2"
+        className="min-h-0 flex-1 overflow-x-auto p-2"
         onMouseDown={() => {
           // Click-to-focus for the padding/letterbox area a docked grid tile's
           // xterm canvas doesn't cover (Feature C5); also the click half of the
@@ -909,6 +1229,40 @@ export function LaunchTerminal({
         }}
       />
     </div>
+  );
+}
+
+// ProjectPanelButton is a small chrome button (Files / Git) that opens the
+// per-terminal project panel. Honest-disabled when the run has no project root
+// (per the honest-disabled-copy convention).
+function ProjectPanelButton({
+  label,
+  enabled,
+  onClick,
+  enabledTitle,
+  disabledTitle = "This terminal was launched without a project root",
+}: {
+  label: string;
+  enabled: boolean;
+  onClick: () => void;
+  enabledTitle: string;
+  disabledTitle?: string;
+}) {
+  return (
+    <button
+      type="button"
+      disabled={!enabled}
+      onClick={onClick}
+      title={enabled ? enabledTitle : disabledTitle}
+      className={
+        "rounded-2 px-2 py-0.5 text-[11px] focus:outline-none " +
+        (enabled
+          ? "text-fg-3 hover:bg-white/10 hover:text-fg-1"
+          : "cursor-not-allowed text-fg-4 opacity-60")
+      }
+    >
+      {label}
+    </button>
   );
 }
 
@@ -978,6 +1332,7 @@ function RemoteControlBar({
   onConfirm,
   onAcquire,
   acqErr,
+  revokedBy,
   standingStored,
   standingInput,
   rememberStanding,
@@ -995,6 +1350,7 @@ function RemoteControlBar({
   onConfirm: (v: string) => void;
   onAcquire: () => void;
   acqErr: string | null;
+  revokedBy: "local" | "remote" | null;
   standingStored: boolean;
   standingInput: string;
   rememberStanding: boolean;
@@ -1011,7 +1367,11 @@ function RemoteControlBar({
       : control === "requesting"
         ? "Requesting control…"
         : control === "revoked"
-          ? "Control ended — you are viewing read-only"
+          ? revokedBy === "local"
+            ? "The owner took control — you are viewing read-only"
+            : revokedBy === "remote"
+              ? "Another remote device took control — you are viewing read-only"
+              : "Control ended — you are viewing read-only"
           : control === "denied"
             ? "Read-only — control was denied"
             : "Read-only view";
@@ -1022,8 +1382,8 @@ function RemoteControlBar({
       : "bg-warn/20 text-warn";
   return (
     <div className="border-b border-white/10 bg-[#101017] px-3 py-1.5 text-[11px]">
-      <div className="flex items-center justify-between gap-2">
-        <span className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
+        <span className="flex min-w-0 flex-wrap items-center gap-2">
           <span
             className={`rounded-full px-1.5 py-0.5 text-[9.5px] font-medium uppercase tracking-[0.05em] ${pillCls}`}
           >
@@ -1031,7 +1391,7 @@ function RemoteControlBar({
           </span>
           {!writer && !requesting && (
             <span className="text-fg-3">
-              Ask the owner to “Approve remote control”, then paste what they send you.
+              Ask the owner to “Grant control”, then paste the capability + confirm code they send you.
             </span>
           )}
         </span>
@@ -1046,7 +1406,7 @@ function RemoteControlBar({
         )}
       </div>
       {standingStored && (
-        <div className="mt-1.5 flex items-center justify-between gap-2 rounded-2 border border-line-2 bg-bg-1 px-2 py-1">
+        <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2 rounded-2 border border-line-2 bg-bg-1 px-2 py-1">
           <span className="text-[10.5px] text-fg-3">
             Standing access is saved on this device — control is re-acquired automatically on refresh.
           </span>

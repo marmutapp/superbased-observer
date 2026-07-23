@@ -225,7 +225,6 @@ func TestRemoteEnableSatisfiesSubstratePredicate(t *testing.T) {
 	if !found {
 		t.Errorf("controller allow-list missing the tailnet host: %v", rc.AllowedHosts())
 	}
-
 	if _, err := runRemote(t, "disable", "--config", cfgPath); err != nil {
 		t.Fatalf("disable: %v", err)
 	}
@@ -235,6 +234,47 @@ func TestRemoteEnableSatisfiesSubstratePredicate(t *testing.T) {
 	}
 	if rc := buildRemoteController(cfg, nil); rc != nil {
 		t.Error("controller non-nil after disable — must fail closed again")
+	}
+}
+
+// TestBuildRemoteControllerCopiesAllowRemoteTerminalTakeover isolates the
+// runtime-init default-on trap without opening a listener: both the default true
+// and an explicit false must reach the controller before any dashboard toggle.
+func TestBuildRemoteControllerCopiesAllowRemoteTerminalTakeover(t *testing.T) {
+	cfgPath, dataDir := writeRemoteTestConfig(t)
+	cfg, err := config.Load(config.LoadOptions{GlobalPath: cfgPath})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	raw, _, err := remoteauth.GenerateSecret()
+	if err != nil {
+		t.Fatalf("GenerateSecret: %v", err)
+	}
+	hash, err := remoteauth.HashSecret(raw)
+	if err != nil {
+		t.Fatalf("HashSecret: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "remote-secret"), []byte(hash), 0o600); err != nil {
+		t.Fatalf("write pairing hash: %v", err)
+	}
+	cfg.Remote.Enabled = true
+	cfg.Remote.BindAddr = "box.ts.net"
+
+	for _, tc := range []struct {
+		name string
+		want bool
+	}{
+		{"default true", true},
+		{"explicit false", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg.Remote.AllowRemoteTerminalTakeover = tc.want
+			rc := buildRemoteController(cfg, nil)
+			live, ok := rc.(interface{ AllowRemoteTerminalTakeover() bool })
+			if !ok || live.AllowRemoteTerminalTakeover() != tc.want {
+				t.Fatalf("controller takeover = (%v,%v), want %v", live, ok, tc.want)
+			}
+		})
 	}
 }
 

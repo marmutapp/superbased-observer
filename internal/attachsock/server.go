@@ -134,6 +134,17 @@ type Reclaimer interface {
 	ReclaimWriter() error
 }
 
+// ReclaimAvailabler is an OPTIONAL companion to Reclaimer: a Session that can
+// report whether reclaim-on-input is currently enabled. The server uses it only
+// to WORD the takeover notice — so it tells the operator to press a key to take
+// control back ONLY when that gesture will actually reclaim (reclaim-on-input
+// on). A Session that does not implement it is treated as "unknown ⇒ don't
+// promise reclaim", preserving the neutral wording.
+type ReclaimAvailabler interface {
+	// ReclaimAvailable reports whether a real keystroke will reclaim the writer.
+	ReclaimAvailable() bool
+}
+
 // Host launches daemon-owned PTYs on behalf of attach clients.
 type Host interface {
 	// LaunchAttachable spawns a PTY for req and returns the live Session, or an
@@ -501,7 +512,7 @@ func (s *server) handleFencedWrite(fc *frameConn, sess Session, payload []byte, 
 			if _, werr := sess.Write(payload); werr == nil {
 				// The reclaimed lease delivered this very chunk; tell the client
 				// its keystrokes are landing again (re-notifiable per transition).
-				_ = fc.sendError(CodeWriterReclaimed, "control reclaimed — your keystrokes are reaching the session again")
+				_ = fc.sendError(CodeWriterReclaimed, "You're back in control of this terminal — keep typing.")
 				return
 			}
 		}
@@ -510,7 +521,18 @@ func (s *server) handleFencedWrite(fc *frameConn, sess Session, payload []byte, 
 	// unavailable, or the re-acquire / re-delivery failed): the lease stays
 	// fenced. Surface the revoked notice once (the client dedupes) and keep
 	// streaming output (A5).
-	_ = fc.sendError(CodeWriterRevoked, "writer control was taken over — your keystrokes are not reaching the session")
+	_ = fc.sendError(CodeWriterRevoked, revokedNotice(sess))
+}
+
+// revokedNotice returns the operator-facing takeover message. When reclaim-on-
+// input is live it guides the operator to the reclaim gesture (press a key);
+// otherwise it states plainly that input won't land from here — never promising
+// a key press that would do nothing.
+func revokedNotice(sess Session) string {
+	if ra, ok := sess.(ReclaimAvailabler); ok && ra.ReclaimAvailable() {
+		return "The dashboard is controlling this terminal. Press any key here to take control back."
+	}
+	return "The dashboard is controlling this terminal. Take control back from the dashboard to type here again."
 }
 
 // readLoop consumes client frames until the connection ends or a protocol

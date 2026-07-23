@@ -604,7 +604,7 @@ function CoworkReconcileCard({ data }: { data: CoworkReconcileResult }) {
   return (
     <ChartShell
       title="Cowork cost reconciliation"
-      sub={`Observer-derived vs Cowork-authoritative spend · drift threshold ${data.drift_threshold_percent.toFixed(1)}%`}
+      sub={`SuperBased-derived vs Cowork-authoritative spend · drift threshold ${data.drift_threshold_percent.toFixed(1)}%`}
     >
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <StatCard
@@ -619,7 +619,7 @@ function CoworkReconcileCard({ data }: { data: CoworkReconcileResult }) {
           sub="authoritative"
         />
         <StatCard
-          label="Observer derived"
+          label="SuperBased derived"
           value={fmtUSD(data.derived_total_usd)}
           sub="pricing-table × tokens"
         />
@@ -638,7 +638,7 @@ function CoworkReconcileCard({ data }: { data: CoworkReconcileResult }) {
               <Th>Process</Th>
               <Th>Title</Th>
               <Th align="right">Cowork $</Th>
-              <Th align="right">Observer $</Th>
+              <Th align="right">SuperBased $</Th>
               <Th align="right">Δ $</Th>
               <Th align="right">Δ %</Th>
             </tr>

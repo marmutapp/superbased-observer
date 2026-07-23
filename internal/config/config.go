@@ -119,15 +119,33 @@ type RemoteConfig struct {
 	// AllowTerminal gates the execute-tier remote terminal surface (Phase 4).
 	// Default false — off even for an execute-capable user until enabled.
 	AllowTerminal bool `toml:"allow_terminal"`
+	// AllowRemoteTerminalTakeover controls whether a successfully authenticated
+	// remote writer may supersede an existing local/native or remote writer.
+	// Default true for seamless handoff; false preserves the explicit-yield
+	// posture. This changes only post-authorization lease policy: AllowTerminal,
+	// device authentication, launch policy, and the capability/standing-secret
+	// credential gate remain mandatory and upstream. Local-only; never
+	// distributed or server-forced.
+	AllowRemoteTerminalTakeover bool `toml:"allow_remote_terminal_takeover"`
 	// AllowTerminalView is the independent READ opt-in for remote VIEWING of
 	// attach/resume terminals (session-attach design §3.2, Phase 4). It is
 	// STRICTLY WEAKER than AllowTerminal (write): an attach/resume PTY binds a
 	// daemon-owned terminal to a REAL external transcript whose TUI can echo
-	// secrets/customer data, so a remote paired device is denied both the
-	// snapshot row AND the websocket subscription by default. Turning this on
-	// lets a remote caller SEE (subscribe read-only to) such sessions; driving
-	// them still requires AllowTerminal AND the full execute-tier writer-acquire
-	// conjunction. Default false (deny). Never distributed; never server-forced.
+	// secrets/customer data, so this controls whether a remote paired device
+	// gets the snapshot row AND the websocket subscription for such sessions.
+	// Default TRUE — mirroring the AllowRemoteTerminalTakeover default-true
+	// precedent. View-by-default is acceptable because the remote surface is
+	// ALREADY multi-lever gated: it opens nothing until the operator arms the
+	// rail and a paired device authenticates over the tailnet, and the remote
+	// WRITE/drive path is UNCHANGED by this default — driving still requires
+	// AllowTerminal AND the full execute-tier writer-acquire conjunction
+	// (device auth + per-terminal approval / standing secret + takeover). The
+	// toggle still exists: setting allow_terminal_view = false restores the
+	// deny-read posture. Seeded true in Default(); BurntSushi's field-level
+	// decode leaves an absent key untouched, so a legacy [remote] block that
+	// predates the key loads as true while an explicit false sticks (the same
+	// partial-merge mechanism AllowRemoteTerminalTakeover relies on). Never
+	// distributed; never server-forced.
 	AllowTerminalView bool `toml:"allow_terminal_view"`
 	// AllowStandingTerminalControl is the OPT-IN master switch for the standing
 	// terminal-control secret (standing-terminal-access §B): a single durable,
@@ -2580,6 +2598,8 @@ func Default() Config {
 			Mode:                         "off",
 			RequireTLS:                   true,
 			AllowTerminal:                false,
+			AllowRemoteTerminalTakeover:  true,
+			AllowTerminalView:            true,
 			AllowStandingTerminalControl: false,
 			WriterLeaseIdleMinutes:       5,
 			WriterLeaseMaxMinutes:        30,

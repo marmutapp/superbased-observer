@@ -797,7 +797,8 @@ func TestRemoteAuditTablePinnedOutOfPush(t *testing.T) {
 	// table-level exclusion must still hold with a canary in every column.
 	for _, k := range []string{
 		"terminal_writer_acquire", "terminal_writer_release", "terminal_writer_revoke",
-		"terminal_local_takeover", "terminal_control_local_approval", "terminal_control_request",
+		"terminal_local_takeover", "terminal_remote_takeover",
+		"terminal_control_local_approval", "terminal_control_request",
 		"terminal_control_capability_consume", "terminal_control_denied", "terminal_denied_frame",
 	} {
 		if err := st.InsertRemoteAudit(ctx, store.RemoteAuditEvent{

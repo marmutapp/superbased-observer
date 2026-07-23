@@ -6,7 +6,7 @@ export function registerDoctor(
   bin: ResolvedBinary,
 ): vscode.Disposable {
   return vscode.commands.registerCommand('observer.doctor', () => {
-    const term = vscode.window.createTerminal({ name: 'Observer Doctor' });
+    const term = vscode.window.createTerminal({ name: 'SuperBased Doctor' });
     const quoted = bin.path.includes(' ') ? `"${bin.path}"` : bin.path;
     term.sendText(`${quoted} doctor`);
     term.show();

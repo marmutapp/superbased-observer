@@ -170,6 +170,16 @@ type Options struct {
 	// (GET /api/terminal/<handle>/status + GET /ws/terminal/status). Nil is the
 	// honest disabled state (503 / the WS closes).
 	TerminalStatus TerminalStatusProvider
+	// ProjectRootResolver, when non-nil, backs the per-terminal project panel
+	// (GET /api/terminal/project/<token>...). It resolves a live launch token
+	// (LaunchInfo.ID / PTY handle) to the canonical project root the run was
+	// launched with, from server-retained state only — the browser never sends
+	// a filesystem root. It returns known=false for an unknown OR exited token
+	// (→404 unknown_token) and (root="", known=true) for a live run launched
+	// with the default cwd (→409 no_project_root). Injected by cmd from
+	// termsvc.Service; nil (the default) makes the panel endpoints 404 (a nil
+	// seam IS the disabled state), keeping the solo-local experience unchanged.
+	ProjectRootResolver func(token string) (root string, known bool)
 	// RestartFunc, when non-nil, restarts the daemon from the dashboard
 	// (POST /api/admin/restart): it preflights the config and triggers the
 	// daemon's graceful shutdown + self re-exec (cmd owns the process
@@ -517,6 +527,11 @@ func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[st
 	reg("/api/attach/sessions", V, s.handleAttachSessions)
 	// F4 agent status: point-in-time (GET /api/terminal/<handle>/status) via the
 	// prefix route, and the multiplexed live stream — both VIEW (read-only). The
+	// Per-terminal project panel (Arc A): git tree + read-only file explorer
+	// rooted at the terminal's server-resolved project root. VIEW (GET-only);
+	// the more-specific pattern takes mux precedence over /api/terminal/ below,
+	// and its own handler re-gates remote-exposed callers on allow_terminal_view.
+	reg("/api/terminal/project/", V, s.handleTerminalProject)
 	// exact /launch + /sessions patterns above take mux precedence.
 	reg("/api/terminal/", V, s.handleTerminalStatus)
 	reg("/ws/terminal/status", V, s.handleTerminalStatusWS)
@@ -650,6 +665,10 @@ func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[st
 	// (attach/resume) terminal (§3.2). Strictly weaker than allow_terminal
 	// (write). Local; owner-loopback only; hot-reloads the live VIEW gate.
 	reg("/api/remote/allow-terminal-view", L, s.handleRemoteSetAllowTerminalView)
+	// Flip the post-authorization remote writer policy. Credential validation,
+	// allow_terminal, TLS, pairing, and allow_terminal_view remain independent.
+	// Local; owner-loopback only; hot-reloads for the next acquire.
+	reg("/api/remote/allow-remote-takeover", L, s.handleRemoteSetAllowRemoteTakeover)
 	// Flip [remote].revoke_standing_on_takeover — the OPT-IN hardening that
 	// makes a LOCAL writer takeover of a standing-credential remote writer also
 	// revoke standing access (default false = seamless). Local; owner-loopback

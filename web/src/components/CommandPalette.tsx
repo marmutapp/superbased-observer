@@ -10,6 +10,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { useNavigate } from "react-router-dom";
 import clsx from "clsx";
 import { NAV_ITEMS } from "@/lib/nav";
+import { useTour } from "@/components/tour/TourProvider";
 import { useFilters } from "@/lib/filters";
 import { toolMeta } from "@/lib/tools";
 import type {
@@ -53,7 +54,18 @@ type ActionItem = {
   timestamp: string;
 };
 
-type Item = JumpItem | SessionItem | ActionItem;
+// CommandItem — an app action (not a navigation target) that runs an
+// arbitrary callback. Kept as its own kind so activate() dispatches on
+// shape, not on a magic path string.
+type CommandItem = {
+  kind: "command";
+  key: string;
+  label: string;
+  hint: string;
+  run: () => void;
+};
+
+type Item = JumpItem | SessionItem | ActionItem | CommandItem;
 
 const RECENT_LIMIT = 8;
 
@@ -65,6 +77,7 @@ export function CommandPalette({
   onClose: () => void;
 }) {
   const navigate = useNavigate();
+  const { startTour } = useTour();
   const { query, setQuery } = useFilters();
   const [sessions, setSessions] = useState<SessionRow[] | null>(null);
   const [actions, setActions] = useState<ActionListRow[] | null>(null);
@@ -128,6 +141,15 @@ export function CommandPalette({
 
   const items = useMemo<Item[]>(() => {
     const q = query.trim().toLowerCase();
+    const commands: CommandItem[] = [
+      {
+        kind: "command",
+        key: "cmd:tour",
+        label: "Start product tour",
+        hint: "Replay the guided walkthrough",
+        run: startTour,
+      },
+    ];
     const pages: JumpItem[] = NAV_ITEMS.map((n) => ({
       kind: "page",
       key: `page:${n.path}`,
@@ -152,7 +174,9 @@ export function CommandPalette({
       target: r.target,
       timestamp: r.timestamp,
     }));
-    if (!q) return [...pages, ...sessRows, ...actRows];
+    if (!q) return [...commands, ...pages, ...sessRows, ...actRows];
+    const matchCmd = (i: CommandItem) =>
+      i.label.toLowerCase().includes(q) || i.hint.toLowerCase().includes(q);
     const matchPage = (i: JumpItem) =>
       i.label.toLowerCase().includes(q) || i.path.includes(q);
     const matchSess = (i: SessionItem) =>
@@ -164,11 +188,12 @@ export function CommandPalette({
       i.target.toLowerCase().includes(q) ||
       i.tool.toLowerCase().includes(q);
     return [
+      ...commands.filter(matchCmd),
       ...pages.filter(matchPage),
       ...sessRows.filter(matchSess),
       ...actRows.filter(matchAct),
     ];
-  }, [query, sessions, actions]);
+  }, [query, sessions, actions, startTour]);
 
   // Keep cursor in range as the items list narrows.
   useEffect(() => {
@@ -176,6 +201,11 @@ export function CommandPalette({
   }, [items.length, activeIdx]);
 
   function activate(it: Item) {
+    if (it.kind === "command") {
+      it.run();
+      onClose();
+      return;
+    }
     if (it.kind === "page") navigate(it.path);
     else if (it.kind === "session") {
       // Push the session id into Sessions filter via globalQuery and
@@ -209,15 +239,18 @@ export function CommandPalette({
   // same flat array.
   const sections: { title: string; rows: { item: Item; idx: number }[] }[] =
     useMemo(() => {
+      const cmds: { item: Item; idx: number }[] = [];
       const pages: { item: Item; idx: number }[] = [];
       const sess: { item: Item; idx: number }[] = [];
       const acts: { item: Item; idx: number }[] = [];
       items.forEach((it, idx) => {
-        if (it.kind === "page") pages.push({ item: it, idx });
+        if (it.kind === "command") cmds.push({ item: it, idx });
+        else if (it.kind === "page") pages.push({ item: it, idx });
         else if (it.kind === "session") sess.push({ item: it, idx });
         else acts.push({ item: it, idx });
       });
       const out: { title: string; rows: { item: Item; idx: number }[] }[] = [];
+      if (cmds.length) out.push({ title: "Commands", rows: cmds });
       if (pages.length) out.push({ title: "Jump to", rows: pages });
       if (sess.length) out.push({ title: "Recent sessions", rows: sess });
       if (acts.length) out.push({ title: "Recent actions", rows: acts });
@@ -360,6 +393,15 @@ function Row({
 }
 
 function renderRow(item: Item): ReactNode {
+  if (item.kind === "command") {
+    return (
+      <>
+        <PlayIcon />
+        <span className="text-[12px] font-semibold">{item.label}</span>
+        <span className="ml-auto text-[10.5px] text-fg-3">{item.hint}</span>
+      </>
+    );
+  }
   if (item.kind === "page") {
     return (
       <>
@@ -445,6 +487,27 @@ function PageIcon() {
         d="M9 2.5V6h3"
         stroke="currentColor"
         strokeWidth="1.4"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function PlayIcon() {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 16 16"
+      fill="none"
+      aria-hidden
+      className="text-accent"
+    >
+      <path
+        d="M5 3.5v9l7-4.5-7-4.5Z"
+        fill="currentColor"
+        stroke="currentColor"
+        strokeWidth="1.2"
         strokeLinejoin="round"
       />
     </svg>

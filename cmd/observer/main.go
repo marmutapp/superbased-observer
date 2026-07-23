@@ -77,10 +77,42 @@ func main() {
 	}
 }
 
+// invocationName returns the command name to show in help/usage, derived from
+// how the binary was invoked. Both `superbased` and `observer` are supported
+// command names (dual-name compatibility, 2026-07-23): npm/PyPI install both,
+// and the release tarball ships a `superbased` alias beside `observer`. Only an
+// explicit `superbased` argv[0] flips the displayed name; every other argv[0]
+// (the npm/PyPI shim, which spawns the binary as `observer`; a temp test
+// binary; a bare path) defaults to the canonical `observer`. Runtime behaviour
+// is identical either way — self-invocations (hooks, MCP, launchers) resolve
+// os.Executable() absolute paths, never this name.
+func invocationName() string {
+	return commandNameFrom(os.Args[0])
+}
+
+// commandNameFrom maps an argv[0] to the displayed command name. Only an
+// explicit `superbased` basename flips it; anything else defaults to the
+// canonical `observer`. It splits on both path separators (and trims `.exe`
+// case-insensitively) so a Windows argv[0] resolves the same regardless of the
+// OS the binary was built for — filepath.Base only honours the host separator.
+func commandNameFrom(argv0 string) string {
+	base := argv0
+	if i := strings.LastIndexAny(base, `/\`); i >= 0 {
+		base = base[i+1:]
+	}
+	if strings.HasSuffix(strings.ToLower(base), ".exe") {
+		base = base[:len(base)-len(".exe")]
+	}
+	if strings.EqualFold(base, "superbased") {
+		return "superbased"
+	}
+	return "observer"
+}
+
 func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
-		Use:          "observer",
-		Short:        "SuperBased Observer — unify AI coding tool activity",
+		Use:          invocationName(),
+		Short:        "SuperBased — unify AI coding tool activity",
 		Long:         "Captures, normalizes, and analyzes tool call activity from AI coding assistants.\nSee README.md for a feature tour.",
 		Version:      version,
 		SilenceUsage: true,

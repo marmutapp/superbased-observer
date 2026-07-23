@@ -1,6 +1,6 @@
 # Verify your install
 
-`Observer: Doctor` runs the binary's own health-check against the
+`SuperBased: Doctor` runs the binary's own health-check against the
 resolved observer install:
 
 - DB integrity (`PRAGMA quick_check`)

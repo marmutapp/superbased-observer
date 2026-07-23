@@ -101,7 +101,7 @@ export const HELP_REGISTRY: HelpEntry[] = [
     oneLiner:
       "Distill this session into a priced, scrubbed handover doc another AI tool can pick up — forked from any stable point.",
     detail:
-      "Session handoff re-reads the conversation from the source tool's own transcript files (nothing is stored in the observer DB), distills it into a HANDOFF-*.md the target tool reads in the project root, and prices every carry mode at the target model: metadata (action-derived facts only), distilled (facts + mission), distilled + tail (adds the verbatim last exchanges), full (the whole context through the fork with tool results excerpted — every message tagged [msg <id>] with an MCP hint so a target with the Observer MCP pulls any full body on demand via get_session_message), and full + cache (the un-excerpted read bodies written into the doc; the target reads that doc to load the source read cache into the new session up front — for targets with no Observer MCP, or when you want a zero-round-trip warm start. Large docs are delivered as a read-this-file pointer because a launch prompt is a single OS argument capped near 128KB). The fork picker offers only STABLE boundaries — assistant exchanges whose tool calls all resolved; a request inside an unresolved tool chain or on an unanswered user message snaps backward with a reason. Important honesty note: this is NOT cache migration. Provider prompt caches are server-side and prefix-exact — they cannot move between tools; the estimate's rows show what rehydration actually costs.",
+      "Session handoff re-reads the conversation from the source tool's own transcript files (nothing is stored in the SuperBased DB), distills it into a HANDOFF-*.md the target tool reads in the project root, and prices every carry mode at the target model: metadata (action-derived facts only), distilled (facts + mission), distilled + tail (adds the verbatim last exchanges), full (the whole context through the fork with tool results excerpted — every message tagged [msg <id>] with an MCP hint so a target with the SuperBased MCP pulls any full body on demand via get_session_message), and full + cache (the un-excerpted read bodies written into the doc; the target reads that doc to load the source read cache into the new session up front — for targets with no SuperBased MCP, or when you want a zero-round-trip warm start. Large docs are delivered as a read-this-file pointer because a launch prompt is a single OS argument capped near 128KB). The fork picker offers only STABLE boundaries — assistant exchanges whose tool calls all resolved; a request inside an unresolved tool chain or on an unanswered user message snaps backward with a reason. Important honesty note: this is NOT cache migration. Provider prompt caches are server-side and prefix-exact — they cannot move between tools; the estimate's rows show what rehydration actually costs.",
     formula:
       "carry cost = rendered doc tokens × target-model input rate; full row = session prefix tokens × fork share × input rate",
     source:
@@ -1735,7 +1735,7 @@ export const HELP_REGISTRY: HelpEntry[] = [
     oneLiner:
       "Node-side control over what an enrolled agent shares: metadata-only by default (hashes + counts), full content only if YOU flip it here — the org admin has no remote switch.",
     detail:
-      "When this agent is enrolled in an organisation's Observer server, the push loop ships activity rollups on a timer. This section controls what those batches may contain — and every switch lives in this node's own config.toml. The server cannot set, request, or override any of it; that's a designed-in invariant, not a default.\n\n• Share mode OFF (the default): only sha256 hashes and counts cross the wire. Raw command bodies, assistant prose, and filesystem paths are stripped at the single SQL seam that builds push rows — there is exactly one place content can leave, and it's gated here.\n• Full content ON: raw commands, prose, and paths ship alongside the hashes, visible to your org admins. Deliberate opt-in only.\n• Per-action allowlist: the cautious middle — ship raw targets only for chosen action types (say, file paths for read_file/edit_file) while still withholding commands and prose.\n• Project scope: allow/deny lists by project root decide which projects push at all.\n\nEnrolment itself (server URL, credentials) is owned by `observer enroll` / `observer unenroll` and the Enrolment section — a save here can never detach or re-point it (test-pinned). Push-loop changes bind at daemon start: restart to apply.",
+      "When this agent is enrolled in an organisation's SuperBased server, the push loop ships activity rollups on a timer. This section controls what those batches may contain — and every switch lives in this node's own config.toml. The server cannot set, request, or override any of it; that's a designed-in invariant, not a default.\n\n• Share mode OFF (the default): only sha256 hashes and counts cross the wire. Raw command bodies, assistant prose, and filesystem paths are stripped at the single SQL seam that builds push rows — there is exactly one place content can leave, and it's gated here.\n• Full content ON: raw commands, prose, and paths ship alongside the hashes, visible to your org admins. Deliberate opt-in only.\n• Per-action allowlist: the cautious middle — ship raw targets only for chosen action types (say, file paths for read_file/edit_file) while still withholding commands and prose.\n• Project scope: allow/deny lists by project root decide which projects push at all.\n\nEnrolment itself (server URL, credentials) is owned by `observer enroll` / `observer unenroll` and the Enrolment section — a save here can never detach or re-point it (test-pinned). Push-loop changes bind at daemon start: restart to apply.",
     related: ["tab.settings", "glossary.health_doctor"],
   },
   {
@@ -1831,7 +1831,7 @@ export const HELP_REGISTRY: HelpEntry[] = [
     category: "glossary",
     title: "Settings — Secrets scrubbing section",
     oneLiner: "Redaction applied to captured tool output before anything is written to the database.",
-    detail: "Observer scrubs secrets from captured output BEFORE storage — the database never holds the raw value.\n\n• Scrubbing — default on. Built-in patterns cover common credential shapes: API keys (Anthropic, OpenAI, AWS, GitHub, …), bearer tokens, connection strings.\n• Extra patterns — your own regex additions, for org-specific shapes the built-ins can't know: internal token prefixes, license keys, hostnames. Comma-separated; each pattern's matches are replaced at capture time.\n\nScrubbing is capture-time and irreversible by design: rows written while a pattern was active stay scrubbed forever, and rows written before you added a pattern are NOT retroactively scrubbed (see `observer scrub` / docs/teams-operations.md for retroactive cleanup). Restart required after saving.",
+    detail: "SuperBased scrubs secrets from captured output BEFORE storage — the database never holds the raw value.\n\n• Scrubbing — default on. Built-in patterns cover common credential shapes: API keys (Anthropic, OpenAI, AWS, GitHub, …), bearer tokens, connection strings.\n• Extra patterns — your own regex additions, for org-specific shapes the built-ins can't know: internal token prefixes, license keys, hostnames. Comma-separated; each pattern's matches are replaced at capture time.\n\nScrubbing is capture-time and irreversible by design: rows written while a pattern was active stay scrubbed forever, and rows written before you added a pattern are NOT retroactively scrubbed (see `observer scrub` / docs/teams-operations.md for retroactive cleanup). Restart required after saving.",
     related: ["tab.settings", "tab.actions"],
   },
 
@@ -2147,6 +2147,48 @@ export const HELP_REGISTRY: HelpEntry[] = [
     oneLiner: "Severity tone, category + detector pills, scope chip, the nudge, show-math, confidence, the action button, and snooze/dismiss — what each piece means.",
     detail: "Title tone encodes severity (warning = red, advice = accent, info = muted). The pills name the category (cost / latency / quality / hygiene) and the detector that fired. The scope chip says what the suggestion is ABOUT — a specific session (click-through to its detail), a project, a model, or your global pattern. The nudge is the prescriptive sentence: what to change. The right rail: the dollar (or ~minutes) estimate, the confidence percentage (the detector's calibrated belief the pattern is real waste, not legitimate work), an optional action button that NAVIGATES to the relevant surface (it never writes anything — any change happens behind that surface's own consent flow), 'show math' (the exact arithmetic behind the estimate — every number is auditable), and snooze 7d / dismiss (persisted node-locally; a dismissed suggestion won't re-fire for its cooldown even if the pattern recurs).",
     related: ["tab.suggestions", "tile.suggestions.avoidable", "tile.suggestions.open"],
+  },
+
+  // ----- remote / terminal control -----
+  {
+    id: "glossary.connect_a_device",
+    category: "glossary",
+    title: "How to connect a device",
+    oneLiner:
+      "Turn on remote access → pair a device by QR → (to drive) enable Allow terminal → Grant control to that device, or mint a standing secret.",
+    detail:
+      "The end-to-end path for using this dashboard from a phone or laptop:\n\n1. Turn on remote access in Configuration (writes [remote] config and mints a pairing secret; the listener binds on the next daemon restart). The Tailscale card guides install / login / serve if needed.\n2. Pair a device — click “Pair a device” for a one-time QR and scan it on the phone or laptop. It lands on the read-only view. Pairing takes effect immediately; already-paired devices are unaffected.\n3. To let a device DRIVE a terminal, turn on Allow terminal in Configuration (this expands the remote execution authority; it hot-reloads, no restart). Allow terminal view is on by default and only lets a device SEE attach/resume terminals read-only.\n4. In “Terminal control for paired devices”, click Grant control on the terminal you want that device to drive — convey the one-time capability + confirm code it shows. For persistent control across refreshes, mint a standing secret instead (advanced, off by default).\n\nEverything here is owner-local — these actions only work from the local dashboard, never from a paired remote device.",
+    related: ["card.remote_config", "card.terminal_control", "card.standing_terminal"],
+  },
+  {
+    id: "card.remote_config",
+    category: "tile",
+    title: "Configuration — Allow terminal / Allow terminal view",
+    oneLiner:
+      "The two remote-terminal capability switches: Allow terminal (drive terminals) and Allow terminal view (see them read-only).",
+    detail:
+      "Configuration holds the armed-remote settings plus two capability switches:\n\n• Allow terminal — lets a paired device DRIVE terminals (execute tier). OFF by default because it expands the remote execution authority. Hot-reloads in both directions with no restart; turning it off also revokes any live remote terminal writer immediately. It is the prerequisite for “Terminal control for paired devices” and for standing access below.\n\n• Allow terminal view — an independent READ opt-in that lets a paired device SEE (read-only) attach/resume terminals like Claude Code and Codex. ON by default, and a switch you can turn off. Strictly weaker than Allow terminal: seeing a terminal never lets a device drive it — driving still needs Allow terminal plus a per-terminal Grant. Hot-reloads; turning it off closes any open remote view at once.\n\nBoth are owner-local writes — they only save from the local dashboard.",
+    related: ["card.terminal_control", "card.standing_terminal", "glossary.connect_a_device"],
+  },
+  {
+    id: "card.terminal_control",
+    category: "tile",
+    title: "Terminal control for paired devices",
+    oneLiner:
+      "Grant a paired device a one-time capability + confirm code to drive ONE terminal, revoke it, or take control back.",
+    detail:
+      "For each live terminal this shows the current controller and viewer count, and lets you: Grant control (mints a ONE-TIME capability + confirm code scoped to ONE device AND ONE terminal, execute tier — shown once beside that terminal's row, masked after ~60s, held only in memory (never written to disk) until consumed or expiry; you convey both values to the device); Revoke (ends a remote device's control of that terminal now); and Take over (opens the terminal locally, demoting any remote writer). Granting depends on Allow terminal being on in Configuration above, and on having a paired device. Below the table, Paired devices lets you unpair a device entirely, which also ends any control it holds. All of this is owner-local — it only works from the local dashboard.",
+    related: ["card.remote_config", "card.standing_terminal", "glossary.connect_a_device"],
+  },
+  {
+    id: "card.standing_terminal",
+    category: "tile",
+    title: "Standing terminal-control access",
+    oneLiner:
+      "Opt-in durable secret that lets a paired device keep terminal control across refreshes without re-granting each time.",
+    detail:
+      "A single durable secret that lets a paired device re-acquire terminal writer control across websocket refreshes without a fresh per-terminal Grant. OFF by default — the per-terminal single-use grants above are the safer path, because a standing secret is a strict superset of risk: anyone holding the secret AND a paired session can control EVERY live terminal until you revoke it. The raw secret is shown ONCE on mint and stored hashed at rest; revoke deletes it and immediately drops every writer holding through it. Requires Allow terminal on in Configuration above (standing access only grants what Allow terminal permits). Two lease-policy toggles live here too: allow remote devices to take over control (on by default), and revoke standing access when this desktop takes over (off by default). Owner-local only.",
+    related: ["card.remote_config", "card.terminal_control", "glossary.connect_a_device"],
   },
 ];
 const BY_ID = new Map(HELP_REGISTRY.map((e) => [e.id, e]));

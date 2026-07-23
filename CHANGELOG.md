@@ -4,6 +4,93 @@ All notable changes to SuperBased Observer are documented here.
 
 ## [Unreleased]
 
+## [1.23.0] — 2026-07-23
+
+### Added
+
+- **`superbased` CLI alias.** The binary now also runs as `superbased`,
+  selected from `argv[0]` — `observer` is unchanged and stays canonical
+  (no deprecation yet). npm and PyPI ship `superbased` alongside `observer`
+  as console entry points, and release tarballs/zips include a `superbased`
+  alias next to the `observer` binary.
+- **First-run guided dashboard tour.** A spotlight-and-coach-mark
+  walkthrough (Overview → Live → Sessions → Cost → Cache → Terminals →
+  Security → Settings → global filter/help) auto-starts once on new
+  installs and is replayable any time from the Help drawer or the command
+  palette.
+- **Per-terminal Files/Git project explorer.** Every dashboard terminal
+  (floating window or grid tile) gets Files/Git panel buttons: a read-only
+  file tree + viewer and a git view (branch, ahead/behind, changes,
+  100-commit history). Panels are floating, draggable, multi-panel windows
+  — one per terminal, open simultaneously — with a right-click context
+  menu to copy the selected path (relative or absolute) and, on a live
+  write-capable terminal, paste it straight into that terminal.
+- **Authenticated remote terminal takeover.** A fully-authorized remote
+  dashboard can now take over control of a terminal from a local/native
+  writer or from another remote seat, completing the native → local →
+  remote handoff. Default-on; see the config change below.
+- **Playwright e2e regression suites** covering the guided tour, terminal
+  key/paste handling, and the new project panels.
+- **VS Code extension lint gate.** `npm run lint` (eslint) is now runnable
+  in the extension's dev workflow; dev-only, not part of the packaged
+  extension.
+- **Pricing: the 2026 model-release wave.** ~35 new cost-engine rows for
+  Claude Mythos 5 (Fable-5-equivalent pricing); the Qwen 3.5 family
+  (plus/flash/omni-plus/omni-flash) plus 3.7-Plus and a 3.8-Max-Preview
+  placeholder row (no published rate yet — anchored to 3.7-Max's exact
+  price pending an official card); GLM-5.2; MiniMax M3; Tencent Hy3;
+  StepFun Step-3.5-Flash; ERNIE 5.1; ByteDance Seed 2.0 (provisional,
+  Volcengine has no official card yet); Meta Muse Spark 1.1; Cohere North
+  Mini Code (genuinely free); Sakana Fugu Ultra; Thinking Machines
+  Inkling; Jamba Mini 2; Gemini Omni Flash; and Sarvam (free). A
+  researched-but-not-priced ledger is kept in code comments for models
+  with no public rate card (Cohere Command A+, the original pre-1.1 Muse
+  Spark, Phi-4-reasoning-vision-15B, Falcon H1R 7B) so they aren't
+  re-researched needlessly.
+- **Website repositioned around the AI-agent control-plane story.**
+  superbased.app now leads with seeing agents' actions and provider-
+  reported token usage across 26 tools, then controlling the supported
+  sessions (dashboard terminals, paired-device session attach/takeover,
+  model routing, egress guardrails); four decorative Canvas animations
+  from the marketing library embed on the homepage
+  (`prefers-reduced-motion`-aware, pause when hidden/offscreen).
+  "Observer Quest" renamed "SuperBased Quest". 12 README + 3 website
+  dashboard screenshots refreshed against the current UI.
+
+### Changed
+
+- **`[remote].allow_terminal_view` now defaults to `true`.** A paired,
+  authenticated remote device can view (read-only) attach/resume terminal
+  output by default; set it to `false` to restore the prior deny-by-default
+  posture.
+- **New `[remote].allow_remote_terminal_takeover`, defaults to `true`.**
+  Pairs with the takeover feature above; set it to `false` to keep refusing
+  a remote takeover of an existing writer.
+- **`[terminal].idle_timeout` now defaults to `"0"`.** Idle embedded
+  terminals are no longer reaped after 30 minutes of no PTY I/O (a quiet
+  agent sitting at its prompt was being killed mid-session); set it back to
+  `"30m"` to restore the old cleanup behavior.
+- **Product renamed "SuperBased Observer" → "SuperBased"** in prose and UI
+  only. Every technical identifier — the `observer` CLI, package names, the
+  `[observer]` config section, `~/.observer`, the `observer.db` filename —
+  is unchanged. VS Code extension display strings (command titles, activity
+  bar, output channel, notifications) were renamed the same way; the
+  Marketplace listing name updates at the next publish.
+
+### Fixed
+
+- `observer run` no longer mangles multi-line commands or shell builtins
+  (`cd`, `export`, …) when wrapping them for hooks, and the wrapped command
+  now skips the daemon's integrity check on that path — about 750× faster
+  to start (measured 0.16s vs. over 120s against a large database).
+- STT/dictation paste into the embedded terminal: xterm.js was silently
+  canceling plain Ctrl+V, so dictation tools' fallback paste landed a stale
+  clipboard instead of the transcription; plain Ctrl+V now reaches the
+  browser's native paste handling.
+- Terminal-dock drag gestures: an interrupted drag (pointer cancel or lost
+  pointer capture) can no longer leave the gesture armed for a later stray
+  pointer move to resume from a stale origin.
+
 ## [1.22.0] — 2026-07-21
 
 ### Added

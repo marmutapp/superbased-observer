@@ -73,7 +73,7 @@ describe('hoverMarkdown', () => {
       edit_count_24h: 5,
       tools_touched: ['claude-code', 'cursor'],
     });
-    assert.match(md, /\*\*Observer\*\*/);
+    assert.match(md, /\*\*SuperBased\*\*/);
     assert.match(md, /Last read by `claude-code`/);
     assert.match(md, /\*\*Edits \(24h\)\*\*: 5/);
     assert.match(md, /Tools touched.*claude-code, cursor/);

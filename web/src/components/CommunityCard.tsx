@@ -23,7 +23,7 @@ const CONTACT = "contact@superbased.app";
 const TESTIMONIALS: { quote: string; author: string; role?: string }[] = [];
 
 const SHARE_TEXT =
-  "I've been using SuperBased Observer to see what my AI coding tools actually cost and do — it's worth a look:";
+  "I've been using SuperBased to see what my AI coding tools actually cost and do — it's worth a look:";
 
 function xShareURL(): string {
   const p = new URLSearchParams({ text: SHARE_TEXT, url: SITE });
@@ -34,12 +34,12 @@ function linkedInShareURL(): string {
   return `https://www.linkedin.com/sharing/share-offsite/?${p.toString()}`;
 }
 function emailShareURL(): string {
-  const subject = encodeURIComponent("You should try SuperBased Observer");
+  const subject = encodeURIComponent("You should try SuperBased");
   const body = encodeURIComponent(`${SHARE_TEXT}\n\n${SITE}`);
   return `mailto:?subject=${subject}&body=${body}`;
 }
 function feedbackURL(): string {
-  const subject = encodeURIComponent("SuperBased Observer — feedback / testimonial");
+  const subject = encodeURIComponent("SuperBased — feedback / testimonial");
   return `mailto:${CONTACT}?subject=${subject}`;
 }
 
@@ -140,7 +140,7 @@ export function CommunityCard() {
 
   const share = async () => {
     // Prefer the native share sheet; fall back to copying the site link.
-    const data = { title: "SuperBased Observer", text: SHARE_TEXT, url: SITE };
+    const data = { title: "SuperBased", text: SHARE_TEXT, url: SITE };
     try {
       if (typeof navigator !== "undefined" && navigator.share) {
         await navigator.share(data);
@@ -170,7 +170,7 @@ export function CommunityCard() {
             </span>
           </div>
           <p className="mt-1 text-[12px] text-fg-3">
-            Observer is open source and built in the open. A star helps others find it,
+            SuperBased is open source and built in the open. A star helps others find it,
             issues get fixed fast, and a share goes a long way.
           </p>
 
@@ -179,7 +179,7 @@ export function CommunityCard() {
               href={REPO}
               icon={<GitHubIcon />}
               title="Star us on GitHub"
-              desc="If Observer's useful, a star helps other developers find it."
+              desc="If SuperBased is useful, a star helps other developers find it."
             />
             <ActionTile
               href={ISSUES}
@@ -200,7 +200,7 @@ export function CommunityCard() {
                   {shared === "copied" ? "Link copied ✓" : "Refer a friend"}
                 </span>
                 <span className="mt-0.5 block text-[11px] text-fg-4">
-                  Share Observer with someone who'd find it useful.
+                  Share SuperBased with someone who'd find it useful.
                 </span>
               </span>
             </button>
@@ -244,7 +244,7 @@ export function CommunityCard() {
             ) : (
               <p className="text-[11.5px] text-fg-3">
                 <span className="font-medium text-fg-2">Testimonials &amp; feedback.</span>{" "}
-                Observer save you time or money?{" "}
+                SuperBased save you time or money?{" "}
                 <a href={feedbackURL()} className="font-medium text-accent hover:underline">
                   Send us a testimonial
                 </a>{" "}

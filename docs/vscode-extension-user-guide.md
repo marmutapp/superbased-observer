@@ -1,11 +1,11 @@
-# SuperBased Observer for VS Code — User Guide
+# SuperBased for VS Code — User Guide
 
-> A workflow-oriented walkthrough of the SuperBased Observer
+> A workflow-oriented walkthrough of the SuperBased
 > extension. Pairs with the reference documentation at
 > [`docs/vscode-extension.md`](./vscode-extension.md).
 
 The extension's in-editor **Get Started** walkthrough (Help →
-Welcome → "Get Started with SuperBased Observer") is the
+Welcome → "Get Started with SuperBased") is the
 interactive version of this guide; this document is the long-form
 read for users who prefer prose, or who want to dig into per-AI-tool
 integration details.
@@ -33,7 +33,7 @@ code --install-extension superbased.superbased-observer
 ```
 
 Or open the Extensions view (`Ctrl+Shift+X` / `⌘⇧X`) and search
-**"SuperBased Observer"**.
+**"SuperBased"**.
 
 If you're on Cursor, VSCodium, or Windsurf, the same VSIX ships to
 [Open VSX](https://open-vsx.org/) — `cursor --install-extension
@@ -41,7 +41,7 @@ superbased.superbased-observer` works identically.
 
 ### 2. Confirm the binary is healthy
 
-Open the command palette (`Ctrl+Shift+P` / `⌘⇧P`) and run **Observer:
+Open the command palette (`Ctrl+Shift+P` / `⌘⇧P`) and run **SuperBased:
 Doctor**. A terminal opens with the binary's own health-check
 (database integrity, hook integrity, MCP registrations, binary path
 sanity). All four lines should show `✓`.
@@ -70,7 +70,7 @@ the Settings UI or in `settings.json`.
 
 ### 4. Open the dashboard
 
-Run **Observer: Open Dashboard**. The full React analytics SPA
+Run **SuperBased: Open Dashboard**. The full React analytics SPA
 renders inside an editor tab — same surface as
 `http://127.0.0.1:8081/` outside the editor.
 
@@ -95,9 +95,9 @@ dashboard panel.
 Three states:
 
 - **Live** (normal) — the dollar amount + a graph icon.
-- **Idle** (warning background) — "Observer idle" when no daemon
+- **Idle** (warning background) — "SuperBased idle" when no daemon
   is running.
-- **Degraded** (error background) — "Observer unreachable" when the
+- **Degraded** (error background) — "SuperBased unreachable" when the
   lockfile says a daemon is running but the dashboard port isn't
   answering. Usually means the daemon crashed; in `managed`/`auto`
   modes the extension will restart it within a few seconds.
@@ -107,7 +107,7 @@ cleaner bar.
 
 ### Activity-bar sidebar
 
-The activity bar (left rail) has an **Observer** container with
+The activity bar (left rail) has a **SuperBased** container with
 four trees:
 
 - **Today** — spend, top model, burn rate, month to date.
@@ -126,12 +126,12 @@ four trees:
   every 5 minutes.
 
 Click the refresh icon in any view's title bar (or run
-**Observer: Refresh All Trees**) to force-refresh without waiting
+**SuperBased: Refresh All Trees**) to force-refresh without waiting
 for the next poll.
 
 ### Dashboard webview
 
-**Observer: Open Dashboard** opens the React SPA in an editor tab.
+**SuperBased: Open Dashboard** opens the React SPA in an editor tab.
 This is the same surface as the standalone
 `http://127.0.0.1:8081/` — all nine tabs (Overview / Sessions /
 Actions / Cost / Analysis / Tools / Compression / Discovery /
@@ -154,7 +154,7 @@ explorer **or** at the top of the editor) to see a Markdown summary:
 
 - Last read by which tool, when
 - Number of edits in the last 24h
-- Number of stale re-reads **flagged** in the last 24h (Observer
+- Number of stale re-reads **flagged** in the last 24h (SuperBased
   detects these but doesn't prevent the AI tool from issuing them;
   the count is the observability signal)
 - Which tools touched the file
@@ -175,15 +175,15 @@ deserves your attention**, both deduped to avoid nagging:
   the toast body. Deduped per file on a 5-minute window. Offers
   **Show Output** / **Dismiss**.
 
-The Output channel (`View → Output → Observer`) shows every poll
+The Output channel (`View → Output → SuperBased`) shows every poll
 and any errors — useful when investigating why something didn't
 fire.
 
 ### Daemon lifecycle commands
 
-- **Observer: Start Daemon** — only meaningful in `managed`/`auto`
+- **SuperBased: Start Daemon** — only meaningful in `managed`/`auto`
   modes. Spawns `observer start` with the configured ports.
-- **Observer: Stop Daemon** — only kills daemons the extension
+- **SuperBased: Stop Daemon** — only kills daemons the extension
   spawned (status `managed`); never touches attached daemons.
   SIGTERM with a 5-second grace before SIGKILL.
 
@@ -193,16 +193,16 @@ restarts, an error toast offers **Open Output Channel** / **Retry**.
 
 ### Terminal profile + proxy env vars
 
-Two ways to route an AI CLI through Observer's reverse proxy
+Two ways to route an AI CLI through SuperBased's reverse proxy
 (needed for **accurate** token capture, which the JSONL adapter
 path approximates):
 
 - **Contributed terminal profile** — Open the terminal dropdown
   (down arrow next to **+** in the Terminal panel) → **AI Coding
-  Tool (Observer-proxied)**. The new terminal already has
+  Tool (SuperBased-proxied)**. The new terminal already has
   `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, and
   `ENABLE_TOOL_SEARCH=true` set.
-- **Observer: Copy Proxy Env Vars** — Copies the same triple to
+- **SuperBased: Copy Proxy Env Vars** — Copies the same triple to
   the clipboard in your shell's syntax (bash/zsh/fish → `export …`;
   PowerShell → `$env:…`; cmd → `set …`). Paste into any existing
   terminal.
@@ -212,9 +212,9 @@ path approximates):
 Open a `CLAUDE.md`, `AGENTS.md`, or `.cursorrules` and two
 CodeLenses appear at line 1:
 
-- **🔄 Refresh from Observer learnings** — runs
+- **🔄 Refresh from SuperBased learnings** — runs
   `observer suggest --apply --project <workspaceRoot> --target <…>`
-  and reloads the editor. Touches only content inside Observer's
+  and reloads the editor. Touches only content inside SuperBased's
   managed marker block; everything outside is preserved verbatim.
 - **👁 Preview suggestions** — runs the dry-run and opens stdout
   as a new untitled markdown editor beside the original. Use this
@@ -224,7 +224,7 @@ CodeLenses appear at line 1:
 
 ## Per-AI-tool integration
 
-Observer captures **fourteen** AI tools out of the box. Here's how
+SuperBased captures **fourteen** AI tools out of the box. Here's how
 the extension integrates with the five most common ones.
 
 ### Claude Code
@@ -232,8 +232,8 @@ the extension integrates with the five most common ones.
 - **Proxy** — the contributed terminal profile sets
   `ANTHROPIC_BASE_URL=http://127.0.0.1:8820` and
   `ENABLE_TOOL_SEARCH=true`. Launch `claude` from that terminal and
-  every API call goes through Observer.
-- **MCP** — Observer's MCP server is registered via `observer init`
+  every API call goes through SuperBased.
+- **MCP** — SuperBased's MCP server is registered via `observer init`
   outside the extension (the `observer.init` palette command is
   still a stub; use the CLI). Once registered, Claude Code spawns
   `observer serve` as a subprocess and can call `get_file`,
@@ -249,7 +249,7 @@ the extension integrates with the five most common ones.
   respect `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` when set. Open
   Cursor from the contributed terminal profile (or use Cursor's
   own settings → AI Provider → Base URL field).
-- **Watcher** — Observer reads `~/.cursor/chats/<ws>/<conv>/store.db`
+- **Watcher** — SuperBased reads `~/.cursor/chats/<ws>/<conv>/store.db`
   directly for the CLI's system prompt + per-section token budget;
   the IDE's data lives in `globalStorage/state.vscdb` and is read
   by the IDE-side hook.
@@ -272,7 +272,7 @@ the extension integrates with the five most common ones.
 - **Proxy** — both respect `ANTHROPIC_BASE_URL`. Set it via the
   contributed terminal profile or in each extension's own
   preferences (Cline: VS Code Settings → Cline → Base URL).
-- **Watcher** — Observer reads Cline's task transcripts under
+- **Watcher** — SuperBased reads Cline's task transcripts under
   `~/.cline/` (and the Roo equivalent) directly.
 
 ### GitHub Copilot (Copilot CLI)
@@ -345,22 +345,22 @@ the port the extension reads, so attach-mode works regardless.
 
 There's no per-surface kill switch beyond `observer.statusBar.enabled`.
 If you don't want the activity-bar sidebar, right-click the
-**Observer** icon in the activity bar and pick **Hide 'Observer'**.
+**SuperBased** icon in the activity bar and pick **Hide 'SuperBased'**.
 If you don't want the dashboard webview, just don't run
-**Observer: Open Dashboard**.
+**SuperBased: Open Dashboard**.
 
 ---
 
 ## Troubleshooting
 
-### "Observer: binary not found"
+### "SuperBased: binary not found"
 
 `observer.binary.path` is empty + `observer` isn't on your `$PATH`
 + no bundled binary in the VSIX. Two fixes:
 
 1. Install observer via `npm install -g @superbased/observer` or
    `pip install superbased-observer`. Then either restart VS Code
-   or run **Observer: Doctor** to re-resolve.
+   or run **SuperBased: Doctor** to re-resolve.
 2. Set `observer.binary.path` to the absolute path of a working
    binary.
 
@@ -369,29 +369,29 @@ activation. If the download failed (network blocked, permissions
 issue under `globalStorageUri`), the Output channel will show the
 specific failure mode.
 
-### "Observer idle" — the status bar shows the warning state
+### "SuperBased idle" — the status bar shows the warning state
 
 The lockfile is missing or stale. Three options:
 
-1. Run **Observer: Start Daemon** if you're in `managed`/`auto`
+1. Run **SuperBased: Start Daemon** if you're in `managed`/`auto`
    mode.
 2. Run `observer start` in a terminal if you're in `detect` mode.
 3. Check `~/.observer/observer-*.lock` — if there's a stale file
    with a PID that's no longer running, delete it.
 
-### "Observer unreachable" — the status bar shows the error state
+### "SuperBased unreachable" — the status bar shows the error state
 
 The lockfile says a daemon is running but the dashboard port isn't
 answering. Usually one of:
 
 - The daemon crashed and the lockfile cleanup hasn't fired yet.
-  Run **Observer: Start Daemon** in `managed`/`auto` to restart;
+  Run **SuperBased: Start Daemon** in `managed`/`auto` to restart;
   or kill the stale PID + restart manually in `detect`.
 - A firewall is blocking `127.0.0.1:<observer.dashboard.port>`.
 - You changed `observer.dashboard.port` after the daemon started.
   Restart the daemon to pick up the new value.
 
-### CodeLens "Refresh from Observer learnings" failed
+### CodeLens "Refresh from SuperBased learnings" failed
 
 The Output channel logs the exact `observer suggest` failure.
 Common causes:
@@ -402,7 +402,7 @@ Common causes:
 - **Stale daemon** — `observer suggest` reads the same DB the
   daemon writes to. If the daemon is in a broken state (e.g.
   WAL-locked), restart it.
-- **Permissions** — Observer needs write access to the instruction
+- **Permissions** — SuperBased needs write access to the instruction
   file. Check ownership and the file's permissions bits.
 
 ### Dashboard webview shows a blank page
@@ -450,7 +450,7 @@ The extension is a UX shell; the CLI is the canonical surface.
 
 ### MCP server
 
-Observer exposes thirteen MCP tools (`get_file`, `get_symbols`,
+SuperBased exposes thirteen MCP tools (`get_file`, `get_symbols`,
 `get_relations`, `retrieve_stashed`, etc.) over stdio. AI tools
 that support MCP (Claude Code, Cline, Cursor with MCP, Continue,
 etc.) can call them directly. Register via `observer init` —
@@ -483,13 +483,13 @@ The extension is **strictly local-first**:
   the webview-side `127.0.0.1` to the workspace host's loopback.
   Data still doesn't cross any wire that wasn't already part of
   your VS Code remote-dev session.
-- **No data leaves your machine.** Every byte Observer captures is
+- **No data leaves your machine.** Every byte SuperBased captures is
   written to `~/.observer/observer.db` (or
   `$OBSERVER_HOME/observer.db`) and stays there. If you enroll in
-  Observer Teams, you opt-in to a specific push contract; the
+  SuperBased Teams, you opt-in to a specific push contract; the
   default is solo-local.
 
-The same guarantees apply to the binary itself — Observer is
+The same guarantees apply to the binary itself — SuperBased is
 Apache-2.0 and the source for everything captured + computed is in
 the [main repository](https://github.com/superbasedapp/observer).
 
@@ -499,6 +499,6 @@ the [main repository](https://github.com/superbasedapp/observer).
 
 - **Issues** — [github.com/superbasedapp/observer/issues](https://github.com/superbasedapp/observer/issues)
 - **Discussions** — [github.com/superbasedapp/observer/discussions](https://github.com/superbasedapp/observer/discussions)
-- **Output channel** — `View → Output → Observer` shows everything
+- **Output channel** — `View → Output → SuperBased` shows everything
   the extension is doing. Include the relevant excerpt when filing
   bugs.

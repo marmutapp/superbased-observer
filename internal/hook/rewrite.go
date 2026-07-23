@@ -15,8 +15,16 @@ import (
 //   - the command contains unquoted shell operators (|, &, ;, <, >, (, ), `, $)
 //     — those require the host shell's own interpretation, which `observer
 //     run` bypasses
+//   - the command spans multiple lines (an interior newline) — `observer run`
+//     execs only the first line's argv, so the remaining lines would be
+//     silently dropped (a trailing newline is fine; it is trimmed away)
+//   - the first word is a shell builtin (cd, export, source, …) — those have
+//     no external binary and/or mutate the parent shell, so exec'ing them
+//     fails (127) or loses the side effect; wrapping `cd` in particular makes
+//     the directory change vanish while later commands run in the wrong cwd
 //   - the first word's basename is in excludeCommands
-//   - the first word is already `observer` (double-wrap guard)
+//   - the first word is already the tool's own command (`observer` or the
+//     going-forward `superbased`) — the double-wrap guard
 //
 // The rewrite form is `<binary> run -- <original>`. The `--` is intentional
 // so that flags embedded in the wrapped command (e.g. `git --no-pager log`)
@@ -34,7 +42,10 @@ func RewriteBash(binary, original string, excludeCommands []string) (string, boo
 		return original, false
 	}
 	base := filepath.Base(first)
-	if base == "observer" {
+	if isSelfCommand(base) {
+		return original, false
+	}
+	if shellBuiltins[base] {
 		return original, false
 	}
 	for _, ex := range excludeCommands {
@@ -43,6 +54,39 @@ func RewriteBash(binary, original string, excludeCommands []string) (string, boo
 		}
 	}
 	return binary + " run -- " + trimmed, true
+}
+
+// shellBuiltins is the set of shell builtins that must never be wrapped in
+// `observer run`: they either have no external binary (so exec returns 127) or
+// they mutate the invoking shell's state (cwd, environment, aliases, function
+// table), which is lost when the builtin runs in a child process instead of
+// the shell. `cd` is the canonical hazard — wrapping it makes the directory
+// change silently vanish. Commands like echo/pwd/test that ALSO exist as real
+// binaries in /usr/bin are deliberately absent: exec finds the binary and the
+// wrap is harmless.
+var shellBuiltins = map[string]bool{
+	"cd": true, "export": true, "unset": true, "set": true, "source": true,
+	".": true, "eval": true, "exec": true, "alias": true, "unalias": true,
+	"local": true, "declare": true, "typeset": true, "readonly": true,
+	"let": true, "pushd": true, "popd": true, "dirs": true, "shift": true,
+	"trap": true, "umask": true, "ulimit": true, "wait": true, "read": true,
+	"hash": true, "jobs": true, "fg": true, "bg": true, "disown": true,
+	"times": true, "caller": true, "mapfile": true, "readarray": true,
+	"enable": true, "builtin": true, "command": true, "history": true,
+	"bind": true, "logout": true, "return": true, "break": true,
+	"continue": true, "suspend": true, "compgen": true, "complete": true,
+	"compopt": true, "getopts": true, "shopt": true,
+}
+
+// isSelfCommand reports whether base names the tool's own binary — `observer`
+// or the going-forward `superbased` (dual-name compatibility). Both must be
+// recognized so `observer run …` AND `superbased run …` are left un-wrapped
+// rather than double-wrapped. Case-insensitive and `.exe`-tolerant for Git Bash
+// on Windows.
+func isSelfCommand(base string) bool {
+	b := strings.ToLower(base)
+	b = strings.TrimSuffix(b, ".exe")
+	return b == "observer" || b == "superbased"
 }
 
 // isShellSimple returns true when cmd contains no shell operators that
@@ -79,6 +123,11 @@ func isShellSimple(cmd string) bool {
 			if r == '$' || r == '`' {
 				return false
 			}
+		case r == '\n' || r == '\r':
+			// An interior newline means a multi-line command; `observer run`
+			// would exec only the first line and silently drop the rest.
+			// (A trailing newline never reaches here — trimmed by the caller.)
+			return false
 		case !inSingle && !inDouble:
 			switch r {
 			case '|', '&', ';', '<', '>', '(', ')', '`', '$':

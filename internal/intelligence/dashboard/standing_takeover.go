@@ -117,3 +117,56 @@ func (s *Server) handleRemoteSetRevokeStandingOnTakeover(w http.ResponseWriter, 
 		"revoke_standing_on_takeover": next,
 	})
 }
+
+// handleRemoteSetAllowRemoteTakeover — POST
+// /api/remote/allow-remote-takeover (Local). Flips only
+// [remote].allow_remote_terminal_takeover, persists it, and hot-swaps the live
+// controller before returning. The credential gates are untouched and remain
+// upstream. Strict pointer decode prevents a malformed body from silently
+// selecting false.
+func (s *Server) handleRemoteSetAllowRemoteTakeover(w http.ResponseWriter, r *http.Request) {
+	if !requireConfirmToken(w, r) {
+		return
+	}
+	var body struct {
+		AllowRemoteTerminalTakeover *bool `json:"allow_remote_terminal_takeover"`
+	}
+	if err := decodeJSONBody(r, &body); err != nil || body.AllowRemoteTerminalTakeover == nil {
+		http.Error(w, `{"error":"body must be JSON with a boolean allow_remote_terminal_takeover field"}`, http.StatusBadRequest)
+		return
+	}
+	next := *body.AllowRemoteTerminalTakeover
+	remoteManageMu.Lock()
+	defer remoteManageMu.Unlock()
+	cfg, cfgPath, err := s.loadConfigForManage()
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if !cfg.Remote.Enabled {
+		http.Error(w, `{"error":"remote access is off — arm remote access first"}`, http.StatusBadRequest)
+		return
+	}
+	cfg.Remote.AllowRemoteTerminalTakeover = next
+	if err := config.Validate(cfg); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if err := config.WriteToml(cfgPath, cfg); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if rl, ok := s.opts.Remote.(allowRemoteTerminalTakeoverReloader); ok {
+		rl.ReloadAllowRemoteTerminalTakeover(next)
+	}
+	detail := "disabled"
+	if next {
+		detail = "enabled"
+	}
+	s.recordManageAudit(r, "allow-remote-takeover", detail)
+	writeJSON(w, map[string]any{
+		"ok":                             true,
+		"restart_required":               false,
+		"allow_remote_terminal_takeover": next,
+	})
+}

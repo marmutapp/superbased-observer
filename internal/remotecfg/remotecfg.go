@@ -18,7 +18,12 @@ type EnableOptions struct {
 	AllowTerminal bool
 	// AllowTerminalView is the independent remote-VIEW opt-in for attach/resume
 	// terminals (session-attach design §3.2). Strictly weaker than AllowTerminal.
-	AllowTerminalView bool
+	//
+	// A POINTER so "unset" is distinguishable from "explicitly false": nil means
+	// INHERIT the caller's loaded/seed value (the seed default is now true, so a
+	// plain arm through the CLI or the dashboard — neither of which sets this —
+	// must NOT clobber that default back to false). Only a non-nil value writes.
+	AllowTerminalView *bool
 }
 
 // PairingInfo is the result of an arm/rotate transaction. The encoded secret +
@@ -87,7 +92,12 @@ func Enable(cfg config.Config, cfgPath string, opts EnableOptions) (PairingInfo,
 	cfg.Remote.TailscaleBackendAddr = backendAddr
 	cfg.Remote.RequireTLS = true
 	cfg.Remote.AllowTerminal = opts.AllowTerminal
-	cfg.Remote.AllowTerminalView = opts.AllowTerminalView
+	// nil = inherit the loaded/seed default (now true); only an explicit value
+	// overrides. This is what keeps a plain arm from writing allow_terminal_view
+	// = false and defeating the default-visible flip.
+	if opts.AllowTerminalView != nil {
+		cfg.Remote.AllowTerminalView = *opts.AllowTerminalView
+	}
 	if cfg.Remote.RateLimitPerMin <= 0 {
 		cfg.Remote.RateLimitPerMin = 6
 	}
@@ -107,7 +117,7 @@ func Enable(cfg config.Config, cfgPath string, opts EnableOptions) (PairingInfo,
 		EncodedSecret:     enc,
 		PairingURL:        pairingURL(host, enc),
 		AllowTerminal:     opts.AllowTerminal,
-		AllowTerminalView: opts.AllowTerminalView,
+		AllowTerminalView: cfg.Remote.AllowTerminalView,
 		SecretPath:        secretPath,
 	}, nil
 }

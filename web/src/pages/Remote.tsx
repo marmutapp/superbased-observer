@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { ChartShell, Pill } from "@/components/primitives";
+import { HelpInd, TitleWithHelp } from "@/components/HelpInd";
 import { useApi } from "@/lib/useApi";
 import { fetchJSON } from "@/lib/api";
 import { markRestartPending } from "@/lib/restartPending";
 import { LaunchTerminal } from "@/components/LaunchTerminal";
+import { useLaunchDock, type DockSession } from "@/components/LaunchDock";
 
 // Remote page (dashboard-management-surface plan §9-§11). Arms/disarms tailnet
 // remote access, reveals the one-time pairing URL + QR, and manages live device
@@ -98,6 +100,49 @@ type GrantResult = {
 
 const REVEAL_MS = 60_000;
 
+// LaunchInfoWire mirrors dashboard.LaunchInfo (GET /api/launch/sessions). The
+// terminal-control surface reads writer_holder ("local" | a remote device
+// fingerprint | "") and the viewer count to show who currently drives each
+// live terminal.
+type LaunchInfoWire = {
+  token: string;
+  subcommand?: string;
+  session_id?: string;
+  viewers?: number;
+  writer_holder?: string;
+  exited?: boolean;
+  has_project_root?: boolean;
+};
+
+type RemoteSessionRow = { fingerprint: string };
+
+// ApproveReveal holds a one-time grant-control result. Like the pairing QR it
+// is kept ONLY in memory, masked after a timeout, and never re-fetched. It is
+// keyed by the terminal token (its `handle`) so the reveal renders beside the
+// exact row the operator granted control on.
+type ApproveReveal = {
+  handle: string;
+  device: string;
+  capability: string;
+  confirm: string;
+};
+
+const APPROVE_REVEAL_MS = 60_000;
+
+// StandingStatus mirrors GET /api/remote/standing-terminal — the opt-in durable
+// terminal-control secret + the two lease-policy toggles.
+type StandingStatus = {
+  enabled: boolean;
+  secret_present: boolean;
+  secret_fingerprint: string;
+  allow_terminal: boolean;
+  remote_enabled: boolean;
+  config_writable: boolean;
+  warning: string;
+  revoke_on_takeover: boolean;
+  allow_remote_terminal_takeover: boolean;
+};
+
 async function postJSON<T>(path: string, confirmToken: string, body: unknown): Promise<T> {
   return fetchJSON<T>(path, undefined, {
     method: "POST",
@@ -121,6 +166,16 @@ export function RemotePage() {
   const tailscale = useApi<TailscaleStatus>("/api/remote/tailscale/status", undefined, [], {
     refreshMs: 20_000,
   });
+  // Live terminals (GET /api/launch/sessions) power the terminal-control surface
+  // moved here from the Terminals page — grant control of a live terminal to a
+  // paired device, revoke it, or take control back locally.
+  const launchSessions = useApi<{ sessions: LaunchInfoWire[] }>(
+    "/api/launch/sessions",
+    undefined,
+    [],
+    { refreshMs: 8_000 },
+  );
+  const dock = useLaunchDock();
 
   const [host, setHost] = useState("");
   const [hostEdited, setHostEdited] = useState(false);
@@ -310,7 +365,7 @@ export function RemotePage() {
       if (res.restart_required) markRestartPending("remote-allow-terminal-view");
       setTermViewMsg(
         saved
-          ? "Allow terminal view is now on. Live now — no restart needed. Paired devices can now SEE attach/resume terminals (read-only); driving them still needs Allow terminal."
+          ? "Allow terminal view is now on (this is the default). Live now — no restart needed. Paired devices can SEE attach/resume terminals like Claude Code and Codex (read-only); driving them still needs Allow terminal + a per-terminal Grant."
           : "Allow terminal view is now off. Live now — no restart needed. Any open remote view of an attach/resume terminal was closed immediately.",
       );
       cfg.reload();
@@ -500,6 +555,13 @@ export function RemotePage() {
   }
 
   async function revoke(fingerprint: string) {
+    if (
+      !window.confirm(
+        "Revoke this device now? It ends any live remote session and unpairs the device (it must scan a new QR to reconnect).",
+      )
+    ) {
+      return;
+    }
     try {
       await fetchJSON(`/api/remote/sessions/${fingerprint}`, undefined, { method: "DELETE" });
       sessions.reload();
@@ -524,7 +586,10 @@ export function RemotePage() {
     <div className="space-y-4 p-5">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-[15px] font-semibold text-fg-1">Remote access</h1>
+          <h1 className="inline-flex items-center text-[15px] font-semibold text-fg-1">
+            Remote access
+            <HelpInd id="glossary.connect_a_device" />
+          </h1>
           <p className="mt-0.5 text-[12px] text-fg-3">
             Open this dashboard on your phone or laptop over your tailnet (Tailscale HTTPS, read-only).
             Turning it on/off and pairing devices are owner actions — they only work from this machine.
@@ -625,7 +690,7 @@ export function RemotePage() {
       {/* Arm / disarm controls. */}
       <div id="remote-arm">
       <ChartShell
-        title="Configuration"
+        title={<TitleWithHelp text="Configuration" helpId="card.remote_config" />}
         sub={
           c?.enabled
             ? "Remote access is on. Pair a device to connect a phone or laptop — that takes effect immediately. Turning remote access off needs a daemon restart to unbind the listener."
@@ -665,7 +730,7 @@ export function RemotePage() {
                   <div className="text-[10px] uppercase tracking-wide text-fg-3">allow terminal view</div>
                   <label
                     className="mt-0.5 inline-flex items-center gap-1.5"
-                    title="Independent READ opt-in: lets a paired device SEE (read-only) attach/resume terminals whose TUI can echo secrets. Strictly weaker than Allow terminal — driving still needs Allow terminal + a per-terminal approval. Hot-reloads; no restart."
+                    title="On by default — a switch you can turn OFF. Lets a paired device SEE (read-only) attach/resume terminals like Claude Code and Codex. Strictly weaker than Allow terminal: driving still needs Allow terminal + a per-terminal Grant. Hot-reloads; no restart."
                   >
                     <input
                       type="checkbox"
@@ -794,6 +859,34 @@ export function RemotePage() {
         </div>
       </ChartShell>
       </div>
+
+      {/* Terminal control for paired devices — grant a paired device control of
+          a live terminal (mints a one-time capability + confirm code scoped to
+          ONE device AND ONE terminal), revoke it, or take control back. Depends
+          on the "allow terminal" enablement in Configuration above. Owner-local
+          only. Moved here from the Terminals page so enablement → grant →
+          standing reads as one flow. */}
+      <RemoteTerminalControl
+        sessions={(launchSessions.data?.sessions ?? []).filter((s) => s.token && !s.exited)}
+        devices={sessions.data?.sessions ?? []}
+        controllerLive={sessions.data?.controller_live ?? false}
+        confirmToken={confirmToken}
+        configWritable={c?.config_writable ?? false}
+        onReload={() => {
+          launchSessions.reload();
+          sessions.reload();
+        }}
+        onTakeOver={(handle, tool, sessionId, hasProjectRoot) => {
+          const arg = { tool, sessionId, hasProjectRoot } as unknown as DockSession;
+          arg.token = handle;
+          dock.launch(arg);
+        }}
+      />
+
+      {/* Standing terminal-control access — opt-in, off by default, owner-local.
+          Rendered below the single-use grant flow so the safer per-terminal path
+          reads as the primary one. */}
+      <StandingTerminalAccess confirmToken={confirmToken} />
 
       {/* Tailscale setup + detection (§D) — a guided state machine: install →
           log in → arm → serve → pair, each step naming what's next + the
@@ -1027,7 +1120,7 @@ function TailscaleCard({
                   official install script
                 </a>{" "}
                 with <code>sudo</code> — enter your password when prompted. The command is fixed
-                (<code>curl -fsSL https://tailscale.com/install.sh | sh</code>); Observer never runs a
+                (<code>curl -fsSL https://tailscale.com/install.sh | sh</code>); SuperBased never runs a
                 command you didn't start.
               </p>
               <button
@@ -1063,8 +1156,8 @@ function TailscaleCard({
             …or download it yourself →
           </a>
           <p className="text-[11px] text-fg-3">
-            On WSL2 the tailnet may be owned by a Windows-side Tailscale, but Observer needs the Linux binary
-            the daemon itself lives beside — so installing here (in Linux) is still what Observer needs.
+            On WSL2 the tailnet may be owned by a Windows-side Tailscale, but SuperBased needs the Linux binary
+            the daemon itself lives beside — so installing here (in Linux) is still what SuperBased needs.
           </p>
         </div>
       </ChartShell>
@@ -1203,7 +1296,7 @@ function TailscaleCard({
         {!serveActive && hasBackend && (
           <div className="space-y-2">
             <p className="text-[11px] text-fg-3">
-              <strong className="text-fg-2">Step:</strong> expose Observer over tailnet HTTPS. This runs{" "}
+              <strong className="text-fg-2">Step:</strong> expose SuperBased over tailnet HTTPS. This runs{" "}
               <code>tailscale serve</code> for you — no terminal needed if the daemon has permission.
             </p>
             <button
@@ -1250,7 +1343,7 @@ function TailscaleCard({
             {/* Control-plane consent Observer cannot perform. */}
             {serveResult?.enable_url && (
               <p className="text-[11px] text-warn">
-                One-time step Observer can't do for you — enable Serve in your Tailscale account, then click
+                One-time step SuperBased can't do for you — enable Serve in your Tailscale account, then click
                 again:{" "}
                 <a href={serveResult.enable_url} target="_blank" rel="noreferrer" className="text-accent underline">
                   enable Serve →
@@ -1328,5 +1421,622 @@ function CopyButton({ text }: { text: string }) {
     >
       Copy
     </button>
+  );
+}
+
+// RemoteTerminalControl is the owner-local terminal-control surface (moved here
+// from the Terminals page). For each live terminal it shows the current
+// controller (writer_holder) + viewer count and offers: Grant control (POST
+// /api/remote/approve-execute → a one-time capability + confirm code, scoped to
+// ONE device AND ONE terminal, masked/copied to convey), emergency Revoke
+// control (DELETE the remote controller's device session), and Take over (open
+// the terminal locally, which the backend treats as a local takeover that
+// demotes the remote writer). Granting depends on the "allow terminal"
+// enablement in Configuration above. All routes are owner-loopback-only, so this
+// panel works only from the local dashboard.
+function RemoteTerminalControl({
+  sessions,
+  devices,
+  controllerLive,
+  confirmToken,
+  configWritable,
+  onReload,
+  onTakeOver,
+}: {
+  sessions: LaunchInfoWire[];
+  devices: RemoteSessionRow[];
+  controllerLive: boolean;
+  configWritable: boolean;
+  confirmToken: string;
+  onReload: () => void;
+  onTakeOver: (handle: string, tool: string, sessionId: string, hasProjectRoot: boolean) => void;
+}) {
+  const [pickDevice, setPickDevice] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  // Single active reveal (only one grant can be minted at a time), but rendered
+  // PER-ROW: the panel appears under the terminal row whose token matches
+  // reveal.handle, so the capability/confirm codes sit beside the exact terminal
+  // the operator granted control on. Masked after ~60s; "shown once" semantics.
+  const [reveal, setReveal] = useState<ApproveReveal | null>(null);
+  const [masked, setMasked] = useState(false);
+  const maskTimer = useRef<number | null>(null);
+
+  // Mask the one-time capability + confirm after a timeout, like the pairing
+  // reveal. The value survives in memory so "Reveal" re-shows it with no
+  // server round-trip.
+  useEffect(() => {
+    if (reveal) {
+      setMasked(false);
+      if (maskTimer.current) window.clearTimeout(maskTimer.current);
+      maskTimer.current = window.setTimeout(() => setMasked(true), APPROVE_REVEAL_MS);
+    }
+    return () => {
+      if (maskTimer.current) window.clearTimeout(maskTimer.current);
+    };
+  }, [reveal]);
+
+  async function approve(handle: string) {
+    const device = pickDevice[handle] || devices[0]?.fingerprint || "";
+    if (!device) {
+      setErr("No paired device to grant — pair one in Configuration above first.");
+      return;
+    }
+    if (!confirmToken) {
+      setErr("No confirm token — reload the page.");
+      return;
+    }
+    setBusy("approve:" + handle);
+    setErr(null);
+    try {
+      const res = await postJSON<{
+        capability: string;
+        confirm: string;
+        device: string;
+        handle: string;
+      }>("/api/remote/approve-execute", confirmToken, { device, handle });
+      setReveal({
+        handle,
+        device: res.device || device,
+        capability: res.capability,
+        confirm: res.confirm,
+      });
+      onReload();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function revoke(fingerprint: string) {
+    if (!fingerprint || fingerprint === "local") return;
+    if (
+      !window.confirm(
+        "Revoke this device's control now? It ends the remote writer immediately and unpairs the device (it must scan a new QR to reconnect).",
+      )
+    ) {
+      return;
+    }
+    setBusy("revoke:" + fingerprint);
+    setErr(null);
+    try {
+      await fetchJSON(`/api/remote/sessions/${fingerprint}`, undefined, { method: "DELETE" });
+      onReload();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function holderLabel(h?: string) {
+    if (!h) return { text: "no controller", variant: "neutral" as const };
+    if (h === "local") return { text: "you (local)", variant: "success" as const };
+    return { text: `remote ${h}`, variant: "warn" as const };
+  }
+
+  return (
+    <ChartShell
+      title={<TitleWithHelp text="Terminal control for paired devices" helpId="card.terminal_control" />}
+      sub="Grant a paired remote device control of a live terminal, revoke it, or take control back. Granting mints a ONE-TIME capability + confirm code scoped to ONE device AND ONE terminal (execute tier) — shown once; held only in memory (never written to disk) until it is consumed or expires. Depends on “allow terminal” enablement in Configuration above. Owner-local only."
+      right={
+        <Pill variant={controllerLive ? "success" : "neutral"}>
+          {controllerLive ? "remote live" : "remote off"}
+        </Pill>
+      }
+    >
+      <div className="space-y-3 p-1 text-[12px]">
+        {err && (
+          <div className="rounded-2 border border-danger/40 bg-danger/10 px-3 py-2 text-danger">
+            {err}
+          </div>
+        )}
+
+        {!configWritable && (
+          <div className="rounded-2 border border-line-2 bg-bg-2 px-3 py-2 text-fg-3">
+            This dashboard has no writable config path, so terminal-control grants aren't available here.
+          </div>
+        )}
+        {!controllerLive && (
+          <div className="rounded-2 border border-warn/40 bg-warn/10 px-3 py-2 text-warn">
+            Remote access isn't live. Arm it and pair a device in <span className="font-medium">Configuration</span> above
+            before you can grant terminal control.
+          </div>
+        )}
+
+        {sessions.length === 0 ? (
+          <div className="text-fg-3">No live terminals. Launch or continue a session to manage terminal control.</div>
+        ) : (
+          <table className="w-full text-left">
+            <thead className="text-[11px] text-fg-3">
+              <tr>
+                <th className="py-1">terminal</th>
+                <th className="py-1">controller</th>
+                <th className="py-1">viewers</th>
+                <th className="py-1">grant device</th>
+                <th className="py-1"></th>
+              </tr>
+            </thead>
+            <tbody className="text-fg-2">
+              {sessions.map((s) => {
+                const holder = holderLabel(s.writer_holder);
+                const remoteHeld = !!s.writer_holder && s.writer_holder !== "local";
+                return (
+                  <Fragment key={s.token}>
+                  <tr className="border-t border-line-1 align-top">
+                    <td className="py-1.5">
+                      <span className="font-mono text-fg-1">{s.subcommand || "terminal"}</span>
+                      <span className="ml-1 font-mono text-[10.5px] text-fg-3">
+                        {s.token.slice(0, 8)}…
+                      </span>
+                    </td>
+                    <td className="py-1.5">
+                      <Pill variant={holder.variant}>{holder.text}</Pill>
+                    </td>
+                    <td className="py-1.5">{s.viewers ?? 0}</td>
+                    <td className="py-1.5">
+                      <select
+                        value={pickDevice[s.token] ?? ""}
+                        disabled={!controllerLive || devices.length === 0}
+                        onChange={(e) =>
+                          setPickDevice((cur) => ({ ...cur, [s.token]: e.target.value }))
+                        }
+                        className="w-full rounded-2 border border-line-2 bg-bg-0 px-1.5 py-1 text-[11px] text-fg-1 disabled:opacity-40"
+                      >
+                        {devices.length === 0 && <option value="">no paired devices</option>}
+                        {devices.length > 0 && <option value="">choose device…</option>}
+                        {devices.map((d) => (
+                          <option key={d.fingerprint} value={d.fingerprint}>
+                            {d.fingerprint}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
+                    <td className="py-1.5">
+                      <div className="flex flex-wrap justify-end gap-1.5">
+                        <button
+                          type="button"
+                          disabled={
+                            !controllerLive ||
+                            !configWritable ||
+                            devices.length === 0 ||
+                            busy !== null
+                          }
+                          onClick={() => approve(s.token)}
+                          className="rounded-2 border border-accent/50 bg-accent/15 px-2 py-0.5 text-[11px] font-medium text-accent hover:bg-accent/25 disabled:opacity-40"
+                        >
+                          {busy === "approve:" + s.token ? "granting…" : "Grant control"}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={!remoteHeld || busy !== null}
+                          title={
+                            remoteHeld
+                              ? "Revoke this device's control of this terminal now"
+                              : "No remote device is currently controlling this terminal — writer control is single-use and ends when the device's socket closes (e.g. a phone refresh). To revoke a device entirely, use “Paired devices” below."
+                          }
+                          onClick={() => revoke(s.writer_holder as string)}
+                          className="rounded-2 border border-danger/40 bg-danger/10 px-2 py-0.5 text-[11px] text-danger hover:bg-danger/20 disabled:opacity-40"
+                        >
+                          {busy === "revoke:" + s.writer_holder ? "revoking…" : "Revoke"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onTakeOver(s.token, s.subcommand || "terminal", s.session_id || "", !!s.has_project_root)
+                          }
+                          title="Open this terminal locally — you take control back (demotes any remote writer)"
+                          className="rounded-2 border border-line-2 bg-bg-2 px-2 py-0.5 text-[11px] text-fg-2 hover:bg-bg-3"
+                        >
+                          Take over
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                  {/* Per-row one-time reveal — rendered under the exact terminal
+                      the operator granted control on. Masked after ~60s. */}
+                  {reveal?.handle === s.token && (
+                    <tr className="border-t border-line-1">
+                      <td colSpan={5} className="py-2">
+                        <div className="space-y-2 rounded-2 border border-accent/40 bg-accent/10 p-3">
+                          <div className="text-[11px] text-fg-2">
+                            Convey BOTH values to device <span className="font-mono">{reveal.device}</span> —
+                            they grant that ONE device control of THIS terminal{" "}
+                            <span className="font-mono">{reveal.handle.slice(0, 8)}…</span> (execute tier),
+                            once. Shown only now.
+                          </div>
+                          <CopyField label="capability" value={reveal.capability} masked={masked} />
+                          <CopyField label="confirm code" value={reveal.confirm} masked={masked} />
+                          <div className="flex gap-2">
+                            {masked ? (
+                              <button
+                                type="button"
+                                onClick={() => setMasked(false)}
+                                className="rounded-2 border border-line-2 bg-bg-2 px-2 py-1 text-[11px] text-fg-2 hover:bg-bg-3"
+                              >
+                                Reveal
+                              </button>
+                            ) : null}
+                            <button
+                              type="button"
+                              onClick={() => setReveal(null)}
+                              className="rounded-2 border border-line-2 bg-bg-2 px-2 py-1 text-[11px] text-fg-3 hover:bg-bg-3"
+                            >
+                              Done
+                            </button>
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                  </Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+
+        {/* Paired devices. A device is revocable whenever it is paired — NOT
+            only while it happens to hold a live writer lease (writer leases are
+            single-use and die on a phone refresh, so the per-terminal Revoke
+            above is disabled most of the time). Revoking a device here ends any
+            control it holds AND unpairs it. */}
+        <div className="rounded-2 border border-line-2 bg-bg-1 p-3">
+          <div className="mb-1 text-[11px] font-medium text-fg-2">Paired devices</div>
+          <div className="mb-2 text-[11px] text-fg-3">
+            Revoke a device to unpair it and immediately end any terminal control it holds. A revoked
+            device must scan a new QR to reconnect.
+          </div>
+          {devices.length === 0 ? (
+            <div className="text-[11px] text-fg-3">No paired devices.</div>
+          ) : (
+            <div className="space-y-1">
+              {devices.map((d) => (
+                <div key={d.fingerprint} className="flex items-center gap-2">
+                  <code className="flex-1 rounded-2 border border-line-2 bg-bg-0 px-2 py-1 font-mono text-[11px] text-fg-2">
+                    {d.fingerprint}
+                  </code>
+                  <button
+                    type="button"
+                    disabled={busy !== null}
+                    onClick={() => revoke(d.fingerprint)}
+                    title="Unpair this device and end any control it holds now"
+                    className="rounded-2 border border-danger/40 bg-danger/10 px-2 py-1 text-[11px] text-danger hover:bg-danger/20 disabled:opacity-40"
+                  >
+                    {busy === "revoke:" + d.fingerprint ? "revoking…" : "Revoke device"}
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </ChartShell>
+  );
+}
+
+// StandingTerminalAccess is the OPT-IN standing terminal-control surface: mint a
+// single durable, hashed-at-rest secret that lets a paired device re-acquire
+// writer control across websocket refreshes WITHOUT a fresh per-terminal Grant
+// each time. DEFAULT OFF, with a firm security warning: standing access is a
+// strict superset of risk over the single-use grant flow (anyone with the secret
+// + a paired session controls EVERY terminal). Owner-local only. The raw secret
+// is shown ONCE on mint and stored hashed at rest; revoke kills the secret AND
+// every writer holding through it.
+function StandingTerminalAccess({
+  confirmToken,
+}: {
+  confirmToken: string;
+}) {
+  const status = useApi<StandingStatus>("/api/remote/standing-terminal", undefined, [], {
+    refreshMs: 20_000,
+  });
+  const st = status.data;
+  const [busy, setBusy] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [secret, setSecret] = useState<string | null>(null);
+  const [masked, setMasked] = useState(false);
+  const maskTimer = useRef<number | null>(null);
+
+  // Mask the one-time secret after a timeout (like the pairing reveal). The
+  // value survives in memory so "Reveal" re-shows it with no round-trip.
+  useEffect(() => {
+    if (secret) {
+      setMasked(false);
+      if (maskTimer.current) window.clearTimeout(maskTimer.current);
+      maskTimer.current = window.setTimeout(() => setMasked(true), APPROVE_REVEAL_MS);
+    }
+    return () => {
+      if (maskTimer.current) window.clearTimeout(maskTimer.current);
+    };
+  }, [secret]);
+
+  const canManage = !!st?.config_writable;
+  const prereqOK = !!st?.remote_enabled && !!st?.allow_terminal;
+  // Honest disabled copy: name the exact missing dependency. Both prerequisites
+  // now live on THIS page (Configuration above), so point there.
+  const disabledReason = !canManage
+    ? "This dashboard has no writable config path, so standing access can't be managed here."
+    : !st?.remote_enabled
+      ? "Remote access is off. Arm it in Configuration above first."
+      : !st?.allow_terminal
+        ? "“Allow terminal” is off. Turn it on in Configuration above first — standing access only grants what allow terminal permits."
+        : "";
+
+  async function mint() {
+    if (!confirmToken) {
+      setErr("No confirm token — reload the page.");
+      return;
+    }
+    setBusy("mint");
+    setErr(null);
+    try {
+      const res = await postJSON<{ secret: string }>(
+        "/api/remote/standing-terminal/mint",
+        confirmToken,
+        {},
+      );
+      setSecret(res.secret);
+      status.reload();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function revoke() {
+    if (!confirmToken) {
+      setErr("No confirm token — reload the page.");
+      return;
+    }
+    if (
+      !window.confirm(
+        "Revoke standing terminal-control access? This deletes the secret and immediately drops every remote writer that acquired control through it.",
+      )
+    ) {
+      return;
+    }
+    setBusy("revoke");
+    setErr(null);
+    try {
+      await postJSON("/api/remote/standing-terminal/revoke", confirmToken, {});
+      setSecret(null);
+      status.reload();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // saveRevokeOnTakeover flips [remote].revoke_standing_on_takeover — the opt-in
+  // hardening that makes a desktop takeover of a standing-secret writer also
+  // revoke the standing secret. Default off (seamless). Live immediately.
+  async function saveRevokeOnTakeover(next: boolean) {
+    if (!confirmToken) {
+      setErr("No confirm token — reload the page.");
+      return;
+    }
+    setBusy("revoke-on-takeover");
+    setErr(null);
+    try {
+      await postJSON("/api/remote/standing-revoke-on-takeover", confirmToken, {
+        revoke_standing_on_takeover: next,
+      });
+      status.reload();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // saveAllowRemoteTakeover flips the default-on post-authentication lease
+  // policy. Credential validation is unchanged; the live controller hot-reloads.
+  async function saveAllowRemoteTakeover(next: boolean) {
+    if (!confirmToken) {
+      setErr("No confirm token — reload the page.");
+      return;
+    }
+    setBusy("allow-remote-takeover");
+    setErr(null);
+    try {
+      await postJSON("/api/remote/allow-remote-takeover", confirmToken, {
+        allow_remote_terminal_takeover: next,
+      });
+      status.reload();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <ChartShell
+      title={<TitleWithHelp text="Standing terminal-control access (advanced)" helpId="card.standing_terminal" />}
+      sub="Opt-in: a single durable secret that lets a paired device keep terminal control across page refreshes, without re-granting each terminal. Off by default — the per-terminal single-use grants above are the safer path. Owner-local only."
+      right={
+        <Pill variant={st?.enabled ? "warn" : "neutral"}>
+          {st?.enabled ? "standing access ON" : "standing access off"}
+        </Pill>
+      }
+    >
+      <div className="space-y-3 p-1 text-[12px]">
+        {err && (
+          <div className="rounded-2 border border-danger/40 bg-danger/10 px-3 py-2 text-danger">{err}</div>
+        )}
+
+        {/* The firm security warning — shown verbatim from the server. */}
+        <div className="rounded-2 border border-warn/40 bg-warn/10 px-3 py-2 text-[11px] text-warn">
+          <span className="font-medium">Security warning. </span>
+          {st?.warning ??
+            "Standing access means anyone who has this secret AND a paired remote session can control EVERY live terminal, across refreshes, until you revoke it. Per-terminal single-use grants are safer."}
+        </div>
+
+        {disabledReason && (
+          <div className="rounded-2 border border-line-2 bg-bg-2 px-3 py-2 text-fg-3">{disabledReason}</div>
+        )}
+
+        {/* One-time secret reveal — masked after ~60s. */}
+        {secret && (
+          <div className="space-y-2 rounded-2 border border-accent/40 bg-accent/10 p-3">
+            <div className="text-[11px] text-fg-2">
+              Standing secret — shown ONCE. Convey it to the device you want to grant standing control. A
+              device may store it in its browser localStorage so control survives a refresh; that means the
+              secret lives on that device — treat it like a password and revoke it if the device is lost.
+            </div>
+            <CopyField label="standing secret" value={secret} masked={masked} />
+            <div className="flex gap-2">
+              {masked && (
+                <button
+                  type="button"
+                  onClick={() => setMasked(false)}
+                  className="rounded-2 border border-line-2 bg-bg-2 px-2 py-1 text-[11px] text-fg-2 hover:bg-bg-3"
+                >
+                  Reveal
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setSecret(null)}
+                className="rounded-2 border border-line-2 bg-bg-2 px-2 py-1 text-[11px] text-fg-3 hover:bg-bg-3"
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        )}
+
+        {st?.enabled && st?.secret_present && (
+          <div className="text-[11px] text-fg-3">
+            A standing secret is provisioned (<span className="font-mono">{st.secret_fingerprint}</span>). The
+            raw secret is never re-shown — rotate to issue a fresh one, or revoke to turn standing access off.
+          </div>
+        )}
+
+        {st?.remote_enabled && (
+          <label className="flex items-start gap-2 rounded-2 border border-line-2 bg-bg-2 px-3 py-2">
+            <input
+              type="checkbox"
+              className="mt-[2px]"
+              checked={st?.allow_remote_terminal_takeover ?? true}
+              disabled={!canManage || busy !== null}
+              onChange={(e) => void saveAllowRemoteTakeover(e.target.checked)}
+            />
+            <span>
+              <span className="font-medium text-fg-2">Allow remote devices to take over control</span>
+              <span className="block text-[11px] text-fg-3">
+                On (default): an authenticated remote device with a valid one-time grant or standing secret
+                can take control from the native/local seat or another remote device; the losing seat stays
+                connected read-only and can take control back. Off: a held terminal refuses the remote
+                acquire. A refused one-time grant is consumed, so a fresh grant is required. Live
+                immediately; no restart.
+              </span>
+            </span>
+          </label>
+        )}
+
+        {st?.remote_enabled && (
+          <label className="flex items-start gap-2 rounded-2 border border-line-2 bg-bg-2 px-3 py-2">
+            <input
+              type="checkbox"
+              className="mt-[2px]"
+              checked={!!st?.revoke_on_takeover}
+              disabled={!canManage || busy !== null}
+              onChange={(e) => void saveRevokeOnTakeover(e.target.checked)}
+            />
+            <span>
+              <span className="font-medium text-fg-2">Revoke standing access when this desktop takes over</span>
+              <span className="block text-[11px] text-fg-3">
+                Off (default): taking over a remote writer only revokes its live control — the paired device
+                can re-take control later (seamless). On: a desktop takeover of a writer that held control
+                through the standing secret ALSO revokes the secret itself — the device must be granted a
+                fresh secret to regain standing control. Live immediately; no restart.
+              </span>
+            </span>
+          </label>
+        )}
+
+        <div className="flex flex-wrap items-center gap-2 pt-1">
+          <button
+            type="button"
+            disabled={!prereqOK || !canManage || busy !== null}
+            onClick={mint}
+            className="rounded-2 border border-accent/50 bg-accent/15 px-3 py-1 text-[12px] text-accent hover:bg-accent/25 disabled:opacity-40"
+          >
+            {busy === "mint"
+              ? st?.enabled
+                ? "rotating…"
+                : "enabling…"
+              : st?.enabled
+                ? "Rotate standing secret"
+                : "Enable standing access"}
+          </button>
+          {st?.enabled && (
+            <button
+              type="button"
+              disabled={!canManage || busy !== null}
+              onClick={revoke}
+              className="rounded-2 border border-danger/40 bg-danger/10 px-3 py-1 text-[12px] text-danger hover:bg-danger/20 disabled:opacity-40"
+            >
+              {busy === "revoke" ? "revoking…" : "Revoke standing access"}
+            </button>
+          )}
+        </div>
+      </div>
+    </ChartShell>
+  );
+}
+
+// CopyField renders a masked-or-shown secret with a copy button — the same
+// convey-once discipline as the pairing reveal.
+function CopyField({
+  label,
+  value,
+  masked,
+}: {
+  label: string;
+  value: string;
+  masked: boolean;
+}) {
+  return (
+    <div>
+      <div className="mb-0.5 text-[10px] uppercase tracking-wide text-fg-3">{label}</div>
+      <div className="flex items-center gap-2">
+        <code className="flex-1 break-all rounded-2 border border-line-2 bg-bg-1 px-2 py-1 font-mono text-[11px] text-fg-2">
+          {masked ? "•••••••••••••• (hidden — click Reveal)" : value}
+        </code>
+        <button
+          type="button"
+          onClick={() => navigator.clipboard?.writeText(value)}
+          className="rounded-2 border border-line-2 bg-bg-2 px-2 py-1 text-[11px] text-fg-2 hover:bg-bg-3"
+        >
+          Copy
+        </button>
+      </div>
+    </div>
   );
 }

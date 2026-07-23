@@ -77,7 +77,7 @@ export function ReportPage() {
               ) : (
                 "all projects · "
               )}
-              generated {r.generated_at} · SuperBased Observer
+              generated {r.generated_at} · SuperBased
             </p>
           </header>
 

@@ -3,7 +3,7 @@
 // Polls /api/analysis/headline?days=1 every 60s. Shows period.cost_usd
 // with delta vs yesterday in the tooltip alongside the top model and
 // month projection. Click → observer.openDashboard. Degrades to a
-// "Observer not running" state when the daemon is unreachable; in
+// "SuperBased not running" state when the daemon is unreachable; in
 // managed/auto mode the click action upgrades to "Restart Daemon"
 // so the operator can recover without leaving the editor.
 
@@ -30,10 +30,10 @@ export function createCostStatusBar(
   }
 
   const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-  item.name = 'Observer: Today spend';
+  item.name = 'SuperBased: Today spend';
   item.command = 'observer.openDashboard';
-  item.text = '$(graph) Observer …';
-  item.tooltip = 'Observer: polling…';
+  item.text = '$(graph) SuperBased …';
+  item.tooltip = 'SuperBased: polling…';
   item.show();
   ctx.subscriptions.push(item);
 
@@ -87,22 +87,22 @@ function renderHeadline(item: vscode.StatusBarItem, data: HeadlineResponse): voi
 }
 
 function renderIdle(item: vscode.StatusBarItem, mode: string): void {
-  item.text = '$(circle-slash) Observer idle';
+  item.text = '$(circle-slash) SuperBased idle';
   const hint =
     mode === 'detect'
       ? 'No daemon running. Run `observer start` in a terminal, or set `observer.daemon.mode` to `managed`.'
-      : 'No daemon running. Run `Observer: Start Daemon` to launch one.';
+      : 'No daemon running. Run `SuperBased: Start Daemon` to launch one.';
   const md = new vscode.MarkdownString();
-  md.appendMarkdown(`**Observer**: idle\n\n${hint}`);
+  md.appendMarkdown(`**SuperBased**: idle\n\n${hint}`);
   item.tooltip = md;
   item.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
 }
 
 function renderDegraded(item: vscode.StatusBarItem, mode: string): void {
-  item.text = '$(warning) Observer unreachable';
+  item.text = '$(warning) SuperBased unreachable';
   const md = new vscode.MarkdownString();
   md.appendMarkdown(
-    `**Observer**: dashboard did not respond.\n\n` +
+    `**SuperBased**: dashboard did not respond.\n\n` +
       (mode === 'detect'
         ? 'The lockfile says a daemon is running, but its dashboard port is not answering. Check the Output channel.'
         : 'Click to restart the extension-managed daemon.'),

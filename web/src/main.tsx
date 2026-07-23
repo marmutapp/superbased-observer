@@ -7,6 +7,17 @@ import { LaunchDockProvider } from "./components/LaunchDock";
 import { RemotePairingGate } from "./components/RemotePairing";
 import "./index.css";
 
+// Input-event trace overlay (lib/sttdebug.ts) — the diagnostic that cracked
+// the 2026-07-23 dictation-paste bug (see docs/session-handoff.md "STT /
+// dictation into terminals"). DEV BUILDS ONLY, and even there a no-op unless
+// ?sttdebug=1 or localStorage sbo_sttdebug=1. The import.meta.env.DEV guard
+// compile-gates it: the dynamic import is tree-shaken out of production
+// bundles, so the shipped dashboard carries no input-capture surface
+// (codex review 2026-07-23, finding 1).
+if (import.meta.env.DEV) {
+  import("./lib/sttdebug").then((m) => m.initSttDebug());
+}
+
 // Stale-preload auto-recovery. After `make web-build` ships a new
 // bundle, every open dashboard tab still references the prior
 // chunk hashes via its cached index.html — any lazy-imported route

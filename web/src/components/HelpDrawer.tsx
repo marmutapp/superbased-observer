@@ -10,6 +10,7 @@ import {
   type HelpCategory,
   type HelpEntry,
 } from "@/lib/help";
+import { useTour } from "@/components/tour/TourProvider";
 
 const CATEGORY_LABEL: Record<HelpCategory, string> = {
   tab: "Tabs",
@@ -34,6 +35,7 @@ export function HelpDrawer({
   const [query, setQuery] = useState("");
   const [activeId, setActiveId] = useState<string | null>(null);
   const itemRefs = useRef<Map<string, HTMLLIElement>>(new Map());
+  const { startTour } = useTour();
 
   // Sync the externally-supplied initialId into local state on open.
   useEffect(() => {
@@ -92,6 +94,18 @@ export function HelpDrawer({
       width={560}
     >
       <div className="flex h-full flex-col">
+        <div className="border-b border-line-1 px-4 pt-4">
+          <button
+            type="button"
+            onClick={() => {
+              onClose();
+              startTour();
+            }}
+            className="flex w-full items-center justify-center gap-1.5 rounded-2 border border-accent/40 bg-accent-soft px-3 py-2 text-[12px] font-semibold text-accent transition-colors hover:bg-accent/20"
+          >
+            <span aria-hidden>▶</span> Take the product tour
+          </button>
+        </div>
         <div className="border-b border-line-1 p-4">
           <input
             type="search"

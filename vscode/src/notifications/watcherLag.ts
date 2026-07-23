@@ -58,7 +58,7 @@ export class WatcherLagNotifier implements vscode.Disposable {
       if (!decision.fire) return;
       this.lastFiredAtMs.set(decision.worstFile!, Date.now());
       const msg =
-        `Observer watcher behind on ${baseName(decision.worstFile!)} ` +
+        `SuperBased watcher behind on ${baseName(decision.worstFile!)} ` +
         `(${formatBytes(decision.worstBytes ?? 0)}; total lag ${formatBytes(decision.totalBytes ?? 0)}).`;
       const choice = await vscode.window.showWarningMessage(msg, 'Show Output', 'Dismiss');
       if (choice === 'Show Output') {

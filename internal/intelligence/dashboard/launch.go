@@ -19,6 +19,7 @@ import (
 
 	"github.com/marmutapp/superbased-observer/internal/handoff"
 	"github.com/marmutapp/superbased-observer/internal/integration"
+	"github.com/marmutapp/superbased-observer/internal/remoteauth"
 	"github.com/marmutapp/superbased-observer/internal/termrun"
 	"github.com/marmutapp/superbased-observer/internal/termsvc"
 )
@@ -89,15 +90,17 @@ type LaunchManager interface {
 	// local-only) session. The dashboard redacts these from remotely-visible
 	// snapshots and refuses their remote termination. Unknown handle ⇒ false.
 	IsSetupSession(handle string) bool
-	// IsRemoteSensitiveSession reports whether a handle is a remote-deny-by-default
-	// run: an external `observer <tool> --attach` session (KindAttach) OR a native
-	// resume of a real closed transcript (KindResume) — both bind a daemon-owned
-	// PTY to a REAL external transcript whose TUI can echo secrets/customer data.
-	// The dashboard denies a remote-exposed caller both the snapshot row
-	// (visibleSnapshot) and the websocket subscription (handleLaunchWS) for such a
-	// handle by default (§3.2), pending the Phase-4 [remote].allow_terminal_view
-	// opt-in. Branches on run KIND (the shared termrun.IsRemoteSensitiveKind
-	// table), never a tool name. Unknown handle ⇒ false.
+	// IsRemoteSensitiveSession reports whether a handle is a remote-VIEW
+	// sensitive run: an external `observer <tool> --attach` session (KindAttach)
+	// OR a native resume of a real closed transcript (KindResume) — both bind a
+	// daemon-owned PTY to a REAL external transcript whose TUI can echo
+	// secrets/customer data. Whether the dashboard exposes such a handle to a
+	// remote-exposed caller (its snapshot row via visibleSnapshot and its
+	// websocket subscription via handleLaunchWS) is governed by the
+	// [remote].allow_terminal_view toggle, which now DEFAULTS TRUE (§3.2) — set
+	// it false to restore the deny-read posture. Branches on run KIND (the shared
+	// termrun.IsRemoteSensitiveKind table), never a tool name. Unknown handle ⇒
+	// false.
 	IsRemoteSensitiveSession(handle string) bool
 	// Unsubscribe releases a viewer's subscription (child survives for
 	// reconnect).
@@ -160,7 +163,7 @@ type LaunchWriter interface {
 	// Holder is the lease holder identity ("local" or a device fingerprint).
 	Holder() string
 	// RevokeIsTakeover reports (meaningfully only AFTER Revoked() has closed)
-	// whether the lease ended because a LOCAL takeover superseded it. On the
+	// whether the lease ended because another granted writer superseded it. On the
 	// remote bridge a takeover only DEMOTES the client to a viewer (the device
 	// session is still valid); any other termination — an admin/device revoke,
 	// an expiry, or teardown — CLOSES the socket. *termsession.WriterLease
@@ -253,8 +256,15 @@ type LaunchInfo struct {
 	Tool string `json:"tool,omitempty"`
 	// RunID is the durable terminal_run identity this PTY handle belongs to
 	// (F1); empty when the session predates the run-identity wiring.
-	RunID     string    `json:"run_id,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	RunID string `json:"run_id,omitempty"`
+	// HasProjectRoot reports whether this run has a resolvable project root
+	// (Arc A). It lets the dashboard enable/disable the per-terminal Files/Git
+	// panel buttons straight from the /api/launch/sessions rehydrate with no
+	// extra round-trip. The raw path is DELIBERATELY not carried here (this
+	// struct flows to remote viewers); the path itself is served only by the
+	// gated project-panel endpoint.
+	HasProjectRoot bool      `json:"has_project_root"`
+	CreatedAt      time.Time `json:"created_at"`
 	// Attached is retained for wire compatibility: true when at least one viewer
 	// is subscribed. Viewers is the exact read-only subscriber count and
 	// WriterHolder identifies the controlling writer ("local" or a remote device
@@ -309,34 +319,95 @@ var (
 	ErrLaunchSetupInFlight = errors.New("a setup session of this kind is already starting")
 )
 
+// ControlDenialReason is the stable wire taxonomy for a refused remote writer
+// acquire. Only ControlDenialAuth means a credential was genuinely rejected;
+// callers must not clear a standing secret for any other reason.
+type ControlDenialReason string
+
+const (
+	// ControlDenialAuth means the capability/confirm or standing secret failed
+	// its credential check.
+	ControlDenialAuth ControlDenialReason = "auth"
+	// ControlDenialHeldLocally means a local/native writer holds control and the
+	// authenticated-remote takeover policy is disabled.
+	ControlDenialHeldLocally ControlDenialReason = "held_locally"
+	// ControlDenialHeldByRemote means another remote writer holds control and the
+	// authenticated-remote takeover policy is disabled.
+	ControlDenialHeldByRemote ControlDenialReason = "held_by_remote"
+	// ControlDenialTerminalDisabled means [remote].allow_terminal is off.
+	ControlDenialTerminalDisabled ControlDenialReason = "terminal_disabled"
+	// ControlDenialSessionInvalid means the paired device session is no longer valid.
+	ControlDenialSessionInvalid ControlDenialReason = "session_invalid"
+	// ControlDenialPolicyDenied means listener/launch/session policy refused the target.
+	ControlDenialPolicyDenied ControlDenialReason = "policy_denied"
+	// ControlDenialNotFound means the terminal session no longer exists.
+	ControlDenialNotFound ControlDenialReason = "not_found"
+	// ControlDenialUnavailable means the writer path or a raced lifecycle state
+	// was unavailable without proving any credential defect.
+	ControlDenialUnavailable ControlDenialReason = "unavailable"
+)
+
+// ControlDeniedError carries a typed acquire refusal across the cmd adapter
+// boundary without importing internal/termsession into dashboard. Cause remains
+// unwrap-able for backend tests and diagnostics. CapabilityConsumed is true
+// only when a valid single-use capability was burned before a later lease-policy
+// refusal, allowing the audit/UI to request a fresh approval honestly.
+type ControlDeniedError struct {
+	Reason             ControlDenialReason
+	CapabilityConsumed bool
+	Cause              error
+}
+
+// Error implements error without exposing secret-adjacent details.
+func (e *ControlDeniedError) Error() string {
+	if e == nil {
+		return "terminal control denied"
+	}
+	return "terminal control denied: " + string(e.Reason)
+}
+
+// Unwrap preserves the adapter's underlying sentinel for internal callers.
+func (e *ControlDeniedError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+// NewControlDeniedError constructs a typed dashboard-boundary denial.
+func NewControlDeniedError(reason ControlDenialReason, capabilityConsumed bool, cause error) error {
+	return &ControlDeniedError{Reason: reason, CapabilityConsumed: capabilityConsumed, Cause: cause}
+}
+
 // visibleSnapshot returns the live launch-session list filtered for the request
 // principal: on the owner-trusted loopback listener (not remote-exposed) it is
-// the full snapshot; for a REMOTE-exposed caller every SpecSetup handle AND
-// every remote-sensitive (attach OR resume) handle is redacted (defence in depth
+// the full snapshot; for a REMOTE-exposed caller every SpecSetup handle is
+// redacted, and every remote-sensitive (attach OR resume) handle is redacted
+// UNLESS the [remote].allow_terminal_view READ opt-in is on (defence in depth
 // over the SubscribeRemote / WS-gate refusals). Branches on the boundary-resolved
 // local-vs-remote signal (remoteExposedFromContext) + the run KIND carried on the
 // row (the shared termrun.IsRemoteSensitiveKind table), never on tool/route name.
 //
-// Remote-sensitive redaction is deny-by-default (§3.2): an `observer <tool>
-// --attach` session (KindAttach) is an EXTERNAL agent PTY the operator started
-// outside the dashboard, and a native resume (KindResume) reopens a real closed
-// transcript; either TUI can echo API keys / customer data, and the operator is
-// less likely to intend exposing it than a dashboard-spawned fresh/handoff
-// session. So a paired remote device does not even learn such a session exists.
-// This is the READ half of the Phase-4 gate pulled forward; Phase 4 adds a
-// `[remote].allow_terminal_view` opt-in that, when true, will let these rows
-// through here (and past the WS gate) for a remote caller. Until then: default
-// deny, uniformly across every remotely-visible snapshot
+// The remote-VIEW gate `[remote].allow_terminal_view` now DEFAULTS TRUE (§3.2),
+// so a paired remote device SEES attach/resume rows by default and may subscribe
+// read-only past the WS gate. This is acceptable because remote access is already
+// multi-lever gated (armed rail + authenticated paired device over the tailnet)
+// and the remote WRITE/drive path is UNCHANGED — driving still requires
+// allow_terminal plus the full writer-acquire conjunction. The toggle still
+// exists: allow_terminal_view = false restores the deny-read posture, redacting
+// these rows uniformly across every remotely-visible snapshot
 // (/api/attach/sessions, /api/terminal/sessions, /api/launch/sessions all route
-// through here).
+// through here). SpecSetup handles are ALWAYS redacted — no view opt-in relaxes
+// them.
 func (s *Server) visibleSnapshot(ctx context.Context) []LaunchInfo {
 	all := s.opts.LaunchManager.Snapshot()
 	if !remoteExposedFromContext(ctx) {
 		return all
 	}
-	// The remote-VIEW opt-in ([remote].allow_terminal_view, Phase 4) lets a
-	// remote caller SEE attach/resume rows; until it is on, they are redacted.
-	// Setup handles are ALWAYS redacted (local-only, no view opt-in relaxes them).
+	// The remote-VIEW opt-in ([remote].allow_terminal_view, default TRUE) lets a
+	// remote caller SEE attach/resume rows; when explicitly turned OFF they are
+	// redacted. Setup handles are ALWAYS redacted (local-only; no view opt-in
+	// relaxes them).
 	viewSensitive := s.allowTerminalView()
 	out := make([]LaunchInfo, 0, len(all))
 	for _, info := range all {
@@ -344,7 +415,7 @@ func (s *Server) visibleSnapshot(ctx context.Context) []LaunchInfo {
 			continue // redact privileged setup handles from remote callers
 		}
 		if !viewSensitive && termrun.IsRemoteSensitiveKind(termrun.Kind(info.Kind)) {
-			continue // deny-by-default remote VIEW of an attach/resume session (§3.2)
+			continue // allow_terminal_view is OFF — hide this attach/resume PTY (§3.2; default is now ON)
 		}
 		out = append(out, info)
 	}
@@ -352,11 +423,13 @@ func (s *Server) visibleSnapshot(ctx context.Context) []LaunchInfo {
 }
 
 // allowTerminalView reports whether the LIVE [remote].allow_terminal_view READ
-// opt-in is enabled (session-attach design §3.2, Phase 4). It is the independent
-// remote-VIEW gate that relaxes the attach/resume deny-by-default — strictly
-// weaker than allow_terminal (write). Read via a type assertion off the injected
-// RemoteController (additive, CLAUDE.md #6): a nil / non-implementing controller
-// (loopback-only, no remote exposure) yields false, so the deny-by-default holds
+// opt-in is enabled (session-attach design §3.2). It is the independent
+// remote-VIEW gate for attach/resume rows — strictly weaker than allow_terminal
+// (write) — and now DEFAULTS TRUE in config, so a remote-exposed node exposes
+// these rows read-only unless the operator sets allow_terminal_view = false.
+// Read via a type assertion off the injected RemoteController (additive,
+// CLAUDE.md #6): a nil / non-implementing controller (loopback-only, no remote
+// exposure) yields false, so the redaction still holds on any non-remote path
 // and every existing test path is unchanged. Mirrors how the live allow_terminal
 // gate is read.
 func (s *Server) allowTerminalView() bool {
@@ -647,6 +720,24 @@ type launchResponse struct {
 	Token      string `json:"token"`
 	Subcommand string `json:"subcommand"`
 	SessionID  string `json:"session_id"`
+	// HasProjectRoot lets the dock enable the Files/Git project panels
+	// immediately on a fresh launch instead of waiting for a later
+	// /api/launch/sessions rehydrate (finding 8). Resolved from the same
+	// token→root seam the project panel Snapshot uses.
+	HasProjectRoot bool `json:"has_project_root"`
+}
+
+// hasProjectRoot reports whether a freshly-minted terminal token resolves to a
+// known, non-default project root — via the same ProjectRootResolver seam the
+// project panel uses. A nil resolver (panel unwired) or a rootless/unknown token
+// both yield false, so a POST response can honestly tell the dock up front
+// whether the Files/Git panels are available (finding 8).
+func (s *Server) hasProjectRoot(token string) bool {
+	if s.opts.ProjectRootResolver == nil {
+		return false
+	}
+	root, known := s.opts.ProjectRootResolver(token)
+	return known && root != ""
 }
 
 // handleSessionLaunch serves POST /api/session/<id>/launch. It validates the
@@ -705,7 +796,10 @@ func (s *Server) handleSessionLaunch(w http.ResponseWriter, r *http.Request, ses
 		}
 		return
 	}
-	writeJSON(w, launchResponse{Token: handle, Subcommand: sub, SessionID: sessionID})
+	writeJSON(w, launchResponse{
+		Token: handle, Subcommand: sub, SessionID: sessionID,
+		HasProjectRoot: s.hasProjectRoot(handle),
+	})
 }
 
 // resumeResponse is the reply from POST /api/session/<id>/resume. It carries
@@ -718,6 +812,8 @@ type resumeResponse struct {
 	RunID      string `json:"run_id"`
 	Subcommand string `json:"subcommand"`
 	SessionID  string `json:"session_id"`
+	// HasProjectRoot: see launchResponse (finding 8).
+	HasProjectRoot bool `json:"has_project_root"`
 }
 
 // resumeGate is a reference-counted per-session mutex used to single-flight the
@@ -872,7 +968,10 @@ func (s *Server) handleSessionResume(w http.ResponseWriter, r *http.Request, ses
 	// (the writer-lease audit only fires once a client attaches). Metadata only —
 	// run id, handle, tool — never argv/env/content.
 	s.auditSpawn(SpawnAuditKind(termrun.KindResume), tool, handle, runID, r)
-	writeJSON(w, resumeResponse{Token: handle, RunID: runID, Subcommand: cap.Resume.Subcommand, SessionID: sessionID})
+	writeJSON(w, resumeResponse{
+		Token: handle, RunID: runID, Subcommand: cap.Resume.Subcommand, SessionID: sessionID,
+		HasProjectRoot: s.hasProjectRoot(handle),
+	})
 }
 
 // terminalLaunchRequest is the POST /api/terminal/launch body (F1). The only
@@ -890,6 +989,8 @@ type terminalLaunchResponse struct {
 	Token      string `json:"token"`
 	Tool       string `json:"tool"`
 	Subcommand string `json:"subcommand"`
+	// HasProjectRoot: see launchResponse (finding 8).
+	HasProjectRoot bool `json:"has_project_root"`
 }
 
 // handleTerminalLaunch serves POST /api/terminal/launch — the F1 fresh-agent
@@ -940,7 +1041,10 @@ func (s *Server) handleTerminalLaunch(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	writeJSON(w, terminalLaunchResponse{Token: handle, Tool: body.Tool, Subcommand: sub})
+	writeJSON(w, terminalLaunchResponse{
+		Token: handle, Tool: body.Tool, Subcommand: sub,
+		HasProjectRoot: s.hasProjectRoot(handle),
+	})
 }
 
 // handleTerminalSessions serves GET /api/terminal/sessions — the live
@@ -1088,6 +1192,10 @@ type wsControl struct {
 	Rows uint16 `json:"rows,omitempty"`
 	Cols uint16 `json:"cols,omitempty"`
 	Code int    `json:"code,omitempty"`
+	// Gen identifies the session-monotonic writer-lease generation on
+	// control_granted and control_revoked. The browser uses it to ignore a stale
+	// revoke that arrives after a newer grant during rapid takeover ping-pong.
+	Gen uint64 `json:"gen,omitempty"`
 	// InitialRows/InitialCols ride the on-open {"t":"pty_size",…} geometry frame
 	// (Feature 2) alongside Rows/Cols (the current size), so the web terminal can
 	// restore the PTY's real dimensions. Omitted on every other control frame.
@@ -1100,6 +1208,10 @@ type wsControl struct {
 	// websocket, never a URL/subprotocol/query (§8.1 #5).
 	Cap     string `json:"cap,omitempty"`
 	Confirm string `json:"confirm,omitempty"`
+	// By identifies the requester that superseded this writer (local|remote).
+	By string `json:"by,omitempty"`
+	// Reason carries the typed denial taxonomy on control_denied.
+	Reason ControlDenialReason `json:"reason,omitempty"`
 }
 
 // ptyGeometry is the PTY dimension snapshot the on-open (and control-transition)
@@ -1247,10 +1359,11 @@ func (s *Server) handleLaunchWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.opts.LaunchManager.Unsubscribe(sub)
 
-	// A remote-exposed request may NEVER take the owner-local writer (that would
-	// hand a remote principal an ungated PTY); it starts read-only and must
-	// acquire a writer through the §4.δ conjunction (AcquireWriterRemote) via a
-	// writer-acquire control frame. The owner-trusted loopback path keeps the
+	// A remote-exposed request may never take the owner-local writer implicitly
+	// (that would hand a remote principal an ungated PTY). It starts read-only and
+	// must acquire through the §4.δ conjunction (AcquireWriterRemote) via a
+	// writer-acquire control frame; only after that credential gate may live
+	// policy permit a takeover. The owner-trusted loopback path keeps the
 	// CapabilityLocal writer (never refused).
 	if remoteExposed {
 		device := sessionCookie(r)
@@ -1265,6 +1378,7 @@ func (s *Server) handleLaunchWS(w http.ResponseWriter, r *http.Request) {
 		// failed leg (never which leg) + consume on success.
 		acquire := func(capTok, confirm string) (LaunchWriter, error) {
 			s.auditTerminalControl("terminal_control_request", deviceFP, handle, peer, "request", "acquire_writer")
+			standingCredential := remoteauth.IsStandingSecret(capTok)
 			wl, err := s.opts.LaunchManager.AcquireWriterRemote(RemoteWriterRequest{
 				Handle:          handle,
 				DeviceSessionID: device,
@@ -1273,11 +1387,24 @@ func (s *Server) handleLaunchWS(w http.ResponseWriter, r *http.Request) {
 				RemoteExposed:   true, // provenance, resolved at the boundary
 			})
 			if err != nil || wl == nil {
-				// Coarse denial: never which leg failed, never the secret (§8.1 #6).
-				s.auditTerminalControl("terminal_control_denied", deviceFP, handle, peer, "deny", "authorize_rejected")
+				reason := ControlDenialUnavailable
+				var denial *ControlDeniedError
+				if errors.As(err, &denial) {
+					if denial.Reason != "" {
+						reason = denial.Reason
+					}
+					if denial.CapabilityConsumed {
+						s.auditTerminalControl("terminal_control_capability_consume", deviceFP, handle, peer, "allow", "consumed_before_"+string(reason))
+					}
+				}
+				// The reason is coarse and stable; it never reveals which credential
+				// sub-leg failed. A consumed capability is audited separately above.
+				s.auditTerminalControl("terminal_control_denied", deviceFP, handle, peer, "deny", string(reason))
 				return wl, err
 			}
-			s.auditTerminalControl("terminal_control_capability_consume", deviceFP, handle, peer, "allow", "")
+			if !standingCredential {
+				s.auditTerminalControl("terminal_control_capability_consume", deviceFP, handle, peer, "allow", "")
+			}
 			return wl, err
 		}
 		// Denied-frame coalescer: a viewer with no writer lease flooding forged
@@ -1286,7 +1413,7 @@ func (s *Server) handleLaunchWS(w http.ResponseWriter, r *http.Request) {
 		denied := s.newDeniedFrameCoalescer(deviceFP, handle, peer)
 		// closeOnHardRevoke=true: on the REMOTE bridge an admin/device revoke of
 		// the writer lease closes the socket (the device is no longer trusted); a
-		// local takeover only demotes. The owner-local bridge below passes false
+		// lease takeover only demotes. The owner-local bridge below passes false
 		// so its revoke behaviour stays byte-identical (always demote).
 		s.bridgeTerminalWS(r.Context(), c, sub, nil, acquire, denied, true, func() ptyGeometry { return s.ptySizeForHandle(handle) })
 		return
@@ -1354,9 +1481,9 @@ func init() {
 // acquired here is Release()d when the bridge exits.
 //
 // closeOnHardRevoke distinguishes the two revoke outcomes (§4.α): when true (the
-// REMOTE bridge), a writer-lease revocation that is NOT a local takeover — an
+// REMOTE bridge), a writer-lease revocation that is NOT a lease takeover — an
 // admin disable/rotate/device-revoke/allow_terminal→false, i.e. the device is no
-// longer trusted — CLOSES the socket; a local takeover only demotes the client to
+// longer trusted — CLOSES the socket; a lease takeover only demotes the client to
 // a read-only viewer. When false (the owner-local bridge) every revoke merely
 // demotes, keeping that path byte-identical. A normal PTY-exit teardown never
 // reaches this branch: the exit notifier cancels the bridge context first, so
@@ -1416,13 +1543,13 @@ func (s *Server) bridgeTerminalWS(parent context.Context, c *websocket.Conn, sub
 			return false
 		default:
 		}
-		_ = wsjson.Write(ctx, c, wsControl{T: "control_granted"})
+		_ = wsjson.Write(ctx, c, wsControl{T: "control_granted", Gen: launchWriterGen(wl)})
 		sendPTYSize()
 		return true
 	}
 
 	// watchRevoke tells the client it lost control when a writer's lease is
-	// revoked (local takeover / allow_terminal→false / device revoke). Started
+	// revoked (lease takeover / allow_terminal→false / device revoke). Started
 	// once per writer (the initial loopback writer, and again after a remote
 	// acquire installs a new one).
 	watchRevoke := func(wl LaunchWriter) {
@@ -1430,12 +1557,16 @@ func (s *Server) bridgeTerminalWS(parent context.Context, c *websocket.Conn, sub
 			select {
 			case <-wl.Revoked():
 				// Always tell the client it lost control. On the remote bridge, a
-				// revocation that is NOT a local takeover means the device is no
+				// revocation that is NOT a lease takeover means the device is no
 				// longer trusted (admin disable/rotate/device-revoke/allow_terminal
 				// →false) — cancel the bridge so the deferred CloseNow tears the
-				// socket down. A local takeover (device still valid) only demotes.
+				// socket down. A lease takeover (device still valid) only demotes.
 				ctrlSeqMu.Lock()
-				_ = wsjson.Write(ctx, c, wsControl{T: "control_revoked"})
+				by := ""
+				if rb, ok := wl.(interface{ RevokedBy() string }); ok && wl.RevokeIsTakeover() {
+					by = rb.RevokedBy()
+				}
+				_ = wsjson.Write(ctx, c, wsControl{T: "control_revoked", By: by, Gen: launchWriterGen(wl)})
 				// Re-affirm geometry on the control handoff (Feature 2, cheap):
 				// after a native-terminal reclaim the client should re-fit to the
 				// PTY's current dims.
@@ -1548,9 +1679,21 @@ func (s *Server) bridgeTerminalWS(parent context.Context, c *websocket.Conn, sub
 	cancel()
 }
 
+// launchWriterGen reads the concrete lease generation through an additive
+// optional interface. LaunchWriter deliberately stays narrow so existing
+// dashboard fakes and alternate adapters remain source-compatible; a writer
+// without generation support preserves the pre-generation wire shape via
+// wsControl's omitempty tag.
+func launchWriterGen(wl LaunchWriter) uint64 {
+	if withGen, ok := wl.(interface{ Gen() uint64 }); ok {
+		return withGen.Gen()
+	}
+	return 0
+}
+
 // bridgeAcquireWriter handles one {"t":"acquire-writer"} control frame for
 // bridgeTerminalWS's read loop. The loop's writer can be a STALE demoted lease:
-// a revoke (native-terminal reclaim / local takeover) fires watchRevoke, but
+// a revoke (native-terminal reclaim / any lease takeover) fires watchRevoke, but
 // the loop variable is only cleared when a write fails — and a demoted client
 // stops writing. So a still-live writer is re-affirmed (idempotent,
 // revoke-checked under the control-order mutex), a stale one is cleared and
@@ -1574,7 +1717,12 @@ func bridgeAcquireWriter(ctx context.Context, c *websocket.Conn, ctrl wsControl,
 	}
 	wl, aerr := acquire(ctrl.Cap, ctrl.Confirm)
 	if aerr != nil || wl == nil {
-		_ = wsjson.Write(ctx, c, wsControl{T: "control_denied"})
+		reason := ControlDenialUnavailable
+		var denial *ControlDeniedError
+		if errors.As(aerr, &denial) && denial.Reason != "" {
+			reason = denial.Reason
+		}
+		_ = wsjson.Write(ctx, c, wsControl{T: "control_denied", Reason: reason})
 		return nil, nil
 	}
 	// Grant-before-watch: sendGrantChecked withholds the grant if this fresh

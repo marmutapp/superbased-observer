@@ -1127,6 +1127,15 @@ func (s *attachSession) ReclaimWriter() error {
 	return nil
 }
 
+// ReclaimAvailable satisfies attachsock.ReclaimAvailabler: a real keystroke can
+// reclaim the writer only when a reacquire hook is wired
+// ([terminal.attach].reclaim_on_input on). Lets the server word the takeover
+// notice honestly — offering "press a key to take control back" only when that
+// gesture will actually reclaim.
+func (s *attachSession) ReclaimAvailable() bool {
+	return s.reacquire != nil
+}
+
 // CorrelatedSessions satisfies attachsock.CorrelationSource. It returns the
 // per-run correlation channel (nil when the hub is disabled — the server's
 // relay treats a nil channel as "no correlations", so no frame is ever sent).

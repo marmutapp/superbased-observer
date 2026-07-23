@@ -76,6 +76,21 @@ func TestRewriteBash(t *testing.T) {
 			changed: false,
 		},
 		{
+			name:    "superbased double-wrap guard",
+			in:      "superbased run -- git status",
+			changed: false,
+		},
+		{
+			name:    "superbased command skipped",
+			in:      "superbased start",
+			changed: false,
+		},
+		{
+			name:    "superbased with leading path skipped",
+			in:      "/usr/local/bin/superbased status",
+			changed: false,
+		},
+		{
 			name:    "empty string",
 			in:      "",
 			changed: false,
@@ -94,6 +109,46 @@ func TestRewriteBash(t *testing.T) {
 		{
 			name:    "unbalanced quote disqualifies",
 			in:      "echo 'unterminated",
+			changed: false,
+		},
+		{
+			name:    "interior newline disqualifies",
+			in:      "cd /tmp\nls",
+			changed: false,
+		},
+		{
+			name:    "multi-line non-builtin disqualifies",
+			in:      "git status\ngit log",
+			changed: false,
+		},
+		{
+			name:    "carriage return disqualifies",
+			in:      "git status\r\ngit log",
+			changed: false,
+		},
+		{
+			name:    "bare cd builtin skipped",
+			in:      "cd /tmp",
+			changed: false,
+		},
+		{
+			name:    "export builtin skipped",
+			in:      "export FOO=bar",
+			changed: false,
+		},
+		{
+			name:    "source builtin skipped",
+			in:      "source ./env.sh",
+			changed: false,
+		},
+		{
+			name:    "dot-source builtin skipped",
+			in:      ". ./env.sh",
+			changed: false,
+		},
+		{
+			name:    "eval builtin skipped",
+			in:      "eval echo hi",
 			changed: false,
 		},
 	}

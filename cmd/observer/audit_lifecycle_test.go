@@ -163,15 +163,60 @@ func TestLeaseWriterAuditLifecycle(t *testing.T) {
 		t.Fatalf("lease audit kinds\n got: %v\nwant subsequence: %v", kinds, want)
 	}
 
-	// Holder capability class: the takeover + revoke rows are the remote holder
-	// (not "local"); the release row is the local holder.
-	assertHolderPrincipal(t, rows, "terminal_local_takeover", "remote")
+	// Actor capability class: takeover rows identify the incoming controller,
+	// while non-takeover revoke/release rows identify their holder.
+	assertHolderPrincipal(t, rows, "terminal_local_takeover", "local")
 	assertHolderPrincipal(t, rows, "terminal_writer_revoke", "remote")
 	assertHolderPrincipal(t, rows, "terminal_writer_release", "local")
 
 	// Canary: the raw device-session bearer and every minted capability/confirm
 	// must be absent from every column of every row.
 	assertNoCanary(t, rows, []string{h.device, cap1, cfm1, cap2, cfm2})
+}
+
+// TestLeaseTakeoverAuditDirections proves the takeover event records the
+// incoming actor rather than mislabeling every direction as a local takeover:
+// remote-over-local and remote-over-remote are remote-principal events, while
+// local take-back remains a local-principal event.
+func TestLeaseTakeoverAuditDirections(t *testing.T) {
+	h := newLeaseAuditHarness(t)
+	local, err := h.mgr.AcquireWriterLocal(h.handle)
+	if err != nil {
+		t.Fatalf("AcquireWriterLocal: %v", err)
+	}
+	_ = local
+	h.acquireRemote(t)
+	h.acquireRemote(t)
+	if _, err := h.mgr.AcquireWriterLocal(h.handle); err != nil {
+		t.Fatalf("local take-back: %v", err)
+	}
+
+	rows, err := h.st.RecentRemoteAudit(context.Background(), 200)
+	if err != nil {
+		t.Fatalf("RecentRemoteAudit: %v", err)
+	}
+	remoteTakeovers := 0
+	localTakeovers := 0
+	for _, row := range rows {
+		if row.Route != h.handle {
+			continue
+		}
+		switch row.Kind {
+		case "terminal_remote_takeover":
+			remoteTakeovers++
+			if row.Principal != "remote" || row.SessionID == "local" || !strings.Contains(row.Detail, "superseded") {
+				t.Errorf("dishonest remote takeover row: %+v", row)
+			}
+		case "terminal_local_takeover":
+			localTakeovers++
+			if row.Principal != "local" || row.SessionID != "local" {
+				t.Errorf("dishonest local takeover row: %+v", row)
+			}
+		}
+	}
+	if remoteTakeovers != 2 || localTakeovers != 1 {
+		t.Fatalf("takeover audit counts remote=%d local=%d, want 2/1", remoteTakeovers, localTakeovers)
+	}
 }
 
 // TestSetupLeaseAuditRedactsHandle proves FIX A(i) (second adversarial review

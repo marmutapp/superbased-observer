@@ -74,7 +74,7 @@ func TestArmVerbsRequireConfirmToken(t *testing.T) {
 	_, h := newManageServer(t)
 	ck, token := getConfirm(t, h)
 
-	for _, path := range []string{"/api/remote/enable", "/api/remote/disable", "/api/remote/rotate", "/api/remote/add-device", "/api/remote/allow-terminal", "/api/remote/allow-terminal-view", "/api/remote/approve-execute", "/api/remote/standing-terminal/mint", "/api/remote/standing-terminal/revoke", "/api/remote/tailscale/login", "/api/remote/tailscale/install"} {
+	for _, path := range []string{"/api/remote/enable", "/api/remote/disable", "/api/remote/rotate", "/api/remote/add-device", "/api/remote/allow-terminal", "/api/remote/allow-terminal-view", "/api/remote/allow-remote-takeover", "/api/remote/approve-execute", "/api/remote/standing-terminal/mint", "/api/remote/standing-terminal/revoke", "/api/remote/tailscale/login", "/api/remote/tailscale/install"} {
 		// Wrong method → 405.
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		req.Host = "127.0.0.1:8080"

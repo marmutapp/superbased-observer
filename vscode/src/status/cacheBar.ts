@@ -34,7 +34,7 @@ export function createCacheStatusBar(
 
   // Sits just left of the cost item (priority 99 < 100).
   const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
-  item.name = 'Observer: Cache expiry';
+  item.name = 'SuperBased: Cache expiry';
   item.command = 'observer.openDashboard';
   item.hide();
   ctx.subscriptions.push(item);

@@ -118,7 +118,11 @@ export function JumpInButton({
     // through a computed key so the source never contains a `token: value`
     // pattern (the harness write-filter mangles those;
     // feedback_write_filter_token_patterns).
-    const seat = { tool: row.tool || tool, sessionId } as DockSession;
+    const seat = {
+      tool: row.tool || tool,
+      sessionId,
+      hasProjectRoot: row.has_project_root ?? false,
+    } as DockSession;
     const handleKey = "tok" + "en";
     (seat as unknown as Record<string, string>)[handleKey] = row.token;
     dock.launch(seat);

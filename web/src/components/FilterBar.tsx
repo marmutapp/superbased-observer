@@ -173,7 +173,7 @@ function WindowSelect() {
   }
 
   return (
-    <div className="relative flex items-center gap-1">
+    <div className="relative flex items-center gap-1" data-tour="global-filter">
       <ComboChip
         label="Window"
         value={win}

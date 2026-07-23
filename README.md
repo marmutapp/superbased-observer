@@ -1,4 +1,4 @@
-# SuperBased Observer
+# SuperBased
 
 > The exact tokens your AI provider billed you — cache splits,
 > reasoning tokens, long-context surcharges — reconciled across 26
@@ -47,7 +47,7 @@ can't give you, in order of how much they matter:
    tokens, long-context repricing — the same math your invoice uses,
    not a JSONL-derived estimate. It's accurate enough that it caught
    its **own** bug: a Codex reasoning-token double-billing regression
-   Observer found and back-corrected months of history for
+   SuperBased found and back-corrected months of history for
    (migration 058, shipped v1.18.0) — the kind of self-audit a vendor
    console has no incentive to run against itself.
 2. **Local-first, by construction.** The watcher, proxy, dashboard,
@@ -78,7 +78,7 @@ machine, with an optional team rollup server for org-wide spend.
 **Plane A** is general LLM-app observability — admin-server-first:
 OTLP trace/span capture, evals, and an LLM-as-judge input-admission
 guardrail for an application *you* host, whose end users route
-through Observer. Most solo developers only ever touch Plane B; teams
+through SuperBased. Most solo developers only ever touch Plane B; teams
 add Plane A when they're also running an LLM-powered product. Full
 explainer: [superbased.app/docs/getting-started/two-planes](https://superbased.app/docs/getting-started/two-planes)
 (or [docs/deployment-models.md](docs/deployment-models.md) if you're reading this in the repo).
@@ -509,7 +509,7 @@ while you work.
 
 *General observability — [Plane A](https://superbased.app/docs/getting-started/two-planes). Distinct
 from the coding-agent usage above: this observes an LLM **application**
-you run at the admin level, whose **end-users** route through Observer.*
+you run at the admin level, whose **end-users** route through SuperBased.*
 
 <p align="center">
   <img src="docs/assets/screenshots/13-trajectories.png" alt="Trajectories — OTLP trace and span capture (general-observability plane)" width="900">
@@ -842,7 +842,7 @@ bearers for agents; no prompts, command bodies, full assistant responses, or
 file contents ever leave the machine — even in the opt-in full-content mode,
 only the small set of fields the agent already stores in metadata-only mode
 gets expanded. The server ships as a signed Docker image
-(`ghcr.io/marmutapp/observer-org`) and a Helm chart (`charts/observer-org/`).
+(`ghcr.io/superbasedapp/observer-org`) and a Helm chart (`charts/observer-org/`).
 
 Local-in-5-minutes: `observer-org quickstart` brings up a dev compose stack,
 provisions an admin, mints an enrolment token, and prints a ready-to-share

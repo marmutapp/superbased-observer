@@ -39,7 +39,7 @@ type launchManagerAdapter struct {
 	// AFTER the lease install and must return true for the lease to survive —
 	// false means the standing secret was revoked/rotated while the (argon2)
 	// verify was in flight, so the just-installed lease is torn down.
-	remoteAuthz func(dashboard.RemoteWriterRequest) (termlease.WriterGrant, func() bool, error)
+	remoteAuthz func(dashboard.RemoteWriterRequest) (termlease.WriterGrant, func() dashboard.ControlDenialReason, error)
 	// attachAudit records the metadata-only terminal_attach spawn-audit row (F4,
 	// session-attach design §3.5) for attach-socket launches. Nil when no DB is
 	// wired (auditing disabled). Built in buildTerminalStack over the SAME
@@ -279,7 +279,7 @@ func (p termsvcLaunchPolicy) Allowed(handle string) bool {
 // field. Until this is called, AcquireWriterRemote stays fail-closed.
 func (a *launchManagerAdapter) wireRemoteExecute(authz dashboard.TerminalControlAuthorizer, allowTerminal func() bool) {
 	policy := termsvcLaunchPolicy{svc: a.svc}
-	a.remoteAuthz = func(req dashboard.RemoteWriterRequest) (termlease.WriterGrant, func() bool, error) {
+	a.remoteAuthz = func(req dashboard.RemoteWriterRequest) (termlease.WriterGrant, func() dashboard.ControlDenialReason, error) {
 		// A standing terminal-control secret (opt-in §B) rides the SAME
 		// acquire-writer cap field, distinguished by its collision-free prefix.
 		// Route it to the AuthorizeStanding leg — the IDENTICAL §4.δ conjunction
@@ -289,7 +289,9 @@ func (a *launchManagerAdapter) wireRemoteExecute(authz dashboard.TerminalControl
 		if remoteauth.IsStandingSecret(credOf(req)) {
 			standing, ok := authz.(dashboard.StandingTerminalVerifier)
 			if !ok {
-				return termlease.WriterGrant{}, nil, termlease.ErrCapabilityRejected
+				return termlease.WriterGrant{}, nil, dashboard.NewControlDeniedError(
+					dashboard.ControlDenialUnavailable, false, dashboard.ErrLaunchExecuteUnavailable,
+				)
 			}
 			// TOCTOU close (finding 1): capture the standing generation BEFORE
 			// the verify. Every revoke/rotate bumps it BEFORE killing writers,
@@ -316,8 +318,17 @@ func (a *launchManagerAdapter) wireRemoteExecute(authz dashboard.TerminalControl
 			// gate time could leave a surviving writer past the disable). Any of
 			// the three moving means the acquire raced an admin transition and
 			// the just-installed lease must not survive.
-			recheck := func() bool {
-				return standing.StandingTerminalGeneration() == gen && authz.Validate(req.DeviceSessionID) == nil && allowTerminal()
+			recheck := func() dashboard.ControlDenialReason {
+				if standing.StandingTerminalGeneration() != gen {
+					return dashboard.ControlDenialAuth
+				}
+				if authz.Validate(req.DeviceSessionID) != nil {
+					return dashboard.ControlDenialSessionInvalid
+				}
+				if !allowTerminal() {
+					return dashboard.ControlDenialTerminalDisabled
+				}
+				return ""
 			}
 			return grant, recheck, err
 		}
@@ -339,7 +350,15 @@ func (a *launchManagerAdapter) wireRemoteExecute(authz dashboard.TerminalControl
 			RemoteExposed:   req.RemoteExposed, // boundary-resolved provenance
 			AllowTerminal:   allowTerminal(),   // LIVE allow_terminal (finding 3 residual)
 		}, authz, policy, authz)
-		recheck := func() bool { return authz.Validate(req.DeviceSessionID) == nil && allowTerminal() }
+		recheck := func() dashboard.ControlDenialReason {
+			if authz.Validate(req.DeviceSessionID) != nil {
+				return dashboard.ControlDenialSessionInvalid
+			}
+			if !allowTerminal() {
+				return dashboard.ControlDenialTerminalDisabled
+			}
+			return ""
+		}
 		return grant, recheck, err
 	}
 }
@@ -349,6 +368,28 @@ func (a *launchManagerAdapter) wireRemoteExecute(authz dashboard.TerminalControl
 // no-op — leaving AcquireWriterRemote fail-closed (ErrLaunchExecuteUnavailable) —
 // when either is absent. Both `observer dashboard` and `observer start` call it
 // with the identical assembly, so the two commands share one authorization path.
+// projectRootResolver adapts the launch manager's termsvc.Service into the
+// dashboard's token→project-root seam (Arc A project panel). It reports
+// known=false for an unknown OR exited token (RunIDForHandle tracks LIVE runs
+// only — an exited handle lingers in byMeta for classification but is not
+// browsable) and (root="", known=true) for a live run launched with the default
+// cwd. Returns nil when the manager isn't the concrete adapter (or has no
+// service), which leaves the panel endpoints disabled (404).
+func projectRootResolver(launchMgr dashboard.LaunchManager) func(string) (string, bool) {
+	a, ok := launchMgr.(*launchManagerAdapter)
+	if !ok || a == nil || a.svc == nil {
+		return nil
+	}
+	svc := a.svc
+	return func(token string) (string, bool) {
+		if _, live := svc.RunIDForHandle(token); !live {
+			return "", false
+		}
+		root, _ := svc.ProjectRoot(token)
+		return root, true
+	}
+}
+
 func wireRemoteExecuteTier(cfg config.Config, launchMgr dashboard.LaunchManager, remoteCtrl dashboard.RemoteController) {
 	a, ok := launchMgr.(*launchManagerAdapter)
 	if !ok || a == nil {
@@ -364,8 +405,16 @@ func wireRemoteExecuteTier(cfg config.Config, launchMgr dashboard.LaunchManager,
 	// single-use and standing acquire paths immediately refuse without a restart.
 	// remoteCtrl.AllowTerminal() returns the construction value until the first
 	// hot-swap, so the initial behaviour is identical to the cfg snapshot.
-	_ = cfg // allow_terminal now comes from the live controller, not this snapshot
 	a.wireRemoteExecute(authz, remoteCtrl.AllowTerminal)
+	// The takeover flag is a post-authorization policy input. Bind the manager to
+	// the controller's live reader; the cfg fallback keeps additive fake
+	// controllers deterministic. The manager invokes this source at Decide while
+	// holding the session write fence.
+	allowRemoteTakeover := func() bool { return cfg.Remote.AllowRemoteTerminalTakeover }
+	if live, ok := remoteCtrl.(interface{ AllowRemoteTerminalTakeover() bool }); ok {
+		allowRemoteTakeover = live.AllowRemoteTerminalTakeover
+	}
+	a.mgr.SetAllowRemoteTakeoverSource(allowRemoteTakeover)
 }
 
 // AcquireWriterRemote runs the single §4.δ authorization conjunction over the
@@ -375,15 +424,15 @@ func wireRemoteExecuteTier(cfg config.Config, launchMgr dashboard.LaunchManager,
 // remote-execute tier is wired (a nil authorizer), it fails closed.
 func (a *launchManagerAdapter) AcquireWriterRemote(req dashboard.RemoteWriterRequest) (dashboard.LaunchWriter, error) {
 	if a.remoteAuthz == nil {
-		return nil, dashboard.ErrLaunchExecuteUnavailable
+		return nil, dashboard.NewControlDeniedError(dashboard.ControlDenialUnavailable, false, dashboard.ErrLaunchExecuteUnavailable)
 	}
 	grant, recheck, err := a.remoteAuthz(req)
 	if err != nil {
-		return nil, err
+		return nil, mapRemoteAcquireDenial(err, false)
 	}
 	l, err := a.mgr.AcquireWriterRemote(req.Handle, grant)
 	if err != nil {
-		return nil, err
+		return nil, mapRemoteAcquireDenial(err, !grant.Standing())
 	}
 	// Standing-path TOCTOU close (finding 1): the reusable-secret verify runs
 	// OUTSIDE any lock (argon2 is slow by design), so a revoke/rotate can land
@@ -392,11 +441,38 @@ func (a *launchManagerAdapter) AcquireWriterRemote(req dashboard.RemoteWriterReq
 	// check overlap: either the kill sees the installed lease (and revokes it),
 	// or the generation moved (and we tear it down here). No input can have
 	// ridden the lease yet — it has not been returned to the bridge.
-	if recheck != nil && !recheck() {
-		l.Release()
-		return nil, termlease.ErrCapabilityRejected
+	if recheck != nil {
+		if reason := recheck(); reason != "" {
+			l.Release()
+			return nil, dashboard.NewControlDeniedError(reason, !grant.Standing(), nil)
+		}
 	}
 	return l, nil
+}
+
+func mapRemoteAcquireDenial(err error, capabilityConsumed bool) error {
+	var typed *dashboard.ControlDeniedError
+	if errors.As(err, &typed) {
+		return err
+	}
+	reason := dashboard.ControlDenialUnavailable
+	switch {
+	case errors.Is(err, termlease.ErrCapabilityRejected):
+		reason = dashboard.ControlDenialAuth
+	case errors.Is(err, termlease.ErrTerminalDisabled):
+		reason = dashboard.ControlDenialTerminalDisabled
+	case errors.Is(err, termlease.ErrNoDeviceSession):
+		reason = dashboard.ControlDenialSessionInvalid
+	case errors.Is(err, termlease.ErrPolicyDenied), errors.Is(err, termlease.ErrNotRemoteExposed), errors.Is(err, termlease.ErrMissingField), errors.Is(err, termsession.ErrNoGrant), errors.Is(err, termsession.ErrSetupSessionLocalOnly):
+		reason = dashboard.ControlDenialPolicyDenied
+	case errors.Is(err, termsession.ErrHeldLocally):
+		reason = dashboard.ControlDenialHeldLocally
+	case errors.Is(err, termsession.ErrWriterHeld):
+		reason = dashboard.ControlDenialHeldByRemote
+	case errors.Is(err, termsession.ErrNotFound):
+		reason = dashboard.ControlDenialNotFound
+	}
+	return dashboard.NewControlDeniedError(reason, capabilityConsumed, err)
 }
 
 func (a *launchManagerAdapter) Close(handle string) { a.mgr.Close(handle) }
@@ -449,6 +525,13 @@ func (a *launchManagerAdapter) Snapshot() []dashboard.LaunchInfo {
 			Rows:        s.Rows,
 			Cols:        s.Cols,
 		}
+		// HasProjectRoot drives the dashboard's Files/Git panel button enablement
+		// straight from the snapshot — the raw path is NOT carried on the wire
+		// (LaunchInfo flows to remote viewers); only the gated panel endpoint
+		// serves it.
+		if _, ok := a.svc.ProjectRoot(s.ID); ok {
+			info.HasProjectRoot = true
+		}
 		if runID, ok := a.svc.RunIDForHandle(s.ID); ok {
 			info.RunID = runID
 			// An attach run carries no source session at spawn — it is
@@ -476,8 +559,8 @@ func (a *launchManagerAdapter) Snapshot() []dashboard.LaunchInfo {
 // leaseAuditKind maps a termsession writer-lease transition to its typed
 // remote_audit event kind (Phase-4 execute-tier audit lifecycle, plan §8.1).
 // Table-driven so a new lease kind is one row, never a nested branch.
-func leaseAuditKind(k termsession.LeaseEventKind) string {
-	switch k {
+func leaseAuditKind(ev termsession.LeaseEvent) string {
+	switch ev.Kind {
 	case termsession.LeaseAcquired:
 		return "terminal_writer_acquire"
 	case termsession.LeaseReleased:
@@ -485,9 +568,12 @@ func leaseAuditKind(k termsession.LeaseEventKind) string {
 	case termsession.LeaseRevoked:
 		return "terminal_writer_revoke"
 	case termsession.LeaseTakenOver:
+		if ev.Actor != "" && ev.Actor != "local" {
+			return "terminal_remote_takeover"
+		}
 		return "terminal_local_takeover"
 	default:
-		return "terminal_writer_" + string(k)
+		return "terminal_writer_" + string(ev.Kind)
 	}
 }
 
@@ -535,14 +621,20 @@ func newLeaseAuditSink(database *sql.DB) func(termsession.LeaseEvent) {
 				route = "setup:" + ev.Label
 			}
 		}
+		principalID := ev.Holder
+		detail := ev.Reason
+		if ev.Kind == termsession.LeaseTakenOver && ev.Actor != "" {
+			principalID = ev.Actor
+			detail = "actor " + ev.Actor + " superseded " + ev.Holder + ": " + ev.Reason
+		}
 		_ = st.InsertRemoteAudit(ctx, store.RemoteAuditEvent{
 			TS:        ev.At,
-			Kind:      leaseAuditKind(ev.Kind),
-			SessionID: ev.Holder, // "local" or a device-session fingerprint — never the raw id
-			Principal: leaseHolderPrincipal(ev.Holder),
+			Kind:      leaseAuditKind(ev),
+			SessionID: principalID, // takeover actor, otherwise holder; never the raw id
+			Principal: leaseHolderPrincipal(principalID),
 			Route:     route,
 			Decision:  "ok",
-			Detail:    ev.Reason, // coarse, non-sensitive transition reason
+			Detail:    detail, // coarse, non-sensitive transition direction + reason
 		})
 	}
 }

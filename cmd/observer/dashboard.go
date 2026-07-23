@@ -77,6 +77,9 @@ func newDashboardCmd() *cobra.Command {
 				// is false → the endpoints 503 and the button hides.
 				LaunchManager:  launchMgr,
 				TerminalStatus: launchStatus,
+				// Per-terminal project panel (Arc A): token→root resolver from
+				// termsvc. Nil when the launch manager is absent → panel 404s.
+				ProjectRootResolver: projectRootResolver(launchMgr),
 				// Remote-access substrate (plan §4). Nil unless [remote] is
 				// enabled AND a pairing secret is provisioned — so a
 				// non-loopback bind stays fail-closed until Phase 2 exposure.

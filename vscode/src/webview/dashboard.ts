@@ -13,7 +13,7 @@ import { generateNonce } from './nonce';
 import { output } from '../output';
 
 const VIEW_TYPE = 'observerDashboard';
-const TITLE = 'Observer Dashboard';
+const TITLE = 'SuperBased Dashboard';
 
 export class DashboardPanel implements vscode.Disposable {
   private static current: DashboardPanel | undefined;
@@ -146,11 +146,11 @@ function renderIdleHtml(nonce: string, state: DaemonState): string {
   const csp = buildCsp(nonce);
   const hint =
     state.mode === 'detect'
-      ? 'Observer is not running. Run <code>observer start</code> in a terminal, or change <code>observer.daemon.mode</code> to <code>managed</code> / <code>auto</code> to let the extension start it for you.'
-      : 'Observer is not running. Click below to start the extension-managed daemon.';
+      ? 'SuperBased is not running. Run <code>observer start</code> in a terminal, or change <code>observer.daemon.mode</code> to <code>managed</code> / <code>auto</code> to let the extension start it for you.'
+      : 'SuperBased is not running. Click below to start the extension-managed daemon.';
   const cta =
     state.mode === 'detect'
-      ? '<a class="cta" href="command:workbench.action.openSettings?%22observer.daemon.mode%22">Open Observer settings</a>'
+      ? '<a class="cta" href="command:workbench.action.openSettings?%22observer.daemon.mode%22">Open SuperBased settings</a>'
       : '<button class="cta" id="start-btn" type="button">Start Daemon</button>';
   return `<!doctype html>
 <html lang="en">
@@ -174,7 +174,7 @@ function renderIdleHtml(nonce: string, state: DaemonState): string {
   <body>
     <div class="wrap">
       <div class="card">
-        <h1>Observer Dashboard</h1>
+        <h1>SuperBased Dashboard</h1>
         <p>${hint}</p>
         ${cta}
         <p class="meta">Mode: <code>${state.mode}</code> · Dashboard port: <code>${state.dashboardPort}</code> · Proxy port: <code>${state.proxyPort}</code></p>

@@ -93,7 +93,11 @@ export function ResumeButton({
       // Same dock path as HandoffCard's launch: the token rides a computed key
       // so the source carries no literal token property (the harness
       // write-filter mangles those; feedback_write_filter_token_patterns).
-      const seat: Record<string, string> = { tool, sessionId };
+      const seat: Record<string, unknown> = {
+        tool,
+        sessionId,
+        hasProjectRoot: r.has_project_root ?? false,
+      };
       seat["tok" + "en"] = r.token;
       dock.launch(seat as unknown as Parameters<typeof dock.launch>[0]);
     } catch (e) {

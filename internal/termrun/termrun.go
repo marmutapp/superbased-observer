@@ -44,23 +44,28 @@ func (k Kind) Valid() bool {
 	return k == KindHandoff || k == KindFresh || k == KindAttach || k == KindResume
 }
 
-// remoteSensitiveKinds is the set of run kinds whose live PTY the dashboard
-// remote-denies BY DEFAULT (session-attach design §3.2). Both kinds bind a
-// daemon-owned terminal to a REAL external transcript — an attach session the
-// operator started outside the dashboard (KindAttach) or a native reopen of a
-// closed session's ACTUAL prior conversation (KindResume) — whose TUI can echo
-// API keys / customer data. A fresh/handoff launch has no such pre-existing
-// transcript, so it is not remote-sensitive. Phase 4's
-// [remote].allow_terminal_view opt-in will relax this. A data set (not an
-// if-chain) so a new sensitive kind is one row (CLAUDE.md #5).
+// remoteSensitiveKinds is the set of run kinds classified as remote-VIEW
+// sensitive (session-attach design §3.2). Both kinds bind a daemon-owned
+// terminal to a REAL external transcript — an attach session the operator
+// started outside the dashboard (KindAttach) or a native reopen of a closed
+// session's ACTUAL prior conversation (KindResume) — whose TUI can echo API
+// keys / customer data. A fresh/handoff launch has no such pre-existing
+// transcript, so it is not remote-sensitive. Whether a remote caller may SEE a
+// sensitive-kind PTY is governed by the [remote].allow_terminal_view toggle,
+// which now DEFAULTS TRUE (view-on-by-default; the remote WRITE/drive path is
+// unchanged) — set allow_terminal_view = false to restore the deny-read
+// posture. This table only marks the kinds the toggle applies to; it is a data
+// set (not an if-chain) so a new sensitive kind is one row (CLAUDE.md #5).
 var remoteSensitiveKinds = map[Kind]bool{
 	KindAttach: true,
 	KindResume: true,
 }
 
-// IsRemoteSensitiveKind reports whether a run kind is remote-deny-by-default:
-// its live PTY must be hidden from a remote-exposed snapshot and its websocket
-// refused for a remote caller (§3.2). Used at BOTH the dashboard visibleSnapshot
+// IsRemoteSensitiveKind reports whether a run kind is remote-VIEW sensitive: its
+// live PTY is hidden from a remote-exposed snapshot and its websocket refused
+// for a remote caller WHEN [remote].allow_terminal_view is off (§3.2). That
+// toggle now defaults TRUE, so such PTYs are visible by default; the mechanism
+// (and the off-switch) is unchanged. Used at BOTH the dashboard visibleSnapshot
 // / WS gates and the cmd adapter's IsRemoteSensitiveSession so the two dispatch
 // on ONE shared table, never a per-site if-chain. An unknown kind is not
 // sensitive (fresh/handoff are the honest non-sensitive floor).

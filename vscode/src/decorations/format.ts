@@ -47,7 +47,7 @@ export function decorationTooltip(state: FileStateResponse): string {
  * the standard `**bold**` convention.
  */
 export function hoverMarkdown(state: FileStateResponse): string {
-  const lines = ['**Observer**'];
+  const lines = ['**SuperBased**'];
   if (state.last_read_at && state.last_read_by) {
     lines.push(
       `Last read by \`${state.last_read_by}\` at \`${state.last_read_at}\``,

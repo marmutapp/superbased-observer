@@ -21,6 +21,7 @@ import { CommandPalette } from "@/components/CommandPalette";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { NotFoundPage } from "@/pages/NotFound";
 import { FilterProvider } from "@/lib/filters";
+import { TourProvider } from "@/components/tour/TourProvider";
 
 // HelpDrawer carries the 164-entry registry — defer until first
 // open so it doesn't bloat the shell chunk.
@@ -233,46 +234,48 @@ export default function App() {
   const openHelp = useCallback(() => setHelpOpen(true), []);
 
   return (
-    <FilterProvider>
-      <div className="flex h-full w-full bg-bg-0 text-fg-1">
-        <Sidebar
-          open={mobileNavOpen}
-          onClose={() => setMobileNavOpen(false)}
-        />
-        <main className="flex min-w-0 flex-1 flex-col">
-          <TopBar onHelp={openHelp} onMenu={() => setMobileNavOpen(true)} />
-          <RestartPendingBanner />
-          <DemoBanner />
-          <BudgetBanner />
-          <FirstCaptureToast />
-          <ToastViewport />
-          <KonamiEgg />
-          <FilterBar onOpenPalette={() => setPaletteOpen(true)} />
-          <div className="min-h-0 flex-1 overflow-y-auto">
-            {/* D-6: the boundary sits below the shell so a crashing
-                page can't take the sidebar/topbar with it; keying on
-                pathname resets it when the user navigates away. */}
-            <RouteErrorBoundary>
-              <Suspense fallback={<RouteFallback />}>
-                <AnimatedRoutes />
-              </Suspense>
-            </RouteErrorBoundary>
-          </div>
-        </main>
-        {helpEverOpened && (
-          <Suspense fallback={null}>
-            <HelpDrawer
-              open={helpOpen}
-              onClose={() => setHelpOpen(false)}
-              initialId={helpId}
-            />
-          </Suspense>
-        )}
-        <CommandPalette
-          open={paletteOpen}
-          onClose={() => setPaletteOpen(false)}
-        />
-      </div>
-    </FilterProvider>
+    <TourProvider>
+      <FilterProvider>
+        <div className="flex h-full w-full bg-bg-0 text-fg-1">
+          <Sidebar
+            open={mobileNavOpen}
+            onClose={() => setMobileNavOpen(false)}
+          />
+          <main className="flex min-w-0 flex-1 flex-col">
+            <TopBar onHelp={openHelp} onMenu={() => setMobileNavOpen(true)} />
+            <RestartPendingBanner />
+            <DemoBanner />
+            <BudgetBanner />
+            <FirstCaptureToast />
+            <ToastViewport />
+            <KonamiEgg />
+            <FilterBar onOpenPalette={() => setPaletteOpen(true)} />
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              {/* D-6: the boundary sits below the shell so a crashing
+                  page can't take the sidebar/topbar with it; keying on
+                  pathname resets it when the user navigates away. */}
+              <RouteErrorBoundary>
+                <Suspense fallback={<RouteFallback />}>
+                  <AnimatedRoutes />
+                </Suspense>
+              </RouteErrorBoundary>
+            </div>
+          </main>
+          {helpEverOpened && (
+            <Suspense fallback={null}>
+              <HelpDrawer
+                open={helpOpen}
+                onClose={() => setHelpOpen(false)}
+                initialId={helpId}
+              />
+            </Suspense>
+          )}
+          <CommandPalette
+            open={paletteOpen}
+            onClose={() => setPaletteOpen(false)}
+          />
+        </div>
+      </FilterProvider>
+    </TourProvider>
   );
 }

@@ -6,7 +6,7 @@ Pick one via the `observer.daemon.mode` setting:
 
 | Mode | What happens |
 |---|---|
-| **`detect`** (default) | Attach only. Never spawn. If no daemon is running, the status bar shows "Observer idle" and you start one yourself with `observer start`. |
+| **`detect`** (default) | Attach only. Never spawn. If no daemon is running, the status bar shows "SuperBased idle" and you start one yourself with `observer start`. |
 | **`managed`** | The extension spawns `observer start` on activation and kills it on shutdown. Refuses to spawn a second daemon when one is already running (safety rail). |
 | **`auto`** | If a daemon is running, attach to it. Otherwise spawn one — same supervision as `managed`. |
 

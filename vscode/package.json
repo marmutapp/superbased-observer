@@ -1,8 +1,8 @@
 {
   "name": "superbased-observer",
-  "displayName": "SuperBased Observer",
+  "displayName": "SuperBased",
   "description": "Claude Code cost tracking, Cursor token usage, Codex spend — AI coding agent observability across 26 adapters (Claude Code, Codex, Cursor, Cline + Cline CLI, Copilot, Gemini CLI, Hermes Agent, Kilo Code, Aider, Goose, Devin, and more), proxy-accurate. No telemetry. No cloud.",
-  "version": "1.22.0",
+  "version": "1.23.0",
   "publisher": "superbased",
   "license": "Apache-2.0",
   "author": "Santosh Kathira <contact@superbased.app>",
@@ -56,75 +56,75 @@
     "commands": [
       {
         "command": "observer.doctor",
-        "title": "Observer: Doctor"
+        "title": "SuperBased: Doctor"
       },
       {
         "command": "observer.start",
-        "title": "Observer: Start Daemon"
+        "title": "SuperBased: Start Daemon"
       },
       {
         "command": "observer.stop",
-        "title": "Observer: Stop Daemon"
+        "title": "SuperBased: Stop Daemon"
       },
       {
         "command": "observer.openDashboard",
-        "title": "Observer: Open Dashboard"
+        "title": "SuperBased: Open Dashboard"
       },
       {
         "command": "observer.init",
-        "title": "Observer: Init for this project"
+        "title": "SuperBased: Init for this project"
       },
       {
         "command": "observer.initWithMCP",
-        "title": "Observer: Enable MCP for this project"
+        "title": "SuperBased: Enable MCP for this project"
       },
       {
         "command": "observer.copyProxyEnv",
-        "title": "Observer: Copy Proxy Env Vars"
+        "title": "SuperBased: Copy Proxy Env Vars"
       },
       {
         "command": "observer.launchClaude",
-        "title": "Observer: Launch Claude Code (proxied)"
+        "title": "SuperBased: Launch Claude Code (proxied)"
       },
       {
         "command": "observer.launchCodex",
-        "title": "Observer: Launch Codex (proxied)"
+        "title": "SuperBased: Launch Codex (proxied)"
       },
       {
         "command": "observer.enroll",
-        "title": "Observer: Enroll in Org"
+        "title": "SuperBased: Enroll in Org"
       },
       {
         "command": "observer.refreshTrees",
-        "title": "Observer: Refresh All Trees",
+        "title": "SuperBased: Refresh All Trees",
         "icon": "$(refresh)"
       },
       {
         "command": "observer.openSession",
-        "title": "Observer: Open Session in Dashboard"
+        "title": "SuperBased: Open Session in Dashboard"
       },
       {
         "command": "observer.copySessionId",
-        "title": "Observer: Copy Session ID"
+        "title": "SuperBased: Copy Session ID"
       },
       {
         "command": "observer.copyPath",
-        "title": "Observer: Copy Path"
+        "title": "SuperBased: Copy Path"
       },
       {
         "command": "observer.refreshInstructions",
-        "title": "Observer: Refresh Instructions from Learnings"
+        "title": "SuperBased: Refresh Instructions from Learnings"
       },
       {
         "command": "observer.previewInstructions",
-        "title": "Observer: Preview Instruction Suggestions"
+        "title": "SuperBased: Preview Instruction Suggestions"
       }
     ],
     "viewsContainers": {
       "activitybar": [
         {
           "id": "observer",
-          "title": "Observer",
+          "title": "SuperBased",
           "icon": "media/icon-activity.svg"
         }
       ]
@@ -153,7 +153,7 @@
       "profiles": [
         {
           "id": "observer.terminalProfile",
-          "title": "AI Coding Tool (Observer-proxied)",
+          "title": "AI Coding Tool (SuperBased-proxied)",
           "icon": "$(rocket)"
         }
       ]
@@ -161,13 +161,13 @@
     "walkthroughs": [
       {
         "id": "observer.getStarted",
-        "title": "Get Started with SuperBased Observer",
-        "description": "Connect Observer to your AI coding workflow in about 5 minutes.",
+        "title": "Get Started with SuperBased",
+        "description": "Connect SuperBased to your AI coding workflow in about 5 minutes.",
         "steps": [
           {
             "id": "welcome",
-            "title": "Welcome to Observer",
-            "description": "Observer captures, normalises, and analyses every AI coding tool's activity — locally, with no telemetry.\n[Open Sidebar](command:workbench.view.extension.observer)",
+            "title": "Welcome to SuperBased",
+            "description": "SuperBased captures, normalises, and analyses every AI coding tool's activity — locally, with no telemetry.\n[Open Sidebar](command:workbench.view.extension.observer)",
             "media": {
               "markdown": "walkthroughs/01-welcome.md"
             },
@@ -178,7 +178,7 @@
           {
             "id": "doctor",
             "title": "Verify your install",
-            "description": "Run `Observer: Doctor` to confirm the binary is resolved and the daemon's DB / hooks / MCP registrations are all healthy.\n[Run Observer: Doctor](command:observer.doctor)",
+            "description": "Run `SuperBased: Doctor` to confirm the binary is resolved and the daemon's DB / hooks / MCP registrations are all healthy.\n[Run SuperBased: Doctor](command:observer.doctor)",
             "media": {
               "markdown": "walkthroughs/02-doctor.md"
             },
@@ -223,7 +223,7 @@
           {
             "id": "instructions",
             "title": "Auto-update your instruction files",
-            "description": "Open a `CLAUDE.md`, `AGENTS.md`, or `.cursorrules` to see two CodeLenses at the top. Preview composes Observer's suggestions into a side editor; Refresh materialises them into the file.\n[Run Observer: Preview Instruction Suggestions](command:observer.previewInstructions)",
+            "description": "Open a `CLAUDE.md`, `AGENTS.md`, or `.cursorrules` to see two CodeLenses at the top. Preview composes SuperBased's suggestions into a side editor; Refresh materialises them into the file.\n[Run SuperBased: Preview Instruction Suggestions](command:observer.previewInstructions)",
             "media": {
               "markdown": "walkthroughs/06-instructions.md"
             },
@@ -235,7 +235,7 @@
           {
             "id": "done",
             "title": "You're set",
-            "description": "Observer is wired into VS Code. The full user guide covers per-AI-tool workflows.\n[Open Dashboard](command:observer.openDashboard)",
+            "description": "SuperBased is wired into VS Code. The full user guide covers per-AI-tool workflows.\n[Open Dashboard](command:observer.openDashboard)",
             "media": {
               "markdown": "walkthroughs/07-done.md"
             },
@@ -273,7 +273,7 @@
       ]
     },
     "configuration": {
-      "title": "Observer",
+      "title": "SuperBased",
       "properties": {
         "observer.daemon.mode": {
           "type": "string",
@@ -322,7 +322,7 @@
     "vscode:prepublish": "npm run build",
     "build": "node esbuild.mjs --production",
     "watch": "node esbuild.mjs --watch",
-    "lint": "eslint src --ext ts",
+    "lint": "eslint src",
     "test": "node --import tsx --test test/unit/*.test.ts",
     "package": "vsce package",
     "package:platform": "vsce package --target ${TARGET}"
@@ -338,8 +338,10 @@
     "@types/vscode": "^1.90.0",
     "@vscode/vsce": "^3.0.0",
     "esbuild": "^0.24.0",
+    "eslint": "^9.39.0",
     "ovsx": "^0.10.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.5.0"
+    "typescript": "^5.5.0",
+    "typescript-eslint": "^8.65.0"
   }
 }

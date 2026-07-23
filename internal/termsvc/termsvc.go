@@ -137,8 +137,15 @@ type Launcher interface {
 // even against a STALE live-handle set (R2-2) — and it gates the grace-based
 // aging that eventually GCs a long-dead entry.
 type runMeta struct {
-	Kind    termrun.Kind
-	Tool    string
+	Kind termrun.Kind
+	Tool string
+	// dir is the canonical, already-validated project root this run was launched
+	// with ("" when launched with the default cwd). It is the SAME value the run
+	// hashed into ProjectRootHash at spawn — retained in memory (never persisted;
+	// terminal_runs stores only the hash) so the dashboard's project panel can
+	// resolve a token to its root without a store read. Retained past exit like
+	// the rest of runMeta and read through Service.ProjectRoot.
+	dir     string
 	endedAt time.Time
 }
 
@@ -511,7 +518,25 @@ func (s *Service) launch(ctx context.Context, run termrun.Run, lr LaunchRequest)
 	s.mu.Lock()
 	s.byHandle[handle] = runID
 	s.byRun[runID] = handle
-	s.byMeta[handle] = runMeta{Kind: run.Kind, Tool: run.Tool}
+	// dir is lr.Dir — the canonical, already-validated project root each caller
+	// (LaunchFresh/LaunchResume via ValidateProjectRoot, LaunchAttachable via
+	// AttachRequest.Dir) hashed into run.ProjectRootHash. One place, same value.
+	//
+	// Pin the retained root by fully resolving its symlinks HERE, the single
+	// storage point (finding 2a): the project panel resolves this token back to
+	// its root and browses under it, so canonicalizing at launch means a symlink
+	// component retargeted after launch cannot silently move the panel's root to
+	// a new target. On any resolution error (path missing/unreadable) store ""
+	// → treated as "no browsable project root" (ProjectRoot returns ok=false).
+	dir := lr.Dir
+	if dir != "" {
+		if resolved, rerr := filepath.EvalSymlinks(dir); rerr == nil {
+			dir = resolved
+		} else {
+			dir = ""
+		}
+	}
+	s.byMeta[handle] = runMeta{Kind: run.Kind, Tool: run.Tool, dir: dir}
 	s.mu.Unlock()
 
 	s.publish(termfeed.Event{
@@ -573,6 +598,25 @@ func (s *Service) KindForHandle(handle string) (termrun.Kind, string, bool) {
 	s.gcEndedMetaLocked()
 	m, ok := s.byMeta[handle]
 	return m.Kind, m.Tool, ok
+}
+
+// ProjectRoot returns the canonical project root a live PTY handle was launched
+// with, resolved from the run identity the Service minted at spawn — no store
+// read. ok=false when the handle is unknown OR the run was launched with the
+// default cwd (empty dir): both are honest "no browsable project root" answers.
+// Served from byMeta (retained past exit-linger), so it stays answerable for a
+// lingering handle exactly like KindForHandle. Additive read seam for the
+// dashboard project panel (Arc A): the daemon already knows a run's validated
+// root at launch, so a token can be resolved to its root without a query, and
+// the browser never supplies a filesystem path.
+func (s *Service) ProjectRoot(handle string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, ok := s.byMeta[handle]
+	if !ok || m.dir == "" {
+		return "", false
+	}
+	return m.dir, true
 }
 
 // SessionForRun returns the observer session id a run has been correlated to,

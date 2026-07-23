@@ -20,10 +20,11 @@
 //
 //   - The lease-grant / takeover POLICY TABLE (Decide) — the table-driven
 //     rule set (CLAUDE.md #5) that decides, given the requester and the current
-//     lease holder, whether to grant/refuse and whether to revoke the incumbent:
-//     the local controller is never silently evicted, a remote writer needs the
-//     local owner to not hold the writer, and a local takeover always revokes a
-//     remote writer. One input source ever.
+//     lease holder, whether to grant/refuse and whether to revoke the incumbent.
+//     Local acquisition is never refused; authenticated remote acquisition may
+//     supersede local or remote writers when the live takeover policy is on and
+//     requires an explicit yield when it is off. Every superseded lease is
+//     fenced. One input source ever.
 //
 // The package is pinned pure by imports_test.go.
 package termlease

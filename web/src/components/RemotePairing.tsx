@@ -80,7 +80,7 @@ export function RemotePairingGate({ children }: { children: ReactNode }) {
     return (
       <PairingScreen
         title="Pairing this device…"
-        body="Securely linking to your Observer dashboard over your tailnet."
+        body="Securely linking to your SuperBased dashboard over your tailnet."
       />
     );
   }

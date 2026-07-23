@@ -162,6 +162,7 @@ export function Sidebar({
                   to={it.path}
                   end={it.path === "/"}
                   onClick={onClose}
+                  data-tour={`nav-${it.id}`}
                   // Native title tooltip is the collapsed-rail affordance
                   // (no in-repo hover primitive on NavLink); only when
                   // collapsed so the expanded rail stays tooltip-free.
@@ -287,9 +288,6 @@ function Brand({
         )}
       >
         <b className="text-[13px] font-bold text-fg-0">SuperBased</b>
-        <span className="text-[10px] font-medium uppercase tracking-[0.08em] text-fg-3">
-          Observer
-        </span>
       </div>
       {/* Close button — mobile drawer only. */}
       <button

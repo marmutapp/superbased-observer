@@ -56,7 +56,7 @@ export async function resolveBinary(ctx: vscode.ExtensionContext): Promise<Resol
   // Resolution still falls back (below) so the extension keeps working.
   if (resolution.settingError) {
     output.appendLine(resolution.settingError);
-    void vscode.window.showErrorMessage(`Observer: ${resolution.settingError}`);
+    void vscode.window.showErrorMessage(`SuperBased: ${resolution.settingError}`);
   }
 
   if (resolution.hit) {
@@ -121,7 +121,7 @@ async function downloadFromReleases(ctx: vscode.ExtensionContext): Promise<Resol
     await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
-        title: `Observer: downloading v${version} (${asset})`,
+        title: `SuperBased: downloading v${version} (${asset})`,
         cancellable: false,
       },
       async (progress) => {
@@ -186,7 +186,7 @@ async function downloadFromReleases(ctx: vscode.ExtensionContext): Promise<Resol
     await fs.rm(sentinel, { force: true });
     const msg = err instanceof Error ? err.message : String(err);
     const choice = await vscode.window.showErrorMessage(
-      `Observer: download failed (${msg}).`,
+      `SuperBased: download failed (${msg}).`,
       'Retry',
       'Open Issue',
     );

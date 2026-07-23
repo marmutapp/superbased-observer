@@ -192,7 +192,7 @@ export function DiscoveryPage() {
       {/* Cross-tool overlap */}
       <ChartShell
         title="Cross-tool overlap"
-        sub="Files touched by 2+ AI clients in this window — Observer's unique multi-tool value prop."
+        sub="Files touched by 2+ AI clients in this window — SuperBased's unique multi-tool value prop."
       >
         <ChartState
           loading={data.loading && !data.data}

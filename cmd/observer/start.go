@@ -303,6 +303,9 @@ func newStartCmd() *cobra.Command {
 					// is false → endpoints 503, button hidden.
 					LaunchManager:  launchMgr,
 					TerminalStatus: launchStatus,
+					// Per-terminal project panel (Arc A): token→root resolver
+					// from termsvc. Nil when the launch manager is absent → 404.
+					ProjectRootResolver: projectRootResolver(launchMgr),
 					// Restart-from-dashboard (docs/plans/dashboard-daemon-
 					// restart-plan-2026-07-14.md): preflight the config, then
 					// cancel the root context so the daemon runs its NORMAL

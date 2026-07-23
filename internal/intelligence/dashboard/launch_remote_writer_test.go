@@ -2,6 +2,8 @@ package dashboard
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -48,6 +50,7 @@ type recordingLaunchManager struct {
 	sub               *fakeSubscription
 	localWriter       *recordingWriter // pre-created; AcquireWriterLocal never reassigns
 	remoteWriter      *recordingWriter // nil ⇒ AcquireWriterRemote denies
+	remoteErr         error
 	localCalls        atomic.Int32
 	remoteCalls       atomic.Int32
 	remoteExposedSeen atomic.Bool
@@ -111,9 +114,70 @@ func (m *recordingLaunchManager) AcquireWriterRemote(req RemoteWriterRequest) (L
 	r := req
 	m.lastRemoteReq.Store(&r)
 	if m.remoteWriter == nil {
+		if m.remoteErr != nil {
+			return nil, m.remoteErr
+		}
 		return nil, ErrLaunchExecuteUnavailable
 	}
 	return m.remoteWriter, nil
+}
+
+// TestControlDeniedReasonWireTaxonomy proves bridgeAcquireWriter consumes only
+// the dashboard-level typed denial boundary and emits the precise stable reason;
+// an untyped adapter failure degrades to unavailable, never to auth.
+func TestControlDeniedReasonWireTaxonomy(t *testing.T) {
+	tests := []struct {
+		name   string
+		err    error
+		reason ControlDenialReason
+	}{
+		{"credential rejection", NewControlDeniedError(ControlDenialAuth, false, errors.New("credential")), ControlDenialAuth},
+		{"held locally after consume", NewControlDeniedError(ControlDenialHeldLocally, true, errors.New("held")), ControlDenialHeldLocally},
+		{"held by remote after consume", NewControlDeniedError(ControlDenialHeldByRemote, true, errors.New("held")), ControlDenialHeldByRemote},
+		{"terminal disabled", NewControlDeniedError(ControlDenialTerminalDisabled, false, errors.New("off")), ControlDenialTerminalDisabled},
+		{"session invalid", NewControlDeniedError(ControlDenialSessionInvalid, false, errors.New("session")), ControlDenialSessionInvalid},
+		{"policy denied", NewControlDeniedError(ControlDenialPolicyDenied, false, errors.New("policy")), ControlDenialPolicyDenied},
+		{"not found", NewControlDeniedError(ControlDenialNotFound, false, errors.New("missing")), ControlDenialNotFound},
+		{"untyped is unavailable", errors.New("opaque adapter failure"), ControlDenialUnavailable},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			lm := newRecordingLaunchManager(nil)
+			lm.remoteErr = tc.err
+			t.Cleanup(func() { close(lm.sub.release) })
+			s := newLaunchTestServer(t, lm)
+			ts := remoteExposedWSServer(t, s)
+			t.Cleanup(ts.Close)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			c, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/ws/launch/HANDLE-abc", &websocket.DialOptions{
+				HTTPHeader: http.Header{"Origin": {ts.URL}},
+			})
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer c.CloseNow()
+			if err := c.Write(ctx, websocket.MessageText, []byte(`{"t":"acquire-writer","cap":"x","confirm":"y"}`)); err != nil {
+				t.Fatalf("write acquire: %v", err)
+			}
+			for {
+				typ, data, err := c.Read(ctx)
+				if err != nil {
+					t.Fatalf("read control_denied: %v", err)
+				}
+				if typ != websocket.MessageText {
+					continue
+				}
+				var ctrl wsControl
+				if json.Unmarshal(data, &ctrl) == nil && ctrl.T == "control_denied" {
+					if ctrl.Reason != tc.reason {
+						t.Fatalf("reason = %q, want %q", ctrl.Reason, tc.reason)
+					}
+					break
+				}
+			}
+		})
+	}
 }
 func (m *recordingLaunchManager) Close(string)                                   {}
 func (m *recordingLaunchManager) Snapshot() []LaunchInfo                         { return m.snapshot }

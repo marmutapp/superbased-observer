@@ -1192,7 +1192,7 @@ function RoutingApplyCard({ days }: { days: number }) {
             <div className="space-y-1.5">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <h3 className="text-[11px] font-semibold uppercase tracking-[0.06em] text-fg-3">
-                  Observer backups (revertable)
+                  SuperBased backups (revertable)
                 </h3>
                 <RevertAllControl count={backups.length} />
               </div>

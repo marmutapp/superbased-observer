@@ -144,12 +144,14 @@ export function TopBar({
         </div>
         <ThemeToggle />
         {onHelp && (
-          <IconButton
-            title={<>Help <kbd>?</kbd></>}
-            onClick={onHelp}
-          >
-            <span className="text-[12px] font-semibold">?</span>
-          </IconButton>
+          <span data-tour="topbar-help" className="inline-flex">
+            <IconButton
+              title={<>Help <kbd>?</kbd></>}
+              onClick={onHelp}
+            >
+              <span className="text-[12px] font-semibold">?</span>
+            </IconButton>
+          </span>
         )}
       </div>
     </header>
@@ -169,6 +171,7 @@ function ThemeToggle() {
     <div
       role="radiogroup"
       aria-label="Theme"
+      data-tour="topbar-theme"
       className="flex items-center gap-0.5 rounded-2 border border-line-2 bg-bg-2 p-0.5"
     >
       {opts.map((o) => (

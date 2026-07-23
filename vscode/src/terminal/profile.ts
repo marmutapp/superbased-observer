@@ -16,7 +16,7 @@ export function registerTerminalProfile(
     provideTerminalProfile() {
       const env = proxyEnvFor(daemon.getState().proxyPort);
       return new vscode.TerminalProfile({
-        name: 'AI Coding Tool (Observer-proxied)',
+        name: 'AI Coding Tool (SuperBased-proxied)',
         env: {
           ANTHROPIC_BASE_URL: env.ANTHROPIC_BASE_URL,
           OPENAI_BASE_URL: env.OPENAI_BASE_URL,

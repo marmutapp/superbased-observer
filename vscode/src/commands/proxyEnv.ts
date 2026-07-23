@@ -16,7 +16,7 @@ export function registerCopyProxyEnv(
       const text = formatEnv(env, shell);
       await vscode.env.clipboard.writeText(text);
       void vscode.window.showInformationMessage(
-        `Observer: proxy env vars copied (${shell} syntax). Paste into your terminal to route AI CLIs through the proxy.`,
+        `SuperBased: proxy env vars copied (${shell} syntax). Paste into your terminal to route AI CLIs through the proxy.`,
       );
     }),
   );

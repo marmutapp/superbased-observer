@@ -66,32 +66,36 @@ func TestConcurrentRemoteWriterClaims(t *testing.T) {
 	wg.Wait()
 	close(results)
 
-	var wins int
-	var held int
-	var winnerHolder string
+	var leases []*WriterLease
 	for res := range results {
-		switch {
-		case res.err == nil:
-			wins++
-			winnerHolder = res.lease.Holder()
-		case errors.Is(res.err, ErrWriterHeld):
-			held++
-		default:
-			t.Fatalf("AcquireWriterRemote error = %v, want nil or ErrWriterHeld", res.err)
+		if res.err != nil {
+			t.Fatalf("AcquireWriterRemote error = %v, want both authenticated claims granted", res.err)
 		}
-	}
-	if wins != 1 {
-		t.Fatalf("remote winners = %d, want exactly 1", wins)
-	}
-	if held != 1 {
-		t.Fatalf("remote losers rejected with ErrWriterHeld = %d, want 1", held)
+		leases = append(leases, res.lease)
 	}
 	holder, ok := m.WriterHolder(handle)
 	if !ok {
-		t.Fatal("writer lease not held after winning remote claim")
+		t.Fatal("writer lease not held after concurrent remote claims")
 	}
-	if holder != winnerHolder {
-		t.Fatalf("final holder = %q, want winning remote holder %q", holder, winnerHolder)
+	live := 0
+	for _, lease := range leases {
+		select {
+		case <-lease.Revoked():
+			if !lease.RevokeIsTakeover() || lease.RevokedBy() != "remote" {
+				t.Fatalf("superseded lease = (%q, by %q), want takeover by remote", lease.RevokeKind(), lease.RevokedBy())
+			}
+			if _, err := lease.Write([]byte("stale")); !errors.Is(err, ErrNotWriter) {
+				t.Fatalf("superseded lease Write = %v, want ErrNotWriter", err)
+			}
+		default:
+			live++
+			if lease.Holder() != holder {
+				t.Fatalf("live lease holder = %q, manager holder = %q", lease.Holder(), holder)
+			}
+		}
+	}
+	if live != 1 {
+		t.Fatalf("live writers = %d, want exactly one", live)
 	}
 }
 
@@ -124,13 +128,7 @@ func TestLocalTakeoverRacesRemoteAcquire(t *testing.T) {
 		go func() {
 			<-start
 			lease, err := m.AcquireWriterRemote(handle, remoteGrant)
-			if err == nil {
-				<-localDone
-				if _, writeErr := lease.Write([]byte("remote-after-local")); !errors.Is(writeErr, ErrNotWriter) {
-					remoteResult <- result{lease: lease, err: writeErr}
-					return
-				}
-			}
+			<-localDone
 			remoteResult <- result{lease: lease, err: err}
 		}()
 
@@ -144,29 +142,46 @@ func TestLocalTakeoverRacesRemoteAcquire(t *testing.T) {
 		if local.lease == nil || !local.lease.IsLocal() {
 			t.Fatalf("iteration %d: local acquire did not install a local lease", i)
 		}
-		switch {
-		case remote.err == nil:
-			select {
-			case <-remote.lease.Revoked():
-				if !remote.lease.RevokeIsTakeover() {
-					t.Fatalf("iteration %d: remote lease revoked by %q, want local takeover", i, remote.lease.RevokeKind())
-				}
-			case <-time.After(2 * time.Second):
-				t.Fatalf("iteration %d: remote lease was not revoked by local takeover", i)
-			}
-		case errors.Is(remote.err, ErrHeldLocally):
-		default:
-			t.Fatalf("iteration %d: remote acquire/write error = %v, want nil or ErrHeldLocally", i, remote.err)
+		if remote.err != nil {
+			t.Fatalf("iteration %d: remote acquire = %v, want success with takeover enabled", i, remote.err)
 		}
 		holder, ok := m.WriterHolder(handle)
 		if !ok {
 			t.Fatalf("iteration %d: final writer missing", i)
 		}
-		if holder != "local" {
-			t.Fatalf("iteration %d: final holder = %q, want local", i, holder)
+		var incumbent *WriterLease
+		if holder == "local" {
+			incumbent = local.lease
+			<-remote.lease.Revoked()
+			if !remote.lease.RevokeIsTakeover() || remote.lease.RevokedBy() != "local" {
+				t.Fatalf("iteration %d: remote loser = (%q, by %q), want takeover by local", i, remote.lease.RevokeKind(), remote.lease.RevokedBy())
+			}
+			if _, err := remote.lease.Write([]byte("stale-remote")); !errors.Is(err, ErrNotWriter) {
+				t.Fatalf("iteration %d: stale remote Write = %v, want ErrNotWriter", i, err)
+			}
+		} else {
+			incumbent = remote.lease
+			<-local.lease.Revoked()
+			if !local.lease.RevokeIsTakeover() || local.lease.RevokedBy() != "remote" {
+				t.Fatalf("iteration %d: local loser = (%q, by %q), want takeover by remote", i, local.lease.RevokeKind(), local.lease.RevokedBy())
+			}
+			if _, err := local.lease.Write([]byte("stale-local")); !errors.Is(err, ErrNotWriter) {
+				t.Fatalf("iteration %d: stale local Write = %v, want ErrNotWriter", i, err)
+			}
 		}
-		if _, err := m.AcquireWriterRemote(handle, realRemoteGrant(t, caps, handle, "device-late")); !errors.Is(err, ErrHeldLocally) {
-			t.Fatalf("iteration %d: late remote acquire = %v, want ErrHeldLocally", i, err)
+		late, err := m.AcquireWriterRemote(handle, realRemoteGrant(t, caps, handle, "device-late"))
+		if err != nil {
+			t.Fatalf("iteration %d: late remote acquire = %v, want takeover success", i, err)
+		}
+		<-incumbent.Revoked()
+		if !incumbent.RevokeIsTakeover() || incumbent.RevokedBy() != "remote" {
+			t.Fatalf("iteration %d: late-superseded writer = (%q, by %q), want takeover by remote", i, incumbent.RevokeKind(), incumbent.RevokedBy())
+		}
+		if _, err := incumbent.Write([]byte("stale-incumbent")); !errors.Is(err, ErrNotWriter) {
+			t.Fatalf("iteration %d: late-superseded Write = %v, want ErrNotWriter", i, err)
+		}
+		if final, ok := m.WriterHolder(handle); !ok || final != late.Holder() {
+			t.Fatalf("iteration %d: final writer = (%q,%v), want late remote %q", i, final, ok, late.Holder())
 		}
 		m.Shutdown()
 	}

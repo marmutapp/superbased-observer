@@ -520,7 +520,7 @@ function ProcessDiagnosticsPanel({
           <Link to={processURL} className="text-accent hover:underline">
             Body capture = proxied
           </Link>
-          . Payload capture is only for Observer-proxied/plaintext flows; non-proxied TLS stays metadata-only.
+          . Payload capture is only for SuperBased-proxied/plaintext flows; non-proxied TLS stays metadata-only.
         </p>
       )}
       {hasNetworkRows && !hasProcessRows && (
@@ -530,7 +530,7 @@ function ProcessDiagnosticsPanel({
       )}
       {!hasNetworkRows && !hasProcessRows && (
         <p>
-          Historical sessions may not have process/network rows. Run new tool sessions with Observer running after changing settings; use{" "}
+          Historical sessions may not have process/network rows. Run new tool sessions with SuperBased running after changing settings; use{" "}
           <Link to={backfillURL} className="text-accent hover:underline">
             Backfill
           </Link>{" "}
@@ -538,7 +538,7 @@ function ProcessDiagnosticsPanel({
         </p>
       )}
       <p>
-        If you save process, network, or proxy settings, restart Observer from{" "}
+        If you save process, network, or proxy settings, restart SuperBased from{" "}
         <Link to={restartURL} className="text-accent hover:underline">
           Settings → Health
         </Link>
@@ -546,7 +546,7 @@ function ProcessDiagnosticsPanel({
         <Link to={proxyURL} className="text-accent hover:underline">
           Settings → Proxy
         </Link>{" "}
-        if Codex is not routed through the Observer proxy.
+        if Codex is not routed through the SuperBased proxy.
       </p>
     </div>
   );

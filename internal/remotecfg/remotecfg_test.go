@@ -207,3 +207,47 @@ func TestAllowTerminalPreservedAcrossTransactions(t *testing.T) {
 		t.Fatal("disable() cleared allow_terminal — it must leave the field untouched")
 	}
 }
+
+// TestEnableInheritsAllowTerminalViewWhenUnset pins the enable-overwrites-default
+// fix: a plain arm (EnableOptions.AllowTerminalView == nil, as the CLI and the
+// dashboard Arm form both leave it) must NOT clobber the seed default (true) to
+// false. Only an explicit non-nil value writes.
+func TestEnableInheritsAllowTerminalViewWhenUnset(t *testing.T) {
+	// Sanity: the seed default is now visible-by-default.
+	if !config.Default().Remote.AllowTerminalView {
+		t.Fatal("default config has allow_terminal_view=false — expected true seed")
+	}
+
+	// nil (unset) → inherit the loaded/seed true.
+	cfg, cfgPath := baseCfg(t)
+	if _, err := Enable(cfg, cfgPath, EnableOptions{Host: "box.ts.net"}); err != nil {
+		t.Fatalf("Enable: %v", err)
+	}
+	loaded, _ := config.Load(config.LoadOptions{GlobalPath: cfgPath})
+	if !loaded.Remote.AllowTerminalView {
+		t.Fatal("enable with AllowTerminalView unset clobbered the true default to false")
+	}
+
+	// Explicit false → sticks.
+	cfg2, cfgPath2 := baseCfg(t)
+	no := false
+	if _, err := Enable(cfg2, cfgPath2, EnableOptions{Host: "box.ts.net", AllowTerminalView: &no}); err != nil {
+		t.Fatalf("Enable(explicit false): %v", err)
+	}
+	loaded2, _ := config.Load(config.LoadOptions{GlobalPath: cfgPath2})
+	if loaded2.Remote.AllowTerminalView {
+		t.Fatal("enable(AllowTerminalView=&false) did not persist false")
+	}
+
+	// Explicit true when the loaded value was false → also writes.
+	cfg3, cfgPath3 := baseCfg(t)
+	cfg3.Remote.AllowTerminalView = false
+	yes := true
+	if _, err := Enable(cfg3, cfgPath3, EnableOptions{Host: "box.ts.net", AllowTerminalView: &yes}); err != nil {
+		t.Fatalf("Enable(explicit true): %v", err)
+	}
+	loaded3, _ := config.Load(config.LoadOptions{GlobalPath: cfgPath3})
+	if !loaded3.Remote.AllowTerminalView {
+		t.Fatal("enable(AllowTerminalView=&true) did not persist true")
+	}
+}

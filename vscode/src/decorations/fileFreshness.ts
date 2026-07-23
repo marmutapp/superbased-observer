@@ -45,7 +45,7 @@ export class FileFreshnessProvider
     if (!badge) return undefined;
     return {
       badge,
-      tooltip: `Observer: ${decorationTooltip(cached)}`,
+      tooltip: `SuperBased: ${decorationTooltip(cached)}`,
       color: DECORATION_COLOR,
       propagate: false,
     };

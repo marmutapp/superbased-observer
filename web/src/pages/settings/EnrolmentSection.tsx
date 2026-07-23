@@ -38,7 +38,7 @@ export function EnrolmentSection() {
   return (
     <ChartShell
       title="Organisation enrolment"
-      sub="Teams visibility: when enrolled, this agent shares content-free activity rollups (counts, costs, timings, paths — never prompt text or tool output) with your organisation's Observer server. Enrol with `observer enroll <org-url> <token>`; unenrol any time below."
+      sub="Teams visibility: when enrolled, this agent shares content-free activity rollups (counts, costs, timings, paths — never prompt text or tool output) with your organisation's SuperBased server. Enrol with `observer enroll <org-url> <token>`; unenrol any time below."
       right={
         enrolled ? (
           <div className="flex items-center gap-2 text-[11px]">

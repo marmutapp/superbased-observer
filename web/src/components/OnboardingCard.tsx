@@ -58,7 +58,7 @@ export function OnboardingCard({ sessions }: { sessions: number | null }) {
             Welcome. Let's get your first session on the board.
           </h2>
           <p className="mt-1 text-[12px] text-fg-3">
-            Observer captures what your AI coding tools actually do — once a
+            SuperBased captures what your AI coding tools actually do — once a
             tool is wired, sessions, costs, and cache behavior appear here on
             their own.
           </p>

@@ -1,6 +1,6 @@
 # Open the dashboard
 
-`Observer: Open Dashboard` opens the full React analytics dashboard
+`SuperBased: Open Dashboard` opens the full React analytics dashboard
 inside a VS Code editor tab. It's the same surface as the standalone
 `http://127.0.0.1:8081/` — Overview / Sessions / Actions / Cost /
 Analysis / Tools / Compression / Discovery / Settings.

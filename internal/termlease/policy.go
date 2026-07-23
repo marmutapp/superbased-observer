@@ -30,8 +30,8 @@ type Requester int
 const (
 	// RequesterLocal is the owner-local loopback path (never refused).
 	RequesterLocal Requester = iota
-	// RequesterRemote is an authenticated remote device (needs the local owner
-	// to not hold the writer).
+	// RequesterRemote is an authenticated remote device. Whether it may
+	// supersede a current writer is selected by the live takeover policy.
 	RequesterRemote
 )
 
@@ -71,31 +71,45 @@ type leaseRule struct {
 	out     Outcome
 }
 
-// leaseRules is the ordered grant/takeover policy table (plan §4.α.3), walked
-// top-down, one row per case. It encodes:
-//   - The local controller is NEVER silently evicted, and a local acquire is
-//     NEVER refused (local takeover cannot be refused).
-//   - A local takeover ALWAYS revokes an incumbent remote writer.
-//   - A remote writer requires the local owner to not hold the writer (an
-//     explicit local yield = local Release ⇒ HolderNone); otherwise it fails
-//     closed with "held locally".
-//   - Only one remote writer at a time: a second remote acquire is refused
-//     while a remote holds (one input source ever).
-var leaseRules = []leaseRule{
+// leaseRulesCommon is the shared prefix of both ordered grant/takeover policy
+// tables (plan §4.α.3): the four cases whose outcome does not depend on the
+// authenticated-remote takeover setting.
+var leaseRulesCommon = []leaseRule{
 	{RequesterLocal, HolderNone, Outcome{ActionGrant, false, "local acquire, no current holder"}},
 	{RequesterLocal, HolderLocal, Outcome{ActionGrant, true, "local re-acquire, revoke prior local lease"}},
 	{RequesterLocal, HolderRemote, Outcome{ActionGrant, true, "local takeover, revoke remote writer"}},
 	{RequesterRemote, HolderNone, Outcome{ActionGrant, false, "remote acquire, no current holder"}},
-	{RequesterRemote, HolderLocal, Outcome{ActionRefuse, false, "held locally — remote refused until explicit local yield"}},
-	{RequesterRemote, HolderRemote, Outcome{ActionRefuse, false, "already held by another remote writer"}},
 }
+
+// leaseRules keeps the opt-out posture for rows five and six: when authenticated
+// remote takeover is disabled, a remote requester cannot evict either holder.
+// The local controller is therefore never evicted by a remote in this table.
+var leaseRules = append(
+	append([]leaseRule{}, leaseRulesCommon...),
+	leaseRule{RequesterRemote, HolderLocal, Outcome{ActionRefuse, false, "held locally — remote takeover disabled"}},
+	leaseRule{RequesterRemote, HolderRemote, Outcome{ActionRefuse, false, "already held by another remote writer"}},
+)
+
+// leaseRulesRemoteTakeover keeps rows one through four byte-identical and
+// replaces only rows five and six. A valid remote credential has already been
+// authorized upstream before this policy is consulted; these grants revoke the
+// incumbent lease so the one-live-writer invariant remains intact.
+var leaseRulesRemoteTakeover = append(
+	append([]leaseRule{}, leaseRulesCommon...),
+	leaseRule{RequesterRemote, HolderLocal, Outcome{ActionGrant, true, "authenticated remote takeover of local writer"}},
+	leaseRule{RequesterRemote, HolderRemote, Outcome{ActionGrant, true, "authenticated remote takeover of remote writer"}},
+)
 
 // Decide evaluates the grant/takeover policy table for a requester against the
 // current holder. It walks the ordered rule set top-down and returns the first
 // match; an unmatched combination fails closed (refuse). Pure: no side effects,
 // no locking — the caller applies the verdict under its own write fence.
-func Decide(req Requester, current HolderKind) Outcome {
-	for _, r := range leaseRules {
+func Decide(req Requester, current HolderKind, allowRemoteTakeover bool) Outcome {
+	rules := leaseRules
+	if allowRemoteTakeover {
+		rules = leaseRulesRemoteTakeover
+	}
+	for _, r := range rules {
 		if r.req == req && r.current == current {
 			return r.out
 		}

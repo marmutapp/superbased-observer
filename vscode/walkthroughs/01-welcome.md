@@ -1,9 +1,9 @@
-# SuperBased Observer
+# SuperBased
 
 **See and control exactly what your AI coding agents cost — across every
 tool, 100% local.**
 
-Observer captures, normalises, and analyses tool-call activity from
+SuperBased captures, normalises, and analyses tool-call activity from
 Claude Code, Codex, Cursor, Cline (and forks like Roo Code), Copilot,
 Gemini, Devin, Aider, and 18 more — 26 adapters in all — entirely on
 your machine. No telemetry. No data leaves your machine.
@@ -16,7 +16,7 @@ This walkthrough takes about **5 minutes** and covers:
 - Routing your AI CLIs through the observer proxy so token counts
   are accurate
 - Auto-updating your `CLAUDE.md` / `AGENTS.md` / `.cursorrules`
-  from the patterns Observer learns about your workflow
+  from the patterns SuperBased learns about your workflow
 
 You can revisit any step later via **Help → Welcome** or the
 **Get Started: Open Walkthrough…** command.

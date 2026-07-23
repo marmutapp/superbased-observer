@@ -1,6 +1,6 @@
 # Route AI CLIs through the proxy
 
-JSONL adapters give Observer approximate token counts. The
+JSONL adapters give SuperBased approximate token counts. The
 **reverse proxy** gives you **accurate** counts by sitting between
 your AI tool and the upstream API — every request/response is
 captured byte-for-byte.
@@ -12,7 +12,7 @@ the OpenAI equivalent).
 ### Option 1 — Use the contributed terminal profile
 
 Open the terminal dropdown (down arrow next to **+** in the
-Terminal panel) → **AI Coding Tool (Observer-proxied)**.
+Terminal panel) → **AI Coding Tool (SuperBased-proxied)**.
 
 The new terminal already has these env vars set:
 
@@ -23,11 +23,11 @@ ENABLE_TOOL_SEARCH=true
 ```
 
 Launch `claude`, `codex`, or any AI CLI from here and it routes
-through Observer automatically.
+through SuperBased automatically.
 
 ### Option 2 — Copy the env to your existing terminal
 
-The `Observer: Copy Proxy Env Vars` command writes the same triple
+The `SuperBased: Copy Proxy Env Vars` command writes the same triple
 to your clipboard in your shell's syntax (`export …` for bash/zsh,
 `$env:…` for PowerShell, `set …` for cmd). Paste into any existing
 terminal.
@@ -36,6 +36,6 @@ terminal.
 
 Without it, Claude Code's SDK disables its `ToolSearch` feature
 when `ANTHROPIC_BASE_URL` is set, and the proxy becomes a net
-**cost** on the claude-code recipe. The Observer proxy is
+**cost** on the claude-code recipe. The SuperBased proxy is
 specifically engineered to forward `tool_reference` blocks safely,
 so this override re-enables the SDK's normal lazy-MCP path.

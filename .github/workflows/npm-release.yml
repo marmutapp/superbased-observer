@@ -352,11 +352,19 @@ jobs:
 
   # ----------------------------------------------------------------
   # Docker image (Teams M5). Build the observer-org server image from
-  # Dockerfile.observer-org, push it to ghcr.io under the marmutapp
-  # org using the private repo's GITHUB_TOKEN, then keyless-sign it
-  # with cosign BY DIGEST (immutable reference; signing a mutable tag
-  # is a TOCTOU footgun). The image digest is exposed as a job output
-  # so downstream steps / docs can reference the exact pushed image.
+  # Dockerfile.observer-org, push it to ghcr.io under the superbasedapp
+  # org, then keyless-sign it with cosign BY DIGEST (immutable
+  # reference; signing a mutable tag is a TOCTOU footgun). The image
+  # digest is exposed as a job output so downstream steps / docs can
+  # reference the exact pushed image.
+  #
+  # Auth: the repo's own GITHUB_TOKEN can only publish into THIS
+  # repo's owner namespace (marmutapp), so cross-org publish uses the
+  # GHCR_PUSH_TOKEN secret (a classic PAT with write:packages; GHCR is not
+  # covered by fine-grained PATs), held on the private repo like every
+  # other release secret. Absent secret => the job no-ops gracefully
+  # (VSCE_PAT pattern). One-time backfill of pre-transfer tags is the
+  # manual ghcr-mirror.yml workflow.
   # ----------------------------------------------------------------
   docker_image:
     name: Docker image (observer-org)
@@ -371,34 +379,51 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Check GHCR_PUSH_TOKEN presence (skip job if unset)
+        id: ghcr_gate
+        env:
+          GHCR_PUSH_TOKEN: ${{ secrets.GHCR_PUSH_TOKEN }}
+        run: |
+          if [ -z "${GHCR_PUSH_TOKEN:-}" ]; then
+            echo "::notice::GHCR_PUSH_TOKEN not set; skipping observer-org image publish (org-transfer secret setup pending)."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up Buildx
+        if: steps.ghcr_gate.outputs.present == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to ghcr.io
+        if: steps.ghcr_gate.outputs.present == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GHCR_PUSH_TOKEN }}
 
       - name: Build and push
+        if: steps.ghcr_gate.outputs.present == 'true'
         id: push
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.observer-org
           push: true
-          tags: ghcr.io/marmutapp/observer-org:${{ github.ref_name }}
+          tags: ghcr.io/superbasedapp/observer-org:${{ github.ref_name }}
 
       - name: Install cosign
+        if: steps.ghcr_gate.outputs.present == 'true'
         uses: sigstore/cosign-installer@v3
 
       - name: Sign image by digest (keyless)
+        if: steps.ghcr_gate.outputs.present == 'true'
         # Keyless OIDC signing — no long-lived keys; the signature is
         # bound to this workflow's identity. Verifiable later with
         # `cosign verify ... --certificate-identity-regexp ...`.
         run: |
-          cosign sign --yes "ghcr.io/marmutapp/observer-org@${{ steps.push.outputs.digest }}"
+          cosign sign --yes "ghcr.io/superbasedapp/observer-org@${{ steps.push.outputs.digest }}"
 
   # ----------------------------------------------------------------
   # Hashes (Teams M5). Compute the base64-encoded sha256sum subject
@@ -1125,10 +1150,19 @@ jobs:
           # Linux + Darwin: tar.gz preserves the executable bit
           # (chmod +x set in the build job rides along). Windows:
           # zip is the conventional Windows artifact format.
+          #
+          # Dual-name compatibility (2026-07-23): ship a `superbased` alias
+          # beside `observer` so direct-download users get both command names
+          # (npm/PyPI installs get both via their bin/scripts maps). A relative
+          # symlink rides inside the tar for POSIX; Windows zip gets a copy
+          # (zip symlink support is unreliable across extractors).
           for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            ln -sf observer "artifacts/observer-${target}/superbased"
             tar -czf "release-assets/observer-${VERSION}-${target}.tar.gz" \
               -C "artifacts/observer-${target}" .
           done
+          cp "artifacts/observer-win32-x64/observer.exe" \
+             "artifacts/observer-win32-x64/superbased.exe"
           (cd "artifacts/observer-win32-x64" && \
               zip -r "$GITHUB_WORKSPACE/release-assets/observer-${VERSION}-win32-x64.zip" .)
 
@@ -1224,13 +1258,13 @@ jobs:
             echo "The self-hosted org server ships as a Docker image and as per-platform \`observer-org-${GITHUB_REF_NAME}-*\` archives (attached below)."
             echo ""
             echo '```bash'
-            echo "docker pull ghcr.io/marmutapp/observer-org:${GITHUB_REF_NAME}"
+            echo "docker pull ghcr.io/superbasedapp/observer-org:${GITHUB_REF_NAME}"
             echo '```'
             echo ""
             echo "The image is keyless-signed with cosign. Verify it:"
             echo ""
             echo '```bash'
-            echo "cosign verify ghcr.io/marmutapp/observer-org:${GITHUB_REF_NAME} \\"
+            echo "cosign verify ghcr.io/superbasedapp/observer-org:${GITHUB_REF_NAME} \\"
             echo "  --certificate-identity-regexp 'https://github.com/marmutapp/superbased-observer-private/.*' \\"
             echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
             echo '```'

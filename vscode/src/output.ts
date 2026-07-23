@@ -4,7 +4,7 @@ let channel: vscode.OutputChannel | undefined;
 
 function ensure(): vscode.OutputChannel {
   if (!channel) {
-    channel = vscode.window.createOutputChannel('Observer');
+    channel = vscode.window.createOutputChannel('SuperBased');
   }
   return channel;
 }

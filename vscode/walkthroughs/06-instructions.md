@@ -1,6 +1,6 @@
 # Auto-update your instruction files
 
-Observer learns patterns from your captured activity — hot files,
+SuperBased learns patterns from your captured activity — hot files,
 common commands, edit-then-test pairs, onboarding sequences,
 correction rules derived from failure→recovery traces — and can
 materialise them into your project's instruction files.
@@ -16,10 +16,10 @@ It works on three files, mapping to three CLI targets:
 When you open one of these files, **two CodeLenses** appear at the
 top:
 
-- **🔄 Refresh from Observer learnings** — runs
+- **🔄 Refresh from SuperBased learnings** — runs
   `observer suggest --apply --project <root> --target <…>` and
   reloads the editor with the new content (preserves anything
-  outside Observer's managed block).
+  outside SuperBased's managed block).
 - **👁 Preview suggestions** — runs the same command **without**
   `--apply` and opens the dry-run output as a new untitled markdown
   editor beside the original, so you can see exactly what would be
@@ -37,7 +37,7 @@ top:
 
 ### Manual block markers
 
-Observer only touches content between its own marker block:
+SuperBased only touches content between its own marker block:
 
 ```markdown
 <!-- BEGIN OBSERVER -->

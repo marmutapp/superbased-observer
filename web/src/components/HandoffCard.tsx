@@ -168,7 +168,7 @@ function HandoffModal({
       );
       // Hand the session to the app-level dock and close this picker — the
       // terminal now lives above the modal, so closing it doesn't kill it.
-      dock.launch({ token: r.token, tool: target, sessionId });
+      dock.launch({ token: r.token, tool: target, sessionId, hasProjectRoot: r.has_project_root ?? false });
       onClose();
     } catch (e) {
       setPostErr(e instanceof Error ? e.message : String(e));

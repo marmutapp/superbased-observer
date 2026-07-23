@@ -112,14 +112,14 @@ export class DaemonManager implements vscode.Disposable {
   async start(): Promise<DaemonState> {
     if (this.state.mode === 'detect') {
       void vscode.window.showInformationMessage(
-        'Observer: daemon.mode is "detect" — set it to "managed" or "auto" to allow the extension to spawn the daemon.',
+        'SuperBased: daemon.mode is "detect" — set it to "managed" or "auto" to allow the extension to spawn the daemon.',
       );
       return this.state;
     }
     const live = await readLiveLocks(dbDirDefault());
     if (live.length > 0) {
       void vscode.window.showInformationMessage(
-        `Observer: already running (PID ${live[0].pid}) — attaching instead.`,
+        `SuperBased: already running (PID ${live[0].pid}) — attaching instead.`,
       );
       this.setState({ status: 'attached', lock: live[0] });
       return this.state;
@@ -136,7 +136,7 @@ export class DaemonManager implements vscode.Disposable {
   async stop(): Promise<DaemonState> {
     if (this.state.status !== 'managed' || !this.child) {
       void vscode.window.showInformationMessage(
-        'Observer: no extension-managed daemon to stop.',
+        'SuperBased: no extension-managed daemon to stop.',
       );
       return this.state;
     }
@@ -209,7 +209,7 @@ export class DaemonManager implements vscode.Disposable {
       this.child = undefined;
       this.setState({ status: 'idle', lock: undefined });
       void vscode.window.showErrorMessage(
-        `Observer: failed to start the daemon (${err.message}). Check the Output channel.`,
+        `SuperBased: failed to start the daemon (${err.message}). Check the Output channel.`,
       );
       spawnErrored = true;
       rejectSpawn(err);
@@ -250,7 +250,7 @@ export class DaemonManager implements vscode.Disposable {
       if (spawnErrored) return;
       output.appendLine(`Daemon health probe failed: ${(err as Error).message}`);
       void vscode.window.showErrorMessage(
-        `Observer: daemon started but dashboard did not respond on :${this.state.dashboardPort}. Check the Output channel.`,
+        `SuperBased: daemon started but dashboard did not respond on :${this.state.dashboardPort}. Check the Output channel.`,
       );
     }
   }
@@ -291,7 +291,7 @@ export class DaemonManager implements vscode.Disposable {
 
   private async escalateCrash(): Promise<void> {
     const message =
-      'Observer: daemon crashed 4 times in a row — auto-restart paused. Check the Output channel.';
+      'SuperBased: daemon crashed 4 times in a row — auto-restart paused. Check the Output channel.';
     const choice = await vscode.window.showErrorMessage(
       message,
       'Open Output Channel',

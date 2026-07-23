@@ -1,8 +1,8 @@
 # You're set
 
-You've got Observer wired into VS Code end-to-end:
+You've got SuperBased wired into VS Code end-to-end:
 
-- ✅ Binary verified via `Observer: Doctor`
+- ✅ Binary verified via `SuperBased: Doctor`
 - ✅ Daemon mode chosen
 - ✅ Dashboard accessible inside the editor
 - ✅ Proxy env vars routable to your AI CLIs
@@ -23,15 +23,15 @@ You've got Observer wired into VS Code end-to-end:
 
 ### Common follow-ups
 
-- `Observer: Refresh All Trees` — force-refresh the four sidebar
+- `SuperBased: Refresh All Trees` — force-refresh the four sidebar
   views (Today / Sessions / Discovery / Costs) without waiting for
   the next poll.
-- `Observer: Stop Daemon` — only available in `managed`/`auto`
+- `SuperBased: Stop Daemon` — only available in `managed`/`auto`
   modes; SIGTERMs the extension-managed daemon with a 5 s grace
   before SIGKILL.
 
 ### Local-first
 
-Everything Observer captures stays on your machine. No telemetry,
+Everything SuperBased captures stays on your machine. No telemetry,
 no outbound network calls except a first-install binary download
 from GitHub Releases when no `observer` is found locally.

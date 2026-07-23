@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -230,10 +231,17 @@ func newAdminRevokeHarness(t *testing.T) *adminRevokeHarness {
 }
 
 // pairAndAcquire pairs a device on the controller, opens a remote-exposed WS
-// bridge carrying its cookie, acquires the remote writer lease through the REAL
-// §4.δ conjunction, and returns the WS conn, the raw cookie, and the device
-// fingerprint (= grant.Holder() = /api/remote/sessions fingerprint).
+// bridge carrying its cookie, and acquires the remote writer lease through the
+// REAL §4.δ conjunction.
 func (h *adminRevokeHarness) pairAndAcquire(t *testing.T) (*websocket.Conn, string, string) {
+	t.Helper()
+	c, raw, fp, _ := h.pairAndAcquireWithGrant(t)
+	return c, raw, fp
+}
+
+// pairAndAcquireWithGrant also returns the bridge's client-facing grant frame
+// so generation-ordering tests can compare it to the concrete lease.
+func (h *adminRevokeHarness) pairAndAcquireWithGrant(t *testing.T) (*websocket.Conn, string, string, wsControl) {
 	t.Helper()
 	raw, err := h.rc.sessions.Create()
 	if err != nil {
@@ -268,16 +276,14 @@ func (h *adminRevokeHarness) pairAndAcquire(t *testing.T) (*websocket.Conn, stri
 	}
 	_ = c.Write(context.Background(), websocket.MessageText,
 		[]byte(`{"t":"acquire-writer","cap":"`+tok+`","confirm":"`+confirm+`"}`))
-	if !waitForControl(t, context.Background(), c, "control_granted") {
-		t.Fatal("expected control_granted after a valid remote acquire")
-	}
+	grantFrame := readControlFrame(t, c, "control_granted")
 	if h.adapter.lastLease() == nil {
 		t.Fatal("adapter captured no remote lease")
 	}
 	if got := h.adapter.lastLease().Holder(); got != fp {
 		t.Fatalf("lease holder %q != device fingerprint %q — the unified fingerprint is broken", got, fp)
 	}
-	return c, raw, fp
+	return c, raw, fp, grantFrame
 }
 
 func trimHTTP(url string) string {
@@ -285,6 +291,31 @@ func trimHTTP(url string) string {
 		return url[4:]
 	}
 	return url
+}
+
+// readControlFrame reads through geometry/binary frames until the requested
+// control message arrives. It returns the decoded wire frame for field-level
+// assertions (notably the writer-lease generation contract).
+func readControlFrame(t *testing.T, c *websocket.Conn, want string) wsControl {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		typ, data, err := c.Read(ctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("read %s control frame: %v", want, err)
+		}
+		if typ != websocket.MessageText {
+			continue
+		}
+		var ctrl wsControl
+		if json.Unmarshal(data, &ctrl) == nil && ctrl.T == want {
+			return ctrl
+		}
+	}
+	t.Fatalf("timed out waiting for %s control frame", want)
+	return wsControl{}
 }
 
 // assertLeaseDeadAndFenced proves the captured lease was revoked through the
@@ -320,14 +351,35 @@ func assertSocketClosed(t *testing.T, c *websocket.Conn) {
 	t.Fatal("remote websocket stayed OPEN after an admin/device-invalidation kill — it must be closed")
 }
 
-// assertSocketStillOpen proves the socket survives (a local takeover only
+// assertSocketStillOpen proves the socket survives (any lease takeover only
 // demotes): after receiving control_revoked, a subsequent read blocks (idle
 // PTY) and times out rather than returning a websocket CLOSE — the bridge did
 // NOT tear the socket down.
-func assertSocketStillOpen(t *testing.T, c *websocket.Conn) {
+func assertSocketStillOpen(t *testing.T, c *websocket.Conn, wantBy string) {
 	t.Helper()
-	if !waitForControl(t, context.Background(), c, "control_revoked") {
-		t.Fatal("expected control_revoked on a local takeover (demote)")
+	deadline := time.Now().Add(3 * time.Second)
+	found := false
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		typ, data, err := c.Read(ctx)
+		cancel()
+		if err != nil {
+			break
+		}
+		if typ != websocket.MessageText {
+			continue
+		}
+		var ctrl wsControl
+		if json.Unmarshal(data, &ctrl) == nil && ctrl.T == "control_revoked" {
+			if ctrl.By != wantBy {
+				t.Fatalf("control_revoked by=%q, want %q", ctrl.By, wantBy)
+			}
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected control_revoked by %q on a lease takeover (demote)", wantBy)
 	}
 	// A short read: on a demoted-but-open socket the idle PTY produces no
 	// frames, so Read times out (CloseStatus == -1). A closed socket would yield
@@ -339,7 +391,7 @@ func assertSocketStillOpen(t *testing.T, c *websocket.Conn) {
 		return // an output frame arrived — the socket is alive
 	}
 	if websocket.CloseStatus(err) != -1 {
-		t.Fatalf("socket was CLOSED on a local takeover (close status %v) — a takeover must only DEMOTE", websocket.CloseStatus(err))
+		t.Fatalf("socket was CLOSED on a lease takeover (close status %v) — a takeover must only DEMOTE", websocket.CloseStatus(err))
 	}
 	if ctx.Err() == nil {
 		t.Fatalf("unexpected read error on a demoted socket (not a timeout, not a close): %v", err)
@@ -411,5 +463,158 @@ func TestLocalTakeoverDemotesRemoteWriterButKeepsSocket(t *testing.T) {
 	// The remote lease is fenced (demoted): a stale remote Write is dropped.
 	h.assertLeaseDeadAndFenced(t)
 	// But the socket stays open as a read-only viewer.
-	assertSocketStillOpen(t, c)
+	assertSocketStillOpen(t, c, "local")
+}
+
+// TestRemoteTakeoverDemotesLocalBridgeButKeepsSocket pins the local-bridge
+// half of seamless handoff: an authenticated remote acquire supersedes the
+// owner-local writer, but the losing loopback websocket remains a read-only
+// viewer and receives an actor-accurate by:"remote" notice.
+func TestRemoteTakeoverDemotesLocalBridgeButKeepsSocket(t *testing.T) {
+	h := newAdminRevokeHarness(t)
+	localTS := httptest.NewServer(h.h)
+	t.Cleanup(localTS.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	c, _, err := websocket.Dial(ctx, "ws"+trimHTTP(localTS.URL)+"/ws/launch/"+h.handle, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": {localTS.URL}},
+	})
+	if err != nil {
+		t.Fatalf("local ws dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.CloseNow() })
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if holder, ok := h.mgr.WriterHolder(h.handle); ok && holder == "local" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if holder, ok := h.mgr.WriterHolder(h.handle); !ok || holder != "local" {
+		t.Fatalf("local bridge did not acquire writer: holder=(%q,%v)", holder, ok)
+	}
+
+	raw, err := h.rc.sessions.Create()
+	if err != nil {
+		t.Fatalf("sessions.Create: %v", err)
+	}
+	tok, confirm, err := h.rc.MintTerminalControl(remoteauth.HashSessionID(raw), h.handle)
+	if err != nil {
+		t.Fatalf("MintTerminalControl: %v", err)
+	}
+	remote, err := h.adapter.AcquireWriterRemote(RemoteWriterRequest{
+		Handle: h.handle, DeviceSessionID: raw, CapabilityToken: tok, Confirm: confirm, RemoteExposed: true,
+	})
+	if err != nil || remote == nil {
+		t.Fatalf("remote-over-local acquire: writer=%v err=%v", remote, err)
+	}
+	assertSocketStillOpen(t, c, "remote")
+}
+
+// TestRemoteTakeoverDemotesRemoteBridgeButKeepsSocket pins the remote-bridge
+// half: remote-over-remote marks the losing lease LeaseTakenOver, so its bridge
+// stays open despite closeOnHardRevoke=true and reports by:"remote".
+func TestRemoteTakeoverDemotesRemoteBridgeButKeepsSocket(t *testing.T) {
+	h := newAdminRevokeHarness(t)
+	firstConn, _, _ := h.pairAndAcquire(t)
+	t.Cleanup(func() { _ = firstConn.CloseNow() })
+	firstLease := h.adapter.lastLease()
+	secondConn, _, _ := h.pairAndAcquire(t)
+	t.Cleanup(func() { _ = secondConn.CloseNow() })
+
+	select {
+	case <-firstLease.Revoked():
+	case <-time.After(2 * time.Second):
+		t.Fatal("first remote lease was not revoked by second remote")
+	}
+	if !firstLease.RevokeIsTakeover() || firstLease.RevokedBy() != "remote" {
+		t.Fatalf("first remote revoke = (%q, by %q), want LeaseTakenOver by remote", firstLease.RevokeKind(), firstLease.RevokedBy())
+	}
+	if _, err := firstLease.Write([]byte("stale")); err == nil {
+		t.Fatal("superseded remote lease was not fenced")
+	}
+	assertSocketStillOpen(t, firstConn, "remote")
+}
+
+// TestTakeoverReacquireFramesCarryLeaseGenerations pins the ordering contract
+// that closes rapid takeover ping-pong on the browser side. The real manager
+// produces remote grant N, local takeover N+1, then remote re-grant N+2; the
+// bridge must stamp both the OLD revoke with N and the NEW grant with N+2. If
+// scheduling delivers grant(N+2) before revoke(N), the client comparison below
+// keeps the seat writable instead of applying the stale demotion.
+func TestTakeoverReacquireFramesCarryLeaseGenerations(t *testing.T) {
+	h := newAdminRevokeHarness(t)
+	c, raw, _, initialGrant := h.pairAndAcquireWithGrant(t)
+	t.Cleanup(func() { _ = c.CloseNow() })
+
+	oldLease := h.adapter.lastLease()
+	if oldLease == nil || oldLease.Gen() == 0 {
+		t.Fatal("initial remote lease has no generation")
+	}
+	if initialGrant.Gen != oldLease.Gen() {
+		t.Fatalf("initial control_granted gen=%d, want lease gen=%d", initialGrant.Gen, oldLease.Gen())
+	}
+
+	localLease, err := h.mgr.AcquireWriterLocal(h.handle)
+	if err != nil {
+		t.Fatalf("local takeover: %v", err)
+	}
+	if localLease.Gen() != oldLease.Gen()+1 {
+		t.Fatalf("local takeover gen=%d, want old gen+1=%d", localLease.Gen(), oldLease.Gen()+1)
+	}
+	revoked := readControlFrame(t, c, "control_revoked")
+	if revoked.Gen != oldLease.Gen() {
+		t.Fatalf("control_revoked gen=%d, want revoked lease gen=%d", revoked.Gen, oldLease.Gen())
+	}
+	if revoked.By != "local" {
+		t.Fatalf("control_revoked by=%q, want local", revoked.By)
+	}
+
+	// Re-acquire on the SAME still-open remote bridge. This takes over the local
+	// N+1 lease and therefore must grant the remote seat generation N+2.
+	tok, confirm, err := h.rc.MintTerminalControl(remoteauth.HashSessionID(raw), h.handle)
+	if err != nil {
+		t.Fatalf("MintTerminalControl for re-acquire: %v", err)
+	}
+	if err := c.Write(context.Background(), websocket.MessageText,
+		[]byte(`{"t":"acquire-writer","cap":"`+tok+`","confirm":"`+confirm+`"}`)); err != nil {
+		t.Fatalf("write re-acquire frame: %v", err)
+	}
+	regrant := readControlFrame(t, c, "control_granted")
+	newLease := h.adapter.lastLease()
+	if newLease == nil {
+		t.Fatal("adapter captured no re-acquired remote lease")
+	}
+	if regrant.Gen != newLease.Gen() {
+		t.Fatalf("re-grant gen=%d, want live lease gen=%d", regrant.Gen, newLease.Gen())
+	}
+	if regrant.Gen != revoked.Gen+2 {
+		t.Fatalf("re-grant gen=%d, want revoked gen+2=%d", regrant.Gen, revoked.Gen+2)
+	}
+
+	// Replay the two REAL bridge frames in the adversarial wire order. This is
+	// the small state transition implemented in LaunchTerminal.tsx: a revoke is
+	// stale only when a live, strictly newer grant has already been observed.
+	clientControl := "viewer"
+	latestGranted := uint64(0)
+	hasLiveGrant := false
+	for _, frame := range []wsControl{regrant, revoked} {
+		switch frame.T {
+		case "control_granted":
+			if frame.Gen > latestGranted {
+				latestGranted = frame.Gen
+			}
+			hasLiveGrant = true
+			clientControl = "writer"
+		case "control_revoked":
+			if hasLiveGrant && frame.Gen > 0 && frame.Gen < latestGranted {
+				continue
+			}
+			hasLiveGrant = false
+			clientControl = "revoked"
+		}
+	}
+	if clientControl != "writer" {
+		t.Fatalf("grant(gen=%d) then stale revoke(gen=%d) left client %q, want writer", regrant.Gen, revoked.Gen, clientControl)
+	}
 }

@@ -2303,6 +2303,10 @@ export type SessionLaunchResponse = {
   token: string;
   subcommand: string;
   session_id: string;
+  // Additive/optional (review finding 8): whether the launched terminal was
+  // given a project root, so the dock can enable Files/Git immediately without
+  // waiting for a /api/launch/sessions rehydrate. Absence ≡ false.
+  has_project_root?: boolean;
 };
 
 // AttachInfo is one row of GET /api/attach/sessions — a LIVE
@@ -2325,6 +2329,9 @@ export type AttachInfo = {
   writer_holder: string;
   exited: boolean;
   exit_code: number;
+  // Additive/optional (review finding 8): whether the attach session has a
+  // project root, so a jumped-in seat enables Files/Git immediately. Absence ≡ false.
+  has_project_root?: boolean;
 };
 
 export type AttachSessionsResponse = { sessions: AttachInfo[] };

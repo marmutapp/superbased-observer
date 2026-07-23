@@ -21,19 +21,26 @@ func TestDecidePolicyTable(t *testing.T) {
 		name       string
 		req        Requester
 		current    HolderKind
+		allow      bool
 		wantGrant  bool
 		wantRevoke bool
 	}{
-		{"local acquire, none held", RequesterLocal, HolderNone, true, false},
-		{"local re-acquire self", RequesterLocal, HolderLocal, true, true},
-		{"local takeover of remote", RequesterLocal, HolderRemote, true, true},
-		{"remote acquire, none held", RequesterRemote, HolderNone, true, false},
-		{"remote refused while local holds", RequesterRemote, HolderLocal, false, false},
-		{"remote refused while remote holds", RequesterRemote, HolderRemote, false, false},
+		{"local acquire, none held, flag off", RequesterLocal, HolderNone, false, true, false},
+		{"local re-acquire self, flag off", RequesterLocal, HolderLocal, false, true, true},
+		{"local takeover of remote, flag off", RequesterLocal, HolderRemote, false, true, true},
+		{"remote acquire, none held, flag off", RequesterRemote, HolderNone, false, true, false},
+		{"remote refused while local holds, flag off", RequesterRemote, HolderLocal, false, false, false},
+		{"remote refused while remote holds, flag off", RequesterRemote, HolderRemote, false, false, false},
+		{"local acquire, none held, flag on", RequesterLocal, HolderNone, true, true, false},
+		{"local re-acquire self, flag on", RequesterLocal, HolderLocal, true, true, true},
+		{"local takeover of remote, flag on", RequesterLocal, HolderRemote, true, true, true},
+		{"remote acquire, none held, flag on", RequesterRemote, HolderNone, true, true, false},
+		{"remote takes over local, flag on", RequesterRemote, HolderLocal, true, true, true},
+		{"remote takes over remote, flag on", RequesterRemote, HolderRemote, true, true, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			out := Decide(tc.req, tc.current)
+			out := Decide(tc.req, tc.current, tc.allow)
 			if out.Granted() != tc.wantGrant {
 				t.Fatalf("Granted()=%v want %v (reason=%q)", out.Granted(), tc.wantGrant, out.Reason)
 			}
@@ -46,8 +53,10 @@ func TestDecidePolicyTable(t *testing.T) {
 
 func TestDecideLocalNeverRefused(t *testing.T) {
 	for _, h := range []HolderKind{HolderNone, HolderLocal, HolderRemote} {
-		if !Decide(RequesterLocal, h).Granted() {
-			t.Fatalf("local acquire refused with current=%v — local must never be refused", h)
+		for _, allow := range []bool{false, true} {
+			if !Decide(RequesterLocal, h, allow).Granted() {
+				t.Fatalf("local acquire refused with current=%v allowRemoteTakeover=%v — local must never be refused", h, allow)
+			}
 		}
 	}
 }

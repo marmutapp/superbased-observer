@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -283,17 +284,17 @@ func TestCreatePanicDoesNotLeakReservation(t *testing.T) {
 	}
 }
 
-// TestWriterLeaseRemoteExclusivity proves two concurrent remote acquires yield
-// exactly one winner; the loser fails closed (one input source ever).
+// TestWriterLeaseRemoteExclusivity proves concurrent authenticated remote
+// acquires leave exactly one LIVE writer while every superseded lease is fenced.
 func TestWriterLeaseRemoteExclusivity(t *testing.T) {
 	sp := &fakeSpawner{}
 	m := newTestManager(t, sp, time.Now)
 	tok, _ := m.Create(validSpec())
 
 	const n = 8
-	var wins int32
 	var mu sync.Mutex
-	var errCount int
+	var leases []*WriterLease
+	var errs []error
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 	for i := 0; i < n; i++ {
@@ -301,32 +302,47 @@ func TestWriterLeaseRemoteExclusivity(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			_, err := m.AcquireWriterRemote(tok, remoteGrant(t, tok, "device-x"))
+			lease, err := m.AcquireWriterRemote(tok, remoteGrant(t, tok, "device-x"))
 			mu.Lock()
-			if err == nil {
-				wins++
-			} else if errors.Is(err, ErrWriterHeld) {
-				errCount++
+			if err != nil {
+				errs = append(errs, err)
+			} else {
+				leases = append(leases, lease)
 			}
 			mu.Unlock()
 		}(i)
 	}
 	close(start)
 	wg.Wait()
-	if wins != 1 {
-		t.Fatalf("winners = %d, want exactly 1", wins)
+	if len(errs) != 0 || len(leases) != n {
+		t.Fatalf("acquires: leases=%d errors=%v, want all %d authenticated acquires granted", len(leases), errs, n)
 	}
-	if errCount != n-1 {
-		t.Fatalf("losers failing closed = %d, want %d", errCount, n-1)
+	live := 0
+	for _, lease := range leases {
+		select {
+		case <-lease.Revoked():
+			if !lease.RevokeIsTakeover() {
+				t.Fatalf("superseded remote lease revoke kind = %q, want LeaseTakenOver", lease.RevokeKind())
+			}
+			if _, err := lease.Write([]byte("stale")); !errors.Is(err, ErrNotWriter) {
+				t.Fatalf("superseded remote lease Write = %v, want ErrNotWriter", err)
+			}
+		default:
+			live++
+		}
+	}
+	if live != 1 {
+		t.Fatalf("live remote writers = %d, want exactly one; every superseded lease must be fenced", live)
 	}
 }
 
-// TestLocalNeverEvicted proves a remote acquire is refused while the local
-// owner holds the writer, and succeeds only after an explicit local yield.
-func TestLocalNeverEvicted(t *testing.T) {
+// TestRemoteTakeoverDisabledPreservesLocal proves the explicit opt-out refuses
+// a remote acquire while local holds and admits it after an explicit yield.
+func TestRemoteTakeoverDisabledPreservesLocal(t *testing.T) {
 	sp := &fakeSpawner{}
 	m := newTestManager(t, sp, time.Now)
 	tok, _ := m.Create(validSpec())
+	m.SetAllowRemoteTakeoverSource(func() bool { return false })
 
 	local, err := m.AcquireWriterLocal(tok)
 	if err != nil {
@@ -339,6 +355,108 @@ func TestLocalNeverEvicted(t *testing.T) {
 	local.Release()
 	if _, err := m.AcquireWriterRemote(tok, remoteGrant(t, tok, "device-x")); err != nil {
 		t.Fatalf("remote acquire after local yield = %v, want success", err)
+	}
+}
+
+// TestRemoteTakeoverDirections pins the default-on chain: remote-over-local and
+// remote-over-remote both demote the losing lease, publish RevokedBy=remote,
+// and a later local acquire takes control back while demoting the remote.
+func TestRemoteTakeoverDirections(t *testing.T) {
+	sp := &fakeSpawner{}
+	m := newTestManager(t, sp, time.Now)
+	tok, _ := m.Create(validSpec())
+	hookFired := make(chan [2]string, 1)
+	m.SetOnStandingLocalTakeover(func(handle, holder string) {
+		hookFired <- [2]string{handle, holder}
+	})
+
+	local, err := m.AcquireWriterLocal(tok)
+	if err != nil {
+		t.Fatalf("AcquireWriterLocal: %v", err)
+	}
+	remoteA, err := m.AcquireWriterRemote(tok, remoteGrant(t, tok, "device-a"))
+	if err != nil {
+		t.Fatalf("remote-over-local: %v", err)
+	}
+	<-local.Revoked()
+	if !local.RevokeIsTakeover() || local.RevokedBy() != "remote" {
+		t.Fatalf("local revoke = (%q, by %q), want LeaseTakenOver by remote", local.RevokeKind(), local.RevokedBy())
+	}
+	select {
+	case got := <-hookFired:
+		t.Fatalf("standing-local-takeover hook fired on remote-over-local: %v", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	remoteB, err := m.AcquireWriterRemote(tok, remoteGrant(t, tok, "device-b"))
+	if err != nil {
+		t.Fatalf("remote-over-remote: %v", err)
+	}
+	<-remoteA.Revoked()
+	if !remoteA.RevokeIsTakeover() || remoteA.RevokedBy() != "remote" {
+		t.Fatalf("remote A revoke = (%q, by %q), want LeaseTakenOver by remote", remoteA.RevokeKind(), remoteA.RevokedBy())
+	}
+
+	localBack, err := m.AcquireWriterLocal(tok)
+	if err != nil {
+		t.Fatalf("local take-back: %v", err)
+	}
+	<-remoteB.Revoked()
+	if !remoteB.RevokeIsTakeover() || remoteB.RevokedBy() != "local" {
+		t.Fatalf("remote B revoke = (%q, by %q), want LeaseTakenOver by local", remoteB.RevokeKind(), remoteB.RevokedBy())
+	}
+	if _, err := localBack.Write([]byte("owner")); err != nil {
+		t.Fatalf("local take-back writer fenced unexpectedly: %v", err)
+	}
+}
+
+// TestAllowRemoteTakeoverToggleRacesAcquire pins the live-read linearization:
+// the policy source executes while writeMu is held, and a toggle that completes
+// before that source returns determines Decide without revoking the local lease.
+func TestAllowRemoteTakeoverToggleRacesAcquire(t *testing.T) {
+	sp := &fakeSpawner{}
+	m := newTestManager(t, sp, time.Now)
+	tok, _ := m.Create(validSpec())
+	s := m.get(tok)
+	local, err := m.AcquireWriterLocal(tok)
+	if err != nil {
+		t.Fatalf("AcquireWriterLocal: %v", err)
+	}
+
+	var allow atomic.Bool
+	allow.Store(true)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var readOutsideFence atomic.Bool
+	m.SetAllowRemoteTakeoverSource(func() bool {
+		if s.writeMu.TryLock() {
+			readOutsideFence.Store(true)
+			s.writeMu.Unlock()
+		}
+		once.Do(func() { close(entered) })
+		<-release
+		return allow.Load()
+	})
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := m.AcquireWriterRemote(tok, remoteGrant(t, tok, "device-race"))
+		result <- err
+	}()
+	<-entered
+	allow.Store(false)
+	close(release)
+	if err := <-result; !errors.Is(err, ErrHeldLocally) {
+		t.Fatalf("racing acquire = %v, want ErrHeldLocally from the live false value", err)
+	}
+	if readOutsideFence.Load() {
+		t.Fatal("allowRemoteTakeover was read outside the session write fence")
+	}
+	select {
+	case <-local.Revoked():
+		t.Fatal("local lease was revoked after the racing toggle disabled takeover")
+	default:
 	}
 }
 
@@ -1058,6 +1176,37 @@ func TestLocalTakeoverOfStandingWriterFiresHook(t *testing.T) {
 	select {
 	case got := <-fired:
 		t.Fatalf("hook fired for a single-use takeover: %v", got)
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+// TestRemoteTakeoverOfStandingWriterDoesNotFireHook guards the split takeover
+// booleans: remote-over-remote is a lease takeover/demotion, but it must never
+// invoke the standing-local-takeover hook or revoke standing access.
+func TestRemoteTakeoverOfStandingWriterDoesNotFireHook(t *testing.T) {
+	sp := &fakeSpawner{}
+	m := newTestManager(t, sp, time.Now)
+	fired := make(chan [2]string, 1)
+	m.SetOnStandingLocalTakeover(func(handle, revokedHolder string) {
+		fired <- [2]string{handle, revokedHolder}
+	})
+
+	tok, _ := m.Create(validSpec())
+	standing := standingGrant(t, tok, "device-standing")
+	first, err := m.AcquireWriterRemote(tok, standing)
+	if err != nil {
+		t.Fatalf("AcquireWriterRemote(standing): %v", err)
+	}
+	if _, err := m.AcquireWriterRemote(tok, remoteGrant(t, tok, "device-next")); err != nil {
+		t.Fatalf("remote-over-standing-remote: %v", err)
+	}
+	<-first.Revoked()
+	if !first.RevokeIsTakeover() || first.RevokedBy() != "remote" {
+		t.Fatalf("standing remote revoke = (%q, by %q), want takeover by remote", first.RevokeKind(), first.RevokedBy())
+	}
+	select {
+	case got := <-fired:
+		t.Fatalf("standing-local-takeover hook fired on remote-over-remote: %v", got)
 	case <-time.After(150 * time.Millisecond):
 	}
 }

@@ -16,7 +16,7 @@ import { isRemoteView } from "@/lib/remote";
 // the exact missing dependency ([remote].allow_terminal) and the two steps to
 // fix it, matching the honest-disabled-control convention used elsewhere.
 export const REMOTE_TERMINAL_OFF_MSG =
-  "Remote terminal launch is off. On the owner's machine, turn on “Allow terminal” on the Remote page, then restart Observer (Settings → Health) so paired devices can launch terminals.";
+  "Remote terminal launch is off. On the owner's machine, turn on “Allow terminal” on the Remote page, then restart SuperBased (Settings → Health) so paired devices can launch terminals.";
 
 // Actionable copy shown when a paired REMOTE device is refused a session RESUME
 // with "insufficient capability". Resume is an execute-tier action that — unlike
@@ -92,7 +92,7 @@ export function isTerminalCapabilityError(e: unknown): boolean {
 // exact missing dependency and where to fix it, mirroring the honest-disabled
 // convention used for the remote-terminal gate above.
 export const PROJECT_ROOT_DENIED_MSG =
-  "That project root isn't allow-listed. Add it to [terminal.launch].allowed_project_roots (Terminals page → launch policy, on the owner's local dashboard), then restart Observer — or launch in the agent's default directory.";
+  "That project root isn't allow-listed. Add it to [terminal.launch].allowed_project_roots (Terminals page → launch policy, on the owner's local dashboard), then restart SuperBased — or launch in the agent's default directory.";
 
 // isProjectRootDeniedError reports whether an error thrown by the launch POST is
 // the [terminal.launch].allowed_project_roots gate ("project root not
@@ -134,13 +134,58 @@ export const STANDING_SECRET_LS_KEY = "sb_standing_terminal_secret";
 // STANDING_REMEMBER_RISK is the inline risk copy shown beside the "Remember on
 // this device" opt-in — it must spell out the localStorage exposure honestly.
 export const STANDING_REMEMBER_RISK =
-  "Stores the secret in THIS browser's localStorage so control survives refreshes. Anyone with access to this device + browser can then drive every terminal until the owner revokes the secret. Leave off to use it once without saving.";
+  "Stores the secret in THIS browser's localStorage so control survives refreshes. Anyone with access to this device + browser can then drive every terminal — including taking over an active local or remote writer when takeover is enabled — until the owner revokes the secret. Leave off to use it once without saving.";
 
 // STANDING_REVOKED_MSG is shown when a stored standing secret is rejected by the
 // server (revoked or rotated). The stored secret is cleared and the device falls
 // back to the normal single-use approval flow.
 export const STANDING_REVOKED_MSG =
   "Standing access was revoked or rotated — the saved secret no longer works and has been cleared from this device. Ask the owner for a new standing secret, or use a one-time approval.";
+
+// TerminalControlDenialReason mirrors the websocket control_denied taxonomy.
+// Only "auth" proves a credential rejection; every other reason must preserve
+// a saved standing secret.
+export type TerminalControlDenialReason =
+  | "auth"
+  | "held_locally"
+  | "held_by_remote"
+  | "terminal_disabled"
+  | "session_invalid"
+  | "policy_denied"
+  | "not_found"
+  | "unavailable";
+
+// terminalControlDenialMessage turns a typed server refusal into actionable,
+// credential-honest copy. A one-time capability has already been consumed when
+// lease policy reaches held_locally/held_by_remote, hence the fresh-approval
+// instruction; a standing secret is reusable and remains stored.
+export function terminalControlDenialMessage(
+  reason: TerminalControlDenialReason | undefined,
+  usedStanding: boolean,
+): string {
+  switch (reason) {
+    case "auth":
+      return usedStanding
+        ? STANDING_REVOKED_MSG
+        : "Control was denied — the capability or confirm code was wrong or already used. Ask the owner to Grant control again.";
+    case "held_locally":
+    case "held_by_remote":
+      return usedStanding
+        ? "This terminal is controlled by another device and remote takeover is turned off. Your standing secret is still saved; try again after the owner enables takeover or yields control."
+        : "This terminal is controlled by another device and remote takeover is turned off. This one-time grant was consumed, so the owner must Grant control again after enabling takeover or yielding control.";
+    case "terminal_disabled":
+      return "Remote terminal control is turned off. Ask the owner to enable allow_terminal; your standing secret has not been cleared.";
+    case "session_invalid":
+      return "This paired-device session is no longer valid. Pair the device again; any saved standing secret has not been cleared.";
+    case "policy_denied":
+      return "Control is not permitted for this terminal by the current terminal policy. The credential was not blamed or cleared.";
+    case "not_found":
+      return "This terminal is no longer available. The credential was not blamed or cleared.";
+    case "unavailable":
+    default:
+      return "Terminal control is temporarily unavailable. Try again; any saved standing secret has not been cleared.";
+  }
+}
 
 // getStoredStandingSecret returns the browser-stored standing secret, or null.
 // A standing secret always carries the `standing.` prefix; a value missing it is

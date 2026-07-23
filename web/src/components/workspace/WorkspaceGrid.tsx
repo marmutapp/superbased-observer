@@ -1,7 +1,7 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLaunchDock } from "@/components/LaunchDock";
 import { isRemoteView } from "@/lib/remote";
-import type { Status } from "@/components/LaunchTerminal";
+import { isLiveStatus, type Status } from "@/components/LaunchTerminal";
 
 // WorkspaceGrid — the Terminal Workspace dock grid (docs/plans/
 // terminal-dock-grid-design-2026-07-20.md, P0; operator decisions 2026-07-21:
@@ -209,8 +209,16 @@ export function WorkspaceGrid({
   );
 
   const byToken = useMemo(() => {
-    const m: Record<string, { tool: string; sessionId: string }> = {};
-    for (const s of dock.sessions) m[s.token] = { tool: s.tool, sessionId: s.sessionId };
+    const m: Record<
+      string,
+      { tool: string; sessionId: string; hasProjectRoot: boolean }
+    > = {};
+    for (const s of dock.sessions)
+      m[s.token] = {
+        tool: s.tool,
+        sessionId: s.sessionId,
+        hasProjectRoot: s.hasProjectRoot ?? false,
+      };
     return m;
   }, [dock.sessions]);
 
@@ -302,6 +310,7 @@ export function WorkspaceGrid({
                   key={token}
                   token={token}
                   tool={meta.tool}
+                  hasProjectRoot={meta.hasProjectRoot}
                   status={dock.statuses[token]}
                   readOnly={readOnly}
                   onOpenWindow={() => {
@@ -349,6 +358,7 @@ function StatusDot({ status }: { status: Status | undefined }) {
 function TerminalTile({
   token,
   tool,
+  hasProjectRoot,
   status,
   readOnly,
   onOpenWindow,
@@ -357,13 +367,14 @@ function TerminalTile({
 }: {
   token: string;
   tool: string;
+  hasProjectRoot: boolean;
   status: Status | undefined;
   readOnly: boolean;
   onOpenWindow: () => void;
   onUndock: () => void;
   onClose: () => void;
 }) {
-  const { registerWorkspaceCell } = useLaunchDock();
+  const { registerWorkspaceCell, openProjectPanel } = useLaunchDock();
   const cellRef = useCallback(
     (el: HTMLDivElement | null) => registerWorkspaceCell(token, el),
     [token, registerWorkspaceCell],
@@ -384,6 +395,44 @@ function TerminalTile({
             {label[status ?? "connecting"]}
           </span>
         </span>
+        {/* Read-only project panel (file tree + git). Shown regardless of the
+            grid's read-only mode — the remote gate is enforced server-side and
+            the panel surfaces that honestly. Disabled with an honest title when
+            the run has no project root. */}
+        <button
+          type="button"
+          disabled={!hasProjectRoot || !isLiveStatus(status)}
+          onClick={() => openProjectPanel(token, "files")}
+          onMouseDown={(e) => e.stopPropagation()}
+          onTouchStart={(e) => e.stopPropagation()}
+          title={
+            !isLiveStatus(status)
+              ? "This session is no longer running — its project can no longer be browsed"
+              : hasProjectRoot
+                ? "Browse this project's files"
+                : "This terminal was launched without a project root"
+          }
+          className="rounded px-1.5 text-[12px] leading-none text-fg-3 hover:bg-white/10 hover:text-fg-1 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-fg-3"
+        >
+          ▤
+        </button>
+        <button
+          type="button"
+          disabled={!hasProjectRoot || !isLiveStatus(status)}
+          onClick={() => openProjectPanel(token, "git")}
+          onMouseDown={(e) => e.stopPropagation()}
+          onTouchStart={(e) => e.stopPropagation()}
+          title={
+            !isLiveStatus(status)
+              ? "This session is no longer running — its project can no longer be browsed"
+              : hasProjectRoot
+                ? "Show this project's git status, changes, and history"
+                : "This terminal was launched without a project root"
+          }
+          className="rounded px-1.5 text-[12px] leading-none text-fg-3 hover:bg-white/10 hover:text-fg-1 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-fg-3"
+        >
+          ⎇
+        </button>
         {!readOnly && (
           <>
         <button

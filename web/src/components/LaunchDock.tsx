@@ -1,5 +1,7 @@
 import {
   createContext,
+  lazy,
+  Suspense,
   useCallback,
   useContext,
   useEffect,
@@ -11,7 +13,7 @@ import type { ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useNavigate } from "react-router-dom";
 import { isRemoteView } from "@/lib/remote";
-import { LaunchTerminal } from "@/components/LaunchTerminal";
+import { LaunchTerminal, isLiveStatus } from "@/components/LaunchTerminal";
 import type { Status } from "@/components/LaunchTerminal";
 import { NewTerminalDialog } from "@/components/NewTerminalDialog";
 import {
@@ -22,6 +24,61 @@ import {
   REMOTE_TERMINAL_OFF_MSG,
   useRemoteTerminalGate,
 } from "@/lib/remoteTerminal";
+import { usePointerDrag } from "@/lib/useDrag";
+import type { ProjectPanelTab } from "@/components/ProjectPanel";
+import { CompanionProvider } from "@/components/primitives/companion";
+
+// Lazy so the per-terminal project panel (file tree + git graph) stays out of
+// the critical chunk — it loads only when a terminal's Files/Git button fires.
+const ProjectPanel = lazy(() => import("@/components/ProjectPanel"));
+
+// Project panels live in a BOUNDED z-band ABOVE the expanded-terminal backdrop
+// (z-80) and the dock (z-70), but comfortably BELOW the guided tour (z-120/130)
+// and the context menu (z-200). On every raise the sibling panels are
+// renormalized into [PANEL_Z_BASE, PANEL_Z_MAX] (never a monotonically growing
+// counter), so no amount of interaction can push a panel over the tour or its
+// own menu (P2-4).
+const PANEL_Z_BASE = 90;
+const PANEL_Z_MAX = 110;
+
+/**
+ * renormalizeZ reassigns every open panel a compact z in [BASE, MAX], ordered
+ * by current z ascending, with `raiseTok` forced to the top. Returns the SAME
+ * array reference when nothing changes (so a redundant raise — e.g. the double
+ * onRaise a title-drag fires — doesn't churn state or re-increment anything).
+ */
+function renormalizeZ(panels: PanelEntry[], raiseTok?: string): PanelEntry[] {
+  const ordered = [...panels].sort((a, b) => {
+    if (raiseTok) {
+      if (a.token === raiseTok) return 1; // raised token last (top)
+      if (b.token === raiseTok) return -1;
+    }
+    return a.z - b.z;
+  });
+  const next = ordered.map((p, i) => ({
+    ...p,
+    z: Math.min(PANEL_Z_BASE + i, PANEL_Z_MAX),
+  }));
+  // Compare POSITIONALLY, not by matching token->old-z (P3-10): with 22+
+  // panels several clamp to the z=110 ceiling, so raising one tied-at-ceiling
+  // panel changes no z value. A by-z-only check would then report "unchanged"
+  // and the raised panel wouldn't actually reorder. `panels` is always already
+  // in renormalized (z-ascending, raiseTok-last) order, so a positional
+  // token/z diff catches a pure reordering among ceiling ties too.
+  const changed = next.some((p, i) => {
+    const old = panels[i];
+    return !old || old.token !== p.token || old.z !== p.z;
+  });
+  return changed ? next : panels;
+}
+
+/** Lowest cascade slot not currently occupied by an open panel (P2-5). */
+function lowestFreeCascade(panels: PanelEntry[]): number {
+  const used = new Set(panels.map((p) => p.cascade));
+  let i = 0;
+  while (used.has(i)) i++;
+  return i;
+}
 
 // LaunchDock owns every live embedded terminal at the APP level, so a
 // terminal survives the "Continue in…" modal closing and can be minimized
@@ -44,7 +101,7 @@ import {
 //     session (true detach/reattach across reloads is the Tier 2 follow-up).
 
 /** A launched session the dock owns. token is the opaque launch handle. */
-export type DockSession = { token: string; tool: string; sessionId: string };
+export type DockSession = { token: string; tool: string; sessionId: string; hasProjectRoot?: boolean };
 
 /** One row of GET /api/launch/sessions (dashboard.LaunchInfo wire shape). */
 type LaunchInfoWire = {
@@ -52,6 +109,7 @@ type LaunchInfoWire = {
   subcommand?: string;
   session_id?: string;
   exited?: boolean;
+  has_project_root?: boolean;
 };
 
 type LaunchDockCtx = {
@@ -93,7 +151,24 @@ type LaunchDockCtx = {
   /** Tokens queued by requestDock while the workspace was unmounted. */
   pendingDock: string[];
   clearPendingDock: () => void;
+  /** Open the per-terminal project panel (file tree / git) for a token+tab. */
+  openProjectPanel: (token: string, tab: ProjectPanelTab) => void;
+  /**
+   * Register/unregister the live paste-into-terminal callback for a token.
+   * LaunchTerminal registers one while its seat is live + write-capable; a
+   * project panel shows its paste items only when a callback exists for its
+   * token (structurally read-only-safe). The callback routes text through
+   * xterm's own paste pipeline (like a manual Ctrl+V).
+   */
+  registerPaste: (tok: string, fn: ((text: string) => void) | null) => void;
+  /** The open project panels, one per terminal token (multi-panel). */
+  projectPanels: PanelEntry[];
 };
+
+// One open project panel. `z` is the provider-owned stacking order (a band
+// above the expanded-terminal backdrop); `cascade` is the in-memory stagger
+// slot assigned at open time and fixed for the panel's lifetime.
+type PanelEntry = { token: string; tab: ProjectPanelTab; z: number; cascade: number };
 
 const Ctx = createContext<LaunchDockCtx | null>(null);
 
@@ -102,6 +177,20 @@ export function LaunchDockProvider({ children }: { children: ReactNode }) {
   const [activeToken, setActiveToken] = useState<string | null>(null);
   const [statuses, setStatuses] = useState<Record<string, Status>>({});
   const [newOpen, setNewOpen] = useState(false);
+  // The per-terminal project panels (file tree + git). Multi-panel: one entry
+  // per terminal token, all simultaneously open, rendered at provider level.
+  // z-order is renormalized into a bounded band on every raise (renormalizeZ),
+  // so it never climbs into the tour/context-menu layers.
+  const [projectPanels, setProjectPanels] = useState<PanelEntry[]>([]);
+  // Live paste callbacks keyed by token — the paste-into-terminal channel. A
+  // panel shows its paste items only when a callback exists for its token.
+  const [pasteFns, setPasteFns] = useState<Record<string, (text: string) => void>>({});
+  // Latest sessions/statuses read by openProjectPanel's live-token guard
+  // WITHOUT re-creating the callback (it must stay identity-stable).
+  const sessionsRef = useRef(sessions);
+  sessionsRef.current = sessions;
+  const statusesRef = useRef(statuses);
+  statusesRef.current = statuses;
   // Workspace grid cells: token → the registered cell element the session's
   // stable host is reparented into (dock-grid design D2). Docked sessions
   // hide their floating pill; undocked ones behave exactly as before.
@@ -171,6 +260,55 @@ export function LaunchDockProvider({ children }: { children: ReactNode }) {
 
   const openNewTerminal = useCallback(() => setNewOpen(true), []);
 
+  // Open/toggle the panel for a token. Same-tab reopen closes it (toggle);
+  // other-tab reopen retargets the tab and raises; a new token appends a panel
+  // in the lowest free cascade slot. Rejects opening against a token whose
+  // session is gone or no longer live (exited OR error — see isLiveStatus) —
+  // the provider-side guard behind the disabled buttons (P2-3), so a
+  // stale/programmatic open can't resurrect a dead token.
+  const openProjectPanel = useCallback((tok: string, tab: ProjectPanelTab) => {
+    const known = sessionsRef.current.some((s) => s.token === tok);
+    if (!known || !isLiveStatus(statusesRef.current[tok])) return;
+    setProjectPanels((prev) => {
+      const existing = prev.find((p) => p.token === tok);
+      if (existing) {
+        if (existing.tab === tab) return prev.filter((p) => p.token !== tok);
+        return renormalizeZ(
+          prev.map((p) => (p.token === tok ? { ...p, tab } : p)),
+          tok,
+        );
+      }
+      const cascade = lowestFreeCascade(prev);
+      return renormalizeZ([...prev, { token: tok, tab, z: PANEL_Z_BASE, cascade }], tok);
+    });
+  }, []);
+  const raiseProjectPanel = useCallback((tok: string) => {
+    setProjectPanels((prev) =>
+      prev.some((p) => p.token === tok) ? renormalizeZ(prev, tok) : prev,
+    );
+  }, []);
+  const setProjectPanelTab = useCallback((tok: string, tab: ProjectPanelTab) => {
+    setProjectPanels((prev) => prev.map((p) => (p.token === tok ? { ...p, tab } : p)));
+  }, []);
+  const closeProjectPanelToken = useCallback((tok: string) => {
+    setProjectPanels((prev) => prev.filter((p) => p.token !== tok));
+  }, []);
+  const registerPaste = useCallback(
+    (tok: string, fn: ((text: string) => void) | null) => {
+      setPasteFns((prev) => {
+        if (fn === null) {
+          if (!(tok in prev)) return prev;
+          const next = { ...prev };
+          delete next[tok];
+          return next;
+        }
+        if (prev[tok] === fn) return prev;
+        return { ...prev, [tok]: fn };
+      });
+    },
+    [],
+  );
+
   const registerDockSink = useCallback(
     (fn: ((token: string) => void) | null) => {
       dockSinkRef.current = fn;
@@ -222,6 +360,7 @@ export function LaunchDockProvider({ children }: { children: ReactNode }) {
               token: s.token,
               tool: s.subcommand || "terminal",
               sessionId: s.session_id || "",
+              hasProjectRoot: !!s.has_project_root,
             }));
           return add.length ? [...prev, ...add] : prev;
         });
@@ -236,6 +375,20 @@ export function LaunchDockProvider({ children }: { children: ReactNode }) {
       cancelled = true;
     };
   }, []);
+
+  // Lifecycle (review finding 9): when a terminal's session disappears (Stop &
+  // close, or a server reap that drops it from the rehydrate list), auto-close
+  // its project panel — otherwise already-fetched file/git content lingers on
+  // screen against a token the daemon has already invalidated.
+  useEffect(() => {
+    const liveTokens = new Set(sessions.map((s) => s.token));
+    setProjectPanels((prev) => {
+      const next = prev.filter(
+        (p) => liveTokens.has(p.token) && isLiveStatus(statuses[p.token]),
+      );
+      return next.length === prev.length ? prev : next;
+    });
+  }, [sessions, statuses]);
 
   // Warn before a tab-close/refresh silently kills a still-running session.
   useEffect(() => {
@@ -266,6 +419,9 @@ export function LaunchDockProvider({ children }: { children: ReactNode }) {
       registerDockSink,
       pendingDock,
       clearPendingDock,
+      openProjectPanel,
+      registerPaste,
+      projectPanels,
     }),
     [
       launch,
@@ -280,12 +436,16 @@ export function LaunchDockProvider({ children }: { children: ReactNode }) {
       registerDockSink,
       pendingDock,
       clearPendingDock,
+      openProjectPanel,
+      registerPaste,
+      projectPanels,
     ],
   );
 
   return (
     <Ctx.Provider value={value}>
-      {children}
+      <CompanionProvider>
+        {children}
       {sessions.map((s) => (
         <TerminalHost
           key={s.token}
@@ -297,6 +457,10 @@ export function LaunchDockProvider({ children }: { children: ReactNode }) {
           onMinimize={minimize}
           onClose={() => closeSession(s.token)}
           onStatus={(st) => setStatus(s.token, st)}
+          onOpenFiles={() => openProjectPanel(s.token, "files")}
+          onOpenGit={() => openProjectPanel(s.token, "git")}
+          registerPaste={registerPaste}
+          projectPanelEnabled={s.hasProjectRoot ?? false}
         />
       ))}
       <Dock
@@ -310,12 +474,28 @@ export function LaunchDockProvider({ children }: { children: ReactNode }) {
       {newOpen && (
         <NewTerminalDialog
           onClose={() => setNewOpen(false)}
-          onLaunched={(handle, tool) => {
+          onLaunched={(handle, tool, hasProjectRoot) => {
             setNewOpen(false);
-            launch({ token: handle, tool, sessionId: "" });
+            launch({ token: handle, tool, sessionId: "", hasProjectRoot: hasProjectRoot ?? false });
           }}
         />
       )}
+      {projectPanels.map((p) => (
+        <Suspense key={p.token} fallback={null}>
+          <ProjectPanel
+            token={p.token}
+            tool={sessions.find((s) => s.token === p.token)?.tool ?? "terminal"}
+            tab={p.tab}
+            z={p.z}
+            cascade={p.cascade}
+            pasteToTerminal={pasteFns[p.token]}
+            onRaise={() => raiseProjectPanel(p.token)}
+            onTabChange={(t) => setProjectPanelTab(p.token, t)}
+            onClose={() => closeProjectPanelToken(p.token)}
+          />
+        </Suspense>
+      ))}
+      </CompanionProvider>
     </Ctx.Provider>
   );
 }
@@ -346,6 +526,10 @@ function TerminalHost({
   onMinimize,
   onClose,
   onStatus,
+  onOpenFiles,
+  onOpenGit,
+  registerPaste,
+  projectPanelEnabled,
 }: {
   session: DockSession;
   expanded: boolean;
@@ -355,10 +539,20 @@ function TerminalHost({
   onMinimize: () => void;
   onClose: () => void;
   onStatus: (s: Status) => void;
+  onOpenFiles: () => void;
+  onOpenGit: () => void;
+  registerPaste: (tok: string, fn: ((text: string) => void) | null) => void;
+  projectPanelEnabled: boolean;
 }) {
   const boxRef = useRef<HTMLDivElement | null>(null);
   const isLive = status === "open" || status === "connecting";
   const docked = cellEl !== null;
+  // Token-bound paste registrar (stable) so LaunchTerminal can register its
+  // paste-into-terminal callback for this token.
+  const boundRegisterPaste = useCallback(
+    (fn: ((text: string) => void) | null) => registerPaste(session.token, fn),
+    [registerPaste, session.token],
+  );
   const [hostEl] = useState(() => {
     const el = document.createElement("div");
     el.className = "flex w-full flex-1 min-h-0 flex-col";
@@ -496,6 +690,10 @@ function TerminalHost({
           onMinimize={onMinimize}
           onClose={onClose}
           onStatus={onStatus}
+          onOpenFiles={onOpenFiles}
+          onOpenGit={onOpenGit}
+          registerPaste={boundRegisterPaste}
+          projectPanelEnabled={projectPanelEnabled}
         />,
         hostEl,
       )}
@@ -556,6 +754,8 @@ function Dock({
         onPointerDown={drag.gripHandlers.onPointerDown}
         onPointerMove={drag.gripHandlers.onPointerMove}
         onPointerUp={drag.gripHandlers.onPointerUp}
+        onPointerCancel={drag.gripHandlers.onPointerCancel}
+        onLostPointerCapture={drag.gripHandlers.onLostPointerCapture}
         onDoubleClick={drag.onReset}
         className="flex h-4 w-9 touch-none cursor-grab select-none items-center justify-center rounded-full border bg-bg-1 text-fg-4 shadow-lg hover:text-fg-2 active:cursor-grabbing"
       >
@@ -610,9 +810,10 @@ function useDockDrag() {
     }
     return { dx: 0, dy: 0 };
   });
-  const start = useRef<{ x: number; y: number; dx: number; dy: number } | null>(
-    null,
-  );
+  // usePointerDrag reports the cumulative delta from pointer-down, not an
+  // absolute position — capture the pre-drag offset on gesture-start so
+  // onMove can apply the delta on top of it.
+  const base = useRef<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
 
   // Clamp an offset so the dock stays fully on-screen. The element's current
   // rect already includes the current transform, so subtract the applied
@@ -637,40 +838,27 @@ function useDockDrag() {
     [pos.dx, pos.dy],
   );
 
-  const onPointerDown = useCallback(
-    (e: React.PointerEvent) => {
-      (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
-      start.current = { x: e.clientX, y: e.clientY, dx: pos.dx, dy: pos.dy };
+  // Pointer hygiene (primary-button-only, pointer-ID-pinned, single
+  // finalizer on up/cancel/lost-capture) now lives in usePointerDrag; this
+  // hook only owns the offset model, clamp policy, and localStorage persist.
+  const gripHandlers = usePointerDrag({
+    onStart: () => {
+      base.current = pos;
     },
-    [pos.dx, pos.dy],
-  );
-
-  const onPointerMove = useCallback(
-    (e: React.PointerEvent) => {
-      if (!start.current) return;
-      setPos(
-        clamp(
-          start.current.dx + (e.clientX - start.current.x),
-          start.current.dy + (e.clientY - start.current.y),
-        ),
-      );
+    onMove: (delta) => {
+      setPos(clamp(base.current.dx + delta.dx, base.current.dy + delta.dy));
     },
-    [clamp],
-  );
-
-  const onPointerUp = useCallback((e: React.PointerEvent) => {
-    if (!start.current) return;
-    start.current = null;
-    (e.target as HTMLElement).releasePointerCapture?.(e.pointerId);
-    setPos((p) => {
-      try {
-        localStorage.setItem(DOCK_POS_KEY, JSON.stringify(p));
-      } catch {
-        /* storage full/blocked — position still applies for the session */
-      }
-      return p;
-    });
-  }, []);
+    onEnd: () => {
+      setPos((p) => {
+        try {
+          localStorage.setItem(DOCK_POS_KEY, JSON.stringify(p));
+        } catch {
+          /* storage full/blocked — position still applies for the session */
+        }
+        return p;
+      });
+    },
+  });
 
   const onReset = useCallback(() => {
     setPos({ dx: 0, dy: 0 });
@@ -691,7 +879,7 @@ function useDockDrag() {
   return {
     ref,
     style: { transform: `translate(${pos.dx}px, ${pos.dy}px)` },
-    gripHandlers: { onPointerDown, onPointerMove, onPointerUp },
+    gripHandlers,
     onReset,
   };
 }

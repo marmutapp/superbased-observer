@@ -284,10 +284,49 @@ func runAuthorizationMatrix(t *testing.T) {
 		}
 	})
 
+	// Default-on lease policy: independently-authorized remotes may supersede a
+	// local writer and then one another. Each losing lease is takeover-fenced;
+	// exactly one live writer remains after every transition.
+	t.Run("grant/authenticated-remote-takeover-chain", func(t *testing.T) {
+		h.allow.Store(true)
+		h.mgr.SetAllowRemoteTakeoverSource(func() bool { return true })
+		local, err := h.mgr.AcquireWriterLocal(h.handle)
+		if err != nil {
+			t.Fatalf("AcquireWriterLocal: %v", err)
+		}
+		remoteA, err := h.adapter.AcquireWriterRemote(h.validReq(t))
+		if err != nil {
+			t.Fatalf("remote-over-local: %v", err)
+		}
+		<-local.Revoked()
+		if !local.RevokeIsTakeover() {
+			t.Fatal("remote-over-local did not takeover-fence the local lease")
+		}
+		if _, err := local.Write([]byte("stale-local")); !errors.Is(err, termsession.ErrNotWriter) {
+			t.Fatalf("superseded local Write = %v, want ErrNotWriter", err)
+		}
+		remoteB, err := h.adapter.AcquireWriterRemote(h.validReq(t))
+		if err != nil {
+			t.Fatalf("remote-over-remote: %v", err)
+		}
+		<-remoteA.Revoked()
+		if !remoteA.RevokeIsTakeover() {
+			t.Fatal("remote-over-remote did not takeover-fence the losing remote lease")
+		}
+		if _, err := remoteA.Write([]byte("stale-remote")); !errors.Is(err, termsession.ErrNotWriter) {
+			t.Fatalf("superseded remote Write = %v, want ErrNotWriter", err)
+		}
+		if _, err := remoteB.Write([]byte("live")); err != nil {
+			t.Fatalf("final remote writer fenced unexpectedly: %v", err)
+		}
+		h.resetWriter()
+	})
+
 	// Lease held locally: the §4.δ conjunction passes but the manager refuses a
 	// remote acquire while the owner-local writer holds the lease (§4.α.3).
 	t.Run("deny/held-locally", func(t *testing.T) {
 		h.allow.Store(true)
+		h.mgr.SetAllowRemoteTakeoverSource(func() bool { return false })
 		local, err := h.mgr.AcquireWriterLocal(h.handle)
 		if err != nil {
 			t.Fatalf("AcquireWriterLocal: %v", err)
@@ -296,6 +335,7 @@ func runAuthorizationMatrix(t *testing.T) {
 			t.Fatalf("held-locally want ErrHeldLocally, got %v", err)
 		}
 		local.Release()
+		h.mgr.SetAllowRemoteTakeoverSource(func() bool { return true })
 		h.resetWriter()
 	})
 }

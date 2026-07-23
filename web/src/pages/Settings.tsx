@@ -198,7 +198,7 @@ const SECTIONS: SectionDef[] = [
     icon: <OrgSectionIcon />,
     about: {
       summary:
-        "Teams & Org Visibility. When enrolled, this agent shares content-free activity rollups (counts, costs, timings, paths — never prompt text or tool output) with your organisation's Observer server. View exactly what was last shared, or unenrol.",
+        "Teams & Org Visibility. When enrolled, this agent shares content-free activity rollups (counts, costs, timings, paths — never prompt text or tool output) with your organisation's SuperBased server. View exactly what was last shared, or unenrol.",
       whenModified:
         "Joining or leaving an organisation. Enrol with `observer enroll <org-url> <token>`; unenrol from here or with `observer unenroll`.",
       behavior:
@@ -446,7 +446,7 @@ const SECTIONS: SectionDef[] = [
     icon: <EyeIcon size={13} />,
     about: {
       summary:
-        "Generalized observability (admin plane) — the OTLP /v1/traces receiver, trajectory capture, and the eval plane for an admin/org-hosted LLM app whose END-USER requests route through Observer. This is NOT your own coding-agent usage (every other section is); the captured traces + evals are viewed on the admin/org dashboard, not this node dashboard. Opt-in and node-local: trace data never leaves this machine unless you opt into an obs share tier under Org sharing.",
+        "Generalized observability (admin plane) — the OTLP /v1/traces receiver, trajectory capture, and the eval plane for an admin/org-hosted LLM app whose END-USER requests route through SuperBased. This is NOT your own coding-agent usage (every other section is); the captured traces + evals are viewed on the admin/org dashboard, not this node dashboard. Opt-in and node-local: trace data never leaves this machine unless you opt into an obs share tier under Org sharing.",
       whenModified:
         "Turning the subsystem on or off. The judge model + online-sampling eval knobs ([observability.eval]) stay hand-edited config decisions.",
       behavior:

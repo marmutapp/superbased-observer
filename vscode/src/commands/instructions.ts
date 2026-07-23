@@ -32,7 +32,7 @@ export function registerInstructionCommands(
           await vscode.window.showTextDocument(uri, { preview: false });
           await vscode.commands.executeCommand('workbench.action.files.revert');
           void vscode.window.showInformationMessage(
-            `Observer: refreshed ${baseName(uri.fsPath)} from learnings.`,
+            `SuperBased: refreshed ${baseName(uri.fsPath)} from learnings.`,
           );
         } catch (err) {
           surfaceError(err, `refresh ${baseName(uri.fsPath)}`);
@@ -75,19 +75,19 @@ async function resolveContext(
 ): Promise<ResolvedCtx | undefined> {
   const uri = fileUri ?? vscode.window.activeTextEditor?.document.uri;
   if (!uri) {
-    void vscode.window.showErrorMessage('Observer: no file context for this command.');
+    void vscode.window.showErrorMessage('SuperBased: no file context for this command.');
     return undefined;
   }
   const folder = vscode.workspace.getWorkspaceFolder(uri);
   if (!folder) {
     void vscode.window.showErrorMessage(
-      `Observer: ${baseName(uri.fsPath)} is not inside any workspace folder; --project is required.`,
+      `SuperBased: ${baseName(uri.fsPath)} is not inside any workspace folder; --project is required.`,
     );
     return undefined;
   }
   if (!target) {
     void vscode.window.showErrorMessage(
-      `Observer: could not classify ${baseName(uri.fsPath)} (expected CLAUDE.md / AGENTS.md / .cursorrules).`,
+      `SuperBased: could not classify ${baseName(uri.fsPath)} (expected CLAUDE.md / AGENTS.md / .cursorrules).`,
     );
     return undefined;
   }
@@ -120,7 +120,7 @@ function baseName(p: string): string {
 function surfaceError(err: unknown, what: string): void {
   const message = err instanceof Error ? err.message : String(err);
   output.appendLine(`Failed to ${what}: ${message}`);
-  void vscode.window.showErrorMessage(`Observer: failed to ${what} — ${shortError(message)}`);
+  void vscode.window.showErrorMessage(`SuperBased: failed to ${what} — ${shortError(message)}`);
 }
 
 function shortError(message: string): string {

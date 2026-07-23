@@ -57,6 +57,10 @@ Changelog = "https://github.com/superbasedapp/observer/blob/main/CHANGELOG.md"
 
 [project.scripts]
 observer = "observer.__main__:main"
+# Dual-name compatibility (2026-07-23): `superbased` is the going-forward
+# command; `observer` stays for backward compat and is deprecated later. Both
+# resolve to the same entry point and exec the same bundled binary.
+superbased = "observer.__main__:main"
 
 [tool.hatch.version]
 path = "src/observer/__init__.py"

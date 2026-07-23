@@ -34,11 +34,18 @@ type RemoteOptions struct {
 	// launch gating. Writer control is still authorized separately by
 	// termlease.Authorize.
 	AllowTerminal bool
+	// AllowRemoteTerminalTakeover mirrors
+	// [remote].allow_remote_terminal_takeover. It is consulted only after the
+	// credential conjunction succeeds and defaults true through config.Default.
+	// Hot-swapped by ReloadAllowRemoteTerminalTakeover.
+	AllowRemoteTerminalTakeover bool
 	// AllowTerminalView mirrors [remote].allow_terminal_view — the independent
 	// READ opt-in that relaxes the remote-sensitive (attach/resume) deny-by-
 	// default (session-attach design §3.2). It ONLY relaxes the VIEW gate
 	// (snapshot row + read-only subscribe); the writer path stays governed by
-	// AllowTerminal + the execute-tier conjunction. Default false. Hot-swapped
+	// AllowTerminal + the execute-tier conjunction. Default TRUE (seeded in
+	// config.Default, mirroring AllowRemoteTerminalTakeover) — an explicit
+	// allow_terminal_view = false restores the deny-read posture. Hot-swapped
 	// by ReloadAllowTerminalView.
 	AllowTerminalView bool
 	// StandingTerminalSecretHash is the argon2id hash-at-rest of the OPT-IN
@@ -104,9 +111,13 @@ type remoteController struct {
 	// single-use capability acquire path (finding 3 residual) — not just the
 	// standing one, and without waiting for a daemon restart.
 	allowTerminal bool
+	// allowRemoteTerminalTakeover is the LIVE post-authorization writer-policy
+	// gate. It shares standingMu with the sibling terminal gates and is read by
+	// termsession at the Decide linearization point through the cmd adapter.
+	allowRemoteTerminalTakeover bool
 	// allowTerminalView is the LIVE [remote].allow_terminal_view gate — the
-	// independent READ opt-in that relaxes the remote-sensitive (attach/resume)
-	// deny-by-default (session-attach design §3.2). Guarded by standingMu (like
+	// independent READ opt-in for the remote-sensitive (attach/resume) view
+	// gate, which now DEFAULTS TRUE (session-attach design §3.2). Guarded by standingMu (like
 	// allowTerminal, the sibling terminal gate) and hot-swapped by
 	// ReloadAllowTerminalView so a dashboard flip takes effect on the live VIEW
 	// gate (visibleSnapshot + the /ws/launch subscribe gate) without a daemon
@@ -141,18 +152,19 @@ func NewRemoteController(o RemoteOptions) RemoteController {
 		sp.Now = now
 	}
 	return &remoteController{
-		hashedSecret:      o.HashedSecret,
-		allowedHosts:      append([]string(nil), o.AllowedHosts...),
-		sessions:          remoteauth.NewSessionStore(sp),
-		caps:              remoteauth.NewCapabilityStore(o.CapabilityTTL, now),
-		limiter:           remoteauth.NewRateLimiter(o.RateLimitPerMin, o.RateLimitPerMin, now),
-		allowTerminal:     o.AllowTerminal,
-		allowTerminalView: o.AllowTerminalView,
-		audit:             o.Audit,
-		now:               now,
-		csrf:              map[string]string{},
-		standingHash:      o.StandingTerminalSecretHash,
-		standingEnabled:   o.StandingTerminalEnabled,
+		hashedSecret:                o.HashedSecret,
+		allowedHosts:                append([]string(nil), o.AllowedHosts...),
+		sessions:                    remoteauth.NewSessionStore(sp),
+		caps:                        remoteauth.NewCapabilityStore(o.CapabilityTTL, now),
+		limiter:                     remoteauth.NewRateLimiter(o.RateLimitPerMin, o.RateLimitPerMin, now),
+		allowTerminal:               o.AllowTerminal,
+		allowTerminalView:           o.AllowTerminalView,
+		allowRemoteTerminalTakeover: o.AllowRemoteTerminalTakeover,
+		audit:                       o.Audit,
+		now:                         now,
+		csrf:                        map[string]string{},
+		standingHash:                o.StandingTerminalSecretHash,
+		standingEnabled:             o.StandingTerminalEnabled,
 		// A dedicated limiter for standing-secret acquire attempts so a brute
 		// force against the reusable standing secret is throttled independently
 		// of the pairing limiter. rate_limit_per_min=0 means "unlimited" for the
@@ -219,6 +231,25 @@ func (c *remoteController) AllowTerminal() bool {
 func (c *remoteController) ReloadAllowTerminal(allow bool) {
 	c.standingMu.Lock()
 	c.allowTerminal = allow
+	c.standingMu.Unlock()
+}
+
+// AllowRemoteTerminalTakeover reports the live
+// [remote].allow_remote_terminal_takeover policy. The credential gate remains
+// upstream and unchanged; this value is read only when an authorized requester
+// reaches the manager's writer-policy decision.
+func (c *remoteController) AllowRemoteTerminalTakeover() bool {
+	c.standingMu.RLock()
+	defer c.standingMu.RUnlock()
+	return c.allowRemoteTerminalTakeover
+}
+
+// ReloadAllowRemoteTerminalTakeover hot-swaps the live post-authorization
+// takeover policy without restarting the daemon. Existing leases are not
+// revoked merely by toggling it; the next acquire reads the new value.
+func (c *remoteController) ReloadAllowRemoteTerminalTakeover(allow bool) {
+	c.standingMu.Lock()
+	c.allowRemoteTerminalTakeover = allow
 	c.standingMu.Unlock()
 }
 
@@ -398,6 +429,12 @@ type standingTerminalReloader interface {
 // controllers stay valid.
 type allowTerminalReloader interface {
 	ReloadAllowTerminal(allow bool)
+}
+
+// allowRemoteTerminalTakeoverReloader is the additive hot-swap seam for the
+// live authenticated-remote takeover policy. Nil/fake controllers remain valid.
+type allowRemoteTerminalTakeoverReloader interface {
+	ReloadAllowRemoteTerminalTakeover(allow bool)
 }
 
 // allowTerminalViewer is the READ seam for the LIVE allow_terminal_view gate

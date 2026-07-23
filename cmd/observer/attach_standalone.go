@@ -153,7 +153,13 @@ func buildTerminalStack(cfg config.Config, database *sql.DB, logger *slog.Logger
 		return svc.RunIDForHandle(handle)
 	}, logger)
 
-	opts := termsession.Options{Logger: logger}
+	opts := termsession.Options{
+		Logger: logger,
+		// Startup seed closes the construction-before-controller-wiring window.
+		// wireRemoteExecuteTier replaces this with the live controller reader
+		// before either dashboard listener starts serving.
+		AllowRemoteTakeover: func() bool { return cfg.Remote.AllowRemoteTerminalTakeover },
+	}
 	applyTerminalBounds(&opts, cfg.Terminal, logger)
 	// Remote writer-lease lifetimes (§4.α.2c) come from [remote]; 0 falls back
 	// to the termsession defaults (5m idle / 30m hard cap).

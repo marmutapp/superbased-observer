@@ -138,6 +138,12 @@ type Options struct {
 	// remote-execute tier consumes (plan §8.1 audit list). Content-free by
 	// construction. The sink must not block.
 	OnLeaseEvent func(LeaseEvent)
+	// AllowRemoteTakeover is read at the exact writer-policy decision while the
+	// session write fence is held. Nil defaults to true. The cmd adapter replaces
+	// this source with the live remote-controller gate before serving, so a
+	// dashboard toggle takes effect without a daemon restart and cannot be
+	// snapshotted early at credential authorization.
+	AllowRemoteTakeover func() bool
 }
 
 // SessionExit is the metadata handed to Options.OnExit when a session ends.
@@ -161,7 +167,8 @@ const (
 	// LeaseRevoked — the lease was forcibly revoked (config-off, device revoke,
 	// emergency revoke, teardown, or idle/hard-cap expiry).
 	LeaseRevoked LeaseEventKind = "lease_revoked"
-	// LeaseTakenOver — a local takeover revoked an incumbent remote writer.
+	// LeaseTakenOver — a granted acquire superseded an incumbent writer. The
+	// session and losing bridge remain valid; only the old writer lease is fenced.
 	LeaseTakenOver LeaseEventKind = "lease_taken_over"
 )
 
@@ -171,6 +178,10 @@ type LeaseEvent struct {
 	Kind   LeaseEventKind
 	Handle string
 	Holder string // "local" or a device-session fingerprint
+	// Actor is the incoming writer that caused this transition ("local" or a
+	// device-session fingerprint). On a takeover Holder is the superseded seat
+	// and Actor is the requester, preserving direction and accountability.
+	Actor  string
 	Reason string
 	At     time.Time
 	// Setup marks a lease transition on a privileged SpecSetup (local-only)
@@ -202,6 +213,9 @@ type Manager struct {
 	onExit          func(SessionExit)
 	onOutput        func(handle string, p []byte)
 	onLeaseEvent    func(LeaseEvent)
+	// allowRemoteTakeover holds a replaceable LIVE policy source. Sessions call
+	// remoteTakeoverAllowed while holding their own writeMu at Decide time.
+	allowRemoteTakeover atomic.Pointer[func() bool]
 	// standingTakeoverHook, when non-nil, fires (async) after a LOCAL writer
 	// acquisition supersedes a remote lease that was minted through the
 	// STANDING terminal-control secret (grant.Standing()). Registered
@@ -247,6 +261,11 @@ func NewManager(opts Options) *Manager {
 		sessions:        make(map[string]*Session),
 		stop:            make(chan struct{}),
 	}
+	allowRemoteTakeover := opts.AllowRemoteTakeover
+	if allowRemoteTakeover == nil {
+		allowRemoteTakeover = func() bool { return true }
+	}
+	m.allowRemoteTakeover.Store(&allowRemoteTakeover)
 	if m.spawner == nil {
 		m.spawner = NewOSSpawner()
 	}
@@ -318,6 +337,10 @@ type Session struct {
 	writerIdle  time.Duration
 	writerMax   time.Duration
 	leaseEventf func(LeaseEvent)
+	// allowRemoteTakeoverf resolves the live authenticated-remote takeover
+	// policy at Decide time under writeMu. It is bound to the manager's
+	// replaceable source so existing sessions observe dashboard toggles.
+	allowRemoteTakeoverf func() bool
 	// standingTakeoverf reports a local takeover of a STANDING-secret remote
 	// writer (fired async from acquireWriter). Bound at creation to the
 	// manager's late-registered hook dispatcher; nil-safe.
@@ -411,7 +434,7 @@ func (s *Session) markDone(code int) {
 	})
 }
 
-func (s *Session) emitLease(kind LeaseEventKind, holder, reason string) {
+func (s *Session) emitLease(kind LeaseEventKind, holder, actor, reason string) {
 	if s.leaseEventf == nil {
 		return
 	}
@@ -419,7 +442,10 @@ func (s *Session) emitLease(kind LeaseEventKind, holder, reason string) {
 	// LeaseEvent is the metadata-only audit tap, so it carries the 8-char device
 	// token that correlates with the control-audit rows — the lease keeps the
 	// full key internally for revoke matching only.
-	ev := LeaseEvent{Kind: kind, Handle: s.handle, Holder: holderDisplay(holder), Reason: reason, At: s.now()}
+	ev := LeaseEvent{
+		Kind: kind, Handle: s.handle, Holder: holderDisplay(holder),
+		Actor: holderDisplay(actor), Reason: reason, At: s.now(),
+	}
 	// A SpecSetup session is local-only for its whole lifecycle; flag it (and
 	// carry its label) so a remote-audit consumer redacts the handle at persist
 	// time. Branch on the session's own kind, never on the handle string.
@@ -585,6 +611,11 @@ type WriterLease struct {
 	// revoked channel closes, so the channel close/receive edge makes the read
 	// race-free without an atomic. Zero until revoked.
 	revokeKind LeaseEventKind
+	// revokedBy records the requester that superseded this lease. It is written
+	// inside the same revokeOnce publication as revokeKind and read only after
+	// Revoked closes. Non-takeover revocations leave it at RequesterLocal's zero
+	// value, but consumers consult it only when RevokeIsTakeover is true.
+	revokedBy  termlease.Requester
 	revokeOnce sync.Once
 }
 
@@ -623,8 +654,19 @@ func (l *WriterLease) Revoked() <-chan struct{} { return l.revoked }
 // trusted). Zero (empty) before revocation.
 func (l *WriterLease) RevokeKind() LeaseEventKind { return l.revokeKind }
 
-// RevokeIsTakeover reports whether the lease terminated because a LOCAL takeover
-// superseded it (as opposed to an admin/device revoke, an expiry, or teardown).
+// RevokedBy reports whether the requester that superseded this lease was local
+// or remote. It is meaningful only after Revoked has closed and
+// RevokeIsTakeover reports true. Dashboard code accesses it through an additive
+// optional interface so the LaunchWriter seam and its fakes remain unchanged.
+func (l *WriterLease) RevokedBy() string { return l.revokedBy.String() }
+
+// Gen returns the session-monotonic generation assigned when this writer lease
+// was acquired. Dashboard code accesses it through an additive optional
+// interface so the LaunchWriter seam and its fakes remain unchanged.
+func (l *WriterLease) Gen() uint64 { return l.gen }
+
+// RevokeIsTakeover reports whether the lease terminated because another granted
+// writer superseded it (as opposed to an admin/device revoke, expiry, or teardown).
 // A takeover leaves the device session valid, so the remote WS bridge only
 // DEMOTES the client to a viewer; any other termination CLOSES the socket.
 // Meaningful only after Revoked() has closed.
@@ -688,7 +730,15 @@ func (s *Session) acquireWriter(req termlease.Requester, holder string, standing
 	if s.lease != nil {
 		current = s.lease.kind
 	}
-	out := termlease.Decide(req, current)
+	// Linearization point: read the LIVE policy HERE, under writeMu, immediately
+	// before Decide. Credential authorization happens upstream and may consume a
+	// single-use capability, but it must never snapshot this flag early: a toggle
+	// racing the acquire must decide before any incumbent lease is revoked.
+	allowRemoteTakeover := true
+	if s.allowRemoteTakeoverf != nil {
+		allowRemoteTakeover = s.allowRemoteTakeoverf()
+	}
+	out := termlease.Decide(req, current, allowRemoteTakeover)
 	if !out.Granted() {
 		s.writeMu.Unlock()
 		if current == termlease.HolderLocal {
@@ -697,24 +747,26 @@ func (s *Session) acquireWriter(req termlease.Requester, holder string, standing
 		return nil, ErrWriterHeld
 	}
 	var revokedHolder string
-	takeover := false
+	isLeaseTakeover := false
+	isStandingLocalTakeover := false
 	prevStanding := false
 	if out.RevokeCurrent && s.lease != nil {
 		prev := s.lease
 		revokedHolder = prev.holder
 		prevStanding = prev.standing
-		takeover = prev.kind == termlease.HolderRemote && req == termlease.RequesterLocal
+		isLeaseTakeover = out.RevokeCurrent
+		isStandingLocalTakeover = prev.kind == termlease.HolderRemote && req == termlease.RequesterLocal && prevStanding
 		// Record WHY the incumbent lease is ending BEFORE closing its channel so
-		// the WS bridge can branch (takeover ⇒ demote / else ⇒ close). A local
-		// takeover of a remote writer is LeaseTakenOver; a local re-acquire that
-		// supersedes a prior LOCAL lease is a plain LeaseRevoked (the local bridge
-		// demotes on either — closeOnHardRevoke is remote-only).
+		// the WS bridge can branch (takeover ⇒ demote / else ⇒ close). Every
+		// policy grant with RevokeCurrent is LeaseTakenOver, including local
+		// re-acquire and both authenticated remote takeover directions.
 		prevKind := LeaseRevoked
-		if takeover {
+		if isLeaseTakeover {
 			prevKind = LeaseTakenOver
 		}
 		prev.revokeOnce.Do(func() {
 			prev.revokeKind = prevKind
+			prev.revokedBy = req
 			close(prev.revoked)
 		})
 	}
@@ -736,25 +788,27 @@ func (s *Session) acquireWriter(req termlease.Requester, holder string, standing
 	s.lease = l
 	s.writeMu.Unlock()
 
-	if takeover {
-		s.emitLease(LeaseTakenOver, revokedHolder, "local takeover revoked remote writer")
-		// The superseded remote writer held control through the STANDING secret:
-		// report it (async — the hook may take dashboard-side locks and must
-		// never re-enter this session's writeMu path synchronously). Policy —
-		// whether the standing secret itself is then revoked — lives entirely
-		// behind the hook ([remote].revoke_standing_on_takeover, default off).
-		if prevStanding && s.standingTakeoverf != nil {
+	if isLeaseTakeover {
+		s.emitLease(LeaseTakenOver, revokedHolder, holder, out.Reason)
+		// A takeover can point in any direction. If the superseded remote writer
+		// held control through the STANDING credential, report it only for the
+		// narrowly classified local-over-standing-remote direction (async — the
+		// hook may take dashboard-side locks and must never
+		// re-enter this session's writeMu path synchronously). Policy — whether the
+		// standing secret itself is then revoked — lives entirely behind the hook
+		// ([remote].revoke_standing_on_takeover, default off).
+		if isStandingLocalTakeover && s.standingTakeoverf != nil {
 			go s.standingTakeoverf(s.handle, revokedHolder)
 		}
 	} else if revokedHolder != "" {
-		s.emitLease(LeaseRevoked, revokedHolder, "superseded by new lease")
+		s.emitLease(LeaseRevoked, revokedHolder, holder, "superseded by new lease")
 	}
-	s.emitLease(LeaseAcquired, holder, out.Reason)
+	s.emitLease(LeaseAcquired, holder, holder, out.Reason)
 	return l, nil
 }
 
 // revokeLease is the ONE idempotent revocation funnel (§4.α.4) reached by
-// Release, Revoke, local takeover, emergency revoke, device-session revoke,
+// Release, Revoke, lease takeover, emergency revoke, device-session revoke,
 // allow_terminal→false, and teardown. If this lease is the session's current
 // writer it is detached and gen is bumped (fencing its in-flight write); the
 // revocation channel is closed exactly once regardless.
@@ -775,7 +829,7 @@ func (s *Session) revokeLease(l *WriterLease, kind LeaseEventKind, reason string
 		first = true
 	})
 	if first {
-		s.emitLease(kind, l.holder, reason)
+		s.emitLease(kind, l.holder, l.holder, reason)
 	}
 }
 
@@ -794,8 +848,8 @@ func (m *Manager) AcquireWriterLocal(handle string) (*WriterLease, error) {
 // AcquireWriterRemote grants a writer lease against an unforgeable WriterGrant
 // minted only by termlease.Authorize after the full §4.δ conjunction. A
 // zero-value / fabricated grant (Authorized()==false) is refused (ErrNoGrant),
-// making the conjunction structurally unbypassable (§4.α.2a). It fails closed
-// while the local owner holds the writer (ErrHeldLocally).
+// making the conjunction structurally unbypassable (§4.α.2a). ErrHeldLocally
+// and ErrWriterHeld surface only when authenticated remote takeover is disabled.
 func (m *Manager) AcquireWriterRemote(handle string, grant termlease.WriterGrant) (*WriterLease, error) {
 	if !grant.Authorized() {
 		return nil, ErrNoGrant
@@ -820,6 +874,22 @@ func (m *Manager) AcquireWriterRemote(handle string, grant termlease.WriterGrant
 	// 8-char display fingerprint (grant.Holder()), so a per-device revoke matches
 	// exactly one lease with no prefix collision. Display surfaces truncate it.
 	return s.acquireWriter(termlease.RequesterRemote, grant.HolderKey(), grant.Standing())
+}
+
+// SetAllowRemoteTakeoverSource replaces the live policy source used by every
+// session at its writer-decision linearization point. Nil restores the secure
+// product default (authenticated remote takeover enabled); the function itself
+// must be concurrency-safe and non-blocking in production.
+func (m *Manager) SetAllowRemoteTakeoverSource(fn func() bool) {
+	if fn == nil {
+		fn = func() bool { return true }
+	}
+	m.allowRemoteTakeover.Store(&fn)
+}
+
+func (m *Manager) remoteTakeoverAllowed() bool {
+	fn := m.allowRemoteTakeover.Load()
+	return fn == nil || (*fn)()
 }
 
 // SetOnStandingLocalTakeover registers (or replaces; nil clears) the hook fired
@@ -1096,18 +1166,19 @@ func (m *Manager) Create(spec Spec) (string, error) {
 	}
 
 	s := &Session{
-		spec:              spec,
-		pty:               p,
-		out:               newOutBuf(m.ringBytes),
-		createdAt:         m.now(),
-		now:               m.now,
-		subs:              make(map[*Subscription]struct{}),
-		maxSubs:           m.maxSubscribers,
-		writerIdle:        m.writerLeaseIdle,
-		writerMax:         m.writerLeaseMax,
-		leaseEventf:       m.onLeaseEvent,
-		standingTakeoverf: m.fireStandingTakeover,
-		done:              make(chan struct{}),
+		spec:                 spec,
+		pty:                  p,
+		out:                  newOutBuf(m.ringBytes),
+		createdAt:            m.now(),
+		now:                  m.now,
+		subs:                 make(map[*Subscription]struct{}),
+		maxSubs:              m.maxSubscribers,
+		writerIdle:           m.writerLeaseIdle,
+		writerMax:            m.writerLeaseMax,
+		leaseEventf:          m.onLeaseEvent,
+		allowRemoteTakeoverf: m.remoteTakeoverAllowed,
+		standingTakeoverf:    m.fireStandingTakeover,
+		done:                 make(chan struct{}),
 	}
 	s.handle = handle
 	s.touch()

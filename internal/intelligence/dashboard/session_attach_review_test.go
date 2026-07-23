@@ -139,9 +139,11 @@ func TestReArmWithViewOffClosesViewers(t *testing.T) {
 	unregister := s.registerSensitiveViewer("aaaa1111", func() { closed <- struct{}{} })
 	defer unregister()
 
-	// Re-arm WITHOUT allow_terminal_view (omitted ⇒ false): the live view gate
-	// flips off and the open viewer is closed.
-	if rec := postConfirm(t, h, "/api/remote/enable", `{"host":"box.ts.net"}`, ck, token); rec.Code != http.StatusOK {
+	// Re-arm with an EXPLICIT allow_terminal_view:false: the live view gate
+	// flips off and the open viewer is closed. (Omitting the field now INHERITS
+	// the seed default — true — so turning view off must be stated explicitly;
+	// that is the enable-overwrites-default fix.)
+	if rec := postConfirm(t, h, "/api/remote/enable", `{"host":"box.ts.net","allow_terminal_view":false}`, ck, token); rec.Code != http.StatusOK {
 		t.Fatalf("re-arm = %d: %s", rec.Code, rec.Body.String())
 	}
 	if len(closed) != 1 {

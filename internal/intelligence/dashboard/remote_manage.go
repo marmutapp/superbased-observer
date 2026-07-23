@@ -230,17 +230,18 @@ func (s *Server) handleRemoteConfig(w http.ResponseWriter, r *http.Request) {
 		"confirm_token":   token,
 		"config_writable": s.opts.ConfigPath != "",
 		// live controller ⇒ sessions can be revoked instantly (no restart, §C).
-		"controller_live":             s.opts.Remote != nil,
-		"enabled":                     false,
-		"mode":                        "off",
-		"require_tls":                 true,
-		"allow_terminal":              false,
-		"allow_terminal_view":         false,
-		"revoke_standing_on_takeover": false,
-		"trusted_hosts":               []string{},
-		"secret_present":              false,
-		"secret_fingerprint":          "",
-		"ready":                       s.opts.Remote != nil && s.opts.Remote.Ready(),
+		"controller_live":                s.opts.Remote != nil,
+		"enabled":                        false,
+		"mode":                           "off",
+		"require_tls":                    true,
+		"allow_terminal":                 false,
+		"allow_terminal_view":            false,
+		"allow_remote_terminal_takeover": true,
+		"revoke_standing_on_takeover":    false,
+		"trusted_hosts":                  []string{},
+		"secret_present":                 false,
+		"secret_fingerprint":             "",
+		"ready":                          s.opts.Remote != nil && s.opts.Remote.Ready(),
 	}
 
 	if cfg, err := loadConfigForDashboard(s.opts.ConfigPath); err == nil {
@@ -250,6 +251,7 @@ func (s *Server) handleRemoteConfig(w http.ResponseWriter, r *http.Request) {
 		resp["require_tls"] = rc.RequireTLS
 		resp["allow_terminal"] = rc.AllowTerminal
 		resp["allow_terminal_view"] = rc.AllowTerminalView
+		resp["allow_remote_terminal_takeover"] = rc.AllowRemoteTerminalTakeover
 		resp["revoke_standing_on_takeover"] = rc.RevokeStandingOnTakeover
 		resp["backend_addr"] = rc.TailscaleBackendAddr
 		if rc.TrustedHosts != nil {
@@ -317,9 +319,12 @@ func (s *Server) handleRemoteEnable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Host              string `json:"host"`
-		AllowTerminal     bool   `json:"allow_terminal"`
-		AllowTerminalView bool   `json:"allow_terminal_view"`
+		Host          string `json:"host"`
+		AllowTerminal bool   `json:"allow_terminal"`
+		// Pointer so an OMITTED field inherits the loaded/seed default (now
+		// true) instead of clobbering it to false. The Arm form omits it; the
+		// dedicated /api/remote/allow-terminal-view toggle owns explicit flips.
+		AllowTerminalView *bool `json:"allow_terminal_view"`
 	}
 	_ = decodeJSONBody(r, &body)
 	remoteManageMu.Lock()
@@ -797,7 +802,7 @@ func (s *Server) handleRemoteApproveExecute(w http.ResponseWriter, r *http.Reque
 // standingTerminalWarning is the FIRM security warning shown at mint AND on the
 // standing-access section (standing-terminal-access §B). It is the canonical
 // copy the dashboard renders verbatim.
-const standingTerminalWarning = "Standing access means ANYONE who has this secret AND a paired remote session can take control of EVERY live terminal, across page refreshes, until you revoke it. It is stored hashed on this machine, but a device may keep the raw secret in its browser localStorage so control survives a refresh — treat it like a password. Per-terminal single-use approvals (the default above) are safer: they grant one device control of one terminal until its socket closes. Revoke standing access below to kill the secret and drop every writer holding control through it right now."
+const standingTerminalWarning = "Standing access means ANYONE who has this secret AND a paired remote session can take control of EVERY live terminal — including one currently controlled by the native/local seat or another remote when remote takeover is enabled — across page refreshes, until you revoke it. It is stored hashed on this machine, but a device may keep the raw secret in its browser localStorage so control survives a refresh — treat it like a password. Per-terminal single-use approvals (the default above) are safer: they grant one device control of one terminal until its socket closes. Revoke standing access below to kill the secret and drop every writer holding control through it right now."
 
 // readStandingSecretFingerprint returns a short, non-sensitive fingerprint of
 // the standing terminal-control secret hash-at-rest (never the secret), mirroring
@@ -851,18 +856,20 @@ func (s *Server) handleStandingTerminalStatus(w http.ResponseWriter, r *http.Req
 		return
 	}
 	resp := map[string]any{
-		"enabled":            false,
-		"secret_present":     false,
-		"secret_fingerprint": "",
-		"allow_terminal":     false,
-		"remote_enabled":     false,
-		"config_writable":    s.opts.ConfigPath != "",
-		"warning":            standingTerminalWarning,
-		"revoke_on_takeover": false,
+		"enabled":                        false,
+		"secret_present":                 false,
+		"secret_fingerprint":             "",
+		"allow_terminal":                 false,
+		"allow_remote_terminal_takeover": true,
+		"remote_enabled":                 false,
+		"config_writable":                s.opts.ConfigPath != "",
+		"warning":                        standingTerminalWarning,
+		"revoke_on_takeover":             false,
 	}
 	if cfg, err := loadConfigForDashboard(s.opts.ConfigPath); err == nil {
 		resp["enabled"] = cfg.Remote.AllowStandingTerminalControl
 		resp["allow_terminal"] = cfg.Remote.AllowTerminal
+		resp["allow_remote_terminal_takeover"] = cfg.Remote.AllowRemoteTerminalTakeover
 		resp["remote_enabled"] = cfg.Remote.Enabled
 		resp["revoke_on_takeover"] = cfg.Remote.RevokeStandingOnTakeover
 		if fp := readStandingSecretFingerprint(cfg); fp != "" {

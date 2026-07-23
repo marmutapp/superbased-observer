@@ -3,11 +3,13 @@ package dashboard
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,9 +31,10 @@ import (
 // §4.δ conjunction + a real termsession lease are exercised by the cmd-side
 // matrix + lease-audit tests; here we isolate the dashboard control events.
 type leaseAuditManager struct {
-	caps   termlease.CapabilityConsumer
-	handle string
-	sub    *fakeSubscription
+	caps             termlease.CapabilityConsumer
+	handle           string
+	sub              *fakeSubscription
+	denyAfterConsume atomic.Bool
 }
 
 func (m *leaseAuditManager) Create(LaunchSpec) (string, error)           { return m.handle, nil }
@@ -53,7 +56,10 @@ func (m *leaseAuditManager) AcquireWriterLocal(string) (LaunchWriter, error) {
 func (m *leaseAuditManager) AcquireWriterRemote(req RemoteWriterRequest) (LaunchWriter, error) {
 	ok := m.caps.ConsumeTerminalControl(req.CapabilityToken, req.Confirm, req.DeviceSessionID, req.Handle)
 	if !ok {
-		return nil, ErrLaunchExecuteUnavailable
+		return nil, NewControlDeniedError(ControlDenialAuth, false, ErrLaunchExecuteUnavailable)
+	}
+	if m.denyAfterConsume.Load() {
+		return nil, NewControlDeniedError(ControlDenialHeldLocally, true, errors.New("takeover disabled"))
 	}
 	return newFakeWriter(), nil
 }
@@ -74,6 +80,7 @@ type controlAuditHarness struct {
 	device string // raw device-session cookie value
 	fp     string // device fingerprint (Sessions()[].Fingerprint)
 	handle string
+	lm     *leaseAuditManager
 }
 
 func newControlAuditHarness(t *testing.T) *controlAuditHarness {
@@ -94,6 +101,7 @@ func newControlAuditHarness(t *testing.T) *controlAuditHarness {
 	sub := newFakeSubscription()
 	t.Cleanup(func() { close(sub.release) })
 	lm := &leaseAuditManager{caps: h.rc, handle: h.handle, sub: sub}
+	h.lm = lm
 
 	// The RemoteAudit sink persists to the SAME store as the approval handler —
 	// exactly what cmd's remoteAuditSink does in production.
@@ -105,6 +113,56 @@ func newControlAuditHarness(t *testing.T) *controlAuditHarness {
 	}
 	h.s = s
 	return h
+}
+
+// TestTerminalControlAuditCapabilityConsumedBeforePolicyDenial pins the honest
+// refused-takeover lifecycle: a valid one-time capability is consumed upstream,
+// then lease policy denies, so consume is recorded before a held_locally denial
+// and replaying the same approval is a genuine auth rejection.
+func TestTerminalControlAuditCapabilityConsumedBeforePolicyDenial(t *testing.T) {
+	h := newControlAuditHarness(t)
+	ts := remoteExposedWSServer(t, h.s)
+	defer ts.Close()
+	capTok, confirm := h.approve(t)
+	h.lm.denyAfterConsume.Store(true)
+	c := h.dialWS(t, ts)
+	defer c.CloseNow()
+	_ = c.Write(context.Background(), websocket.MessageText,
+		[]byte(`{"t":"acquire-writer","cap":"`+capTok+`","confirm":"`+confirm+`"}`))
+	if !waitForControl(t, context.Background(), c, "control_denied") {
+		t.Fatal("expected policy control_denied after capability consume")
+	}
+	h.lm.denyAfterConsume.Store(false)
+	_ = c.Write(context.Background(), websocket.MessageText,
+		[]byte(`{"t":"acquire-writer","cap":"`+capTok+`","confirm":"`+confirm+`"}`))
+	if !waitForControl(t, context.Background(), c, "control_denied") {
+		t.Fatal("expected replayed consumed capability to be auth-denied")
+	}
+
+	rows := h.rows(t)
+	kinds := make([]string, 0, len(rows))
+	foundHeldDetail := false
+	for _, row := range rows {
+		kinds = append(kinds, row.Kind)
+		if row.Kind == "terminal_control_denied" && row.Detail == string(ControlDenialHeldLocally) {
+			foundHeldDetail = true
+		}
+	}
+	want := []string{
+		"terminal_control_local_approval",
+		"terminal_control_request",
+		"terminal_control_capability_consume",
+		"terminal_control_denied",
+		"terminal_control_request",
+		"terminal_control_denied",
+	}
+	if !stringsContainInOrder(kinds, want) {
+		t.Fatalf("consumed-refusal audit kinds\n got: %v\nwant subsequence: %v", kinds, want)
+	}
+	if !foundHeldDetail {
+		t.Fatalf("audit did not record held_locally policy denial honestly: %+v", rows)
+	}
+	assertRowsNoCanary(t, rows, []string{capTok, confirm, h.device})
 }
 
 func auditSinkToStore(st *store.Store) func(RemoteAuditRecord) {

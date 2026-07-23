@@ -388,7 +388,16 @@ var defaultPricing = map[string]Pricing{
 	"claude-fable-5": {Input: 10, Output: 50, CacheRead: 1, CacheCreation: 12.50, CacheCreation1h: 20, WebSearchPerRequest: 0.01},
 	// claude-fable family prefix so future SKUs (fable-5-2026xxxx, fable-6)
 	// resolve to current-tier rates instead of MISSing to $0.
-	"claude-fable":             {Input: 10, Output: 50, CacheRead: 1, CacheCreation: 12.50, CacheCreation1h: 20, WebSearchPerRequest: 0.01},
+	"claude-fable": {Input: 10, Output: 50, CacheRead: 1, CacheCreation: 12.50, CacheCreation1h: 20, WebSearchPerRequest: 0.01},
+	// Mythos 5 — identical pricing/behavior to Fable 5, available only via
+	// Project Glasswing. Verified against platform.claude.com/docs/en/
+	// about-claude/pricing 2026-07-23 (same card, same rates as Fable 5:
+	// $10/$50, cache read $1, 5m-write $12.50, 1h-write $20). Placed next
+	// to the claude-fable pair per house convention (mirror rates, own
+	// family prefix so future dated SKUs don't MISS to $0).
+	"claude-mythos-5": {Input: 10, Output: 50, CacheRead: 1, CacheCreation: 12.50, CacheCreation1h: 20, WebSearchPerRequest: 0.01},
+	// claude-mythos family prefix — mirrors claude-fable's.
+	"claude-mythos":            {Input: 10, Output: 50, CacheRead: 1, CacheCreation: 12.50, CacheCreation1h: 20, WebSearchPerRequest: 0.01},
 	"claude-opus-4-7":          {Input: 5, Output: 25, CacheRead: 0.50, CacheCreation: 6.25, CacheCreation1h: 10, WebSearchPerRequest: 0.01},
 	"claude-opus-4-6":          {Input: 5, Output: 25, CacheRead: 0.50, CacheCreation: 6.25, CacheCreation1h: 10, WebSearchPerRequest: 0.01},
 	"claude-opus-4-6-20251001": {Input: 5, Output: 25, CacheRead: 0.50, CacheCreation: 6.25, CacheCreation1h: 10, WebSearchPerRequest: 0.01},
@@ -937,6 +946,240 @@ var defaultPricing = map[string]Pricing{
 	// single upstream serves the tokens — rather than fabricating an
 	// OpenRouter-specific number.
 	"moonshotai/kimi-k3": {Input: 3, Output: 15, CacheRead: 0.30},
+
+	// --- 2026-07-23 research batch (new providers/models) ---
+
+	// Alibaba Qwen — additional 3.5/3.7 generation SKUs, first-party
+	// DashScope rates (alibabacloud.com/help/en/model-studio/model-pricing,
+	// standard ≤256K tier; thinking output billed at the same output rate
+	// as non-thinking). qwen3.5-plus is selectable directly in Qwen Code CLI.
+	"qwen3.5-plus":  {Input: 0.40, Output: 2.40, CacheRead: 0.04},
+	"qwen3.5-flash": {Input: 0.10, Output: 0.40, CacheRead: 0.01},
+	// OpenRouter-qualified aliases. ADDED post-review (2026-07-23 codex
+	// adversarial pass, P1): real captured traffic already contains the
+	// dated wire ID "qwen/qwen3.5-plus-20260420" (see
+	// docs/plans/provider-model-price-catalog-2026-06-06.md). Date-strip
+	// (`-\d{8}$`) reduces that to "qwen/qwen3.5-plus", which without this
+	// row was ABSENT from the table and fell through to the generic
+	// "qwen3" family fallback ($0.78/$3.90 — wrong tier entirely).
+	//
+	// "qwen/qwen3.5-plus" deliberately uses the REAL OpenRouter list rate
+	// ($0.30/$1.80, no cache rate published — CacheRead left at 0 so
+	// fillDefaults' 10%-of-input floor applies) from the price catalog
+	// above, NOT a literal mirror of the first-party DashScope bare rate
+	// ($0.40/$2.40/$0.04) — OpenRouter's own price for this route is
+	// verified real data and takes precedence over an assumption that the
+	// two channels bill identically.
+	"qwen/qwen3.5-plus": {Input: 0.30, Output: 1.80},
+	// "qwen/qwen3.5-flash" has no corresponding real OpenRouter data point
+	// in the catalog, so this one DOES mirror the bare DashScope rate for
+	// symmetry with the -plus alias above, per the original request.
+	"qwen/qwen3.5-flash": {Input: 0.10, Output: 0.40, CacheRead: 0.01},
+	// qwen3.5-omni-* are TEXT-tier rates only — Omni also bills audio
+	// input/output at a separate, much higher per-token rate ($11 in /
+	// $44 out per M for -plus; $3 in / $11.90 out per M for -flash) that
+	// this struct has no modality dimension to express. Text-only turns
+	// bill correctly; a turn carrying audio tokens will under-bill until
+	// the schema grows a modality split.
+	"qwen3.5-omni-plus":  {Input: 1.40, Output: 8.30},
+	"qwen3.5-omni-flash": {Input: 0.40, Output: 2.20},
+	"qwen3.7-plus":       {Input: 0.40, Output: 1.60, CacheRead: 0.04},
+	// OpenRouter alias — list price. OR currently runs a 20%-off promo on
+	// top of this (not modeled; promos are time-boxed and this is the
+	// standing list rate).
+	"qwen/qwen3.7-plus": {Input: 0.40, Output: 1.60, CacheRead: 0.04},
+	// qwen3.8-max-preview — NO official per-token rate as of 2026-07-23.
+	// Announced 2026-07-19 as a Token Plan preview only (no metered API
+	// pricing published). PLACEHOLDER anchored to qwen3.7-max's exact
+	// current OpenRouter rate ($1.25/$3.75, cache $0.25).
+	//
+	// CORRECTED post-review (2026-07-23 codex adversarial pass, P3): this
+	// is NOT preventing a $0 miss — without this row the lookup would
+	// still resolve, via the "qwen3" family fallback ($0.78/$3.90,
+	// pricing.go:844), to a real but WRONG-TIER nonzero rate. The
+	// placeholder's actual purpose is to stop that generic-family
+	// mis-price from applying to a specific, much-higher-end preview SKU.
+	// Revisit at GA and replace with the real first-party rate card.
+	"qwen3.8-max-preview": {Input: 1.25, Output: 3.75, CacheRead: 0.25},
+
+	// Z.AI — GLM 5.2 (docs.z.ai/guides/overview/pricing, fetched
+	// 2026-07-23). Cache storage is limited-time free per the same page.
+	"glm-5.2": {Input: 1.40, Output: 4.40, CacheRead: 0.26},
+	// OpenRouter alias — list price (OR currently shows a 45%-off promo on
+	// top of this; not modeled, same reasoning as the Qwen 3.7-plus alias).
+	"z-ai/glm-5.2": {Input: 1.40, Output: 4.40, CacheRead: 0.26},
+
+	// MiniMax M3 — platform.minimax.io, ≤512K tier. >512K doubles ALL
+	// rates (documented, not modeled — no long-context dimension wired
+	// for MiniMax the way Anthropic/OpenAI/Gemini have one).
+	"minimax-m3":         {Input: 0.30, Output: 1.20, CacheRead: 0.06},
+	"minimax/minimax-m3": {Input: 0.30, Output: 1.20, CacheRead: 0.06},
+
+	// Tencent Hunyuan — "hy3" GA'd 2026-07-06 on TokenHub. Rates are
+	// ¥1/¥4/¥0.25-cache per 1M converted at ~7.0 CNY/USD ($0.1429/
+	// $0.5714/$0.0357), cross-checked against the OpenRouter tencent/hy3
+	// listing and rounded to the published-precision figures below.
+	//
+	// KNOWN LIMITATION (2026-07-23 codex adversarial pass, P2): the bare
+	// "hy3" key is, like every other undated bare key in this whole
+	// table (qwen, grok, mistral, etc. — a systemic property of
+	// familyKeys()'s unbounded strings.HasPrefix, not something specific
+	// to this row), an unbounded family prefix: it will also match any
+	// future unrelated model whose ID happens to start with "hy3", e.g.
+	// a hypothetical "hy3d-turbo" from a different line. Documented, not
+	// redesigned, here — see
+	// TestTable_2026Q3UnboundedPrefixKnownLimitation in pricing_test.go.
+	"hy3":         {Input: 0.15, Output: 0.59, CacheRead: 0.037},
+	"tencent/hy3": {Input: 0.15, Output: 0.59, CacheRead: 0.037},
+
+	// StepFun — openrouter.ai/stepfun/step-3.5-flash. No cache rate is
+	// published on the listing — CacheRead left at 0 so fillDefaults'
+	// 10%-of-input floor applies rather than a fabricated exact number.
+	"step-3.5-flash":         {Input: 0.10, Output: 0.30},
+	"stepfun/step-3.5-flash": {Input: 0.10, Output: 0.30},
+
+	// Baidu ERNIE 5.1 — Baidu's own Qianfan rate card is not directly
+	// reachable from here; this rate is the consensus of 3+ independent
+	// third-party trackers (cross-checked, not first-party-verified).
+	// Qianfan exposes no prompt-caching primitive for this model, so
+	// CacheRead is genuinely N/A (left at 0; fillDefaults' 10% floor
+	// still applies as the defensive fallback like every other row).
+	"ernie-5.1": {Input: 0.59, Output: 2.65},
+
+	// ByteDance Doubao Seed 2.0 — PROVISIONAL. Volcengine's official
+	// pricing table is JS-rendered and not fetchable by static tooling;
+	// these CNY-sourced rates come from secondary CN coverage,
+	// cross-checked against an independent USD tracker, but are NOT
+	// first-party-confirmed. Whole group flagged provisional; revisit
+	// when Volcengine's rate card can be fetched directly.
+	"doubao-seed-2.0-pro":  {Input: 0.47, Output: 2.35, CacheRead: 0.094},
+	"doubao-seed-2.0-code": {Input: 0.47, Output: 2.35, CacheRead: 0.094},
+	"doubao-seed-2.0-lite": {Input: 0.088, Output: 0.53, CacheRead: 0.018},
+	"doubao-seed-2.0-mini": {Input: 0.029, Output: 0.29, CacheRead: 0.006},
+	// doubao-seed-2.0 family prefix (dot form) — catches an unrecognized
+	// FUTURE dot-form variant at pro rates only; the four explicit rows
+	// above are all longer strings so they win the longest-prefix ladder
+	// for every KNOWN variant (pro/code/lite/mini never fall through to
+	// this row).
+	"doubao-seed-2.0": {Input: 0.47, Output: 2.35, CacheRead: 0.094},
+	// Volcengine ALSO emits dash-form dated IDs, e.g.
+	// "doubao-seed-2-0-pro-260215" / "doubao-seed-2-0-lite-260215" /
+	// "doubao-seed-2-0-mini-260215". LookupWithSource does not normalize
+	// dashes/dots against each other (confirmed: no such transform exists
+	// in the lookup ladder), and that suffix is only 6 digits (YYMMDD),
+	// so dateSuffix's `-\d{8}$` regex won't strip it either — every
+	// dash-form dated ID resolves via family-prefix, never date-strip.
+	//
+	// FIXED post-review (2026-07-23 codex adversarial pass, P1): a single
+	// bare "doubao-seed-2-0" family key here priced EVERY dash-form
+	// variant — including the ~5.3×-cheaper lite tier and the
+	// ~16×-cheaper mini tier — at PRO rates, because it was the only
+	// dash-form entry in the table and every dash-form dated ID is a
+	// superstring of it. The fix is one dash-form key PER variant,
+	// mirroring the four dot-form rows above 1:1, so the longest-prefix
+	// ladder picks the matching variant (not just "some doubao-seed-2-0
+	// row") before it can ever reach a shorter fallback.
+	"doubao-seed-2-0-pro":  {Input: 0.47, Output: 2.35, CacheRead: 0.094},
+	"doubao-seed-2-0-code": {Input: 0.47, Output: 2.35, CacheRead: 0.094},
+	"doubao-seed-2-0-lite": {Input: 0.088, Output: 0.53, CacheRead: 0.018},
+	"doubao-seed-2-0-mini": {Input: 0.029, Output: 0.29, CacheRead: 0.006},
+	// Bare "doubao-seed-2-0" dash-form family kept ONLY as the same kind
+	// of last-resort fallback as its dot-form counterpart above — an
+	// unrecognized FUTURE dash-form variant lands at pro rates rather
+	// than MISSing to $0. All four KNOWN variants have their own longer
+	// key above and are never shadowed by this one.
+	"doubao-seed-2-0": {Input: 0.47, Output: 2.35, CacheRead: 0.094},
+
+	// Meta — Muse Spark 1.1 (developer.meta.com), public API preview
+	// launched 2026-07-09. 1M context. Reasoning tokens bill at the
+	// output rate (same convention as Anthropic — no separate reasoning
+	// dimension on this struct).
+	"muse-spark-1.1": {Input: 1.25, Output: 4.25, CacheRead: 0.15},
+
+	// Cohere — North Mini Code 1.0. Genuinely free / $0, rate-limited per
+	// docs.cohere.com and the OpenRouter listing (not a promo). A paid
+	// dedicated tier may appear later — revisit this row if/when Cohere
+	// publishes metered pricing for it.
+	"north-mini-code-1-0":    {Input: 0, Output: 0},
+	"cohere/north-mini-code": {Input: 0, Output: 0},
+	// NOTE: an explicit "cohere/north-mini-code:free" row is deliberately
+	// NOT added — LookupWithSource's universal `:free`-suffix guard (see
+	// above) already returns PricingSourceExact $0 for ANY model string
+	// ending in ":free" (case-insensitive) that doesn't already have its
+	// own explicit entry, before the family ladder even runs. (An
+	// explicit exact-match row for a specific "...:free" key, were one
+	// ever added, would still be checked FIRST and win over the guard —
+	// the guard is the fallback for un-enumerated ":free" strings, not an
+	// override.) Adding a duplicate explicit row here would be redundant
+	// with that guard, not a fix for a gap.
+
+	// Sakana AI — Fugu Ultra (console.sakana.ai/pricing,
+	// openrouter.ai/sakana/fugu-ultra). >272K tier is $10/$45/$1
+	// (documented, not modeled — no long-context dimension wired for
+	// Sakana). Orchestration tokens bill at the SAME rates as regular
+	// tokens per the pricing page (no separate orchestration tier to
+	// model). Family key (no date suffix) so dated IDs like
+	// "fugu-ultra-20260615" resolve via the dateSuffix strip to this
+	// exact row, or via family-prefix if some other dated suffix shape
+	// shows up.
+	"fugu-ultra":        {Input: 5, Output: 30, CacheRead: 0.50},
+	"sakana/fugu-ultra": {Input: 5, Output: 30, CacheRead: 0.50},
+
+	// Thinking Machines Lab — Inkling, via OpenRouter
+	// (openrouter.ai/thinkingmachines/inkling). TML has no first-party
+	// per-token API endpoint of its own (TML's product is Tinker
+	// fine-tuning, not a metered inference endpoint); multi-provider price
+	// variance for this model is real across hosts, but OpenRouter's
+	// number is the one verifiable, checkable standard, so it's used here
+	// rather than an unverifiable first-party figure.
+	// Bare "inkling" alias: same KNOWN LIMITATION as "hy3" above (P2) — an
+	// unbounded family prefix that would also match an unrelated future
+	// ID like "inklinglabs-x". Documented in
+	// TestTable_2026Q3UnboundedPrefixKnownLimitation, not redesigned.
+	"thinkingmachines/inkling": {Input: 1, Output: 4.05},
+	"inkling":                  {Input: 1, Output: 4.05}, // bare alias
+
+	// AI21 — Jamba Mini 2 (docs.ai21.com/docs/jamba-foundation-models).
+	// 256K context. No cache pricing offered by AI21 for this line —
+	// CacheRead left at 0 so fillDefaults' 10%-of-input floor applies
+	// rather than a fabricated exact number (same pattern as the StepFun
+	// and ERNIE rows above). Doubles as the family prefix for dated
+	// wire-ID variants.
+	"jamba-mini-2": {Input: 0.20, Output: 0.40},
+
+	// Google — a video-generation model that shares Gemini 3.5 Flash's
+	// TEXT rates (ai.google.dev/gemini-api/docs/pricing). Video output is
+	// billed separately at $17.50/M and is not modeled (no video-output
+	// dimension on this struct). No cache tier while in preview —
+	// CacheRead left at 0 so fillDefaults' 10%-of-input floor applies
+	// rather than a fabricated exact number (same pattern as StepFun/
+	// ERNIE/Jamba above). Verified no shorter existing "gemini-*" family
+	// key (gemini-2, gemini-2.5, gemini-3, gemini-3.1 — there is no bare
+	// "gemini" row) is a string prefix of "gemini-omni-flash-preview", so
+	// this explicit row can't be shadowed by an unrelated family fallback
+	// either way; it wins as a verbatim PricingSourceExact match
+	// regardless.
+	"gemini-omni-flash-preview": {Input: 1.50, Output: 9},
+
+	// Sarvam AI — sarvam.ai/api-pricing. Genuinely free, 60rpm rate limit.
+	"sarvam-30b":  {Input: 0, Output: 0},
+	"sarvam-105b": {Input: 0, Output: 0},
+
+	// Researched-but-not-priced (2026-07-23) — do NOT re-research these;
+	// no table row exists because none of them have a real per-token rate
+	// to record:
+	//   - Cohere Command A+: open-weight + contact-sales hosted tier only,
+	//     no published rate card.
+	//   - Meta Muse Spark (original, pre-1.1): private partner preview,
+	//     never had a public endpoint or rate.
+	//   - Microsoft Phi-4-reasoning-vision-15B: Azure AI Foundry Labs
+	//     experimental listing, no token rate; ships as open weights
+	//     instead (self-host, no metered price to record).
+	//   - TII Falcon H1R 7B: open weights only, no hosted listing/rate
+	//     card from TII or a first-party endpoint.
+	//   - Hy3 preview-era third-party host rates: superseded by the GA
+	//     "hy3" row above (2026-07-06 TokenHub launch); the preview-era
+	//     numbers some trackers still list are stale.
 
 	// Cursor — Composer family. Cursor's stop hook carries `model` per
 	// generation and the cursor adapter (since v1.4.45) lands a

@@ -1087,3 +1087,470 @@ func TestTable_OpusUniformPricingNoLongContext(t *testing.T) {
 		}
 	}
 }
+
+// TestTable_2026Q3ResearchBatch pins the 2026-07-23 research batch (new
+// providers + Mythos 5): exact rates for one representative row per new
+// family. Cache-less rows check only Input/Output; the free rows check
+// Input==Output==0 explicitly.
+func TestTable_2026Q3ResearchBatch(t *testing.T) {
+	tb := NewTable()
+	const skipCache = -1.0
+	for _, tc := range []struct {
+		name, model     string
+		in, out, cacheR float64
+	}{
+		{"claude-mythos-5", "claude-mythos-5", 10, 50, 1},
+		{"claude-mythos (family)", "claude-mythos", 10, 50, 1},
+		{"qwen3.5-plus", "qwen3.5-plus", 0.40, 2.40, 0.04},
+		{"qwen3.5-flash", "qwen3.5-flash", 0.10, 0.40, 0.01},
+		{"qwen3.5-omni-plus", "qwen3.5-omni-plus", 1.40, 8.30, skipCache},
+		{"qwen3.5-omni-flash", "qwen3.5-omni-flash", 0.40, 2.20, skipCache},
+		{"qwen3.7-plus", "qwen3.7-plus", 0.40, 1.60, 0.04},
+		{"qwen/qwen3.7-plus", "qwen/qwen3.7-plus", 0.40, 1.60, 0.04},
+		{"qwen3.8-max-preview", "qwen3.8-max-preview", 1.25, 3.75, 0.25},
+		// qwen/qwen3.5-plus alias uses the REAL OpenRouter rate, which
+		// deliberately differs from the bare DashScope key above (P1-2 fix).
+		{"qwen/qwen3.5-plus", "qwen/qwen3.5-plus", 0.30, 1.80, skipCache},
+		{"qwen/qwen3.5-flash", "qwen/qwen3.5-flash", 0.10, 0.40, 0.01},
+		{"glm-5.2", "glm-5.2", 1.40, 4.40, 0.26},
+		{"z-ai/glm-5.2", "z-ai/glm-5.2", 1.40, 4.40, 0.26},
+		{"minimax-m3", "minimax-m3", 0.30, 1.20, 0.06},
+		{"minimax/minimax-m3", "minimax/minimax-m3", 0.30, 1.20, 0.06},
+		{"hy3", "hy3", 0.15, 0.59, 0.037},
+		{"tencent/hy3", "tencent/hy3", 0.15, 0.59, 0.037},
+		{"step-3.5-flash", "step-3.5-flash", 0.10, 0.30, skipCache},
+		{"stepfun/step-3.5-flash", "stepfun/step-3.5-flash", 0.10, 0.30, skipCache},
+		{"ernie-5.1", "ernie-5.1", 0.59, 2.65, skipCache},
+		{"doubao-seed-2.0-pro", "doubao-seed-2.0-pro", 0.47, 2.35, 0.094},
+		{"doubao-seed-2.0-code", "doubao-seed-2.0-code", 0.47, 2.35, 0.094},
+		{"doubao-seed-2.0-lite", "doubao-seed-2.0-lite", 0.088, 0.53, 0.018},
+		{"doubao-seed-2.0-mini", "doubao-seed-2.0-mini", 0.029, 0.29, 0.006},
+		{"doubao-seed-2-0-pro", "doubao-seed-2-0-pro", 0.47, 2.35, 0.094},
+		{"doubao-seed-2-0-code", "doubao-seed-2-0-code", 0.47, 2.35, 0.094},
+		{"doubao-seed-2-0-lite", "doubao-seed-2-0-lite", 0.088, 0.53, 0.018},
+		{"doubao-seed-2-0-mini", "doubao-seed-2-0-mini", 0.029, 0.29, 0.006},
+		{"muse-spark-1.1", "muse-spark-1.1", 1.25, 4.25, 0.15},
+		{"north-mini-code-1-0 (free)", "north-mini-code-1-0", 0, 0, skipCache},
+		{"cohere/north-mini-code (free)", "cohere/north-mini-code", 0, 0, skipCache},
+		{"fugu-ultra", "fugu-ultra", 5, 30, 0.50},
+		{"sakana/fugu-ultra", "sakana/fugu-ultra", 5, 30, 0.50},
+		{"thinkingmachines/inkling", "thinkingmachines/inkling", 1, 4.05, skipCache},
+		{"inkling (bare alias)", "inkling", 1, 4.05, skipCache},
+		{"jamba-mini-2", "jamba-mini-2", 0.20, 0.40, skipCache},
+		{"gemini-omni-flash-preview", "gemini-omni-flash-preview", 1.50, 9, skipCache},
+		{"sarvam-30b (free)", "sarvam-30b", 0, 0, skipCache},
+		{"sarvam-105b (free)", "sarvam-105b", 0, 0, skipCache},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, ok := tb.Lookup(tc.model)
+			if !ok {
+				t.Fatalf("Lookup(%q) ok=false", tc.model)
+			}
+			if p.Input != tc.in {
+				t.Errorf("input: got %v want %v", p.Input, tc.in)
+			}
+			if p.Output != tc.out {
+				t.Errorf("output: got %v want %v", p.Output, tc.out)
+			}
+			if tc.cacheR != skipCache && p.CacheRead != tc.cacheR {
+				t.Errorf("cache_read: got %v want %v", p.CacheRead, tc.cacheR)
+			}
+		})
+	}
+
+	// north-mini-code-1-0 is genuinely free — both dimensions exactly zero,
+	// not merely "cheap".
+	p, ok := tb.Lookup("north-mini-code-1-0")
+	if !ok {
+		t.Fatalf("Lookup(north-mini-code-1-0) ok=false")
+	}
+	if p.Input != 0 || p.Output != 0 {
+		t.Errorf("north-mini-code-1-0 should be exactly free: %+v", p)
+	}
+}
+
+// TestTable_2026Q3DatedSuffixFamilyResolution pins that a hypothetical
+// dated Fugu Ultra SKU resolves via the "fugu-ultra" family key (the
+// row itself is undated so it's eligible as a family prefix candidate;
+// the dateSuffix regexp strips the trailing -YYYYMMDD before the family
+// ladder is even consulted, landing on the exact "fugu-ultra" row via
+// PricingSourceDateStripped).
+func TestTable_2026Q3DatedSuffixFamilyResolution(t *testing.T) {
+	tb := NewTable()
+	base, srcBase, ok := tb.LookupWithSource("fugu-ultra")
+	if !ok {
+		t.Fatalf("Lookup(fugu-ultra) ok=false")
+	}
+	if srcBase != PricingSourceExact {
+		t.Errorf("fugu-ultra source=%q want exact", srcBase)
+	}
+
+	dated, srcDated, ok := tb.LookupWithSource("fugu-ultra-20260615")
+	if !ok {
+		t.Fatalf("Lookup(fugu-ultra-20260615) ok=false")
+	}
+	if srcDated != PricingSourceDateStripped {
+		t.Errorf("fugu-ultra-20260615 source=%q want date-stripped", srcDated)
+	}
+	if dated.Input != base.Input || dated.Output != base.Output || dated.CacheRead != base.CacheRead {
+		t.Errorf("fugu-ultra-20260615 rates %+v != base %+v", dated, base)
+	}
+	if dated.Input != 5 || dated.Output != 30 || dated.CacheRead != 0.50 {
+		t.Errorf("fugu-ultra-20260615 unexpected rates: %+v", dated)
+	}
+}
+
+// TestTable_2026Q3LongestPrefixShadowing pins that every new explicit row
+// added in the 2026-07-23 research batch wins longest-prefix family
+// resolution against a PRE-EXISTING shorter family it could otherwise be
+// shadowed by. Each case uses a synthetic dateless suffix (not a real
+// -YYYYMMDD date, so the date-strip path doesn't short-circuit the family
+// ladder) to force family-prefix resolution, then asserts the new row's
+// rates win over the shorter pre-existing family's rates.
+func TestTable_2026Q3LongestPrefixShadowing(t *testing.T) {
+	tb := NewTable()
+	for _, tc := range []struct {
+		name           string
+		probe          string // a superstring of the new key, not itself a table entry
+		newKey         string // the new row expected to win
+		shadowedFamily string // the shorter pre-existing family it must beat
+	}{
+		{"glm-5.2 over glm-5/glm", "glm-5.2-turbo", "glm-5.2", "glm-5"},
+		{"minimax-m3 over minimax", "minimax-m3-turbo", "minimax-m3", "minimax"},
+		{"qwen3.5-plus over qwen3", "qwen3.5-plus-turbo", "qwen3.5-plus", "qwen3"},
+		{"qwen3.8-max-preview over qwen3", "qwen3.8-max-preview-turbo", "qwen3.8-max-preview", "qwen3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			newRates, ok := tb.Lookup(tc.newKey)
+			if !ok {
+				t.Fatalf("Lookup(%q) (new key) ok=false", tc.newKey)
+			}
+			shadowedRates, ok := tb.Lookup(tc.shadowedFamily)
+			if !ok {
+				t.Fatalf("Lookup(%q) (shadowed family) ok=false", tc.shadowedFamily)
+			}
+			// Sanity: the two families must actually price differently,
+			// otherwise this test can't distinguish a win from a collision.
+			if newRates.Input == shadowedRates.Input && newRates.Output == shadowedRates.Output {
+				t.Fatalf("new key %q and shadowed family %q price identically (%+v) — test can't discriminate",
+					tc.newKey, tc.shadowedFamily, newRates)
+			}
+
+			probe, src, ok := tb.LookupWithSource(tc.probe)
+			if !ok {
+				t.Fatalf("Lookup(%q) (probe) ok=false", tc.probe)
+			}
+			if src != PricingSourceFamily {
+				t.Errorf("probe %q source=%q want family", tc.probe, src)
+			}
+			if probe.Input != newRates.Input || probe.Output != newRates.Output {
+				t.Errorf("probe %q resolved to %+v, want the longer family %q's rates %+v (was shadowed by %q %+v)",
+					tc.probe, probe, tc.newKey, newRates, tc.shadowedFamily, shadowedRates)
+			}
+		})
+	}
+}
+
+// TestTable_2026Q3ClaudeMythosOverFamily pins "claude-mythos-5" beating
+// "claude-mythos" in the longest-prefix ladder specifically. Unlike the
+// cases in TestTable_2026Q3LongestPrefixShadowing, the baked-in table
+// prices claude-mythos-5 and claude-mythos IDENTICALLY by design (Mythos
+// mirrors Fable's family/SKU pair, which is also same-rate) — so a
+// rate-based discrimination check against the real table can't prove
+// which key actually matched. Instead this uses a synthetic table (same
+// technique as TestTable_LookupPrefix) with deliberately different rates
+// on the two keys, to mechanically prove the sorted-longest-first
+// familyKeys() ladder picks "claude-mythos-5" over "claude-mythos" when a
+// probe string is a prefix-match for both.
+func TestTable_2026Q3ClaudeMythosOverFamily(t *testing.T) {
+	tb := &Table{exact: map[string]Pricing{
+		"claude-mythos":   {Input: 10, Output: 50},
+		"claude-mythos-5": {Input: 99, Output: 199}, // deliberately distinct from the family rate
+	}}
+	p, src, ok := tb.LookupWithSource("claude-mythos-5-turbo")
+	if !ok {
+		t.Fatalf("Lookup(claude-mythos-5-turbo) ok=false")
+	}
+	if src != PricingSourceFamily {
+		t.Errorf("source=%q want family", src)
+	}
+	if p.Input != 99 || p.Output != 199 {
+		t.Errorf("resolved to %+v, want the longer claude-mythos-5 rates (99/199), not the shorter claude-mythos family (10/50)", p)
+	}
+}
+
+// TestTable_2026Q3PricingSourceExactVsFamily pins the exact-vs-family
+// PricingSource distinction for one dated case from the research batch:
+// the bare "doubao-seed-2.0-pro" row resolves PricingSourceExact, while a
+// dashed, non-8-digit-dated wire ID
+// ("doubao-seed-2-0-pro-260215" — Volcengine's dash-form, 6-digit YYMMDD
+// suffix that dateSuffix's `-\d{8}$` regexp does NOT strip) only resolves
+// via the separately-added "doubao-seed-2-0" dash-form family prefix,
+// because dots and dashes are never normalized against each other
+// anywhere in the lookup ladder.
+func TestTable_2026Q3PricingSourceExactVsFamily(t *testing.T) {
+	tb := NewTable()
+
+	exact, src, ok := tb.LookupWithSource("doubao-seed-2.0-pro")
+	if !ok {
+		t.Fatalf("Lookup(doubao-seed-2.0-pro) ok=false")
+	}
+	if src != PricingSourceExact {
+		t.Errorf("doubao-seed-2.0-pro source=%q want exact", src)
+	}
+	if exact.Input != 0.47 || exact.Output != 2.35 || exact.CacheRead != 0.094 {
+		t.Errorf("doubao-seed-2.0-pro rates: %+v", exact)
+	}
+
+	dashed, srcDashed, ok := tb.LookupWithSource("doubao-seed-2-0-pro-260215")
+	if !ok {
+		t.Fatalf("Lookup(doubao-seed-2-0-pro-260215) ok=false — dash-form family prefix missing")
+	}
+	if srcDashed != PricingSourceFamily {
+		t.Errorf("doubao-seed-2-0-pro-260215 source=%q want family (not exact, not date-stripped — "+
+			"6-digit YYMMDD suffix doesn't match the 8-digit dateSuffix regexp)", srcDashed)
+	}
+	if dashed.Input != exact.Input || dashed.Output != exact.Output || dashed.CacheRead != exact.CacheRead {
+		t.Errorf("doubao-seed-2-0-pro-260215 rates %+v != doubao-seed-2.0-pro rates %+v", dashed, exact)
+	}
+}
+
+// TestTable_2026Q3DoubaoDashFormVariantsPinP1Fix pins the P1-1 fix
+// (2026-07-23 codex adversarial pass): a single bare "doubao-seed-2-0"
+// dash-form family key used to price EVERY dash-form dated variant —
+// including the cheaper lite/mini tiers — at Pro rates, because it was
+// the only dash-form entry and every dash-form dated ID is a superstring
+// of it. The Pro-only case in TestTable_2026Q3PricingSourceExactVsFamily
+// couldn't detect this (Pro correctly resolving to Pro rates masks a bug
+// that only shows up on OTHER variants). This test exercises dated
+// dash-form lite AND mini wire IDs specifically, asserting each resolves
+// to ITS OWN variant's rate — not Pro's — via the per-variant dash-form
+// keys added by the fix.
+func TestTable_2026Q3DoubaoDashFormVariantsPinP1Fix(t *testing.T) {
+	tb := NewTable()
+	for _, tc := range []struct {
+		name                   string
+		dotForm, datedDashForm string
+		in, out, cacheR        float64
+	}{
+		// lite and mini are the discriminating cases — their rates are
+		// genuinely cheaper than Pro's, so a P1-1-style regression (a
+		// single over-broad dash-form family key defaulting everything to
+		// Pro rates) is caught. "code" is deliberately NOT included here:
+		// by design it's priced identically to Pro (see the dot-form rows
+		// in defaultPricing), so it can't discriminate a Pro-rate
+		// regression — it's still covered for lookup correctness in
+		// TestTable_2026Q3ResearchBatch.
+		{"lite", "doubao-seed-2.0-lite", "doubao-seed-2-0-lite-260215", 0.088, 0.53, 0.018},
+		{"mini", "doubao-seed-2.0-mini", "doubao-seed-2-0-mini-260215", 0.029, 0.29, 0.006},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Sanity: prove this variant's rate genuinely differs from Pro's
+			// (0.47/2.35/0.094), so a wrongly-Pro-priced result would be
+			// caught rather than accidentally matching.
+			proRate := Pricing{Input: 0.47, Output: 2.35, CacheRead: 0.094}
+			if tc.in == proRate.Input && tc.out == proRate.Output {
+				t.Fatalf("%s variant rate equals Pro rate — test can't discriminate a P1-1 regression", tc.name)
+			}
+
+			dotExact, ok := tb.Lookup(tc.dotForm)
+			if !ok {
+				t.Fatalf("Lookup(%q) ok=false", tc.dotForm)
+			}
+			if dotExact.Input != tc.in || dotExact.Output != tc.out || dotExact.CacheRead != tc.cacheR {
+				t.Fatalf("%q rates %+v, want {%v %v %v}", tc.dotForm, dotExact, tc.in, tc.out, tc.cacheR)
+			}
+
+			dashDated, src, ok := tb.LookupWithSource(tc.datedDashForm)
+			if !ok {
+				t.Fatalf("Lookup(%q) ok=false", tc.datedDashForm)
+			}
+			if src != PricingSourceFamily {
+				t.Errorf("%q source=%q want family", tc.datedDashForm, src)
+			}
+			if dashDated.Input != tc.in || dashDated.Output != tc.out || dashDated.CacheRead != tc.cacheR {
+				t.Errorf("P1-1 REGRESSION: %q resolved to %+v, want its own %s-tier rates {%v %v %v} — "+
+					"NOT the Pro rate %+v it would get from a single over-broad dash-form family key",
+					tc.datedDashForm, dashDated, tc.name, tc.in, tc.out, tc.cacheR, proRate)
+			}
+		})
+	}
+}
+
+// TestTable_2026Q3FreeSuffixGuardCoversCohere pins that the universal
+// `:free`-suffix guard (not a new explicit row) is what makes
+// "cohere/north-mini-code:free" resolve to $0 — see the NOTE left next to
+// the cohere/north-mini-code row in defaultPricing explaining why no
+// explicit "...:free" row was added.
+func TestTable_2026Q3FreeSuffixGuardCoversCohere(t *testing.T) {
+	tb := NewTable()
+	p, src, ok := tb.LookupWithSource("cohere/north-mini-code:free")
+	if !ok {
+		t.Fatalf("Lookup(cohere/north-mini-code:free) ok=false")
+	}
+	if src != PricingSourceExact {
+		t.Errorf("cohere/north-mini-code:free source=%q want exact (via the universal :free guard)", src)
+	}
+	if p.Input != 0 || p.Output != 0 {
+		t.Errorf("cohere/north-mini-code:free rates non-zero: %+v", p)
+	}
+}
+
+// TestTable_2026Q3QwenDatedProviderQualifiedPinsP1Fix pins the P1-2 fix
+// (2026-07-23 codex adversarial pass): real captured traffic contains the
+// dated wire ID "qwen/qwen3.5-plus-20260420" (see
+// docs/plans/provider-model-price-catalog-2026-06-06.md). Date-stripping
+// that (`-\d{8}$`) yields "qwen/qwen3.5-plus", which was ABSENT from the
+// table before the fix and fell through to the generic "qwen3" family
+// row ($0.78/$3.90) — the wrong tier entirely. This test resolves the
+// exact dated ID end-to-end and asserts it lands on the new
+// "qwen/qwen3.5-plus" alias's real OpenRouter rate via
+// PricingSourceDateStripped, not the qwen3 family fallback.
+func TestTable_2026Q3QwenDatedProviderQualifiedPinsP1Fix(t *testing.T) {
+	tb := NewTable()
+
+	genericFamily, ok := tb.Lookup("qwen3")
+	if !ok {
+		t.Fatalf("Lookup(qwen3) ok=false")
+	}
+
+	p, src, ok := tb.LookupWithSource("qwen/qwen3.5-plus-20260420")
+	if !ok {
+		t.Fatalf("Lookup(qwen/qwen3.5-plus-20260420) ok=false")
+	}
+	if src != PricingSourceDateStripped {
+		t.Errorf("qwen/qwen3.5-plus-20260420 source=%q want date-stripped", src)
+	}
+	if p.Input != 0.30 || p.Output != 1.80 {
+		t.Errorf("qwen/qwen3.5-plus-20260420 rates %+v, want the real OpenRouter rate {0.30 1.80}", p)
+	}
+	if p.Input == genericFamily.Input && p.Output == genericFamily.Output {
+		t.Errorf("P1-2 REGRESSION: qwen/qwen3.5-plus-20260420 resolved to the generic qwen3 family rate %+v "+
+			"instead of its own alias rate", genericFamily)
+	}
+
+	// Bare-key alias sanity: "qwen/qwen3.5-plus" resolves exact, and
+	// deliberately differs from the first-party bare "qwen3.5-plus" rate
+	// (0.40/2.40) — it's real OpenRouter data, not a literal mirror.
+	exact, srcExact, ok := tb.LookupWithSource("qwen/qwen3.5-plus")
+	if !ok {
+		t.Fatalf("Lookup(qwen/qwen3.5-plus) ok=false")
+	}
+	if srcExact != PricingSourceExact {
+		t.Errorf("qwen/qwen3.5-plus source=%q want exact", srcExact)
+	}
+	if exact.Input != p.Input || exact.Output != p.Output {
+		t.Errorf("qwen/qwen3.5-plus rates %+v != date-stripped resolution %+v", exact, p)
+	}
+	bare, ok := tb.Lookup("qwen3.5-plus")
+	if !ok {
+		t.Fatalf("Lookup(qwen3.5-plus) ok=false")
+	}
+	if exact.Input == bare.Input && exact.Output == bare.Output {
+		t.Errorf("qwen/qwen3.5-plus (%+v) unexpectedly equals bare qwen3.5-plus (%+v) — "+
+			"expected the real OpenRouter rate to differ from the first-party mirror", exact, bare)
+	}
+}
+
+// TestTable_2026Q3MythosMatchesFableFull asserts FULL Pricing-struct
+// equality (every field, including CacheCreation/CacheCreation1h/
+// WebSearchPerRequest — not just Input/Output) between claude-mythos-5
+// and claude-fable-5, and between their respective family keys, against
+// the PRODUCTION table (NewTable(), not a synthetic one) — proving the
+// real defaultPricing rows exist and mirror Fable's exactly, by design.
+// It also probes a hypothetical future SKU ("claude-mythos-6") to prove
+// the production "claude-mythos" family row itself resolves via
+// PricingSourceFamily (the earlier TestTable_2026Q3ClaudeMythosOverFamily
+// only proves the longest-prefix MECHANICS with a synthetic table and
+// would still pass if the real claude-mythos row were deleted).
+func TestTable_2026Q3MythosMatchesFableFull(t *testing.T) {
+	tb := NewTable()
+
+	mythos5, ok := tb.Lookup("claude-mythos-5")
+	if !ok {
+		t.Fatalf("Lookup(claude-mythos-5) ok=false")
+	}
+	fable5, ok := tb.Lookup("claude-fable-5")
+	if !ok {
+		t.Fatalf("Lookup(claude-fable-5) ok=false")
+	}
+	if mythos5 != fable5 {
+		t.Errorf("claude-mythos-5 full struct %+v != claude-fable-5 full struct %+v", mythos5, fable5)
+	}
+
+	mythosFamily, ok := tb.Lookup("claude-mythos")
+	if !ok {
+		t.Fatalf("Lookup(claude-mythos) ok=false")
+	}
+	fableFamily, ok := tb.Lookup("claude-fable")
+	if !ok {
+		t.Fatalf("Lookup(claude-fable) ok=false")
+	}
+	if mythosFamily != fableFamily {
+		t.Errorf("claude-mythos family full struct %+v != claude-fable family full struct %+v", mythosFamily, fableFamily)
+	}
+
+	// Prove the PRODUCTION "claude-mythos" row itself is a live family
+	// prefix — not just provable via a disconnected synthetic table.
+	future, src, ok := tb.LookupWithSource("claude-mythos-6")
+	if !ok {
+		t.Fatalf("Lookup(claude-mythos-6) ok=false — production claude-mythos family row missing or deleted")
+	}
+	if src != PricingSourceFamily {
+		t.Errorf("claude-mythos-6 source=%q want family (production claude-mythos row must still exist)", src)
+	}
+	if future != mythosFamily {
+		t.Errorf("claude-mythos-6 resolved to %+v, want the production claude-mythos family rate %+v", future, mythosFamily)
+	}
+}
+
+// TestTable_2026Q3UnboundedPrefixKnownLimitation documents (per the P2
+// finding, 2026-07-23 codex adversarial pass) that bare undated keys
+// added in this batch — "hy3" and "inkling" — are, like every other
+// undated bare key already in this table, unbounded strings.HasPrefix
+// family roots: they will also match an unrelated future model ID that
+// merely happens to start with the same characters. This is a systemic
+// property of familyKeys() shared by pre-existing rows too (qwen, grok,
+// mistral, ...), not a defect specific to hy3/inkling, and is
+// deliberately NOT "fixed" by a 2-file patch — it's pinned here as a
+// known, acknowledged limitation so a future change to the ladder's
+// matching semantics is a conscious decision, not an accidental
+// behavior change caught only by this test going red.
+func TestTable_2026Q3UnboundedPrefixKnownLimitation(t *testing.T) {
+	tb := NewTable()
+
+	hy3Base, ok := tb.Lookup("hy3")
+	if !ok {
+		t.Fatalf("Lookup(hy3) ok=false")
+	}
+	// An unrelated hypothetical model "hy3d-turbo" (NOT a Tencent Hunyuan
+	// SKU) currently resolves via the "hy3" family prefix rather than
+	// missing — this is the known limitation, not a desired feature.
+	collision, src, ok := tb.LookupWithSource("hy3d-turbo")
+	if !ok {
+		t.Fatalf("Lookup(hy3d-turbo) ok=false")
+	}
+	if src != PricingSourceFamily {
+		t.Errorf("hy3d-turbo source=%q want family (documenting the known unbounded-prefix limitation)", src)
+	}
+	if collision != hy3Base {
+		t.Errorf("hy3d-turbo rates %+v != hy3 base rates %+v", collision, hy3Base)
+	}
+
+	inklingBase, ok := tb.Lookup("inkling")
+	if !ok {
+		t.Fatalf("Lookup(inkling) ok=false")
+	}
+	// An unrelated hypothetical model "inklinglabs-x" currently resolves
+	// via the "inkling" family prefix rather than missing.
+	inklingCollision, srcInkling, ok := tb.LookupWithSource("inklinglabs-x")
+	if !ok {
+		t.Fatalf("Lookup(inklinglabs-x) ok=false")
+	}
+	if srcInkling != PricingSourceFamily {
+		t.Errorf("inklinglabs-x source=%q want family (documenting the known unbounded-prefix limitation)", srcInkling)
+	}
+	if inklingCollision != inklingBase {
+		t.Errorf("inklinglabs-x rates %+v != inkling base rates %+v", inklingCollision, inklingBase)
+	}
+}
