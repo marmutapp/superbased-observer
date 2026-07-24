@@ -66,7 +66,7 @@ func newPiCmd() *cobra.Command {
 				return fmt.Errorf("load config: %w", err)
 			}
 			resolved := resolveProxyURL(cfg.Proxy.Port, proxyURL)
-			bin, err := resolveToolBin("pi", binPath, "--pi-path")
+			bin, err := resolveToolBin("pi", binPath, "--pi-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}

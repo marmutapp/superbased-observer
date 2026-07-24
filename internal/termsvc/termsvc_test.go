@@ -715,6 +715,115 @@ func TestSessionForRunAfterCorrelate(t *testing.T) {
 	}
 }
 
+// TestSessionLinkForRun covers the confidence-carrying companion of
+// SessionForRun: an unknown run reports ok=false with zero confidence, an
+// established link returns id+confidence, and a MAX-upgrade is visible through
+// the confidence field (a stronger source raises the reported confidence; a
+// weaker later observation never lowers it).
+func TestSessionLinkForRun(t *testing.T) {
+	rec := newFakeRecorder()
+	svc := newService(t, Policy{}, rec, &fakeLauncher{handle: "SH"}, nil)
+	res, err := svc.LaunchAttachable(context.Background(), AttachRequest{Tool: "claude-code", Subcommand: "claude"})
+	if err != nil {
+		t.Fatalf("LaunchAttachable: %v", err)
+	}
+	at := time.Unix(1_700_000_200, 0).UTC()
+
+	// A sequence of correlations, each with the id + confidence
+	// SessionLinkForRun must report AFTER it lands. correlate=="" means "no
+	// correlation applied yet" (the initial probe).
+	steps := []struct {
+		name      string
+		correlate string
+		source    termrun.Source
+		wantOK    bool
+		wantID    string
+		wantConf  float64
+	}{
+		{name: "before any correlation", correlate: "", wantOK: false, wantID: "", wantConf: 0},
+		{name: "sub-threshold heuristic stays unlinked", correlate: "sess-weak", source: termrun.SourceHeuristic, wantOK: false, wantID: "", wantConf: 0},
+		{name: "marker establishes link with its confidence", correlate: "sess-marker", source: termrun.SourceMarker, wantOK: true, wantID: "sess-marker", wantConf: 0.70},
+		{name: "OOB MAX-upgrade raises confidence", correlate: "sess-oob", source: termrun.SourceOOB, wantOK: true, wantID: "sess-oob", wantConf: 0.95},
+		{name: "weaker marker never downgrades", correlate: "sess-weak-marker", source: termrun.SourceMarker, wantOK: true, wantID: "sess-oob", wantConf: 0.95},
+	}
+	for _, st := range steps {
+		t.Run(st.name, func(t *testing.T) {
+			if st.correlate != "" {
+				if err := svc.Correlate(context.Background(), res.RunID, st.correlate, st.source, at); err != nil {
+					t.Fatalf("Correlate: %v", err)
+				}
+			}
+			sid, conf, ok := svc.SessionLinkForRun(res.RunID)
+			if ok != st.wantOK || sid != st.wantID || conf != st.wantConf {
+				t.Fatalf("SessionLinkForRun = (%q, %v, %v), want (%q, %v, %v)", sid, conf, ok, st.wantID, st.wantConf, st.wantOK)
+			}
+		})
+	}
+
+	// Unknown run: never launched → ok=false, zeroed.
+	if sid, conf, ok := svc.SessionLinkForRun("ghost-run"); ok || sid != "" || conf != 0 {
+		t.Fatalf("SessionLinkForRun(unknown) = (%q, %v, %v), want (\"\", 0, false)", sid, conf, ok)
+	}
+
+	// Cleaned up when the run ends (same lifecycle as SessionForRun).
+	svc.EndRunByHandle(context.Background(), "SH", 0)
+	if _, _, ok := svc.SessionLinkForRun(res.RunID); ok {
+		t.Fatal("SessionLinkForRun should be forgotten after EndRunByHandle")
+	}
+}
+
+// TestResolveHandleLink pins the single-lock composition (F4): one call resolves
+// liveness + run identity (kind/tool) + correlation (session id/confidence)
+// atomically, matching the three-call chain it replaces, and reports ok=false
+// for an unknown/exited handle.
+func TestResolveHandleLink(t *testing.T) {
+	rec := newFakeRecorder()
+	svc := newService(t, Policy{}, rec, &fakeLauncher{handle: "SH"}, nil)
+
+	// Unknown handle: never launched → ok=false, everything zeroed.
+	if runID, kind, tool, sid, conf, ok := svc.ResolveHandleLink("ghost"); ok || runID != "" || kind != "" || tool != "" || sid != "" || conf != 0 {
+		t.Fatalf("ResolveHandleLink(unknown) = (%q,%q,%q,%q,%v,%v), want all-zero+false", runID, kind, tool, sid, conf, ok)
+	}
+
+	res, err := svc.LaunchAttachable(context.Background(), AttachRequest{Tool: "claude-code", Subcommand: "claude"})
+	if err != nil {
+		t.Fatalf("LaunchAttachable: %v", err)
+	}
+
+	// Live but uncorrelated: known=true, run identity present, empty session link.
+	runID, kind, tool, sid, conf, ok := svc.ResolveHandleLink(res.Handle)
+	if !ok || runID != res.RunID || tool != "claude-code" || sid != "" || conf != 0 {
+		t.Fatalf("ResolveHandleLink(live, uncorrelated) = (%q,%q,%q,%q,%v,%v), want (%q, attach-kind, claude-code, \"\", 0, true)",
+			runID, kind, tool, sid, conf, ok, res.RunID)
+	}
+	if kind == "" {
+		t.Fatalf("expected a non-empty run Kind for a launched attach run")
+	}
+
+	// After an established (OOB) correlation the same call carries the session id
+	// + confidence — identical to chaining RunIDForHandle→KindForHandle→
+	// SessionLinkForRun, but under one lock.
+	at := time.Unix(1_700_000_200, 0).UTC()
+	if err := svc.Correlate(context.Background(), res.RunID, "sess-strong", termrun.SourceOOB, at); err != nil {
+		t.Fatalf("Correlate: %v", err)
+	}
+	_, _, _, sid, conf, ok = svc.ResolveHandleLink(res.Handle)
+	if !ok || sid != "sess-strong" || conf != 0.95 {
+		t.Fatalf("ResolveHandleLink(correlated) session = (%q, %v, %v), want (sess-strong, 0.95, true)", sid, conf, ok)
+	}
+	// Cross-check parity with the composed chain it replaces.
+	wantSID, wantConf, wantOK := svc.SessionLinkForRun(res.RunID)
+	if sid != wantSID || conf != wantConf || ok != wantOK {
+		t.Fatalf("ResolveHandleLink vs SessionLinkForRun mismatch: (%q,%v,%v) vs (%q,%v,%v)", sid, conf, ok, wantSID, wantConf, wantOK)
+	}
+
+	// Exited handle: forgotten by the live maps → ok=false.
+	svc.EndRunByHandle(context.Background(), res.Handle, 0)
+	if _, _, _, _, _, ok := svc.ResolveHandleLink(res.Handle); ok {
+		t.Fatal("ResolveHandleLink should report ok=false after EndRunByHandle")
+	}
+}
+
 // TestCorrelateUnknownRunNoCacheEntry pins P2-3 (a): a Correlate for a run the
 // service never launched records the durable store correlation but NEVER
 // populates the in-memory bySession cache (which is a strict subset of live

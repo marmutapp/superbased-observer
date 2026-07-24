@@ -36,10 +36,20 @@ func claudeBaseURL(port int) string {
 // action despite the claim of "auto-wire proxy routing".
 func (r *Registrar) RegisterClaudeCode() RegistrationResult {
 	dir := filepath.Join(r.opts.HomeDir, ".claude")
+	return r.registerClaudeCodeAt(dir, claudeBaseURL(r.opts.ProxyPort), "claude-code")
+}
+
+// registerClaudeCodeAt is the parameterized core of RegisterClaudeCode:
+// it writes env.ANTHROPIC_BASE_URL=<want> into <dir>/settings.json,
+// tagging the result with toolLabel. The native RegisterClaudeCode
+// passes ~/.claude + the loopback URL + "claude-code"; the cross-OS
+// RegisterClaudeCodeWindows (windows.go) passes a Windows-side .claude
+// + the localhost URL + "claude-code-windows". Behaviour for the native
+// call is byte-identical to the pre-refactor method.
+func (r *Registrar) registerClaudeCodeAt(dir, want, toolLabel string) RegistrationResult {
 	path := filepath.Join(dir, "settings.json")
-	want := claudeBaseURL(r.opts.ProxyPort)
 	res := RegistrationResult{
-		Tool:       "claude-code",
+		Tool:       toolLabel,
 		ConfigPath: path,
 		BaseURL:    want,
 		DryRun:     r.opts.DryRun,

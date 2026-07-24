@@ -36,6 +36,15 @@ type RegisterOptions struct {
 	// block (which codex 0.128.0+ rejects), and replaces a top-level
 	// model_provider that points at a different provider.
 	Force bool
+	// WindowsClaudeHome / WindowsCodexHome override the auto-detected
+	// Windows-side home used by the cross-OS route writers
+	// (RegisterClaudeCodeWindows / RegisterCodexWindows in windows.go).
+	// Empty = walk crossmount.AllHomes() for the first OS==windows home
+	// carrying the tool's config dir (the production path). Set by tests
+	// to point at a temp dir; mirrors hook.Options.WindowsClaudeHome /
+	// WindowsCursorHome.
+	WindowsClaudeHome string
+	WindowsCodexHome  string
 }
 
 // RegistrationResult summarizes one routing registration.
@@ -119,10 +128,21 @@ func IsObserverBaseURL(raw string) bool {
 // install by default.
 func (r *Registrar) RegisterCodex() RegistrationResult {
 	dir := filepath.Join(r.opts.HomeDir, ".codex")
+	return r.registerCodexAt(dir, codexBaseURL(r.opts.ProxyPort), "codex")
+}
+
+// registerCodexAt is the parameterized core of RegisterCodex: it writes
+// the custom [model_providers.openai-observer] block + top-level
+// model_provider into <dir>/config.toml with base_url=<want>, tagging
+// the result with toolLabel. The native RegisterCodex passes ~/.codex +
+// the loopback /v1 URL + "codex"; the cross-OS RegisterCodexWindows
+// (windows.go) passes a Windows-side .codex + the localhost /v1 URL +
+// "codex-windows". Behaviour for the native call is byte-identical to
+// the pre-refactor method.
+func (r *Registrar) registerCodexAt(dir, want, toolLabel string) RegistrationResult {
 	path := filepath.Join(dir, "config.toml")
-	want := codexBaseURL(r.opts.ProxyPort)
 	res := RegistrationResult{
-		Tool:       "codex",
+		Tool:       toolLabel,
 		ConfigPath: path,
 		BaseURL:    want,
 		DryRun:     r.opts.DryRun,

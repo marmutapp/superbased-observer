@@ -165,12 +165,15 @@ func TestRemoteReplayBound(t *testing.T) {
 		f.emit(payload)
 	}
 	sess := m.get(tok)
-	// Give the pump a moment to drain the final chunk into the ring.
+	// Wait for the pump to have drained ALL produced bytes into the ring —
+	// not just for trimming to have begun (currentBase() != 0) — so a slow
+	// runner's straggling pump appends can't land after Subscribe and inflate
+	// the replay count past the ring size.
 	deadline := time.After(5 * time.Second)
-	for sess.out.currentBase() == 0 {
+	for sess.out.currentTotal() != int64(produced) {
 		select {
 		case <-deadline:
-			t.Fatal("ring never trimmed; test precondition not met")
+			t.Fatal("pump never drained the full stream; test precondition not met")
 		default:
 			time.Sleep(time.Millisecond)
 		}

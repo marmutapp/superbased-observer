@@ -513,6 +513,69 @@ func (s *Store) NetworkEventsForSession(ctx context.Context, sessionID string, l
 	return scanNetworkEventRows(rows, false, "NetworkEventsForSession")
 }
 
+// NetworkSummary is the honest, frontend-renderable rollup for a session's
+// network egress, returned by NetworkSummaryForSession. proxied_calls +
+// os_connections partition the session's network_connect events; the byte sums
+// cover ONLY the proxied calls (the OS-observed backend captures no bodies, so
+// it has no request/response byte metadata to sum).
+type NetworkSummary struct {
+	ProxiedCalls  int64 `json:"proxied_calls"`
+	RequestBytes  int64 `json:"request_bytes"`
+	ResponseBytes int64 `json:"response_bytes"`
+	OSConnections int64 `json:"os_connections"`
+}
+
+// NetworkSummaryForSession computes the proxied-vs-OS network rollup for a
+// session with real COUNT/SUM aggregation, WITHOUT returning any bodies.
+//
+// DISCRIMINATOR (honest, EVENT-level): a network_connect event is "proxied" iff
+// its own details JSON carries capture_source == 'proxy'. Only the proxy capture
+// path (internal/proxy/network_capture.go::captureProcessNetwork) stamps that
+// key into the event details, and it does so ALWAYS — even when body capture is
+// off ([observer.process.network].capture_bodies), in which case the event has
+// NO process_network_bodies row (body_unavailable_reason: body_capture_disabled).
+// The OS-observed backends (eBPF / poll, internal/processobs/observer.go) stamp
+// capture_source='process_backend'. Keying on the EVENT detail — not the mere
+// presence of a body row — is what makes the count correct when body capture is
+// off: a body-row discriminator would misclassify every bodyless proxied call as
+// an OS connection.
+//
+// Byte sums are still sourced from the LEFT-JOINed process_network_bodies
+// metadata (request_body_bytes / response_body_bytes — scrubbed capture-source
+// byte counts, never the bodies themselves) and contribute only for proxied
+// events; a proxied event WITHOUT a body row counts in proxied_calls with zero
+// byte contribution.
+func (s *Store) NetworkSummaryForSession(ctx context.Context, sessionID string) (NetworkSummary, error) {
+	// json_extract raises "malformed JSON" and aborts the WHOLE aggregate if a
+	// single non-NULL details_json row is invalid. Compute capture_source ONCE
+	// per row in an inner query, guarded by json_valid, so a malformed row
+	// yields NULL (⇒ classified OS-observed, non-proxy) instead of failing the
+	// query. A NULL/absent details_json is already non-proxy by the same path.
+	var out NetworkSummary
+	err := s.db.QueryRowContext(ctx, `
+		SELECT
+		  COALESCE(SUM(CASE WHEN e.capture_source = 'proxy' THEN 1 ELSE 0 END), 0),
+		  COALESCE(SUM(CASE WHEN e.capture_source = 'proxy' THEN e.request_body_bytes ELSE 0 END), 0),
+		  COALESCE(SUM(CASE WHEN e.capture_source = 'proxy' THEN e.response_body_bytes ELSE 0 END), 0),
+		  COALESCE(SUM(CASE WHEN e.capture_source IS NULL OR e.capture_source != 'proxy' THEN 1 ELSE 0 END), 0)
+		  FROM (
+		    SELECT
+		      CASE WHEN pe.details_json IS NOT NULL AND json_valid(pe.details_json)
+		           THEN json_extract(pe.details_json, '$.capture_source') END AS capture_source,
+		      COALESCE(pnb.request_body_bytes, 0) AS request_body_bytes,
+		      COALESCE(pnb.response_body_bytes, 0) AS response_body_bytes
+		      FROM process_events pe
+		      LEFT JOIN process_network_bodies pnb ON pnb.process_event_id = pe.id
+		     WHERE pe.session_id = ? AND pe.event_type = ?
+		  ) e`,
+		sessionID, string(processobs.EventNetworkConnect)).
+		Scan(&out.ProxiedCalls, &out.RequestBytes, &out.ResponseBytes, &out.OSConnections)
+	if err != nil {
+		return NetworkSummary{}, fmt.Errorf("store.NetworkSummaryForSession: %w", err)
+	}
+	return out, nil
+}
+
 // NetworkEventDetail returns one network event by id, including its optional
 // captured body row. A clean miss returns sql.ErrNoRows.
 func (s *Store) NetworkEventDetail(ctx context.Context, eventID int64) (ProcessNetworkEventRow, error) {

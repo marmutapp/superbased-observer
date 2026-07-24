@@ -65,7 +65,7 @@ func newClineCLICmd() *cobra.Command {
 				return fmt.Errorf("load config: %w", err)
 			}
 			resolved := resolveProxyURL(cfg.Proxy.Port, proxyURL)
-			bin, err := resolveToolBin("cline", binPath, "--cline-path")
+			bin, err := resolveToolBin("cline-cli", binPath, "--cline-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strconv"
@@ -1073,6 +1074,121 @@ func (s *Server) handleTerminalSessions(w http.ResponseWriter, r *http.Request) 
 		"sessions":              s.visibleSnapshot(r.Context()),
 		"launchable_tools":      launchableTools(),
 		"allowed_project_roots": allowedRoots,
+	})
+}
+
+// ToolPreflight is the wire shape of GET /api/terminal/launch/preflight — the
+// pre-launch binary-resolution verdict for a launchable tool
+// (tool-binary-resolution arc). It tells the New-Terminal dialog, BEFORE a
+// launch, whether the daemon can resolve the tool's binary and — when it cannot
+// — the grounded install command to fix it. The install ARGV is NEVER carried
+// here: InstallCommand is the human Display string only; the server owns argv
+// (registry constants) at the install endpoint. Produced by the nil-able
+// Options.ToolPreflight seam, so the dashboard package carries no dependency on
+// internal/toolresolve (CLAUDE.md #2).
+type ToolPreflight struct {
+	Tool           string   `json:"tool"`
+	Verdict        string   `json:"verdict"`
+	Bin            string   `json:"bin,omitempty"`
+	Notes          []string `json:"notes,omitempty"`
+	InstallCommand string   `json:"install_command,omitempty"`
+	CanInstall     bool     `json:"can_install"`
+}
+
+// handleTerminalPreflight serves GET /api/terminal/launch/preflight?tool=<name>
+// — the pre-launch binary-resolution verdict (VIEW; tool-binary-resolution
+// arc). It resolves how the daemon would find the tool's binary and returns an
+// honest verdict plus, when unresolved, the grounded install command, so the
+// dialog can warn before a launch that would fail. The verdict is produced by
+// the server-side Options.ToolPreflight seam (registry + resolver); a nil seam
+// is the honest disabled state (501). An unknown / non-launchable tool is 400
+// (the seam reports ok=false), mirroring handleTerminalLaunch's tool
+// validation.
+func (s *Server) handleTerminalPreflight(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.opts.ToolPreflight == nil {
+		http.Error(w, "preflight unavailable — this dashboard runs without the tool-resolution seam (run via `observer start`)", http.StatusNotImplemented)
+		return
+	}
+	tool := strings.TrimSpace(r.URL.Query().Get("tool"))
+	if tool == "" {
+		http.Error(w, "missing tool query parameter", http.StatusBadRequest)
+		return
+	}
+	pf, ok := s.opts.ToolPreflight(tool)
+	if !ok {
+		http.Error(w, "tool "+tool+" is not launchable in the embedded terminal", http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, pf)
+}
+
+// terminalInstallRequest is the POST /api/terminal/install body. The only client
+// input is the tool NAME — used SOLELY as a registry map key to look up the
+// server-side install argv; the request never contributes argv (the injection
+// surface is zero by construction, tool-binary-resolution arc §Security).
+type terminalInstallRequest struct {
+	Tool string `json:"tool"`
+}
+
+// handleTerminalInstall serves POST /api/terminal/install — the guided
+// "Install in terminal" affordance (tool-binary-resolution arc). It spawns the
+// tool's GROUNDED, compile-time-constant install command (from the capability
+// registry, keyed by the request's tool name) in a visible local-only PTY, so
+// the operator sees and can Ctrl-C it. Classified LOCAL + confirm-token-gated,
+// EXACTLY like the Tailscale setup handlers — a machine-reaching mutation a
+// remote principal must never drive. Gates, in order: confirm token FIRST; then
+// LaunchManager nil → 503; the [terminal.launch].allow_install kill-switch off
+// (or its seam nil) → 403; no grounded install command for the tool → 400. The
+// argv is a registry constant supplied by the Options.ToolInstallHint seam,
+// never request input, and the spawned session is SpecSetup → local-writer-only.
+func (s *Server) handleTerminalInstall(w http.ResponseWriter, r *http.Request) {
+	if !requireConfirmToken(w, r) {
+		return
+	}
+	if s.opts.LaunchManager == nil {
+		http.Error(w, `{"error":"the in-dashboard terminal is not available on this platform — run the observer daemon under WSL/Linux to install tools from here"}`, http.StatusServiceUnavailable)
+		return
+	}
+	if s.opts.AllowToolInstall == nil || !s.opts.AllowToolInstall() {
+		http.Error(w, `{"error":"guided install is disabled — set [terminal.launch].allow_install = true to enable the Install-in-terminal affordance"}`, http.StatusForbidden)
+		return
+	}
+	var body terminalInstallRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	tool := strings.TrimSpace(body.Tool)
+	if tool == "" {
+		http.Error(w, "missing tool", http.StatusBadRequest)
+		return
+	}
+	if s.opts.ToolInstallHint == nil {
+		http.Error(w, "no grounded install command for "+tool, http.StatusBadRequest)
+		return
+	}
+	argv, display, ok := s.opts.ToolInstallHint(tool)
+	if !ok {
+		http.Error(w, "no grounded install command for "+tool, http.StatusBadRequest)
+		return
+	}
+	handle, err := s.opts.LaunchManager.CreateSetup(SetupSpec{
+		Argv:  argv,
+		Label: "install:" + tool,
+	})
+	if err != nil {
+		writeSetupSpawnErr(w, err)
+		return
+	}
+	s.opts.Logger.Info("dashboard: guided tool install spawned", slog.String("tool", tool), slog.String("command", display))
+	writeJSON(w, map[string]any{
+		"handle":  handle,
+		"tool":    tool,
+		"command": display,
 	})
 }
 

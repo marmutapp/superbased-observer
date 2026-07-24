@@ -125,6 +125,82 @@ func TestWireAIClients_BatchClaudeCode(t *testing.T) {
 	}
 }
 
+// TestInitWindowsHomeFlagsExist pins R4: `observer init` exposes the two
+// disambiguation flags that make the registrar's refusal-advertised fix
+// reachable. Flag registration is asserted directly (executing the command
+// would reach real wiring); the plumbing into the proxyroute + hook registrars
+// is a compile-checked field pass in wireAIClients.
+func TestInitWindowsHomeFlagsExist(t *testing.T) {
+	cmd := newInitCmd()
+	for _, name := range []string{"windows-claude-home", "windows-codex-home", "windows-cursor-home"} {
+		if cmd.Flags().Lookup(name) == nil {
+			t.Errorf("`observer init` should register the --%s flag", name)
+		}
+	}
+}
+
+// TestWireAIClients_ExplicitCodexSelectsWindowsTarget pins F3 by OUTCOME: an
+// explicit `--codex --windows-codex-home=<home>` must also select the
+// codex-windows virtual target and actually WRITE the cross-OS route into that
+// Windows home — the pre-fix selectTools dropped every "-windows" target under
+// an explicit base selector, so nothing landed. proxyroute.SetWSLForTest pins
+// the WSL gate ON so the cross-OS writer engages on any host; the Windows home
+// is a temp dir so the write never touches a real /mnt/c profile.
+func TestWireAIClients_ExplicitCodexSelectsWindowsTarget(t *testing.T) {
+	defer proxyroute.SetWSLForTest(true)()
+
+	home := interactiveHome(t) // native home for the base-codex writes
+	winHome := t.TempDir()     // Windows USER home (override target)
+	if err := os.MkdirAll(filepath.Join(winHome, ".codex"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lines, _, _, _, err := wireAIClients(WireAIClientsOptions{
+		ProxyPort:        18820,
+		HomeDir:          home,
+		OnlyCodex:        true,
+		WindowsCodexHome: winHome,
+	})
+	if err != nil {
+		t.Fatalf("wireAIClients: %v", err)
+	}
+	text := strings.Join(lines, "\n")
+	// The codex-windows route write must have produced a config.toml under the
+	// override Windows home.
+	winCfg := filepath.Join(winHome, ".codex", "config.toml")
+	if _, statErr := os.Stat(winCfg); statErr != nil {
+		t.Fatalf("codex-windows route did not write %s: %v\nlines:\n%s", winCfg, statErr, text)
+	}
+	if !strings.Contains(text, "codex-windows") {
+		t.Errorf("expected a codex-windows result line, got:\n%s", text)
+	}
+	// The config.toml points at the localhost cross-OS base URL.
+	body, rerr := os.ReadFile(winCfg)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if !strings.Contains(string(body), "http://localhost:18820/v1") {
+		t.Errorf("codex-windows config.toml missing the localhost route:\n%s", body)
+	}
+}
+
+// TestWireAIClients_WindowsHomeOptionsPlumbed pins that the Windows-home
+// overrides flow through WireAIClientsOptions without breaking the wire when
+// the cross-OS gate is OFF (native host): a dry-run claude-code wire with both
+// overrides set still succeeds and writes nothing.
+func TestWireAIClients_WindowsHomeOptionsPlumbed(t *testing.T) {
+	home := interactiveHome(t)
+	if _, _, _, _, err := wireAIClients(WireAIClientsOptions{
+		ProxyPort:         18820,
+		DryRun:            true,
+		HomeDir:           home,
+		OnlyClaudeCode:    true,
+		WindowsClaudeHome: filepath.Join(home, "winclaude"),
+		WindowsCodexHome:  filepath.Join(home, "wincodex"),
+	}); err != nil {
+		t.Fatalf("wireAIClients with windows-home overrides: %v", err)
+	}
+}
+
 // TestWireAIClients_SkipProxyEmitsCodexHint pins the hint contract the
 // batch path prints: with the route write skipped, the codex hint comes
 // back non-empty (it is deliberately NOT dry-run-gated — matching the
@@ -429,8 +505,13 @@ func TestRunBrowserExtensionStep_DryRun(t *testing.T) {
 // the `observer opencode` launcher (false here), and proxy-exempt tools
 // (Proxy==nil) are false. Behaviour-identical to the pre-Phase-3 predicate.
 func TestRouteSupportedIsRegistryDriven(t *testing.T) {
-	in := []string{"claude-code", "codex"}
-	out := []string{"opencode", "cursor", "cline", "copilot", "hermes", "antigravity", "pi", "kilo-code-cli", "definitely-not-a-tool", ""}
+	// The "-windows" cross-OS virtual targets are supported exactly for the
+	// base adapters whose ProxyRoute carries CrossOSBridge (claude-code +
+	// codex) — resolved by strings.CutSuffix, mirroring hookSupported. A
+	// "-windows" suffix on a non-bridge tool (cursor routes via launcher,
+	// not a persisted kind) stays false.
+	in := []string{"claude-code", "codex", "claude-code-windows", "codex-windows"}
+	out := []string{"opencode", "cursor", "cursor-windows", "cline", "copilot", "hermes", "antigravity", "pi", "kilo-code-cli", "definitely-not-a-tool", ""}
 	for _, tool := range in {
 		if !routeSupported(tool) {
 			t.Errorf("routeSupported(%q) = false, want true (persisted route kind)", tool)

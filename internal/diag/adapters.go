@@ -5,12 +5,28 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/marmutapp/superbased-observer/internal/adapter"
 	adapterdefaults "github.com/marmutapp/superbased-observer/internal/adapter/defaults"
 	"github.com/marmutapp/superbased-observer/internal/config"
 	"github.com/marmutapp/superbased-observer/internal/integration"
+	"github.com/marmutapp/superbased-observer/internal/toolresolve"
+	"github.com/marmutapp/superbased-observer/internal/toolresolve/host"
 )
+
+// resolveEnvOnce builds the production toolresolve.Env exactly once per
+// process (one login-shell PATH capture + crossmount walk for the whole
+// `observer doctor` run, no matter how many adapters get a launch-resolution
+// note).
+var resolveEnvOnce = sync.OnceValue(func() toolresolve.Env { return host.NewEnv(host.Options{}) })
+
+// launchResolve is the injectable seam over toolresolve.Resolve — tests swap
+// it to exercise every verdict without touching the filesystem or a login
+// shell.
+var launchResolve = func(spec integration.BinaryResolveSpec) toolresolve.Resolution {
+	return toolresolve.Resolve(spec, resolveEnvOnce())
+}
 
 // checkAdapters is the registry-driven, all-adapter capture-health
 // summary (replaces the old two-tool checkAdapterPaths). For every
@@ -21,7 +37,7 @@ import (
 // without touching this function.
 func checkAdapters(cfg config.Config) Check {
 	enabled := enabledSet(cfg)
-	var detected, idle, disabled []string
+	var detected, idle, foreignOnly, disabled []string
 	for _, a := range adapterdefaults.Adapters() {
 		name := a.Name()
 		if enabled != nil && !enabled[name] {
@@ -30,12 +46,23 @@ func checkAdapters(cfg config.Config) Check {
 		}
 		if adapterDetected(a) {
 			detected = append(detected, name)
-		} else {
-			idle = append(idle, name)
+			continue
 		}
+		// Not detected locally — before filing it as merely idle, check
+		// whether it's actually installed on Windows only (a WSL daemon
+		// can't launch it). Resolution only runs for this branch (idle/
+		// undetected tools), and shares the one memoized login-PATH env.
+		if ic, _ := integration.For(name); ic.Binary != nil {
+			if res := launchResolve(*ic.Binary); res.Verdict == toolresolve.VerdictForeignOnly {
+				foreignOnly = append(foreignOnly, name)
+				continue
+			}
+		}
+		idle = append(idle, name)
 	}
 	sort.Strings(detected)
 	sort.Strings(idle)
+	sort.Strings(foreignOnly)
 	sort.Strings(disabled)
 
 	var details []string
@@ -44,6 +71,9 @@ func checkAdapters(cfg config.Config) Check {
 	}
 	if len(idle) > 0 {
 		details = append(details, "enabled, no data yet: "+strings.Join(idle, ", "))
+	}
+	if len(foreignOnly) > 0 {
+		details = append(details, "installed on Windows only (not launchable from WSL): "+strings.Join(foreignOnly, ", "))
 	}
 	if len(disabled) > 0 {
 		details = append(details, "disabled (enabled_adapters): "+strings.Join(disabled, ", "))
@@ -144,6 +174,14 @@ func CheckAdapter(tool string, cfg config.Config) (Check, bool) {
 		note(StatusOK, "captured via the watcher/hooks (no proxy launcher needed for this adapter)")
 	}
 
+	// Launch-binary resolution (registry-sourced BinaryResolveSpec). Only
+	// tools the daemon can actually spawn (`observer <tool>`) carry a spec;
+	// a nil Binary means no grounded resolution row for this adapter.
+	if ic.Binary != nil {
+		status, msg := launchResolutionNote(tool, launchResolve(*ic.Binary))
+		note(status, msg)
+	}
+
 	// Native-console ledger (Phase 4, registry-sourced). Informational:
 	// whether the VENDOR exposes managed-config / usage-export / org-
 	// analytics rails. Most adapters are enrollment-only — that is the
@@ -170,6 +208,75 @@ func CheckAdapter(tool string, cfg config.Config) (Check, bool) {
 		msg = tool + " — see notes below"
 	}
 	return Check{Name: tool, Status: worst, Message: msg, Details: details}, true
+}
+
+// launchResolutionNote renders one tool's toolresolve.Resolution as a doctor
+// note: the status (OK for a clean resolve, Warn for anything the operator
+// should act on) and the one-line honest message. It shares the same verdict
+// vocabulary as toolresolve.FormatVerdict but stays doctor-note-shaped (one
+// line, no leading "tool:" — CheckAdapter already scopes notes to tool).
+func launchResolutionNote(tool string, r toolresolve.Resolution) (Status, string) {
+	switch r.Verdict {
+	case toolresolve.VerdictOK:
+		return StatusOK, "launcher binary: " + r.Bin
+
+	case toolresolve.VerdictOKOffPath:
+		hygiene := ""
+		if len(r.Notes) > 0 {
+			hygiene = r.Notes[0]
+		}
+		msg := "launcher binary found off PATH: " + r.Bin
+		if hygiene != "" {
+			msg += " — " + hygiene
+		}
+		return StatusWarn, msg
+
+	case toolresolve.VerdictShadowed:
+		var shims []string
+		for _, s := range r.Shadowing {
+			shims = append(shims, s.Path)
+		}
+		return StatusWarn, "launcher binary shadowed by a Windows interop shim on PATH (" + strings.Join(shims, ", ") +
+			") — using the native binary at " + r.Bin + " instead"
+
+	case toolresolve.VerdictForeignOnly:
+		msg := "installed on Windows, not in WSL — only a Windows interop install was found"
+		if fc := firstForeignCandidatePath(r.Considered); fc != "" {
+			msg += " (" + fc + ")"
+		}
+		msg += "; the daemon cannot launch it. Install natively: " + firstInstallDisplay(r.Installs) +
+			"; cross-OS launch is a planned follow-up"
+		return StatusWarn, msg
+
+	case toolresolve.VerdictNotFound:
+		return StatusWarn, "launcher binary not found — install: " + firstInstallDisplay(r.Installs)
+
+	default:
+		return StatusWarn, tool + " launcher resolution: " + string(r.Verdict)
+	}
+}
+
+// firstInstallDisplay returns the first grounded install hint's Display, or
+// the honest vendor-docs fallback when none are grounded.
+func firstInstallDisplay(installs []integration.InstallHint) string {
+	for _, h := range installs {
+		if h.Display != "" {
+			return h.Display
+		}
+	}
+	return "no grounded install command — see the vendor's docs"
+}
+
+// firstForeignCandidatePath returns the first foreign (Windows-only)
+// candidate's path from a resolution's evidence trail, or "" when none was
+// recorded.
+func firstForeignCandidatePath(considered []toolresolve.Candidate) string {
+	for _, c := range considered {
+		if c.Foreign {
+			return c.Path
+		}
+	}
+	return ""
 }
 
 // tokenTierSummary renders an adapter's token/cost capture coverage (the
@@ -236,8 +343,10 @@ func nativeRailsSummary(n integration.NativeRails) string {
 }
 
 // adapterDetected reports whether any of an adapter's watch directories
-// exists on this host (a proxy for "this tool is installed + has run").
-func adapterDetected(a adapter.Adapter) bool {
+// exists on this host (a proxy for "this tool is installed + has run"). A
+// package-level var (like launchResolve) so tests can force a deterministic
+// detected/undetected split without depending on the real host filesystem.
+var adapterDetected = func(a adapter.Adapter) bool {
 	for _, p := range a.WatchPaths() {
 		if dirExists(p) {
 			return true

@@ -52,7 +52,7 @@ func newKiloCmd() *cobra.Command {
 			"one-shot form is the `run` subcommand). See docs/session-handoff.md.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			bin, err := resolveToolBin("kilo", kiloPath, "--kilo-path")
+			bin, err := resolveToolBin("kilo-code-cli", kiloPath, "--kilo-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}

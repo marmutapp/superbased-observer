@@ -7,10 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/marmutapp/superbased-observer/internal/browserhost"
 	"github.com/marmutapp/superbased-observer/internal/hook"
+	"github.com/marmutapp/superbased-observer/internal/integration"
 	"github.com/marmutapp/superbased-observer/internal/mcp"
 	"github.com/marmutapp/superbased-observer/internal/proxyroute"
 )
@@ -94,6 +96,129 @@ func (p *initPrompter) ask(question string, def bool) (bool, error) {
 	}
 }
 
+// askChoice reads a 1..max selection (returning the 0-based index) or a skip
+// (empty / n / no → -1). Anything else re-asks. EOF aborts the whole flow like
+// ask. Used by the cross-OS route disambiguation picker (R1/F3) where the
+// operator selects which of several detected Windows homes to route.
+func (p *initPrompter) askChoice(question string, max int) (int, error) {
+	for {
+		fmt.Fprintf(p.out, "  %s ", question)
+		line, err := p.in.ReadString('\n')
+		answer := strings.ToLower(strings.TrimSpace(line))
+		if err != nil && answer == "" {
+			return -1, fmt.Errorf("stdin closed — stopping; nothing further was written")
+		}
+		switch answer {
+		case "", "n", "no":
+			return -1, nil
+		}
+		if n, convErr := strconv.Atoi(answer); convErr == nil && n >= 1 && n <= max {
+			return n - 1, nil
+		}
+		fmt.Fprintf(p.out, "  please enter a number 1-%d, or n to skip\n", max)
+		if err != nil {
+			return -1, fmt.Errorf("stdin closed — stopping; nothing further was written")
+		}
+	}
+}
+
+// runWindowsRouteDisambiguation offers a numbered picker for each cross-OS
+// route tool whose Windows-side home could NOT be auto-resolved (R1 ownership
+// unverifiable / F3 several homes). These tools are excluded from
+// WindowsRouteTargets, so they never reach the main consent loop — this step
+// is where the operator resolves them. candidates is keyed by "<tool>-windows"
+// → the Windows USER homes to choose among (as returned by
+// Registrar.WindowsRouteCandidates). The chosen home feeds a one-off override
+// registrar that performs the write. Returns on the first stdin error (EOF),
+// like the rest of the flow. port is the proxy port; homeDir threads the test
+// home seam through to the one-off registrar.
+func runWindowsRouteDisambiguation(out io.Writer, p *initPrompter, candidates map[string][]string, port int, opts interactiveInitOptions) error {
+	for _, label := range []string{"claude-code-windows", "codex-windows"} {
+		homes := candidates[label]
+		if len(homes) == 0 {
+			continue
+		}
+		base, _ := strings.CutSuffix(label, "-windows")
+		ic, _ := integration.For(base)
+		fmt.Fprintf(out, "\n%s\n", label)
+		fmt.Fprintln(out, "  several Windows-side homes were detected and ownership could not be")
+		fmt.Fprintln(out, "  auto-verified against the current Windows user — pick which one to wire:")
+		for i, h := range homes {
+			fmt.Fprintf(out, "    %d) %s\n", i+1, h)
+		}
+		choice, err := p.askChoice(fmt.Sprintf("route %s through the observer proxy? [1-%d, or n to skip]", label, len(homes)), len(homes))
+		if err != nil {
+			return err
+		}
+		if choice < 0 {
+			fmt.Fprintln(out, "  skipped.")
+			continue
+		}
+		chosen := homes[choice]
+		rOpts := proxyroute.RegisterOptions{ProxyPort: port, HomeDir: opts.HomeDir}
+		switch ic.Proxy.Kind {
+		case integration.RouteEnvSettings:
+			rOpts.WindowsClaudeHome = chosen
+		case integration.RouteConfigFile:
+			rOpts.WindowsCodexHome = chosen
+		}
+		reg, err := proxyroute.NewRegistrar(rOpts)
+		if err != nil {
+			return err
+		}
+		var res proxyroute.RegistrationResult
+		switch ic.Proxy.Kind {
+		case integration.RouteEnvSettings:
+			res = reg.RegisterClaudeCodeWindows()
+		case integration.RouteConfigFile:
+			res = reg.RegisterCodexWindows()
+		}
+		printProxyRouteResult(out, label, res, false)
+
+		// F1: the route write and the hook registration are SEPARATE writes, so
+		// they get SEPARATE consents (init's one-consent-per-write contract).
+		// Gate the hook offer on the route RESULT: when the route write refused
+		// (Error set — e.g. an existing third-party ANTHROPIC_BASE_URL in the
+		// picked home), do NOT silently write hooks into that home. The refusal
+		// was already surfaced honestly by printProxyRouteResult above; just
+		// move on.
+		if res.Error != nil {
+			continue
+		}
+		// No cross-OS hook to offer when the route was a benign off-WSL skip
+		// (ConfigMissing) — localhost forwarding needs WSL, so there's no
+		// cross-OS case to hook — when the picked target carries no hook
+		// (codex-windows is route-only), or when no binary path is available
+		// (nothing to write into the hook command; hook.NewRegistry requires
+		// it).
+		if res.ConfigMissing || !hookSupported(label) || opts.BinaryPath == "" {
+			continue
+		}
+		// Its OWN yes/no, defaulting NO (a second file write into a Windows-side
+		// home the operator only just disambiguated deserves an explicit yes).
+		hookYes, herr := p.ask(fmt.Sprintf("also register Claude Code hooks into %s?", chosen), false)
+		if herr != nil {
+			return herr
+		}
+		if !hookYes {
+			fmt.Fprintln(out, "  skipped.")
+			continue
+		}
+		hr, herr := hook.NewRegistry(hook.Options{
+			BinaryPath:        opts.BinaryPath,
+			ConfigPath:        opts.ConfigPath,
+			HomeDir:           opts.HomeDir,
+			WSLDistro:         opts.WSLDistro,
+			WindowsClaudeHome: chosen,
+		})
+		if herr != nil {
+			return herr
+		}
+		printHookResult(out, label, hr.Register(label), false)
+	}
+	return nil
+}
+
 // runInteractiveInit walks every detected tool and asks one consent
 // per write, executing each write immediately after its yes.
 //
@@ -146,15 +271,29 @@ func runInteractiveInit(out io.Writer, in io.Reader, opts interactiveInitOptions
 		return err
 	}
 
-	tools := selectTools(false, false, false, false, false, unionStrings(previewHooks.Installed(), previewMCP.Installed()))
+	installed := unionStrings(previewHooks.Installed(), previewMCP.Installed())
+	// Cross-OS "<tool>-windows" route targets (a WSL daemon writing the
+	// route into a Windows-side .claude/.codex) join the checklist the same
+	// way hook.Registry.Installed surfaces claude-code-windows.
+	installed = unionStrings(installed, previewRoute.WindowsRouteTargets())
+	tools := selectToolsForInit(false, false, false, false, false, installed)
 	sort.Strings(tools)
-	if len(tools) == 0 {
+	// F2: a cross-OS "<tool>-windows" whose Windows home is ownership-unverified
+	// or ambiguous is EXCLUDED from WindowsRouteTargets (so it isn't in tools),
+	// but it IS reported by WindowsRouteCandidates. On a box whose ONLY AI tool
+	// is such a Windows-side install, tools is empty yet there is real work to
+	// do — the disambiguation picker below. Only conclude "no AI tools detected"
+	// when there are neither tools NOR candidates.
+	routeCandidates := previewRoute.WindowsRouteCandidates()
+	if len(tools) == 0 && len(routeCandidates) == 0 {
 		fmt.Fprintln(out, "no AI tools detected — install one (or pass --claude-code / --cursor / --codex / --hermes explicitly) and re-run")
 		return nil
 	}
 
 	fmt.Fprintln(out, "observer init — interactive setup")
-	fmt.Fprintf(out, "detected: %s\n", strings.Join(tools, ", "))
+	if len(tools) > 0 {
+		fmt.Fprintf(out, "detected: %s\n", strings.Join(tools, ", "))
+	}
 	fmt.Fprintln(out, "each write below asks first; nothing is written without a yes.")
 	p := &initPrompter{in: bufio.NewReader(in), out: out}
 
@@ -213,19 +352,41 @@ func runInteractiveInit(out io.Writer, in io.Reader, opts interactiveInitOptions
 		}
 
 		if routeSupported(t) {
-			previewFn, writeFn := previewRoute.RegisterCodex, writeRoute.RegisterCodex
-			if t == "claude-code" {
-				previewFn, writeFn = previewRoute.RegisterClaudeCode, writeRoute.RegisterClaudeCode
+			// Dispatch on the base adapter's route KIND (CLAUDE.md #3), and on
+			// the "-windows" virtual-target suffix for the cross-OS writer —
+			// mirrors the batch dispatch in wireAIClients.
+			base, isWindows := strings.CutSuffix(t, "-windows")
+			ic, _ := integration.For(base)
+			var previewFn, writeFn func() proxyroute.RegistrationResult
+			switch ic.Proxy.Kind {
+			case integration.RouteEnvSettings:
+				if isWindows {
+					previewFn, writeFn = previewRoute.RegisterClaudeCodeWindows, writeRoute.RegisterClaudeCodeWindows
+				} else {
+					previewFn, writeFn = previewRoute.RegisterClaudeCode, writeRoute.RegisterClaudeCode
+				}
+			case integration.RouteConfigFile:
+				if isWindows {
+					previewFn, writeFn = previewRoute.RegisterCodexWindows, writeRoute.RegisterCodexWindows
+				} else {
+					previewFn, writeFn = previewRoute.RegisterCodex, writeRoute.RegisterCodex
+				}
 			}
 			pre := previewFn()
 			switch {
 			case pre.Error != nil:
 				fmt.Fprintf(out, "  route: ✗ %v\n", pre.Error)
-				fmt.Fprintf(out, "  (an existing conflicting entry can be overwritten with `observer init --%s --force`)\n", t)
+				if !isWindows {
+					fmt.Fprintf(out, "  (an existing conflicting entry can be overwritten with `observer init --%s --force`)\n", t)
+				}
 			case pre.AlreadySet:
 				fmt.Fprintf(out, "  route: already set in %s → %s\n", pre.ConfigPath, pre.BaseURL)
 			default:
-				fmt.Fprintln(out, "  proxy route — exact token accounting + conversation compression via the local proxy.")
+				if isWindows {
+					fmt.Fprintf(out, "  proxy route (Windows → WSL) — route this Windows-installed tool's API traffic through the WSL proxy at %s.\n", pre.BaseURL)
+				} else {
+					fmt.Fprintln(out, "  proxy route — exact token accounting + conversation compression via the local proxy.")
+				}
 				fmt.Fprintf(out, "  would write %s → %s\n", pre.ConfigPath, pre.BaseURL)
 				yes, err := p.ask(fmt.Sprintf("route %s through the observer proxy?", t), true)
 				if err != nil {
@@ -241,6 +402,16 @@ func runInteractiveInit(out io.Writer, in io.Reader, opts interactiveInitOptions
 				}
 			}
 		}
+	}
+
+	// Cross-OS route DISAMBIGUATION (R1/F3): tools whose Windows-side config
+	// was detected but could not be auto-resolved — ownership unverifiable, or
+	// several candidate homes — are excluded from WindowsRouteTargets, so they
+	// never appeared in the loop above. Offer a numbered picker here; the
+	// chosen home feeds a one-off override registrar. Nothing writes without a
+	// pick.
+	if err := runWindowsRouteDisambiguation(out, p, routeCandidates, port, opts); err != nil {
+		return err
 	}
 
 	// Probe-route step: tools whose guarded, ADDITIVE config-lane writer

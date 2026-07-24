@@ -55,7 +55,7 @@ func newGooseCmd() *cobra.Command {
 			"API keys or ~/.config/goose/secrets.yaml.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			bin, err := resolveToolBin("goose", binPath, "--goose-path")
+			bin, err := resolveToolBin("goose", binPath, "--goose-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}

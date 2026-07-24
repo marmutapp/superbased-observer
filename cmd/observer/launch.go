@@ -25,7 +25,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/marmutapp/superbased-observer/internal/config"
+	"github.com/marmutapp/superbased-observer/internal/integration"
+	"github.com/marmutapp/superbased-observer/internal/toolresolve"
+	"github.com/marmutapp/superbased-observer/internal/toolresolve/host"
 )
 
 // resolveProxyURL returns the proxy base URL a launcher should route to: the
@@ -42,16 +48,75 @@ func resolveProxyURL(cfgPort int, override string) string {
 	return "http://127.0.0.1:" + strconv.Itoa(cfgPort)
 }
 
-// resolveToolBin resolves the tool's binary: the explicit --<tool>-path
-// override when set, otherwise the binary looked up on PATH. The error names
-// the override flag so the operator knows how to recover.
-func resolveToolBin(name, override, pathFlag string) (string, error) {
+// resolveEnv returns the toolresolve.Env driving the registry resolution
+// ladder. It is memoized per process via sync.OnceValue so the login-shell
+// PATH capture and the crossmount home walk happen exactly once no matter how
+// many launchers resolve. It is a package var so a test can substitute a
+// map-backed fake env (restore it in a defer).
+var resolveEnv = sync.OnceValue(func() toolresolve.Env {
+	return host.NewEnv(host.Options{})
+})
+
+// resolveToolBin resolves a launchable tool's binary through the registry-
+// driven ladder, returning the launchable path or an honest, actionable error.
+// tool is the integration-registry KEY (e.g. "claude-code", "gemini-cli",
+// "kimi-code") — the binary spellings, probe dirs, and grounded install hints
+// all come from that row, so callers never name the binary themselves. The
+// ladder:
+//
+//  1. override (the --<tool>-path flag) — trusted verbatim, no checks
+//     (unchanged trust semantics).
+//  2. [launch.tools.<tool>].path from the operator's config — stat-checked; a
+//     set-but-missing path is an error NAMING the config key so the operator
+//     can fix it. A config that fails to load falls open to the ladder.
+//  3. the toolresolve ladder over the registry Binary row: `ok` launches
+//     silently; `ok_off_path` / `shadowed` launch with a one-time honest note
+//     on stderr; `foreign_only` / `not_found` return an error whose message IS
+//     the FormatVerdict text (the grounded install command, or "installed on
+//     Windows, not in WSL").
+//  4. no Binary row (defensive — the registry coverage test pins one for every
+//     launchable tool) → a bare PATH lookup of the tool name.
+//
+// pathFlag names the override flag surfaced in the step-4 fallback error.
+// stderr receives the launchable-but-imperfect notes; pass io.Discard to stay
+// quiet.
+func resolveToolBin(tool, override, pathFlag, configPath string, stderr io.Writer) (string, error) {
 	if override != "" {
 		return override, nil
 	}
-	resolved, err := exec.LookPath(name)
+
+	// Step 2: operator config override. Fail open on a config load error so a
+	// broken config never blocks the ladder.
+	if cfg, err := config.Load(config.LoadOptions{GlobalPath: configPath}); err == nil {
+		if tc, ok := cfg.Launch.Tools[tool]; ok && tc.Path != "" {
+			if fi, statErr := os.Stat(tc.Path); statErr != nil || fi.IsDir() {
+				return "", fmt.Errorf(
+					"%s binary not found at [launch.tools.%s].path = %q — fix the path or remove the entry",
+					tool, tool, tc.Path,
+				)
+			}
+			return tc.Path, nil
+		}
+	}
+
+	// Step 3: registry-driven resolution ladder over the Binary row.
+	if row, ok := integration.For(tool); ok && row.Binary != nil {
+		r := toolresolve.Resolve(*row.Binary, resolveEnv())
+		switch r.Verdict {
+		case toolresolve.VerdictOK:
+			return r.Bin, nil
+		case toolresolve.VerdictOKOffPath, toolresolve.VerdictShadowed:
+			fmt.Fprint(stderr, toolresolve.FormatVerdict(tool, pathFlag, r))
+			return r.Bin, nil
+		default: // foreign_only / not_found
+			return "", errors.New(strings.TrimRight(toolresolve.FormatVerdict(tool, pathFlag, r), "\n"))
+		}
+	}
+
+	// Step 4: defensive fallback — no grounded Binary row (should not happen).
+	resolved, err := exec.LookPath(tool)
 	if err != nil {
-		return "", fmt.Errorf("locate %s binary: %w (set %s)", name, err, pathFlag)
+		return "", fmt.Errorf("locate %s binary: %w (set %s)", tool, err, pathFlag)
 	}
 	return resolved, nil
 }

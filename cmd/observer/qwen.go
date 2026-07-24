@@ -51,7 +51,7 @@ func newQwenCmd() *cobra.Command {
 			"to separate observer flags from qwen flags. NEVER touches API keys.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			bin, err := resolveToolBin("qwen", binPath, "--qwen-path")
+			bin, err := resolveToolBin("qwen-code", binPath, "--qwen-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}

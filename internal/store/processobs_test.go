@@ -206,6 +206,104 @@ func TestPersistProcessNetworkEventWithBody(t *testing.T) {
 	}
 }
 
+// TestNetworkSummaryForSession pins the summary aggregation + the honest
+// EVENT-level proxied-vs-OS discriminator: an event is proxied iff its own
+// details JSON carries capture_source='proxy' — whether or not it has a body
+// row (a bodyless proxied call still counts, contributing 0 bytes). Bytes come
+// only from a proxied event's body row; OS-observed events (process_backend
+// details) and any non-proxy body row count as os_connections and contribute
+// NO bytes.
+func TestNetworkSummaryForSession(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	sessionID, _ := mustProjectAndSession(t, s)
+	started := t0Proc()
+
+	mkProxy := func(key string, reqBytes, respBytes int) processobs.ProcessEvent {
+		return processobs.ProcessEvent{
+			ProcessKey: key, Timestamp: started.Add(time.Second),
+			Type:        processobs.EventNetworkConnect,
+			Attribution: processobs.Attribution{SessionID: sessionID, Source: processobs.AttrHeuristic, Confidence: processobs.ConfMedium},
+			TargetKind:  "url", Target: "https://api.example.test/v1/messages",
+			Details: map[string]any{"capture_source": "proxy"},
+			NetworkBody: &processobs.NetworkBodyCapture{
+				CaptureSource: "proxy", Method: "POST",
+				RequestBodyBytes: reqBytes, ResponseBodyBytes: respBytes,
+			},
+		}
+	}
+	// An OS-observed event: capture_source='process_backend', NO body row.
+	osEvent := processobs.ProcessEvent{
+		ProcessKey: "os-1", Timestamp: started.Add(2 * time.Second),
+		Type:        processobs.EventNetworkConnect,
+		Attribution: processobs.Attribution{SessionID: sessionID, Source: processobs.AttrHeuristic, Confidence: processobs.ConfMedium},
+		TargetKind:  "network_endpoint", Target: "1.2.3.4:443",
+		Details: map[string]any{"capture_source": "process_backend"},
+	}
+	// A body row with a NON-proxy capture_source proves discrimination keys on
+	// the EVENT detail (capture_source='proxy'), not mere body presence: this
+	// event carries no proxy detail, so its 999 request bytes must NOT be summed
+	// and it counts as an OS connection.
+	nonProxyBody := processobs.ProcessEvent{
+		ProcessKey: "os-2", Timestamp: started.Add(3 * time.Second),
+		Type:        processobs.EventNetworkConnect,
+		Attribution: processobs.Attribution{SessionID: sessionID, Source: processobs.AttrHeuristic, Confidence: processobs.ConfMedium},
+		TargetKind:  "url", Target: "https://other.test/x",
+		Details:     map[string]any{"capture_source": "process_backend"},
+		NetworkBody: &processobs.NetworkBodyCapture{CaptureSource: "process_backend", RequestBodyBytes: 999, ResponseBodyBytes: 999},
+	}
+	// A PROXIED event whose body capture was OFF: its details carry
+	// capture_source='proxy' and a body_unavailable_reason, but it has NO
+	// process_network_bodies row. The event-level discriminator must count it as
+	// a proxied call with ZERO byte contribution (the body-row discriminator
+	// used to misclassify this as an OS connection — the undercount this fix
+	// closes).
+	proxyNoBody := processobs.ProcessEvent{
+		ProcessKey: "px-3", Timestamp: started.Add(4 * time.Second),
+		Type:        processobs.EventNetworkConnect,
+		Attribution: processobs.Attribution{SessionID: sessionID, Source: processobs.AttrHeuristic, Confidence: processobs.ConfMedium},
+		TargetKind:  "url", Target: "https://api.example.test/v1/messages",
+		Details: map[string]any{"capture_source": "proxy", "body_unavailable_reason": "body_capture_disabled"},
+	}
+
+	if _, err := s.PersistProcessEvents(ctx, []processobs.ProcessEvent{
+		mkProxy("px-1", 100, 200),
+		mkProxy("px-2", 50, 300),
+		osEvent,
+		nonProxyBody,
+		proxyNoBody,
+	}); err != nil {
+		t.Fatalf("PersistProcessEvents: %v", err)
+	}
+
+	sum, err := s.NetworkSummaryForSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("NetworkSummaryForSession: %v", err)
+	}
+	if sum.ProxiedCalls != 3 {
+		t.Fatalf("proxied_calls = %d, want 3 (two proxy bodies + one bodyless proxy event)", sum.ProxiedCalls)
+	}
+	if sum.RequestBytes != 150 {
+		t.Fatalf("request_bytes = %d, want 150 (only proxy bodies summed; bodyless proxy adds 0)", sum.RequestBytes)
+	}
+	if sum.ResponseBytes != 500 {
+		t.Fatalf("response_bytes = %d, want 500 (only proxy bodies summed; bodyless proxy adds 0)", sum.ResponseBytes)
+	}
+	if sum.OSConnections != 2 {
+		t.Fatalf("os_connections = %d, want 2 (OS event + non-proxy body row)", sum.OSConnections)
+	}
+
+	// A session with no network events returns an all-zero summary, not an error.
+	zero, err := s.NetworkSummaryForSession(ctx, "sess-with-no-events")
+	if err != nil {
+		t.Fatalf("NetworkSummaryForSession(empty): %v", err)
+	}
+	if zero != (NetworkSummary{}) {
+		t.Fatalf("empty-session summary = %+v, want all-zero", zero)
+	}
+}
+
 func t0Proc() time.Time { return time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC) }
 
 func execRun(key, sess string, projectID int64, pid int, started time.Time) processobs.ProcessRun {
@@ -997,5 +1095,55 @@ func TestPruneProcessRowsDeletesNetworkBodies(t *testing.T) {
 	}
 	if got := countBodies(); got != 1 {
 		t.Errorf("bodies after prune = %d, want 1 (old body deleted, fresh kept)", got)
+	}
+}
+
+// TestNetworkSummaryForSession_MalformedDetailsJSON proves Fix 5: a single
+// malformed (non-NULL, invalid) details_json row must NOT abort the aggregate.
+// Before the json_valid guard, json_extract raised "malformed JSON" and failed
+// the whole query; now the row yields a NULL capture_source and classifies as
+// OS-observed (non-proxy). PersistProcessEvents always marshals valid JSON, so
+// the bad row is inserted directly to bypass that path.
+func TestNetworkSummaryForSession_MalformedDetailsJSON(t *testing.T) {
+	t.Parallel()
+	s, database := newTestStore(t)
+	ctx := context.Background()
+	sessionID, _ := mustProjectAndSession(t, s)
+	started := t0Proc()
+
+	// One valid proxy event with a body so the aggregate has a proxied call +
+	// byte totals to preserve alongside the malformed row.
+	if _, err := s.PersistProcessEvents(ctx, []processobs.ProcessEvent{{
+		ProcessKey: "px-1", Timestamp: started.Add(time.Second),
+		Type:        processobs.EventNetworkConnect,
+		Attribution: processobs.Attribution{SessionID: sessionID, Source: processobs.AttrHeuristic, Confidence: processobs.ConfMedium},
+		TargetKind:  "url", Target: "https://api.example.test/v1/messages",
+		Details:     map[string]any{"capture_source": "proxy"},
+		NetworkBody: &processobs.NetworkBodyCapture{CaptureSource: "proxy", RequestBodyBytes: 100, ResponseBodyBytes: 200},
+	}}); err != nil {
+		t.Fatalf("PersistProcessEvents: %v", err)
+	}
+
+	// A row whose details_json is present but NOT valid JSON.
+	if _, err := database.ExecContext(ctx, `
+		INSERT INTO process_events (process_key, timestamp, event_type, session_id, target_kind, target, details_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"bad-1", timestamp(started.Add(2*time.Second)), string(processobs.EventNetworkConnect),
+		sessionID, "url", "https://bad.test/x", "{not valid json"); err != nil {
+		t.Fatalf("insert malformed row: %v", err)
+	}
+
+	sum, err := s.NetworkSummaryForSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("NetworkSummaryForSession must not error on a malformed row: %v", err)
+	}
+	if sum.ProxiedCalls != 1 {
+		t.Fatalf("proxied_calls = %d, want 1 (malformed row is not proxy)", sum.ProxiedCalls)
+	}
+	if sum.OSConnections != 1 {
+		t.Fatalf("os_connections = %d, want 1 (malformed row classifies as OS-observed)", sum.OSConnections)
+	}
+	if sum.RequestBytes != 100 || sum.ResponseBytes != 200 {
+		t.Fatalf("bytes = %d/%d, want 100/200 (proxy body preserved)", sum.RequestBytes, sum.ResponseBytes)
 	}
 }

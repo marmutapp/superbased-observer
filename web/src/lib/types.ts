@@ -2309,6 +2309,22 @@ export type SessionLaunchResponse = {
   has_project_root?: boolean;
 };
 
+// ToolPreflight is the reply from GET /api/terminal/launch/preflight?tool=<name>
+// — the pre-launch binary-resolution verdict (tool-binary-resolution arc). It
+// tells the New-Terminal dialog, before a launch, whether the daemon can resolve
+// the tool's binary and — when it cannot — the grounded install command to fix
+// it. `install_command` is the human display string only (the argv never crosses
+// the wire; the server owns it at the install endpoint). Verdict is a closed
+// vocabulary: "ok" | "ok_off_path" | "shadowed" | "foreign_only" | "not_found".
+export type ToolPreflight = {
+  tool: string;
+  verdict: string;
+  bin?: string;
+  notes?: string[];
+  install_command?: string;
+  can_install: boolean;
+};
+
 // AttachInfo is one row of GET /api/attach/sessions — a LIVE
 // `observer <tool> --attach` session the daemon owns and the dashboard can
 // join as a second seat over the existing /ws/launch/<token> bridge

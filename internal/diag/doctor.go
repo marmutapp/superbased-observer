@@ -124,6 +124,9 @@ func Run(ctx context.Context, opts DoctorOptions) Report {
 	r.add(checkConcurrentDaemons(opts.Config))
 	r.add(checkCodexHookTrust(opts.HomeDir))
 	r.add(checkProxyRoutingGap(ctx, opts.DB, opts.HomeDir))
+	if c, ok := checkWindowsProxyRoutes(ctx, opts.Config); ok {
+		r.add(c)
+	}
 	r.add(checkOrgEnrolment(ctx, opts.DB, opts.Config))
 	r.add(checkProcessObservability(ctx, opts.DB, opts.Config))
 	r.add(checkHandoffReaders(ctx, opts.DB))

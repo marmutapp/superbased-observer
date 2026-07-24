@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -346,15 +347,15 @@ func parseClaudeResult(out []byte) (string, bool) {
 	return last, found
 }
 
-// resolveClaudeBin returns the configured claude path or resolves `claude` on
-// PATH. A missing binary is a Drive-time harness error (no spend), not a
-// Preflight failure — Preflight owns only the isolated-daemon gate, so a
-// dry-run cost estimate still works on a host without claude installed.
+// resolveClaudeBin returns the configured claude path or resolves the claude
+// binary through the registry ladder (registry key "claude-code"). A missing
+// binary is a Drive-time harness error (no spend), not a Preflight failure —
+// Preflight owns only the isolated-daemon gate, so a dry-run cost estimate
+// still works on a host without claude installed. stderr is discarded (the
+// harness is non-interactive); any PATH-hygiene note is dropped, and an
+// unresolvable binary surfaces as the returned error at Drive time.
 func resolveClaudeBin(configured string) (string, error) {
-	if configured != "" {
-		return configured, nil
-	}
-	return exec.LookPath("claude")
+	return resolveToolBin("claude-code", configured, "--claude-path", "", io.Discard)
 }
 
 // defaultObserverDBPath returns the operator default observer DB path

@@ -4,17 +4,25 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
+	"os"
+	"runtime"
+	"sync"
 	"time"
 
 	"github.com/marmutapp/superbased-observer/internal/config"
+	"github.com/marmutapp/superbased-observer/internal/integration"
 	"github.com/marmutapp/superbased-observer/internal/intelligence/dashboard"
+	"github.com/marmutapp/superbased-observer/internal/platform/crossmount"
 	"github.com/marmutapp/superbased-observer/internal/remoteauth"
 	"github.com/marmutapp/superbased-observer/internal/store"
 	"github.com/marmutapp/superbased-observer/internal/termlease"
 	"github.com/marmutapp/superbased-observer/internal/termrun"
 	"github.com/marmutapp/superbased-observer/internal/termsession"
 	"github.com/marmutapp/superbased-observer/internal/termsvc"
+	"github.com/marmutapp/superbased-observer/internal/toolresolve"
+	"github.com/marmutapp/superbased-observer/internal/toolresolve/host"
 )
 
 // launch_dashboard.go wires the dashboard's embedded web-terminal launch
@@ -140,7 +148,7 @@ func (a *launchManagerAdapter) CreateFresh(spec dashboard.FreshLaunchSpec) (stri
 	res, err := a.svc.LaunchFresh(context.Background(), termsvc.FreshRequest{
 		Tool:        spec.Tool,
 		Subcommand:  spec.Subcommand,
-		ProjectRoot: spec.ProjectRoot,
+		ProjectRoot: crossmount.TranslateForeignPath(spec.ProjectRoot),
 		Rows:        spec.Rows,
 		Cols:        spec.Cols,
 	})
@@ -161,7 +169,7 @@ func (a *launchManagerAdapter) CreateResume(spec dashboard.ResumeLaunchSpec) (st
 	res, err := a.svc.LaunchResume(context.Background(), termsvc.ResumeRequest{
 		Tool:            spec.Tool,
 		Subcommand:      spec.Subcommand,
-		ProjectRoot:     spec.ProjectRoot,
+		ProjectRoot:     crossmount.TranslateForeignPath(spec.ProjectRoot),
 		SourceSessionID: spec.SessionID,
 		ExtraArgs:       spec.ExtraArgs,
 		Rows:            spec.Rows,
@@ -387,6 +395,41 @@ func projectRootResolver(launchMgr dashboard.LaunchManager) func(string) (string
 		}
 		root, _ := svc.ProjectRoot(token)
 		return root, true
+	}
+}
+
+// sessionResolver adapts the launch manager's termsvc.Service into the
+// dashboard's token→session-link seam (Session Cockpit). It reports
+// known=false for an unknown OR exited token (RunIDForHandle tracks LIVE runs
+// only — same liveness posture as projectRootResolver). For a live run it
+// carries the run identity (id + kind + tool) and, once the daemon has
+// correlated the run, its observer session id + link confidence; a live-but-
+// uncorrelated run returns known=true with an empty SessionID and 0 Confidence.
+// Returns nil when the manager isn't the concrete adapter (or has no service),
+// which leaves the cockpit endpoint disabled (404).
+func sessionResolver(launchMgr dashboard.LaunchManager) func(string) (dashboard.TerminalSessionLink, bool) {
+	a, ok := launchMgr.(*launchManagerAdapter)
+	if !ok || a == nil || a.svc == nil {
+		return nil
+	}
+	svc := a.svc
+	return func(token string) (dashboard.TerminalSessionLink, bool) {
+		// Single-lock resolve (F4): liveness + run identity + correlation are
+		// read atomically, so a run ending mid-resolve can't yield known=true
+		// with a deleted correlation. A miss on the session link inside is an
+		// honest "live run, not correlated yet" — known=true, empty SessionID,
+		// zero Confidence (correlation is scored + async).
+		runID, kind, tool, sessionID, confidence, live := svc.ResolveHandleLink(token)
+		if !live {
+			return dashboard.TerminalSessionLink{}, false
+		}
+		return dashboard.TerminalSessionLink{
+			RunID:      runID,
+			Kind:       string(kind),
+			Tool:       tool,
+			SessionID:  sessionID,
+			Confidence: confidence,
+		}, true
 	}
 }
 
@@ -636,6 +679,168 @@ func newLeaseAuditSink(database *sql.DB) func(termsession.LeaseEvent) {
 			Decision:  "ok",
 			Detail:    detail, // coarse, non-sensitive transition direction + reason
 		})
+	}
+}
+
+// dashResolveEnvTTL bounds how long the dashboard reuses a captured
+// toolresolve.Env before rebuilding it. A short window (not a forever-memoized
+// value) is what keeps the "a fresh install becomes visible in a daemon-side
+// preflight without a restart" story honest (F7): host.NewEnv does a crossmount
+// home walk + a bounded (≤1.5s) login-shell PATH capture, so per-call rebuilds
+// would be wasteful, but a process-lifetime memo would pin the PATH snapshot
+// taken at first launch forever.
+var dashResolveEnvTTL = 30 * time.Second
+
+var (
+	dashResolveEnvMu   sync.Mutex
+	dashResolveEnvVal  toolresolve.Env
+	dashResolveEnvAt   time.Time
+	dashResolveEnvHave bool
+	// dashResolveEnvNow + dashResolveEnvBuild are package-private seams a test
+	// substitutes to drive TTL expiry deterministically (restore in a defer);
+	// production keeps the real clock and the real host env capture.
+	dashResolveEnvNow   = time.Now
+	dashResolveEnvBuild = func() toolresolve.Env { return host.NewEnv(host.Options{}) }
+)
+
+// dashResolveEnv returns the toolresolve.Env driving the dashboard's tool-
+// resolution seams (tool-binary-resolution arc §5), rebuilding it via
+// host.NewEnv when the cached value is older than dashResolveEnvTTL so a
+// daemon-side preflight reflects a freshly installed binary without a restart
+// (F7). Concurrency-safe; the rebuild happens under the lock so a burst of
+// preflights past the TTL rebuilds exactly once.
+func dashResolveEnv() toolresolve.Env {
+	dashResolveEnvMu.Lock()
+	defer dashResolveEnvMu.Unlock()
+	now := dashResolveEnvNow()
+	if !dashResolveEnvHave || now.Sub(dashResolveEnvAt) >= dashResolveEnvTTL {
+		dashResolveEnvVal = dashResolveEnvBuild()
+		dashResolveEnvAt = now
+		dashResolveEnvHave = true
+	}
+	return dashResolveEnvVal
+}
+
+// installOSForGOOS maps the daemon GOOS to an integration.InstallHint.OS token
+// ("linux" | "darwin" | "windows"), the same convention toolresolve uses to
+// filter hints. It is the ONE place the cmd-side install seam picks the OS a
+// grounded hint must match.
+func installOSForGOOS(goos string) string {
+	switch goos {
+	case "windows":
+		return "windows"
+	case "darwin":
+		return "darwin"
+	default:
+		return "linux"
+	}
+}
+
+// toolPreflightSeam builds the dashboard.Options.ToolPreflight closure: it
+// resolves a launchable tool NAME to a dashboard.ToolPreflight verdict via the
+// SAME ladder the actual launcher (cmd/observer/launch.go resolveToolBin)
+// honors, so a preflight never diverges from the launch it predicts (F1). It
+// reports ok=false for an unknown tool, a non-launchable tool, or one with no
+// grounded Binary spec (the honest floor the endpoint turns into a 400).
+//
+// Ladder, mirroring resolveToolBin (the --<tool>-path FLAG has no dashboard
+// equivalent, so only the config override is mirrored):
+//
+//  1. [launch.tools.<tool>].path config override — what the launcher checks
+//     BEFORE the resolution ladder. Present + stats as a file ⇒ verdict "ok"
+//     with Bin=that path and a note that it is configured; present + missing
+//     (or a dir) ⇒ verdict "not_found" with a note NAMING the stale config key
+//     (never a silent fall-through to the ladder — the launch would fail AT the
+//     override, so preflighting past it would lie). A config that fails to load
+//     falls open to the ladder (a broken config never blocks a preflight).
+//  2. the pure internal/toolresolve ladder over the registry Binary row.
+//
+// InstallCommand is the first daemon-GOOS-matching grounded hint's Display
+// (toolresolve already filters Installs to the daemon OS); CanInstall is true
+// only when such a hint exists AND the live allow_install kill-switch is on. The
+// argv NEVER crosses this seam — it is the install endpoint's own registry-
+// constant lookup.
+func toolPreflightSeam(configPath string, allowInstall func() bool) func(string) (dashboard.ToolPreflight, bool) {
+	return func(tool string) (dashboard.ToolPreflight, bool) {
+		ic, ok := integration.For(tool)
+		if !ok || !ic.Handoff.Launchable() || ic.Binary == nil {
+			return dashboard.ToolPreflight{}, false
+		}
+		// Step 1: config override parity with resolveToolBin. Fail open on a
+		// config load error so a broken config never blocks the ladder.
+		if cfg, err := config.Load(config.LoadOptions{GlobalPath: configPath}); err == nil {
+			if tc, ok := cfg.Launch.Tools[tool]; ok && tc.Path != "" {
+				key := fmt.Sprintf("[launch.tools.%s].path", tool)
+				if fi, statErr := os.Stat(tc.Path); statErr != nil || fi.IsDir() {
+					return dashboard.ToolPreflight{
+						Tool:    tool,
+						Verdict: string(toolresolve.VerdictNotFound),
+						Notes: []string{fmt.Sprintf(
+							"%s = %q is set but no binary is there — fix the path or remove the entry",
+							key, tc.Path,
+						)},
+					}, true
+				}
+				return dashboard.ToolPreflight{
+					Tool:    tool,
+					Verdict: string(toolresolve.VerdictOK),
+					Bin:     tc.Path,
+					Notes:   []string{fmt.Sprintf("configured via %s", key)},
+				}, true
+			}
+		}
+		// Step 2: registry-driven resolution ladder over the Binary row.
+		r := toolresolve.Resolve(*ic.Binary, dashResolveEnv())
+		pf := dashboard.ToolPreflight{
+			Tool:    tool,
+			Verdict: string(r.Verdict),
+			Bin:     r.Bin,
+			Notes:   r.Notes,
+		}
+		if len(r.Installs) > 0 {
+			pf.InstallCommand = r.Installs[0].Display
+			pf.CanInstall = allowInstall != nil && allowInstall()
+		}
+		return pf, true
+	}
+}
+
+// toolInstallHintSeam builds the dashboard.Options.ToolInstallHint closure: it
+// returns the SERVER-SIDE install argv + display for a tool NAME, sourced ONLY
+// from the compile-time registry (tool-binary-resolution arc §Security — the
+// request contributes only the map key, so the argv-injection surface is zero).
+// It returns the first grounded hint whose OS is empty (any) or matches the
+// daemon GOOS; a tool with no grounded hint yields ok=false (the endpoint's
+// 400).
+func toolInstallHintSeam() func(string) ([]string, string, bool) {
+	return func(tool string) ([]string, string, bool) {
+		ic, ok := integration.For(tool)
+		if !ok || ic.Binary == nil {
+			return nil, "", false
+		}
+		want := installOSForGOOS(runtime.GOOS)
+		for _, h := range ic.Binary.Installs {
+			if h.OS == "" || h.OS == want {
+				return h.Argv, h.Display, true
+			}
+		}
+		return nil, "", false
+	}
+}
+
+// allowToolInstallSeam builds the dashboard.Options.AllowToolInstall closure: a
+// LIVE read of [terminal.launch].allow_install (default true) so a config edit
+// flips the guided-install kill-switch with no daemon restart. A config-load
+// error fails SAFE (returns false → the endpoint 403s), matching the honest
+// "disabled" posture the dashboard prefers over spawning an install on a
+// half-broken config.
+func allowToolInstallSeam(configPath string) func() bool {
+	return func() bool {
+		cfg, err := config.Load(config.LoadOptions{GlobalPath: configPath})
+		if err != nil {
+			return false
+		}
+		return cfg.Terminal.Launch.AllowInstall
 	}
 }
 

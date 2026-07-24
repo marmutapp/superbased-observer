@@ -34,6 +34,10 @@ import (
 func (s *Server) OnStandingLocalTakeover(handle, revokedHolder string) {
 	remoteManageMu.Lock()
 	defer remoteManageMu.Unlock()
+	// Fix 2: the config read-modify-write below joins the configWriteMu domain
+	// (lock order remoteManageMu → configWriteMu; see remoteManageMu decl).
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	cfg, cfgPath, err := s.loadConfigForManage()
 	if err != nil {
 		return
@@ -88,6 +92,10 @@ func (s *Server) handleRemoteSetRevokeStandingOnTakeover(w http.ResponseWriter, 
 	next := *body.RevokeStandingOnTakeover
 	remoteManageMu.Lock()
 	defer remoteManageMu.Unlock()
+	// Fix 2: the config read-modify-write below joins the configWriteMu domain
+	// (lock order remoteManageMu → configWriteMu; see remoteManageMu decl).
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	cfg, cfgPath, err := s.loadConfigForManage()
 	if err != nil {
 		writeErr(w, err)
@@ -138,6 +146,10 @@ func (s *Server) handleRemoteSetAllowRemoteTakeover(w http.ResponseWriter, r *ht
 	next := *body.AllowRemoteTerminalTakeover
 	remoteManageMu.Lock()
 	defer remoteManageMu.Unlock()
+	// Fix 2: the config read-modify-write below joins the configWriteMu domain
+	// (lock order remoteManageMu → configWriteMu; see remoteManageMu decl).
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	cfg, cfgPath, err := s.loadConfigForManage()
 	if err != nil {
 		writeErr(w, err)

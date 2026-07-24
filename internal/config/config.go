@@ -37,6 +37,7 @@ type Config struct {
 	Browser      BrowserConfig      `toml:"browser"`
 	Handoff      HandoffConfig      `toml:"handoff"`
 	Terminal     TerminalConfig     `toml:"terminal"`
+	Launch       LaunchConfig       `toml:"launch"`
 	CodeIntel    CodeIntelConfig    `toml:"codeintel"`
 	Advisor      AdvisorConfig      `toml:"advisor"`
 	Routing      RoutingConfig      `toml:"routing"`
@@ -1114,10 +1115,16 @@ type TerminalAttachConfig struct {
 }
 
 // TerminalLaunchConfig is the [terminal.launch] block — the fresh-agent
-// launch opt-in (plan §8/F1). Every field defaults to the ZERO value (off /
-// empty): a fresh (non-handoff) agent launch from the dashboard is refused
-// until the operator consciously grants it. This block EXPANDS execution
-// authority, so it is never seeded on by Default().
+// launch opt-in (plan §8/F1). The fresh-launch fields default to the ZERO
+// value (off / empty): a fresh (non-handoff) agent launch from the dashboard
+// is refused until the operator consciously grants it, because those fields
+// EXPAND execution authority. The exception is AllowInstall (added by the
+// tool-binary-resolution arc, 2026-07-23): it is a KILL-SWITCH for the guided
+// install endpoint and defaults TRUE — the consent there is the explicit
+// dashboard click, not a config flip, so the switch's job is to let an
+// operator turn the affordance OFF, not gate it on. It is seeded true in
+// Default() with the same absent-key-preserves-default partial-merge treatment
+// as [terminal.attach]'s booleans.
 //
 // `allow_shell` is intentionally ABSENT — a general browser shell is a
 // separate, separately-reviewed feature, not part of F1.
@@ -1125,6 +1132,18 @@ type TerminalLaunchConfig struct {
 	// AllowFreshAgent is the master opt-in for non-handoff launches. Default
 	// FALSE. With it false, POST /api/terminal/launch refuses every request.
 	AllowFreshAgent bool `toml:"allow_fresh_agent"`
+	// AllowInstall gates POST /api/terminal/install — the guided one-click
+	// "Install in terminal" affordance (tool-binary-resolution arc). Default
+	// TRUE: the consent is the explicit dashboard click that runs a grounded,
+	// compile-time-constant install command in a visible PTY, so this key is
+	// the operator KILL-SWITCH to disable that affordance entirely, not the
+	// gate that turns it on. Independent of AllowFreshAgent — installing a tool
+	// is not launching a fresh agent. Seeded true in Default(); BurntSushi
+	// leaves an absent key untouched, so a pre-existing [terminal.launch] block
+	// that predates this key still loads with AllowInstall=true (the same
+	// partial-merge mechanism [terminal.attach].default_on relies on). An
+	// explicit allow_install = false sticks.
+	AllowInstall bool `toml:"allow_install"`
 	// AllowedTools is the allow-list of launchable tool names a fresh launch
 	// may start (e.g. ["claude-code","codex"]). Empty = none (deny-all). A
 	// tool must ALSO be launchable in the capability registry.
@@ -1146,6 +1165,30 @@ type TerminalStatusConfig struct {
 	// Enabled gates the status classifier + the status API/WS frame. Default
 	// TRUE (seeded by Default()).
 	Enabled bool `toml:"enabled"`
+}
+
+// LaunchConfig is the [launch] block — per-tool binary-resolution overrides
+// for the `observer <tool>` launchers (tool-binary-resolution arc,
+// 2026-07-23). LOCAL-ONLY: it is never distributed to an org (same posture as
+// [routing]/[predict]) and never appears in [org_client.share]. The map is
+// keyed by the registry tool name (e.g. "opencode", "claude-code"); an entry's
+// Path pins the exact binary to launch, winning over the toolresolve
+// resolution ladder (PATH → login PATH → probe dirs) and losing only to the
+// per-launch `--<tool>-path` flag. It is a narrow escape hatch for an install
+// the ladder cannot find or classifies wrong; a missing entry means "resolve
+// normally". Zero value (nil map) = no overrides, the common case.
+type LaunchConfig struct {
+	// Tools maps a registry tool name to its per-tool launch override.
+	Tools map[string]LaunchToolConfig `toml:"tools"`
+}
+
+// LaunchToolConfig is one [launch.tools.<tool>] entry.
+type LaunchToolConfig struct {
+	// Path is an absolute path to the tool's binary. When set (and it stat-
+	// checks as a file), the launcher uses it verbatim, bypassing resolution.
+	// It wins over the toolresolve ladder and loses to the `--<tool>-path`
+	// flag. Empty = resolve normally.
+	Path string `toml:"path"`
 }
 
 // BenchmarkConfig is the [benchmark] surface — the Benchmarks Harness
@@ -2664,7 +2707,10 @@ func Default() Config {
 			// proxy-routed by default; DefaultOn makes the launchers attach by
 			// default (opt-out per-launch with --no-attach).
 			Attach: TerminalAttachConfig{Enabled: true, RouteProxy: true, DefaultOn: true, ReclaimOnInput: true},
-			// Launch stays zero-valued: fresh launch is opt-in.
+			// Launch: fresh-launch fields stay zero-valued (opt-in), but the
+			// guided-install kill-switch defaults ON — the consent is the
+			// dashboard click, so this only lets an operator turn it OFF.
+			Launch: TerminalLaunchConfig{AllowInstall: true},
 		},
 		// Benchmark (the Benchmarks Harness) is CLI-driven; the only default
 		// is the retention horizon for the node-local benchmark_* tables.

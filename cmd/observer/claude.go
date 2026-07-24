@@ -26,7 +26,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -244,13 +243,9 @@ func runClaudeLauncher(ctx context.Context, opts claudeLauncherOptions) error {
 			opts.resume)
 	}
 
-	bin := opts.claudePath
-	if bin == "" {
-		resolved, lookErr := exec.LookPath("claude")
-		if lookErr != nil {
-			return fmt.Errorf("locate claude binary: %w (set --claude-path)", lookErr)
-		}
-		bin = resolved
+	bin, binErr := resolveToolBin("claude-code", opts.claudePath, "--claude-path", opts.configPath, opts.stderr)
+	if binErr != nil {
+		return binErr
 	}
 
 	// --verify is a NO-LAUNCH mode: evaluate it BEFORE any launch branch so it

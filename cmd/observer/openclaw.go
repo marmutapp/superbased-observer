@@ -70,7 +70,7 @@ func newOpenclawCmd() *cobra.Command {
 			"API keys. Requires a running observer proxy (`observer start`).",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			bin, err := resolveToolBin("openclaw", binPath, "--openclaw-path")
+			bin, err := resolveToolBin("openclaw", binPath, "--openclaw-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}

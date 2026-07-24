@@ -32,6 +32,11 @@ import { CompanionProvider } from "@/components/primitives/companion";
 // the critical chunk — it loads only when a terminal's Files/Git button fires.
 const ProjectPanel = lazy(() => import("@/components/ProjectPanel"));
 
+// Lazy so the per-terminal session cockpit (cost / tokens / live activity)
+// stays out of the critical chunk — it loads only when a terminal's Session
+// button fires. Same discipline as ProjectPanel above.
+const SessionCockpitPanel = lazy(() => import("@/components/cockpit/SessionCockpitPanel"));
+
 // Project panels live in a BOUNDED z-band ABOVE the expanded-terminal backdrop
 // (z-80) and the dock (z-70), but comfortably BELOW the guided tour (z-120/130)
 // and the context menu (z-200). On every raise the sibling panels are
@@ -47,11 +52,16 @@ const PANEL_Z_MAX = 110;
  * array reference when nothing changes (so a redundant raise — e.g. the double
  * onRaise a title-drag fires — doesn't churn state or re-increment anything).
  */
-function renormalizeZ(panels: PanelEntry[], raiseTok?: string): PanelEntry[] {
+// raiseKey is the composite `${kind}:${token}` identity a raise/close targets
+// — a bare token would let raising a session cockpit also raise a project
+// panel open on the same terminal (they're independent floating panels that
+// happen to share a token).
+function renormalizeZ(panels: PanelEntry[], raiseKey?: string): PanelEntry[] {
+  const keyOf = (p: PanelEntry) => `${p.kind}:${p.token}`;
   const ordered = [...panels].sort((a, b) => {
-    if (raiseTok) {
-      if (a.token === raiseTok) return 1; // raised token last (top)
-      if (b.token === raiseTok) return -1;
+    if (raiseKey) {
+      if (keyOf(a) === raiseKey) return 1; // raised entry last (top)
+      if (keyOf(b) === raiseKey) return -1;
     }
     return a.z - b.z;
   });
@@ -63,11 +73,11 @@ function renormalizeZ(panels: PanelEntry[], raiseTok?: string): PanelEntry[] {
   // panels several clamp to the z=110 ceiling, so raising one tied-at-ceiling
   // panel changes no z value. A by-z-only check would then report "unchanged"
   // and the raised panel wouldn't actually reorder. `panels` is always already
-  // in renormalized (z-ascending, raiseTok-last) order, so a positional
-  // token/z diff catches a pure reordering among ceiling ties too.
+  // in renormalized (z-ascending, raiseKey-last) order, so a positional
+  // token/kind/z diff catches a pure reordering among ceiling ties too.
   const changed = next.some((p, i) => {
     const old = panels[i];
-    return !old || old.token !== p.token || old.z !== p.z;
+    return !old || old.token !== p.token || old.kind !== p.kind || old.z !== p.z;
   });
   return changed ? next : panels;
 }
@@ -154,6 +164,12 @@ type LaunchDockCtx = {
   /** Open the per-terminal project panel (file tree / git) for a token+tab. */
   openProjectPanel: (token: string, tab: ProjectPanelTab) => void;
   /**
+   * Open/toggle the per-terminal session cockpit panel (cost / tokens / live
+   * activity) for a token. Same live-token guard as openProjectPanel; rejects
+   * a token whose session is gone or no longer live.
+   */
+  openSessionPanel: (token: string) => void;
+  /**
    * Register/unregister the live paste-into-terminal callback for a token.
    * LaunchTerminal registers one while its seat is live + write-capable; a
    * project panel shows its paste items only when a callback exists for its
@@ -161,14 +177,29 @@ type LaunchDockCtx = {
    * xterm's own paste pipeline (like a manual Ctrl+V).
    */
   registerPaste: (tok: string, fn: ((text: string) => void) | null) => void;
-  /** The open project panels, one per terminal token (multi-panel). */
-  projectPanels: PanelEntry[];
+  /**
+   * The open floating panels — project panels AND session cockpit panels,
+   * one entry per terminal token × kind (multi-panel; a token can have both
+   * a project panel and a session panel open at once).
+   */
+  panels: PanelEntry[];
 };
 
-// One open project panel. `z` is the provider-owned stacking order (a band
-// above the expanded-terminal backdrop); `cascade` is the in-memory stagger
-// slot assigned at open time and fixed for the panel's lifetime.
-type PanelEntry = { token: string; tab: ProjectPanelTab; z: number; cascade: number };
+// The two floating-panel kinds that share the same token-keyed stacking/
+// cascade model. `tab` on PanelEntry is meaningful only for "project".
+type PanelKind = "project" | "session";
+
+// One open floating panel (project OR session cockpit). `z` is the
+// provider-owned stacking order (a band above the expanded-terminal
+// backdrop); `cascade` is the in-memory stagger slot assigned at open time
+// and fixed for the panel's lifetime.
+type PanelEntry = {
+  token: string;
+  kind: PanelKind;
+  tab: ProjectPanelTab;
+  z: number;
+  cascade: number;
+};
 
 const Ctx = createContext<LaunchDockCtx | null>(null);
 
@@ -177,11 +208,14 @@ export function LaunchDockProvider({ children }: { children: ReactNode }) {
   const [activeToken, setActiveToken] = useState<string | null>(null);
   const [statuses, setStatuses] = useState<Record<string, Status>>({});
   const [newOpen, setNewOpen] = useState(false);
-  // The per-terminal project panels (file tree + git). Multi-panel: one entry
-  // per terminal token, all simultaneously open, rendered at provider level.
-  // z-order is renormalized into a bounded band on every raise (renormalizeZ),
-  // so it never climbs into the tour/context-menu layers.
-  const [projectPanels, setProjectPanels] = useState<PanelEntry[]>([]);
+  // The per-terminal floating panels — project panels (file tree + git) AND
+  // session cockpit panels. ONE shared array for both kinds: multi-panel, one
+  // entry per terminal token × kind, all simultaneously open, rendered at
+  // provider level. z-order is renormalized into a bounded band on every
+  // raise (renormalizeZ), so it never climbs into the tour/context-menu
+  // layers, and stays shared across kinds so lowestFreeCascade sees every
+  // open panel regardless of kind.
+  const [panels, setPanels] = useState<PanelEntry[]>([]);
   // Live paste callbacks keyed by token — the paste-into-terminal channel. A
   // panel shows its paste items only when a callback exists for its token.
   const [pasteFns, setPasteFns] = useState<Record<string, (text: string) => void>>({});
@@ -260,38 +294,79 @@ export function LaunchDockProvider({ children }: { children: ReactNode }) {
 
   const openNewTerminal = useCallback(() => setNewOpen(true), []);
 
-  // Open/toggle the panel for a token. Same-tab reopen closes it (toggle);
-  // other-tab reopen retargets the tab and raises; a new token appends a panel
-  // in the lowest free cascade slot. Rejects opening against a token whose
-  // session is gone or no longer live (exited OR error — see isLiveStatus) —
-  // the provider-side guard behind the disabled buttons (P2-3), so a
-  // stale/programmatic open can't resurrect a dead token.
+  // Open/toggle the project panel for a token. Same-tab reopen closes it
+  // (toggle); other-tab reopen retargets the tab and raises; a new token
+  // appends a panel in the lowest free cascade slot. Rejects opening against
+  // a token whose session is gone or no longer live (exited OR error — see
+  // isLiveStatus) — the provider-side guard behind the disabled buttons
+  // (P2-3), so a stale/programmatic open can't resurrect a dead token. Matches
+  // entries on token && kind==="project" so a session cockpit open on the same
+  // token is untouched.
   const openProjectPanel = useCallback((tok: string, tab: ProjectPanelTab) => {
     const known = sessionsRef.current.some((s) => s.token === tok);
     if (!known || !isLiveStatus(statusesRef.current[tok])) return;
-    setProjectPanels((prev) => {
-      const existing = prev.find((p) => p.token === tok);
+    setPanels((prev) => {
+      const existing = prev.find((p) => p.token === tok && p.kind === "project");
       if (existing) {
-        if (existing.tab === tab) return prev.filter((p) => p.token !== tok);
+        if (existing.tab === tab) {
+          return prev.filter((p) => !(p.token === tok && p.kind === "project"));
+        }
         return renormalizeZ(
-          prev.map((p) => (p.token === tok ? { ...p, tab } : p)),
-          tok,
+          prev.map((p) => (p.token === tok && p.kind === "project" ? { ...p, tab } : p)),
+          `project:${tok}`,
         );
       }
       const cascade = lowestFreeCascade(prev);
-      return renormalizeZ([...prev, { token: tok, tab, z: PANEL_Z_BASE, cascade }], tok);
+      return renormalizeZ(
+        [...prev, { token: tok, kind: "project", tab, z: PANEL_Z_BASE, cascade }],
+        `project:${tok}`,
+      );
     });
   }, []);
   const raiseProjectPanel = useCallback((tok: string) => {
-    setProjectPanels((prev) =>
-      prev.some((p) => p.token === tok) ? renormalizeZ(prev, tok) : prev,
+    setPanels((prev) =>
+      prev.some((p) => p.token === tok && p.kind === "project")
+        ? renormalizeZ(prev, `project:${tok}`)
+        : prev,
     );
   }, []);
   const setProjectPanelTab = useCallback((tok: string, tab: ProjectPanelTab) => {
-    setProjectPanels((prev) => prev.map((p) => (p.token === tok ? { ...p, tab } : p)));
+    setPanels((prev) =>
+      prev.map((p) => (p.token === tok && p.kind === "project" ? { ...p, tab } : p)),
+    );
   }, []);
   const closeProjectPanelToken = useCallback((tok: string) => {
-    setProjectPanels((prev) => prev.filter((p) => p.token !== tok));
+    setPanels((prev) => prev.filter((p) => !(p.token === tok && p.kind === "project")));
+  }, []);
+
+  // Open/toggle the session cockpit panel for a token — same live-token guard as
+  // openProjectPanel, but a pure toggle (no tab to retarget): open→close,
+  // closed→append at the lowest free cascade slot (shared with project
+  // panels) and raise.
+  const openSessionPanel = useCallback((tok: string) => {
+    const known = sessionsRef.current.some((s) => s.token === tok);
+    if (!known || !isLiveStatus(statusesRef.current[tok])) return;
+    setPanels((prev) => {
+      const existing = prev.find((p) => p.token === tok && p.kind === "session");
+      if (existing) {
+        return prev.filter((p) => !(p.token === tok && p.kind === "session"));
+      }
+      const cascade = lowestFreeCascade(prev);
+      return renormalizeZ(
+        [...prev, { token: tok, kind: "session", tab: "files", z: PANEL_Z_BASE, cascade }],
+        `session:${tok}`,
+      );
+    });
+  }, []);
+  const raiseSessionPanel = useCallback((tok: string) => {
+    setPanels((prev) =>
+      prev.some((p) => p.token === tok && p.kind === "session")
+        ? renormalizeZ(prev, `session:${tok}`)
+        : prev,
+    );
+  }, []);
+  const closeSessionPanelToken = useCallback((tok: string) => {
+    setPanels((prev) => prev.filter((p) => !(p.token === tok && p.kind === "session")));
   }, []);
   const registerPaste = useCallback(
     (tok: string, fn: ((text: string) => void) | null) => {
@@ -378,11 +453,13 @@ export function LaunchDockProvider({ children }: { children: ReactNode }) {
 
   // Lifecycle (review finding 9): when a terminal's session disappears (Stop &
   // close, or a server reap that drops it from the rehydrate list), auto-close
-  // its project panel — otherwise already-fetched file/git content lingers on
-  // screen against a token the daemon has already invalidated.
+  // its floating panels — otherwise already-fetched file/git content (or a
+  // stale session cockpit) lingers on screen against a token the daemon has
+  // already invalidated. Covers BOTH panel kinds unchanged (no kind check
+  // needed — liveness is purely a function of the token).
   useEffect(() => {
     const liveTokens = new Set(sessions.map((s) => s.token));
-    setProjectPanels((prev) => {
+    setPanels((prev) => {
       const next = prev.filter(
         (p) => liveTokens.has(p.token) && isLiveStatus(statuses[p.token]),
       );
@@ -420,8 +497,9 @@ export function LaunchDockProvider({ children }: { children: ReactNode }) {
       pendingDock,
       clearPendingDock,
       openProjectPanel,
+      openSessionPanel,
       registerPaste,
-      projectPanels,
+      panels,
     }),
     [
       launch,
@@ -437,8 +515,9 @@ export function LaunchDockProvider({ children }: { children: ReactNode }) {
       pendingDock,
       clearPendingDock,
       openProjectPanel,
+      openSessionPanel,
       registerPaste,
-      projectPanels,
+      panels,
     ],
   );
 
@@ -459,8 +538,10 @@ export function LaunchDockProvider({ children }: { children: ReactNode }) {
           onStatus={(st) => setStatus(s.token, st)}
           onOpenFiles={() => openProjectPanel(s.token, "files")}
           onOpenGit={() => openProjectPanel(s.token, "git")}
+          onOpenSession={() => openSessionPanel(s.token)}
           registerPaste={registerPaste}
           projectPanelEnabled={s.hasProjectRoot ?? false}
+          sessionPanelEnabled={s.tool !== "terminal"}
         />
       ))}
       <Dock
@@ -480,21 +561,41 @@ export function LaunchDockProvider({ children }: { children: ReactNode }) {
           }}
         />
       )}
-      {projectPanels.map((p) => (
-        <Suspense key={p.token} fallback={null}>
-          <ProjectPanel
-            token={p.token}
-            tool={sessions.find((s) => s.token === p.token)?.tool ?? "terminal"}
-            tab={p.tab}
-            z={p.z}
-            cascade={p.cascade}
-            pasteToTerminal={pasteFns[p.token]}
-            onRaise={() => raiseProjectPanel(p.token)}
-            onTabChange={(t) => setProjectPanelTab(p.token, t)}
-            onClose={() => closeProjectPanelToken(p.token)}
-          />
-        </Suspense>
-      ))}
+      {/* ONE ordered pass over the shared panels array, switching on kind per
+          entry (P2-E). Array order = raise recency (renormalizeZ stores panels
+          z-ascending, raised-last), so rendering in array order makes DOM order
+          match z order — and when the bounded z-band [90,110] saturates and
+          several panels tie at z=110, later DOM order breaks the tie in favour
+          of the most-recently-raised panel. Two separate filtered .map()s could
+          not: a DOM-later session panel would sit above a just-raised project
+          panel at the same ceiling z. */}
+      {panels.map((p) =>
+        p.kind === "project" ? (
+          <Suspense key={`project:${p.token}`} fallback={null}>
+            <ProjectPanel
+              token={p.token}
+              tool={sessions.find((s) => s.token === p.token)?.tool ?? "terminal"}
+              tab={p.tab}
+              z={p.z}
+              cascade={p.cascade}
+              pasteToTerminal={pasteFns[p.token]}
+              onRaise={() => raiseProjectPanel(p.token)}
+              onTabChange={(t) => setProjectPanelTab(p.token, t)}
+              onClose={() => closeProjectPanelToken(p.token)}
+            />
+          </Suspense>
+        ) : (
+          <Suspense key={`session:${p.token}`} fallback={null}>
+            <SessionCockpitPanel
+              token={p.token}
+              z={p.z}
+              cascade={p.cascade}
+              onRaise={() => raiseSessionPanel(p.token)}
+              onClose={() => closeSessionPanelToken(p.token)}
+            />
+          </Suspense>
+        ),
+      )}
       </CompanionProvider>
     </Ctx.Provider>
   );
@@ -528,8 +629,10 @@ function TerminalHost({
   onStatus,
   onOpenFiles,
   onOpenGit,
+  onOpenSession,
   registerPaste,
   projectPanelEnabled,
+  sessionPanelEnabled,
 }: {
   session: DockSession;
   expanded: boolean;
@@ -541,8 +644,10 @@ function TerminalHost({
   onStatus: (s: Status) => void;
   onOpenFiles: () => void;
   onOpenGit: () => void;
+  onOpenSession: () => void;
   registerPaste: (tok: string, fn: ((text: string) => void) | null) => void;
   projectPanelEnabled: boolean;
+  sessionPanelEnabled: boolean;
 }) {
   const boxRef = useRef<HTMLDivElement | null>(null);
   const isLive = status === "open" || status === "connecting";
@@ -692,8 +797,10 @@ function TerminalHost({
           onStatus={onStatus}
           onOpenFiles={onOpenFiles}
           onOpenGit={onOpenGit}
+          onOpenSession={onOpenSession}
           registerPaste={boundRegisterPaste}
           projectPanelEnabled={projectPanelEnabled}
+          sessionPanelEnabled={sessionPanelEnabled}
         />,
         hostEl,
       )}

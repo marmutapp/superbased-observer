@@ -410,13 +410,9 @@ func runCodexLauncher(ctx context.Context, opts codexLauncherOptions) error {
 // bounds; the caller reaches it only on a proxyRouteProceed / neutralized
 // verdict.
 func runCodexChild(ctx context.Context, opts codexLauncherOptions, proxyURL string, preflight []codexipc.Process) error {
-	bin := opts.codexPath
-	if bin == "" {
-		resolved, lookErr := exec.LookPath("codex")
-		if lookErr != nil {
-			return fmt.Errorf("locate codex binary: %w (set --codex-path)", lookErr)
-		}
-		bin = resolved
+	bin, binErr := resolveToolBin("codex", opts.codexPath, "--codex-path", opts.configPath, opts.stderr)
+	if binErr != nil {
+		return binErr
 	}
 
 	codexArgs := opts.codexArgs

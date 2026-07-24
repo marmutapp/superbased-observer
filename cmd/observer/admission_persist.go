@@ -69,19 +69,31 @@ func admissionPolicyPersister() func(ctx context.Context, policyJSON []byte) err
 		if err := json.Unmarshal(policyJSON, &p); err != nil {
 			return fmt.Errorf("admissionPolicyPersister: decode policy: %w", err)
 		}
-		path, err := resolveAdmissionConfigPath("")
-		if err != nil {
-			return fmt.Errorf("admissionPolicyPersister: resolve config path: %w", err)
-		}
-		cfg, err := loadConfigForSetup(path)
-		if err != nil {
-			return fmt.Errorf("admissionPolicyPersister: load config: %w", err)
-		}
-		cfg = applyAdmissionEditorPolicy(cfg, p)
-		if err := config.WriteToml(path, cfg); err != nil {
-			return fmt.Errorf("admissionPolicyPersister: write config: %w", err)
-		}
-		return nil
+		// Serialize the WHOLE resolve→load→overlay→write span against every
+		// other in-process config writer — critically the dashboard's config
+		// handlers, which hold the SAME process-wide mutex via
+		// config.WriteLock(). This daemon runs the dashboard and this persister
+		// in one process; without the shared lock a section save and a policy
+		// persist can each read the same on-disk base and clobber the other's
+		// edit (lost update in BOTH directions). config.WithConfigLock is the
+		// one seam (CLAUDE.md #4 — one owner per piece of state). Cross-PROCESS
+		// CLI writers remain unserialized — an accepted limitation documented on
+		// WithConfigLock (flock is the future upgrade).
+		return config.WithConfigLock(func() error {
+			path, err := resolveAdmissionConfigPath("")
+			if err != nil {
+				return fmt.Errorf("admissionPolicyPersister: resolve config path: %w", err)
+			}
+			cfg, err := loadConfigForSetup(path)
+			if err != nil {
+				return fmt.Errorf("admissionPolicyPersister: load config: %w", err)
+			}
+			cfg = applyAdmissionEditorPolicy(cfg, p)
+			if err := config.WriteToml(path, cfg); err != nil {
+				return fmt.Errorf("admissionPolicyPersister: write config: %w", err)
+			}
+			return nil
+		})
 	}
 }
 

@@ -67,7 +67,7 @@ func TestIndexHTML_Served(t *testing.T) {
 		t.Fatalf("GET /: %d", rr.Code)
 	}
 	body, _ := io.ReadAll(rr.Body)
-	if !strings.Contains(string(body), "SuperBased Observer") {
+	if !strings.Contains(string(body), "<title>SuperBased</title>") {
 		t.Errorf("missing title: %s", body)
 	}
 	if !strings.Contains(string(body), `<div id="root"></div>`) {

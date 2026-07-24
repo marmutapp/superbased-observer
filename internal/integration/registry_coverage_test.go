@@ -2,6 +2,8 @@ package integration_test
 
 import (
 	"context"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	adapterdefaults "github.com/marmutapp/superbased-observer/internal/adapter/defaults"
@@ -166,6 +168,94 @@ func TestReadersImplemented(t *testing.T) {
 	} {
 		if !implemented[want] {
 			t.Errorf("adapter %q must implement ReadTranscript (shipped tranche)", want)
+		}
+	}
+}
+
+// TestEveryLaunchableToolHasBinarySpec pins the binary-resolution coverage
+// invariant: every adapter startable in the dashboard's embedded web
+// terminal (Handoff.Launch != nil) MUST carry a grounded BinaryResolveSpec
+// with at least one Unix binary name — the `observer <x>` launcher's
+// resolution ladder (internal/toolresolve, Phase 2) dispatches on this row,
+// so a launchable tool without one would resolve nothing. It mirrors
+// TestLaunchableImpliesInjectPrompt: a launch capability without its
+// resolution data is an incoherent row.
+func TestEveryLaunchableToolHasBinarySpec(t *testing.T) {
+	for _, c := range integration.Capabilities() {
+		if !c.Handoff.Launchable() {
+			continue
+		}
+		if c.Binary == nil {
+			t.Errorf("adapter %q: Launch set but Binary (BinaryResolveSpec) is nil", c.Tool)
+			continue
+		}
+		if len(c.Binary.Names.Unix) == 0 {
+			t.Errorf("adapter %q: Binary.Names.Unix is empty (a launchable tool needs at least one Unix binary name)", c.Tool)
+		}
+	}
+}
+
+// TestBinarySpecHonesty pins the honesty rules on every populated Binary
+// row: install hints are complete (Argv + Display + Channel all present —
+// never a fabricated/half-grounded command), probe dirs are HOME-RELATIVE
+// and traversal-safe (non-empty, not absolute, no ".." segment), and every
+// declared Windows spelling is non-empty. It walks every non-nil Binary,
+// not just launchable rows, so a future non-launch resolution row is held
+// to the same bar.
+func TestBinarySpecHonesty(t *testing.T) {
+	for _, c := range integration.Capabilities() {
+		if c.Binary == nil {
+			continue
+		}
+		for i, h := range c.Binary.Installs {
+			if len(h.Argv) == 0 {
+				t.Errorf("adapter %q: Installs[%d] has empty Argv", c.Tool, i)
+			}
+			if h.Display == "" {
+				t.Errorf("adapter %q: Installs[%d] has empty Display", c.Tool, i)
+			}
+			if h.Channel == "" {
+				t.Errorf("adapter %q: Installs[%d] has empty Channel", c.Tool, i)
+			}
+		}
+		for i, p := range c.Binary.ProbeDirs {
+			if p.Rel == "" {
+				t.Errorf("adapter %q: ProbeDirs[%d].Rel is empty", c.Tool, i)
+			}
+			if filepath.IsAbs(p.Rel) {
+				t.Errorf("adapter %q: ProbeDirs[%d].Rel %q is absolute (must be HOME-relative)", c.Tool, i, p.Rel)
+			}
+			for _, seg := range strings.Split(p.Rel, "/") {
+				if seg == ".." {
+					t.Errorf("adapter %q: ProbeDirs[%d].Rel %q contains a '..' segment", c.Tool, i, p.Rel)
+				}
+			}
+		}
+		for i, w := range c.Binary.Names.Windows {
+			if w == "" {
+				t.Errorf("adapter %q: Names.Windows[%d] is empty", c.Tool, i)
+			}
+		}
+	}
+}
+
+// TestCrossOSRouteOnlyForPersistedKinds pins that ProxyRoute.CrossOSBridge
+// is set only on the PERSISTED route kinds — RouteEnvSettings (claude-code
+// → ~/.claude/settings.json) and RouteConfigFile (codex →
+// ~/.codex/config.toml). The `<tool>-windows` virtual target writes the
+// route into a foreign Windows home over crossmount; that only makes sense
+// for a route backed by a config FILE observer writes, never a launcher
+// env var (RouteLauncher) or an operator-pasted instruction (RouteManual).
+func TestCrossOSRouteOnlyForPersistedKinds(t *testing.T) {
+	for _, c := range integration.Capabilities() {
+		if c.Proxy == nil || !c.Proxy.CrossOSBridge {
+			continue
+		}
+		switch c.Proxy.Kind {
+		case integration.RouteEnvSettings, integration.RouteConfigFile:
+			// persisted config write — cross-OS bridging is coherent.
+		default:
+			t.Errorf("adapter %q: Proxy.CrossOSBridge set on non-persisted RouteKind %q", c.Tool, c.Proxy.Kind)
 		}
 	}
 }

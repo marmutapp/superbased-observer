@@ -101,6 +101,13 @@ func (s *Server) handleConfigPricing(w http.ResponseWriter, r *http.Request) {
 		req.Models = map[string]config.ModelPricing{}
 	}
 
+	// Same serialization as the section-save path (Fix 1): pricing does the
+	// same load→patch→write against the shared file, so it must take the same
+	// lock or a concurrent section save could clobber the pricing write (or
+	// vice-versa). See Server.configWriteMu.
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
+
 	cfg, err := config.Load(config.LoadOptions{GlobalPath: s.opts.ConfigPath})
 	if err != nil {
 		writeErr(w, fmt.Errorf("load current config: %w", err))
@@ -210,6 +217,12 @@ func (s *Server) handleConfigSection(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+
+	// Serialize the whole load→patch→validate→write critical section against
+	// every other config-file writer (Fix 1): a concurrent PUT to a DIFFERENT
+	// section must not lose this one's change. See Server.configWriteMu.
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 
 	cfg, err := loadConfigForDashboard(s.opts.ConfigPath)
 	if err != nil {
@@ -343,66 +356,111 @@ func applySectionUpdate(cfg *config.Config, name string, body []byte, configPath
 		// sub-sections keep their loaded values (the Settings pane edits only
 		// these operator-facing scalars; sub-struct edits would need their own
 		// panes, mirroring the watcher/retention split above).
+		//
+		// POINTER fields (F3): every scalar is a pointer so a PARTIAL body
+		// preserves the fields it omits instead of zeroing them. Decoding plain
+		// value scalars made a partial {"Enabled":true} also blank Backend to ""
+		// (rejected by the vocabulary check) and reset the intervals to 0 —
+		// forcing the FE into a racy read-then-write and silently overwriting
+		// Backend. nil ⇒ keep the loaded value; assign (and validate) only the
+		// fields the caller actually sent. The FE full-body send (all fields
+		// present) still applies every field, so behaviour there is unchanged.
+		// Mirrors the terminal section's pointer idiom + the Network sub-struct's
+		// existing only-when-non-nil application.
 		var sec struct {
-			Enabled              bool   `json:"Enabled"`
-			Backend              string `json:"Backend"`
-			CaptureUnattributed  bool   `json:"CaptureUnattributed"`
-			PollIntervalMS       int    `json:"PollIntervalMS"`
-			BridgePollIntervalMS int    `json:"BridgePollIntervalMS"`
+			Enabled              *bool   `json:"Enabled"`
+			Backend              *string `json:"Backend"`
+			CaptureUnattributed  *bool   `json:"CaptureUnattributed"`
+			PollIntervalMS       *int    `json:"PollIntervalMS"`
+			BridgePollIntervalMS *int    `json:"BridgePollIntervalMS"`
 			Network              *struct {
-				Enabled           bool   `json:"Enabled"`
-				CaptureRemoteHost bool   `json:"CaptureRemoteHost"`
-				RedactPrivateIPs  bool   `json:"RedactPrivateIPs"`
-				CaptureBodies     string `json:"CaptureBodies"`
-				MaxRequestBytes   int    `json:"MaxRequestBytes"`
-				MaxResponseBytes  int    `json:"MaxResponseBytes"`
-				CaptureHeaders    bool   `json:"CaptureHeaders"`
-				ScrubBodies       bool   `json:"ScrubBodies"`
-				StoreBinary       bool   `json:"StoreBinary"`
+				Enabled           *bool   `json:"Enabled"`
+				CaptureRemoteHost *bool   `json:"CaptureRemoteHost"`
+				RedactPrivateIPs  *bool   `json:"RedactPrivateIPs"`
+				CaptureBodies     *string `json:"CaptureBodies"`
+				MaxRequestBytes   *int    `json:"MaxRequestBytes"`
+				MaxResponseBytes  *int    `json:"MaxResponseBytes"`
+				CaptureHeaders    *bool   `json:"CaptureHeaders"`
+				ScrubBodies       *bool   `json:"ScrubBodies"`
+				StoreBinary       *bool   `json:"StoreBinary"`
 			} `json:"Network"`
 		}
 		if err := json.Unmarshal(body, &sec); err != nil {
 			return fmt.Errorf("decode process: %w", err)
 		}
-		switch sec.Backend {
-		case "auto", "bridge", "both", "linux_ebpf", "etw", "endpointsecurity", "poll", "off":
-		default:
-			return fmt.Errorf("process.backend %q not in {auto, bridge, both, linux_ebpf, etw, endpointsecurity, poll, off}", sec.Backend)
-		}
-		if sec.PollIntervalMS < 0 {
-			return fmt.Errorf("process.poll_interval_ms must be >= 0 (0 inherits the 2000 ms default), got %d", sec.PollIntervalMS)
-		}
-		if sec.BridgePollIntervalMS < 0 {
-			return fmt.Errorf("process.bridge_poll_interval_ms must be >= 0 (0 inherits poll_interval_ms), got %d", sec.BridgePollIntervalMS)
-		}
-		if sec.Network != nil {
-			switch sec.Network.CaptureBodies {
-			case "off", "proxied", "available":
+		// Validate only PROVIDED fields — an omitted (nil) field keeps its
+		// already-valid loaded value.
+		if sec.Backend != nil {
+			switch *sec.Backend {
+			case "auto", "bridge", "both", "linux_ebpf", "etw", "endpointsecurity", "poll", "off":
 			default:
-				return fmt.Errorf("process.network.capture_bodies %q not in {off, proxied, available}", sec.Network.CaptureBodies)
-			}
-			if sec.Network.MaxRequestBytes < 0 {
-				return fmt.Errorf("process.network.max_request_bytes must be >= 0, got %d", sec.Network.MaxRequestBytes)
-			}
-			if sec.Network.MaxResponseBytes < 0 {
-				return fmt.Errorf("process.network.max_response_bytes must be >= 0, got %d", sec.Network.MaxResponseBytes)
+				return fmt.Errorf("process.backend %q not in {auto, bridge, both, linux_ebpf, etw, endpointsecurity, poll, off}", *sec.Backend)
 			}
 		}
-		cfg.Observer.Process.Enabled = sec.Enabled
-		cfg.Observer.Process.Backend = sec.Backend
-		cfg.Observer.Process.CaptureUnattributed = sec.CaptureUnattributed
-		cfg.Observer.Process.PollIntervalMS = sec.PollIntervalMS
-		cfg.Observer.Process.BridgePollIntervalMS = sec.BridgePollIntervalMS
+		if sec.PollIntervalMS != nil && *sec.PollIntervalMS < 0 {
+			return fmt.Errorf("process.poll_interval_ms must be >= 0 (0 inherits the 2000 ms default), got %d", *sec.PollIntervalMS)
+		}
+		if sec.BridgePollIntervalMS != nil && *sec.BridgePollIntervalMS < 0 {
+			return fmt.Errorf("process.bridge_poll_interval_ms must be >= 0 (0 inherits poll_interval_ms), got %d", *sec.BridgePollIntervalMS)
+		}
 		if sec.Network != nil {
-			cfg.Observer.Process.Network.Enabled = sec.Network.Enabled
-			cfg.Observer.Process.Network.CaptureRemoteHost = sec.Network.CaptureRemoteHost
-			cfg.Observer.Process.Network.RedactPrivateIPs = sec.Network.RedactPrivateIPs
-			cfg.Observer.Process.Network.CaptureBodies = sec.Network.CaptureBodies
-			cfg.Observer.Process.Network.MaxRequestBytes = sec.Network.MaxRequestBytes
-			cfg.Observer.Process.Network.MaxResponseBytes = sec.Network.MaxResponseBytes
-			cfg.Observer.Process.Network.CaptureHeaders = sec.Network.CaptureHeaders
-			cfg.Observer.Process.Network.ScrubBodies = sec.Network.ScrubBodies
-			cfg.Observer.Process.Network.StoreBinary = sec.Network.StoreBinary
+			if sec.Network.CaptureBodies != nil {
+				switch *sec.Network.CaptureBodies {
+				case "off", "proxied", "available":
+				default:
+					return fmt.Errorf("process.network.capture_bodies %q not in {off, proxied, available}", *sec.Network.CaptureBodies)
+				}
+			}
+			if sec.Network.MaxRequestBytes != nil && *sec.Network.MaxRequestBytes < 0 {
+				return fmt.Errorf("process.network.max_request_bytes must be >= 0, got %d", *sec.Network.MaxRequestBytes)
+			}
+			if sec.Network.MaxResponseBytes != nil && *sec.Network.MaxResponseBytes < 0 {
+				return fmt.Errorf("process.network.max_response_bytes must be >= 0, got %d", *sec.Network.MaxResponseBytes)
+			}
+		}
+		if sec.Enabled != nil {
+			cfg.Observer.Process.Enabled = *sec.Enabled
+		}
+		if sec.Backend != nil {
+			cfg.Observer.Process.Backend = *sec.Backend
+		}
+		if sec.CaptureUnattributed != nil {
+			cfg.Observer.Process.CaptureUnattributed = *sec.CaptureUnattributed
+		}
+		if sec.PollIntervalMS != nil {
+			cfg.Observer.Process.PollIntervalMS = *sec.PollIntervalMS
+		}
+		if sec.BridgePollIntervalMS != nil {
+			cfg.Observer.Process.BridgePollIntervalMS = *sec.BridgePollIntervalMS
+		}
+		if sec.Network != nil {
+			if sec.Network.Enabled != nil {
+				cfg.Observer.Process.Network.Enabled = *sec.Network.Enabled
+			}
+			if sec.Network.CaptureRemoteHost != nil {
+				cfg.Observer.Process.Network.CaptureRemoteHost = *sec.Network.CaptureRemoteHost
+			}
+			if sec.Network.RedactPrivateIPs != nil {
+				cfg.Observer.Process.Network.RedactPrivateIPs = *sec.Network.RedactPrivateIPs
+			}
+			if sec.Network.CaptureBodies != nil {
+				cfg.Observer.Process.Network.CaptureBodies = *sec.Network.CaptureBodies
+			}
+			if sec.Network.MaxRequestBytes != nil {
+				cfg.Observer.Process.Network.MaxRequestBytes = *sec.Network.MaxRequestBytes
+			}
+			if sec.Network.MaxResponseBytes != nil {
+				cfg.Observer.Process.Network.MaxResponseBytes = *sec.Network.MaxResponseBytes
+			}
+			if sec.Network.CaptureHeaders != nil {
+				cfg.Observer.Process.Network.CaptureHeaders = *sec.Network.CaptureHeaders
+			}
+			if sec.Network.ScrubBodies != nil {
+				cfg.Observer.Process.Network.ScrubBodies = *sec.Network.ScrubBodies
+			}
+			if sec.Network.StoreBinary != nil {
+				cfg.Observer.Process.Network.StoreBinary = *sec.Network.StoreBinary
+			}
 		}
 	case "terminal":
 		// Editable subset of [terminal.attach] (session-attach design Phase 4,
@@ -737,6 +795,14 @@ func (s *Server) handleConfigBackup(w http.ResponseWriter, r *http.Request) {
 	bakPath := s.opts.ConfigPath + ".bak"
 	switch r.Method {
 	case http.MethodGet:
+		// Serialize the .bak READ with the writers (Fix 3): config.WriteToml
+		// overwrites .bak NON-atomically (internal/config/write.go copies
+		// config.toml → .bak in place), so an unguarded read here could observe a
+		// half-written backup mid-save. configWriteMu is the same lock every
+		// config writer holds across its .bak overwrite, so taking it here makes
+		// the read see only whole-file states (never a torn .bak).
+		s.configWriteMu.Lock()
+		defer s.configWriteMu.Unlock()
 		body, err := os.ReadFile(bakPath)
 		if errors.Is(err, os.ErrNotExist) {
 			writeJSON(w, map[string]any{"exists": false, "backup_path": bakPath})
@@ -757,6 +823,11 @@ func (s *Server) handleConfigBackup(w http.ResponseWriter, r *http.Request) {
 			"content":     string(body),
 		})
 	case http.MethodPost:
+		// The restore swaps config.toml ↔ .bak — a read-modify-write of the
+		// shared file, so it serializes with the section/pricing save paths
+		// (Fix 1). See Server.configWriteMu.
+		s.configWriteMu.Lock()
+		defer s.configWriteMu.Unlock()
 		bak, err := os.ReadFile(bakPath)
 		if errors.Is(err, os.ErrNotExist) {
 			http.Error(w, "no backup exists yet — backups are created on the first dashboard save", http.StatusNotFound)

@@ -47,6 +47,15 @@ func readFileTrimmed(path string) (string, error) {
 // mint) with no other synchronization, so two concurrent verbs could clobber
 // each other's full-config write. The verbs are rare, owner-loopback-only
 // actions, so whole-section serialization is cheap and correct.
+//
+// LOCK ORDER (Fix 2 — one config-write lock domain): every manage verb that
+// read-modify-writes config.toml ALSO takes Server.configWriteMu (the lock the
+// settings.go section/pricing/backup writers hold), so a manage verb and a
+// section save can never clobber one another. The order is ALWAYS
+// remoteManageMu (OUTER) → configWriteMu (INNER), never the reverse: the
+// settings.go writers take configWriteMu but NEVER remoteManageMu, so no reverse
+// nesting exists and the two locks can't deadlock. Defers unwind LIFO, so
+// configWriteMu is released before remoteManageMu at each site.
 var remoteManageMu sync.Mutex
 
 const (
@@ -329,6 +338,10 @@ func (s *Server) handleRemoteEnable(w http.ResponseWriter, r *http.Request) {
 	_ = decodeJSONBody(r, &body)
 	remoteManageMu.Lock()
 	defer remoteManageMu.Unlock()
+	// Fix 2: the config read-modify-write below joins the configWriteMu domain
+	// (lock order remoteManageMu → configWriteMu; see remoteManageMu decl).
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	cfg, cfgPath, err := s.loadConfigForManage()
 	if err != nil {
 		writeErr(w, err)
@@ -440,6 +453,10 @@ func (s *Server) handleRemoteSetAllowTerminal(w http.ResponseWriter, r *http.Req
 	next := *body.AllowTerminal
 	remoteManageMu.Lock()
 	defer remoteManageMu.Unlock()
+	// Fix 2: the config read-modify-write below joins the configWriteMu domain
+	// (lock order remoteManageMu → configWriteMu; see remoteManageMu decl).
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	cfg, cfgPath, err := s.loadConfigForManage()
 	if err != nil {
 		writeErr(w, err)
@@ -530,6 +547,10 @@ func (s *Server) handleRemoteSetAllowTerminalView(w http.ResponseWriter, r *http
 	next := *body.AllowTerminalView
 	remoteManageMu.Lock()
 	defer remoteManageMu.Unlock()
+	// Fix 2: the config read-modify-write below joins the configWriteMu domain
+	// (lock order remoteManageMu → configWriteMu; see remoteManageMu decl).
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	cfg, cfgPath, err := s.loadConfigForManage()
 	if err != nil {
 		writeErr(w, err)
@@ -588,6 +609,10 @@ func (s *Server) handleRemoteDisable(w http.ResponseWriter, r *http.Request) {
 	}
 	remoteManageMu.Lock()
 	defer remoteManageMu.Unlock()
+	// Fix 2: the config read-modify-write below joins the configWriteMu domain
+	// (lock order remoteManageMu → configWriteMu; see remoteManageMu decl).
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	cfg, cfgPath, err := s.loadConfigForManage()
 	if err != nil {
 		writeErr(w, err)
@@ -633,6 +658,10 @@ func (s *Server) handleRemoteRotate(w http.ResponseWriter, r *http.Request) {
 	}
 	remoteManageMu.Lock()
 	defer remoteManageMu.Unlock()
+	// Fix 2: the config read-modify-write below joins the configWriteMu domain
+	// (lock order remoteManageMu → configWriteMu; see remoteManageMu decl).
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	cfg, cfgPath, err := s.loadConfigForManage()
 	if err != nil {
 		writeErr(w, err)
@@ -688,6 +717,10 @@ func (s *Server) handleRemoteAddDevice(w http.ResponseWriter, r *http.Request) {
 	}
 	remoteManageMu.Lock()
 	defer remoteManageMu.Unlock()
+	// Fix 2: the config read-modify-write below joins the configWriteMu domain
+	// (lock order remoteManageMu → configWriteMu; see remoteManageMu decl).
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	cfg, cfgPath, err := s.loadConfigForManage()
 	if err != nil {
 		writeErr(w, err)
@@ -894,6 +927,10 @@ func (s *Server) handleStandingTerminalMint(w http.ResponseWriter, r *http.Reque
 	}
 	remoteManageMu.Lock()
 	defer remoteManageMu.Unlock()
+	// Fix 2: the config read-modify-write below joins the configWriteMu domain
+	// (lock order remoteManageMu → configWriteMu; see remoteManageMu decl).
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	cfg, cfgPath, err := s.loadConfigForManage()
 	if err != nil {
 		writeErr(w, err)
@@ -947,6 +984,10 @@ func (s *Server) handleStandingTerminalRevoke(w http.ResponseWriter, r *http.Req
 	}
 	remoteManageMu.Lock()
 	defer remoteManageMu.Unlock()
+	// Fix 2: the config read-modify-write below joins the configWriteMu domain
+	// (lock order remoteManageMu → configWriteMu; see remoteManageMu decl).
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	cfg, cfgPath, err := s.loadConfigForManage()
 	if err != nil {
 		writeErr(w, err)

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { fetchJSON } from "@/lib/api";
-import type { ProjectRow, ProjectsResponse } from "@/lib/types";
+import type { ProjectRow, ProjectsResponse, ToolPreflight } from "@/lib/types";
 import {
   PROJECT_ROOT_DENIED_MSG,
   REMOTE_TERMINAL_OFF_MSG,
@@ -92,6 +92,12 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
   const [customRoot, setCustomRoot] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // Pre-launch binary-resolution verdict for the selected tool (tool-binary-
+  // resolution arc). Null when unknown, the seam is disabled (501), or the fetch
+  // failed — in every case the strip simply doesn't render (fail-silent), so an
+  // older daemon without the preflight endpoint behaves exactly as before.
+  const [preflight, setPreflight] = useState<ToolPreflight | null>(null);
+  const [installBusy, setInstallBusy] = useState(false);
   // Remote-device launch gate: a paired device can only fresh-launch when the
   // owner has enabled [remote].allow_terminal. When it's off we say so up front
   // and disable Start, rather than letting the POST fail with a raw 403.
@@ -131,6 +137,62 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
     };
   }, []);
 
+  // Fetch the pre-launch binary-resolution verdict whenever the selected tool
+  // changes. A 501 (seam disabled on an older daemon) or any other error clears
+  // the strip silently — the launch itself stays the authority.
+  useEffect(() => {
+    if (!tool) {
+      setPreflight(null);
+      return;
+    }
+    let cancelled = false;
+    fetchJSON<ToolPreflight>("/api/terminal/launch/preflight", { tool })
+      .then((d) => {
+        if (!cancelled) setPreflight(d);
+      })
+      .catch(() => {
+        if (!cancelled) setPreflight(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [tool]);
+
+  // installTool spawns the tool's grounded install command in a fresh embedded
+  // terminal (POST /api/terminal/install), the guided fix for a not_found /
+  // foreign_only verdict. It is a Local + confirm-token-gated EXECUTE, so it
+  // reads the double-submit token from /api/remote/config exactly like the
+  // Remote page's privileged POSTs, then opens the returned handle in the dock
+  // like any launch (labelled "<tool> install"). The server owns the argv — the
+  // request carries only the tool name.
+  async function installTool() {
+    if (!tool || installBusy) return;
+    setInstallBusy(true);
+    setErr(null);
+    try {
+      const cfg = await fetchJSON<{ confirm_token?: string }>("/api/remote/config");
+      const ctok = cfg.confirm_token ?? "";
+      if (!ctok) {
+        setErr("No confirm token — reload the page.");
+        return;
+      }
+      const r = await fetchJSON<{ handle: string; tool: string; command: string }>(
+        "/api/terminal/install",
+        undefined,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Observer-Confirm": ctok },
+          body: JSON.stringify({ tool }),
+        },
+      );
+      onLaunched(r.handle, `${tool} install`, false);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setInstallBusy(false);
+    }
+  }
+
   // The path actually sent to the launch API: the hand-typed value when the
   // Custom escape hatch is chosen, otherwise the selected project root ("" ==
   // let the launcher use the agent's own default cwd). Validation is unchanged
@@ -167,6 +229,13 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
     }
     return { permittedRoots: permitted, blockedProjects: blocked };
   }, [projects, allowedRoots]);
+
+  // Verdict-derived UI state (tool-binary-resolution arc). A foreign_only /
+  // not_found tool cannot be launched by the daemon, so Start is disabled — the
+  // server stays the authority (it re-resolves at launch), this is the honest
+  // up-front signal. The strip below renders the full guidance.
+  const verdict = preflight?.verdict ?? "";
+  const launchBlockedByVerdict = verdict === "foreign_only" || verdict === "not_found";
 
   const noAllowList = allowedRoots.length === 0;
   // Honest reason placed on every disabled option so hovering explains the block.
@@ -339,7 +408,63 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
             {rootSel}
           </div>
         ) : null}
+        {rootSel === CUSTOM_ROOT && (
+          <p className="mt-1 text-[10.5px] leading-relaxed text-fg-3">
+            Windows paths (<code className="font-mono">C:\Users\…</code>) are
+            accepted and translated to their WSL{" "}
+            <code className="font-mono">/mnt/c/…</code> form.
+          </p>
+        )}
         <div className="mb-3" />
+
+        {preflight && verdict !== "ok" && (
+          <div className="mb-3">
+            {(verdict === "ok_off_path" || verdict === "shadowed") &&
+              preflight.notes &&
+              preflight.notes.length > 0 && (
+                <div className="rounded-2 border border-fg-3/30 bg-white/5 px-2 py-1.5 text-[11px] leading-relaxed text-fg-3">
+                  {/* Render ALL notes (cap 4), each on its own line: when the
+                      login-capture note is prepended, a shadowed verdict's shim
+                      explanation is in notes[1+] and must stay visible. */}
+                  {preflight.notes.slice(0, 4).map((n, i) => (
+                    <div key={i} className={i > 0 ? "mt-1" : undefined}>
+                      {n}
+                    </div>
+                  ))}
+                </div>
+              )}
+            {(verdict === "foreign_only" || verdict === "not_found") && (
+              <div className="rounded-2 border border-warn/40 bg-warn/10 px-2 py-1.5 text-[11px] leading-relaxed text-warn">
+                {verdict === "foreign_only" ? (
+                  <span>
+                    {tool} is installed on Windows, not in WSL — the daemon can't
+                    launch it.
+                  </span>
+                ) : (
+                  <span>{tool} is not installed.</span>
+                )}
+                {preflight.install_command && (
+                  <>
+                    <div className="mt-1.5 text-fg-3">Install it with:</div>
+                    <code className="mt-1 block break-all rounded-2 bg-bg-0 px-2 py-1 font-mono text-[10.5px] text-fg-1">
+                      {preflight.install_command}
+                    </code>
+                  </>
+                )}
+                {preflight.can_install && (
+                  <button
+                    type="button"
+                    disabled={installBusy}
+                    onClick={installTool}
+                    className="mt-2 rounded-2 bg-accent px-3 py-1 text-[11px] font-medium text-white disabled:opacity-50"
+                  >
+                    {installBusy ? "Starting install…" : "Install in terminal"}
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        )}
 
         {err && (
           <div className="mb-3 rounded-2 border border-danger/30 bg-danger/10 px-2 py-1.5 text-[11px] text-danger">
@@ -357,9 +482,17 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
           </button>
           <button
             type="button"
-            disabled={busy || !tool || remoteBlocked}
+            disabled={busy || !tool || remoteBlocked || launchBlockedByVerdict}
             onClick={submit}
-            title={remoteBlocked ? REMOTE_TERMINAL_OFF_MSG : undefined}
+            title={
+              remoteBlocked
+                ? REMOTE_TERMINAL_OFF_MSG
+                : launchBlockedByVerdict
+                  ? verdict === "foreign_only"
+                    ? `${tool} is installed on Windows, not in WSL — the daemon can't launch it`
+                    : `${tool} is not installed`
+                  : undefined
+            }
             className="rounded-2 bg-accent px-3 py-1.5 text-[12px] font-medium text-white disabled:opacity-50"
           >
             {busy ? "Starting…" : "Start"}

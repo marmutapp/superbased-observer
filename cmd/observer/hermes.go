@@ -95,7 +95,7 @@ func newHermesCmd() *cobra.Command {
 				return fmt.Errorf("load config: %w", err)
 			}
 			resolved := resolveProxyURL(cfg.Proxy.Port, proxyURL)
-			bin, err := resolveToolBin("hermes", binPath, "--hermes-path")
+			bin, err := resolveToolBin("hermes", binPath, "--hermes-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}

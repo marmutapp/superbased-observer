@@ -2,7 +2,79 @@
 
 All notable changes to SuperBased Observer are documented here.
 
-## [Unreleased]
+## [1.24.0] — 2026-07-24
+
+### Added
+
+- **Session Cockpit: a live per-terminal floating panel.** Every embedded
+  dashboard terminal running an AI tool gains a "⊙ Session" button that
+  opens a compact, draggable cockpit next to the terminal — the glanceable
+  companion to the session-detail page, not a clone of it. It shows, live:
+  a now strip (last activity, tokens/sec with an honest measured/estimated
+  basis badge, live process count), total cost with the AI/tool split and
+  the next-message cost band, context fill against the model budget, token
+  buckets, the 5h/7d rate-limit gauge (proxy-routed sessions), prompt-cache
+  expiry countdown chips, system telemetry (CPU/memory/disk sparklines and
+  the spawned-process tree from process observation, plus proxied API
+  traffic with byte totals when body capture measures them), and the last
+  five turns deep-linking into the session-detail page.
+- **Terminal→session live linkage.** New `GET /api/terminal/session/<token>`
+  resolves a running terminal to its correlated observer session (id +
+  correlation confidence, refusal-ordered so remote callers can never probe
+  token existence); the cockpit keeps polling so a later authoritative
+  correlation re-points the panel, and links below the out-of-band tier
+  carry an explicit "≈ linked" badge.
+- **One-click process-capture enable.** When process observation is off, the
+  cockpit's System section explains what's missing and offers an atomic
+  server-side enable (`POST /api/process/enable-capture`): non-runnable
+  backend selections switch to automatic with the previous value named in
+  the notice, hosts with no runnable capture backend get an honest
+  "unavailable on this machine" instead of a false success, and capture
+  honestly starts only after the daemon restarts.
+- **`?tail=N` on the session messages API** — returns the true last N rows
+  of the full timeline for fast pollers (explicitly rejected when combined
+  with pagination parameters).
+- **`?summary=1` on the session network API** — a server-side aggregate
+  separating proxied API calls (with request/response byte sums from body
+  metadata) from OS-observed process connections.
+
+- **Tool-binary resolution with classified verdicts.** Every embedded-
+  terminal launcher now resolves its tool binary through a shared ladder —
+  process PATH, then a memoized login-shell PATH capture, then native
+  install-location probing, then (WSL only) a foreign-Windows-home check —
+  and classifies the result as `ok`, `ok_off_path`, `shadowed`,
+  `foreign_only`, or `not_found`. Fixes the class of bug where a
+  Windows-installed npm shim shadowed (or stood in for) a native binary on
+  WSL, and the launcher's stale process PATH meant a fresh native install
+  wasn't picked up without restarting the daemon.
+- **Guided one-click install.** When a tool isn't natively resolvable, the
+  New Terminal dialog shows the verified official install command and an
+  "Install in terminal" button that runs it in a visible PTY. Gated by the
+  new `[terminal.launch].allow_install` config key (default on).
+- **`observer doctor` and `observer adapters` surface binary-resolution
+  health**, including a `foreign_only` bucket (tool installed on Windows
+  only, not launchable from a WSL daemon) and a best-effort Windows
+  proxy-route reachability check.
+- **`observer init` writes Windows-side proxy routes.** When the daemon
+  runs in WSL, `init` can now also point a Windows-installed claude-code or
+  codex at the daemon's proxy (`localhost:8820`, relying on WSL2's
+  `localhostForwarding`), so accurate token capture works even when the AI
+  tool itself is installed on the Windows side.
+- **`[launch.tools.<tool>].path`** config override to pin a specific binary
+  path per tool, bypassing the resolution ladder.
+- Custom terminal project paths typed in Windows form (`C:\Users\…`) are
+  now translated to their WSL mount equivalent before validation.
+
+### Fixed
+
+- **Concurrent dashboard config saves can no longer lose updates.** All
+  in-process config read-modify-write paths — section saves, pricing,
+  backup restore, remote-manage toggles, terminal limits/policy,
+  experiments, and the admission-policy persister — now serialize on one
+  shared lock in the config package (cross-process CLI writes remain
+  outside a mutex's reach and are documented as such).
+- The attach-replay bound test no longer flakes on slow runners (the
+  precondition now waits for the pump to drain the full produced stream).
 
 ## [1.23.0] — 2026-07-23
 

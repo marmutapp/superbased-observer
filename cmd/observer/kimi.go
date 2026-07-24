@@ -52,7 +52,7 @@ func newKimiCmd() *cobra.Command {
 			"to separate observer flags from kimi flags. NEVER touches API keys.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			bin, err := resolveToolBin("kimi", binPath, "--kimi-path")
+			bin, err := resolveToolBin("kimi-code", binPath, "--kimi-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}

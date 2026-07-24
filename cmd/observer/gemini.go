@@ -56,7 +56,7 @@ func newGeminiCmd() *cobra.Command {
 				return fmt.Errorf("load config: %w", err)
 			}
 			resolved := resolveProxyURL(cfg.Proxy.Port, proxyURL)
-			bin, err := resolveToolBin("gemini", binPath, "--gemini-path")
+			bin, err := resolveToolBin("gemini-cli", binPath, "--gemini-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}

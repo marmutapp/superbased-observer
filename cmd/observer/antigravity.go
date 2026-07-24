@@ -46,7 +46,7 @@ func newAntigravityCmd() *cobra.Command {
 			"to separate observer flags from agy flags. NEVER touches API keys.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			bin, err := resolveToolBin("agy", binPath, "--agy-path")
+			bin, err := resolveToolBin("antigravity-cli", binPath, "--agy-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}

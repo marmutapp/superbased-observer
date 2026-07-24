@@ -77,9 +77,19 @@ func newDashboardCmd() *cobra.Command {
 				// is false → the endpoints 503 and the button hides.
 				LaunchManager:  launchMgr,
 				TerminalStatus: launchStatus,
+				// Tool-binary-resolution seams (tool-binary-resolution arc §5):
+				// pre-launch verdict + guided install. Defined as plain funcs so
+				// the dashboard package never imports internal/toolresolve.
+				ToolPreflight:    toolPreflightSeam(resolvedConfigPath, allowToolInstallSeam(resolvedConfigPath)),
+				AllowToolInstall: allowToolInstallSeam(resolvedConfigPath),
+				ToolInstallHint:  toolInstallHintSeam(),
 				// Per-terminal project panel (Arc A): token→root resolver from
 				// termsvc. Nil when the launch manager is absent → panel 404s.
 				ProjectRootResolver: projectRootResolver(launchMgr),
+				// Per-terminal session cockpit (Session Cockpit): token→run/
+				// session-link resolver from termsvc. Nil when the launch
+				// manager is absent → cockpit 404s.
+				SessionResolver: sessionResolver(launchMgr),
 				// Remote-access substrate (plan §4). Nil unless [remote] is
 				// enabled AND a pairing secret is provisioned — so a
 				// non-loopback bind stays fail-closed until Phase 2 exposure.

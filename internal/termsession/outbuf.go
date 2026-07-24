@@ -110,3 +110,13 @@ func (o *outBuf) currentBase() int64 {
 	defer o.mu.Unlock()
 	return o.base
 }
+
+// currentTotal returns the absolute offset one past the last buffered byte
+// under the ring lock, i.e. how many bytes the pump has drained into the ring
+// so far. Tests use it to wait for the pump to have fully drained a known
+// amount of produced output before asserting on ring state.
+func (o *outBuf) currentTotal() int64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.total
+}

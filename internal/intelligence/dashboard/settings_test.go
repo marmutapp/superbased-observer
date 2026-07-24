@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/marmutapp/superbased-observer/internal/config"
@@ -476,6 +477,87 @@ windows_binary_path = "/mnt/c/Users/x/.observer/observer.exe"
 			strings.NewReader(`{"Enabled":true,"Backend":"both","PollIntervalMS":2000,"Network":{"Enabled":true,"CaptureBodies":"tls","MaxRequestBytes":1,"MaxResponseBytes":1}}`)))
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("bad network capture_bodies: got status %d, want 400", rr.Code)
+	}
+}
+
+// TestHandleConfigSection_SaveProcessPartialBody pins F3: a PARTIAL process body
+// preserves every field it omits (pointer decode) instead of zeroing them. Before
+// the fix a partial {"Enabled":true} blanked Backend to "" (which the vocabulary
+// check then rejected) and reset the intervals to 0, forcing the FE into a racy
+// read-then-write. A partial Network body likewise preserves omitted Network
+// fields.
+func TestHandleConfigSection_SaveProcessPartialBody(t *testing.T) {
+	tdir := t.TempDir()
+	cfgPath := filepath.Join(tdir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte(`[observer.process]
+enabled = false
+backend = "poll"
+capture_unattributed = true
+poll_interval_ms = 3000
+bridge_poll_interval_ms = 1500
+
+[observer.process.network]
+enabled = true
+capture_bodies = "proxied"
+max_request_bytes = 4096
+max_response_bytes = 8192
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	server, err := New(Options{DB: database, ConfigPath: cfgPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Partial body: only Enabled. Everything else must survive.
+	rr := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rr,
+		httptest.NewRequest(http.MethodPut, "/api/config/section/process", strings.NewReader(`{"Enabled":true}`)))
+	if rr.Code != 200 {
+		t.Fatalf("partial process save status: %d body=%s", rr.Code, rr.Body.String())
+	}
+	reloaded, err := config.Load(config.LoadOptions{GlobalPath: cfgPath})
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	p := reloaded.Observer.Process
+	if !p.Enabled {
+		t.Errorf("Enabled not applied: %+v", p)
+	}
+	if p.Backend != "poll" || p.PollIntervalMS != 3000 || p.BridgePollIntervalMS != 1500 || !p.CaptureUnattributed {
+		t.Errorf("partial body zeroed preserved scalars: backend=%q poll=%d bridge=%d capUnattr=%v (want poll/3000/1500/true)",
+			p.Backend, p.PollIntervalMS, p.BridgePollIntervalMS, p.CaptureUnattributed)
+	}
+	if !p.Network.Enabled || p.Network.CaptureBodies != "proxied" || p.Network.MaxRequestBytes != 4096 || p.Network.MaxResponseBytes != 8192 {
+		t.Errorf("partial body (no Network key) clobbered network config: %+v", p.Network)
+	}
+
+	// Partial Network body: flip one field, the sibling Network fields survive.
+	rr = httptest.NewRecorder()
+	server.Handler().ServeHTTP(rr,
+		httptest.NewRequest(http.MethodPut, "/api/config/section/process", strings.NewReader(`{"Network":{"MaxRequestBytes":1024}}`)))
+	if rr.Code != 200 {
+		t.Fatalf("partial network save status: %d body=%s", rr.Code, rr.Body.String())
+	}
+	reloaded, err = config.Load(config.LoadOptions{GlobalPath: cfgPath})
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	p = reloaded.Observer.Process
+	if p.Network.MaxRequestBytes != 1024 {
+		t.Errorf("Network.MaxRequestBytes not applied: got %d", p.Network.MaxRequestBytes)
+	}
+	if p.Network.CaptureBodies != "proxied" || p.Network.MaxResponseBytes != 8192 || !p.Network.Enabled {
+		t.Errorf("partial Network body zeroed siblings: %+v", p.Network)
+	}
+	// The top-level scalars set earlier also survive the Network-only PUT.
+	if p.Backend != "poll" || p.PollIntervalMS != 3000 || !p.Enabled {
+		t.Errorf("Network-only PUT clobbered top-level scalars: backend=%q poll=%d enabled=%v", p.Backend, p.PollIntervalMS, p.Enabled)
 	}
 }
 
@@ -1140,5 +1222,219 @@ func TestHandleConfigSection_Profiles(t *testing.T) {
 		"/api/config/section/profiles", strings.NewReader(`{"ByProvider":{"anthropic":"no-such"}}`)))
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("unknown profile name: got %d want 400 (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+// TestHandleConfigSection_ConcurrentSectionSavesBothPersist proves Fix 1: two
+// concurrent PUTs to DIFFERENT sections must never lose one another's change.
+// Each save is load-from-disk → patch-one-section → validate → write-full-
+// struct; without Server.configWriteMu both PUTs read the same base and the
+// second write clobbers the first's section (a lost update). The `observer`
+// section (LogLevel) and the `intelligence` section (MonthlyBudgetUSD) touch
+// DISJOINT fields, so a correct, serialized implementation always lands both.
+//
+// Deterministic: on the fixed code every iteration passes. Each iteration
+// resets the file to a known baseline, fires the two PUTs from a released
+// start barrier so they genuinely race, waits, then asserts BOTH the log level
+// AND the budget carried through — a regression drops one and fails the assert.
+func TestHandleConfigSection_ConcurrentSectionSavesBothPersist(t *testing.T) {
+	tdir := t.TempDir()
+	cfgPath := filepath.Join(tdir, "config.toml")
+	dbPath := filepath.Join(tdir, "state.db")
+
+	baseline := func() {
+		cfg := config.Default()
+		cfg.Observer.DBPath = dbPath
+		cfg.Observer.LogLevel = "info"
+		cfg.Intelligence.MonthlyBudgetUSD = 0
+		if err := config.WriteToml(cfgPath, cfg); err != nil {
+			t.Fatalf("baseline write: %v", err)
+		}
+	}
+	baseline()
+
+	database, err := db.Open(context.Background(), db.Options{Path: dbPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	server, err := New(Options{DB: database, ConfigPath: cfgPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := server.Handler()
+
+	put := func(section, body string) int {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodPut,
+			"/api/config/section/"+section, strings.NewReader(body)))
+		return rr.Code
+	}
+
+	const iters = 80
+	for i := 0; i < iters; i++ {
+		baseline()
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var codeObserver, codeIntel int
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			// observer: flip LogLevel, keep DBPath non-empty (Validate requires it).
+			codeObserver = put("observer", `{"DBPath":"`+dbPath+`","LogLevel":"error"}`)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			codeIntel = put("intelligence", `{"MonthlyBudgetUSD":999}`)
+		}()
+		close(start)
+		wg.Wait()
+
+		if codeObserver != http.StatusOK {
+			t.Fatalf("iter %d: observer PUT status %d", i, codeObserver)
+		}
+		if codeIntel != http.StatusOK {
+			t.Fatalf("iter %d: intelligence PUT status %d", i, codeIntel)
+		}
+		got, err := config.Load(config.LoadOptions{GlobalPath: cfgPath})
+		if err != nil {
+			t.Fatalf("iter %d: reload: %v", i, err)
+		}
+		if got.Observer.LogLevel != "error" {
+			t.Fatalf("iter %d: observer save lost — log_level=%q want error (budget=%v)",
+				i, got.Observer.LogLevel, got.Intelligence.MonthlyBudgetUSD)
+		}
+		if got.Intelligence.MonthlyBudgetUSD != 999 {
+			t.Fatalf("iter %d: intelligence save lost — monthly_budget_usd=%v want 999 (log_level=%q)",
+				i, got.Intelligence.MonthlyBudgetUSD, got.Observer.LogLevel)
+		}
+	}
+}
+
+// terminalPolicyConfirm fetches a fresh double-submit confirm cookie + token
+// from GET /api/terminal/policy so a following PUT can pass requireJSONConfirm.
+func terminalPolicyConfirm(t *testing.T, h http.Handler) (*http.Cookie, string) {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/terminal/policy", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /api/terminal/policy: %d %s", rr.Code, rr.Body.String())
+	}
+	var cookie *http.Cookie
+	for _, ck := range rr.Result().Cookies() {
+		if ck.Name == remoteConfirmCookie {
+			cookie = ck
+		}
+	}
+	if cookie == nil {
+		t.Fatal("no confirm cookie set on GET /api/terminal/policy")
+	}
+	var body struct {
+		ConfirmToken string `json:"confirm_token"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.ConfirmToken) == 0 {
+		t.Fatal("empty confirm_token")
+	}
+	return cookie, body.ConfirmToken
+}
+
+// TestConfigWrite_RemoteManageRaceSectionSave proves Fix 2: a remote-manage
+// config write (PUT /api/terminal/policy, which read-modify-writes the WHOLE
+// config under remoteManageMu) racing a section save (PUT
+// /api/config/section/observer, under configWriteMu) never loses either change.
+// Before Fix 2 the two paths held DIFFERENT locks, so the second writer
+// clobbered the first (a lost update); after Fix 2 the manage verb ALSO takes
+// configWriteMu (order remoteManageMu → configWriteMu), so they serialize. The
+// two touch DISJOINT fields (observer LogLevel vs terminal AllowFreshAgent), so
+// a correct implementation always lands both.
+func TestConfigWrite_RemoteManageRaceSectionSave(t *testing.T) {
+	tdir := t.TempDir()
+	cfgPath := filepath.Join(tdir, "config.toml")
+	dbPath := filepath.Join(tdir, "state.db")
+
+	baseline := func() {
+		cfg := config.Default()
+		cfg.Observer.DBPath = dbPath
+		cfg.Observer.LogLevel = "info"
+		cfg.Terminal.Launch.AllowFreshAgent = false
+		if err := config.WriteToml(cfgPath, cfg); err != nil {
+			t.Fatalf("baseline write: %v", err)
+		}
+	}
+	baseline()
+
+	database, err := db.Open(context.Background(), db.Options{Path: dbPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	server, err := New(Options{DB: database, ConfigPath: cfgPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := server.Handler()
+
+	confirmCookie, confirmTok := terminalPolicyConfirm(t, h)
+
+	putSection := func(section, body string) int {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodPut,
+			"/api/config/section/"+section, strings.NewReader(body)))
+		return rr.Code
+	}
+	putTerminalPolicy := func() int {
+		req := httptest.NewRequest(http.MethodPut, "/api/terminal/policy",
+			strings.NewReader(`{"allow_fresh_agent":true,"allowed_tools":[],"allowed_project_roots":[]}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(remoteConfirmHeader, confirmTok)
+		req.AddCookie(confirmCookie)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		return rr.Code
+	}
+
+	const iters = 80
+	for i := 0; i < iters; i++ {
+		baseline()
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var codeSection, codePolicy int
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			codeSection = putSection("observer", `{"DBPath":"`+dbPath+`","LogLevel":"error"}`)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			codePolicy = putTerminalPolicy()
+		}()
+		close(start)
+		wg.Wait()
+
+		if codeSection != http.StatusOK {
+			t.Fatalf("iter %d: section PUT status %d", i, codeSection)
+		}
+		if codePolicy != http.StatusOK {
+			t.Fatalf("iter %d: terminal-policy PUT status %d", i, codePolicy)
+		}
+		got, err := config.Load(config.LoadOptions{GlobalPath: cfgPath})
+		if err != nil {
+			t.Fatalf("iter %d: reload: %v", i, err)
+		}
+		if got.Observer.LogLevel != "error" {
+			t.Fatalf("iter %d: section save lost — log_level=%q want error (allow_fresh_agent=%v)",
+				i, got.Observer.LogLevel, got.Terminal.Launch.AllowFreshAgent)
+		}
+		if !got.Terminal.Launch.AllowFreshAgent {
+			t.Fatalf("iter %d: terminal-policy save lost — allow_fresh_agent=false want true (log_level=%q)",
+				i, got.Observer.LogLevel)
+		}
 	}
 }

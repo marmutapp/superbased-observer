@@ -132,9 +132,16 @@ func (s *Server) handleTerminalPolicyPut(w http.ResponseWriter, r *http.Request)
 	// persisted [remote] fields back to their pre-mint values on disk while the
 	// live controller still honours them (finding 6). The lock covers exactly
 	// load→write; validation above and the audit/notify below stay outside it.
+	//
+	// Fix 2: it ALSO takes configWriteMu (the settings.go section/pricing/backup
+	// domain) so a policy PUT and a section save can't clobber one another.
+	// Lock order is remoteManageMu (outer) → configWriteMu (inner), released in
+	// reverse — the same order every manage verb uses (see remoteManageMu decl).
 	remoteManageMu.Lock()
+	s.configWriteMu.Lock()
 	cfg, err := loadConfigForDashboard(s.opts.ConfigPath)
 	if err != nil {
+		s.configWriteMu.Unlock()
 		remoteManageMu.Unlock()
 		writeErr(w, fmt.Errorf("load current config: %w", err))
 		return
@@ -143,6 +150,7 @@ func (s *Server) handleTerminalPolicyPut(w http.ResponseWriter, r *http.Request)
 	cfg.Terminal.Launch.AllowedTools = tools
 	cfg.Terminal.Launch.AllowedProjectRoots = roots
 	werr := writeConfigToml(s.opts.ConfigPath, cfg)
+	s.configWriteMu.Unlock()
 	remoteManageMu.Unlock()
 	if werr != nil {
 		writeErr(w, werr)

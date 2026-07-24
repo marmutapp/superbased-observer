@@ -46,7 +46,7 @@ func newQoderCmd() *cobra.Command {
 			"keys or auth state.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			bin, err := resolveToolBin("qodercli", binPath, "--qoder-path")
+			bin, err := resolveToolBin("qoder", binPath, "--qoder-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}

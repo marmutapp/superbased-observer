@@ -88,6 +88,12 @@ func (s *Server) handleExperimentStart(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Fix 2 (one config-write lock domain): this load→append→write shares
+	// config.toml with the section/pricing/backup/remote-manage writers, so it
+	// takes the same configWriteMu (no remoteManageMu here — a plain
+	// configWriteMu holder, never nested). See Server.configWriteMu.
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	cfg, err := loadConfigForDashboard(s.opts.ConfigPath)
 	if err != nil {
 		writeErr(w, err)
@@ -129,6 +135,10 @@ func (s *Server) handleExperimentStop(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Fix 2 (one config-write lock domain): serialize this load→stamp→write with
+	// every other config.toml writer. See Server.configWriteMu.
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	cfg, err := loadConfigForDashboard(s.opts.ConfigPath)
 	if err != nil {
 		writeErr(w, err)

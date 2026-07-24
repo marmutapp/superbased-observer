@@ -303,9 +303,19 @@ func newStartCmd() *cobra.Command {
 					// is false → endpoints 503, button hidden.
 					LaunchManager:  launchMgr,
 					TerminalStatus: launchStatus,
+					// Tool-binary-resolution seams (tool-binary-resolution arc
+					// §5): pre-launch verdict + guided install. Plain funcs so
+					// the dashboard package never imports internal/toolresolve.
+					ToolPreflight:    toolPreflightSeam(resolvedConfigPath, allowToolInstallSeam(resolvedConfigPath)),
+					AllowToolInstall: allowToolInstallSeam(resolvedConfigPath),
+					ToolInstallHint:  toolInstallHintSeam(),
 					// Per-terminal project panel (Arc A): token→root resolver
 					// from termsvc. Nil when the launch manager is absent → 404.
 					ProjectRootResolver: projectRootResolver(launchMgr),
+					// Per-terminal session cockpit (Session Cockpit): token→run/
+					// session-link resolver from termsvc. Nil when the launch
+					// manager is absent → cockpit 404s.
+					SessionResolver: sessionResolver(launchMgr),
 					// Restart-from-dashboard (docs/plans/dashboard-daemon-
 					// restart-plan-2026-07-14.md): preflight the config, then
 					// cancel the root context so the daemon runs its NORMAL

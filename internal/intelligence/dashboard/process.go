@@ -266,6 +266,22 @@ func (s *Server) handleSessionNetwork(w http.ResponseWriter, r *http.Request, se
 		http.Error(w, "missing session id", http.StatusBadRequest)
 		return
 	}
+	// ?summary=1: server-side proxied-vs-OS rollup with real COUNT/SUM over the
+	// session's network events. The cockpit's "API traffic (proxied)" line
+	// renders from this — it needs honest provenance (proxied calls only, not
+	// git/curl/MCP OS connections) and byte totals, which the event LIST cannot
+	// provide (it omits bodies and mixes both sources). No new §9.3 route: same
+	// path, discriminated by the query param. See store.NetworkSummaryForSession
+	// for the honest discriminator.
+	if r.URL.Query().Get("summary") == "1" {
+		sum, err := store.New(s.db()).NetworkSummaryForSession(r.Context(), sessionID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("load network summary: %v", err), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, sum)
+		return
+	}
 	limit := 100
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {

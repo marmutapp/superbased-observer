@@ -56,7 +56,7 @@ func newKiroCmd() *cobra.Command {
 			"API keys or AWS credentials.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			bin, err := resolveToolBin("kiro-cli", binPath, "--kiro-cli-path")
+			bin, err := resolveToolBin("kiro-cli", binPath, "--kiro-cli-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}

@@ -170,6 +170,27 @@ type Options struct {
 	// (GET /api/terminal/<handle>/status + GET /ws/terminal/status). Nil is the
 	// honest disabled state (503 / the WS closes).
 	TerminalStatus TerminalStatusProvider
+	// ToolPreflight, when non-nil, resolves a launchable tool NAME to its
+	// binary-resolution verdict for GET /api/terminal/launch/preflight
+	// (tool-binary-resolution arc). It is the dashboard's seam onto
+	// internal/toolresolve — DEFINED as a plain func here so the dashboard
+	// package carries no dependency on toolresolve's types (CLAUDE.md #2). A nil
+	// seam is the honest disabled state (the endpoint reports 501); a returned
+	// ok=false means the tool is unknown / not launchable (400). cmd wires a
+	// closure that runs the resolver and fills the ToolPreflight wire shape.
+	ToolPreflight func(tool string) (ToolPreflight, bool)
+	// AllowToolInstall, when non-nil, reports whether the guided install
+	// endpoint (POST /api/terminal/install) is enabled — a LIVE read of the
+	// [terminal.launch].allow_install kill-switch (default true). Nil is treated
+	// as DISABLED (403), so the install affordance stays off until cmd wires the
+	// live-config reader.
+	AllowToolInstall func() bool
+	// ToolInstallHint, when non-nil, resolves a tool NAME to the server-side
+	// install argv + human display string for POST /api/terminal/install. The
+	// argv is a COMPILE-TIME registry constant (never request input — injection
+	// surface is zero by construction); the tool name is only a registry map
+	// key. Nil-able; a miss (ok=false) means no grounded install command → 400.
+	ToolInstallHint func(tool string) (argv []string, display string, ok bool)
 	// ProjectRootResolver, when non-nil, backs the per-terminal project panel
 	// (GET /api/terminal/project/<token>...). It resolves a live launch token
 	// (LaunchInfo.ID / PTY handle) to the canonical project root the run was
@@ -180,6 +201,18 @@ type Options struct {
 	// termsvc.Service; nil (the default) makes the panel endpoints 404 (a nil
 	// seam IS the disabled state), keeping the solo-local experience unchanged.
 	ProjectRootResolver func(token string) (root string, known bool)
+	// SessionResolver, when non-nil, backs the per-terminal session cockpit
+	// (GET /api/terminal/session/<token>). It resolves a live launch token to
+	// its run identity (run id + kind + tool) and — once the daemon has
+	// correlated the run to an observer session — that session id and the
+	// confidence the link was scored at. It returns known=false for an unknown
+	// OR exited token (→404 unknown_token); a live-but-uncorrelated run returns
+	// known=true with an empty SessionID and zero Confidence. Injected by cmd
+	// from termsvc.Service (via a function field so the dashboard package never
+	// imports termsvc — module discipline); nil (the default) makes the
+	// endpoint 404 (a nil seam IS the disabled state), keeping the solo-local
+	// experience unchanged.
+	SessionResolver func(token string) (link TerminalSessionLink, known bool)
 	// RestartFunc, when non-nil, restarts the daemon from the dashboard
 	// (POST /api/admin/restart): it preflights the config and triggers the
 	// daemon's graceful shutdown + self re-exec (cmd owns the process
@@ -199,6 +232,20 @@ type Options struct {
 	// remote_audit store seam; nil (the default) disables auditing. Never
 	// carries a secret.
 	RemoteAudit func(RemoteAuditRecord)
+}
+
+// TerminalSessionLink is the resolved identity of a live terminal launch token
+// for the session cockpit (GET /api/terminal/session/<token>): the run id the
+// daemon minted at spawn, its kind + tool, and — once correlated — the observer
+// session id and the confidence the link was scored at. SessionID is "" and
+// Confidence 0 until the run is correlated (correlation is scored and
+// asynchronous). Populated by Options.SessionResolver.
+type TerminalSessionLink struct {
+	RunID      string
+	Kind       string
+	Tool       string
+	SessionID  string // "" until correlated
+	Confidence float64
 }
 
 // ToolCatalogEntry is one supported tool in Options.ToolCatalog:
@@ -255,6 +302,39 @@ type Server struct {
 	// barely changes between polls — and serve the read fresh every time.
 	correlateMu   sync.Mutex
 	lastCorrelate map[string]time.Time
+
+	// configWriteMu serializes EVERY dashboard-driven config.toml write so two
+	// concurrent PUTs can never lose one another's changes. Each write handler
+	// does load-from-disk → patch-one-section → validate → write-full-struct;
+	// without a lock, two PUTs to DIFFERENT sections both read the same base,
+	// each patches only its own field, and the second write clobbers the first
+	// (a classic lost update — config.WriteToml / writeBytesAtomic are atomic
+	// per file but carry no cross-call serialization). Held across the whole
+	// load→patch→validate→write critical section in handleConfigSection,
+	// handleConfigPricing, and the handleConfigBackup restore swap — the three
+	// paths that read-modify-write the file — so the class is closed, not just
+	// one handler.
+	//
+	// It points at config.WriteLock() (the process-wide config RMW mutex, set
+	// in New), NOT a Server-private lock: the daemon has OTHER in-process
+	// writers of the same file that are not dashboard handlers — notably the obs
+	// admission-policy persister in cmd/observer (wired via obs_wire.go, which
+	// serializes its span through config.WithConfigLock). Sharing the one
+	// package mutex is what makes those cross-package writers serialize against
+	// these handlers instead of racing the file (CLAUDE.md #4 — one owner per
+	// piece of state). The defer-style Lock/Unlock spans here are preserved
+	// exactly; only the mutex's identity moved to the config package.
+	configWriteMu *sync.Mutex
+
+	// processCapabilityFn probes what OS process-capture backends can ACTUALLY
+	// capture on this host (poll native enumerator by GOOS, eBPF privilege
+	// probe, WSL bridge resolution) — the platform truth the enable-capture verb
+	// grounds its decision in, distinct from processBackendRunnable's
+	// selector-vocabulary check. Injected as a field so the enable-capture
+	// handler tests exercise every GOOS-shaped capability set without needing
+	// the real platform (repo injected-IO discipline). Defaults to
+	// realProcessCapability in New.
+	processCapabilityFn func(config.ProcessConfig) processCapability
 
 	// resumeMu + resumeGates single-flight handleSessionResume PER session id
 	// (R2-3): the duplicate-resume liveness check (sessionHasLiveSensitiveRun)
@@ -353,6 +433,11 @@ func New(opts Options) (*Server, error) {
 		execBackfill:  realExecBackfill,
 		now:           func() time.Time { return time.Now().UTC() },
 		lastCorrelate: map[string]time.Time{},
+		// Share the process-wide config RMW mutex so dashboard config writes
+		// serialize against cmd/observer's admission-policy persister and any
+		// other in-process writer (see the configWriteMu field doc).
+		configWriteMu:       config.WriteLock(),
+		processCapabilityFn: realProcessCapability(opts.Logger),
 	}
 	// Wire the controller's session-revoke hook (F2): when a device logs ITSELF
 	// out, close any read-only sensitive viewer that device left open — the
@@ -518,6 +603,20 @@ func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[st
 	// Fresh-agent launch is EXECUTE (it starts a new process — the
 	// privilege-expansion feature); the session list is VIEW (metadata only).
 	reg("/api/terminal/launch", X, s.handleTerminalLaunch)
+	// Pre-launch binary-resolution verdict (tool-binary-resolution arc). LOCAL —
+	// resolving the binary runs a $SHELL -lc login-shell PATH capture (a
+	// side-effecting local exec) AND reveals absolute binary paths + home-dir
+	// layout, so a paired READ-ONLY remote principal must never drive it. Same
+	// owner-local posture as /api/terminal/install (reclassified V→L in the
+	// 2026-07-23 review pass). The exact pattern is MORE specific than the
+	// /api/terminal/ catch-all below, so mux precedence routes it here (not to
+	// handleTerminalStatus).
+	reg("/api/terminal/launch/preflight", L, s.handleTerminalPreflight)
+	// Guided one-click install (tool-binary-resolution arc). LOCAL + confirm-
+	// token-gated, EXACTLY like the Tailscale setup handlers: it spawns a
+	// grounded, compile-time-constant install command in a visible local-only
+	// PTY — a machine-reaching mutation a remote principal must never drive.
+	reg("/api/terminal/install", L, s.handleTerminalInstall)
 	reg("/api/terminal/sessions", V, s.handleTerminalSessions)
 	// Live-attachable session list (session-attach design Phase 2, "Jump in"):
 	// the daemon-owned external (Kind=="attach") sessions a dashboard tab can
@@ -532,11 +631,21 @@ func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[st
 	// the more-specific pattern takes mux precedence over /api/terminal/ below,
 	// and its own handler re-gates remote-exposed callers on allow_terminal_view.
 	reg("/api/terminal/project/", V, s.handleTerminalProject)
+	// Per-terminal session cockpit (Session Cockpit): resolves a live launch
+	// token to its run identity and, once correlated, its observer session id +
+	// link confidence. VIEW (GET-only, metadata only); the more-specific prefix
+	// takes mux precedence over /api/terminal/ below, and its own handler
+	// re-gates remote-exposed callers on allow_terminal_view (identically for
+	// known and unknown tokens — no token oracle).
+	reg("/api/terminal/session/", V, s.handleTerminalSession)
 	// exact /launch + /sessions patterns above take mux precedence.
 	reg("/api/terminal/", V, s.handleTerminalStatus)
 	reg("/ws/terminal/status", V, s.handleTerminalStatusWS)
 	reg("/api/process/findings", V, s.handleProcessFindings)
 	reg("/api/process/network/", V, s.handleProcessNetworkDetail)
+	// enable-capture WRITES config.toml (turns on [observer.process] + fixes a
+	// non-runnable backend) → whole-route Local, like /api/config/section/.
+	reg("/api/process/enable-capture", L, s.handleProcessEnableCapture)
 	reg("/api/actions", V, s.handleActions)
 	reg("/api/live", V, s.handleLive)
 	reg("/api/search", V, s.handleSearch)
@@ -3867,6 +3976,44 @@ func (s *Server) handleSessionMessages(w http.ResponseWriter, r *http.Request, s
 		case !mr.turnRollup && mr.ElapsedMs != nil && *mr.ElapsedMs > 0:
 			ms := *mr.ElapsedMs
 			mr.TpsMs, mr.TpsBasis = &ms, "elapsed"
+		}
+	}
+
+	// ?tail=N (FROZEN contract, v1.24): return the last N rows of the FULL
+	// ordered timeline — NOT a re-slice of a paginated page. Because it
+	// addresses the whole timeline, tail is mutually exclusive with the
+	// pagination params: combined with offset/limit/locate it is an explicit
+	// 400 (they would otherwise fight over which window wins, and the old
+	// "tail-after-page" order silently returned the tail of page 0, not the
+	// true last N). Standalone: response offset = index of the first returned
+	// row (total−N, clamped ≥0); total stays the FULL count. Clamp N to 1..200
+	// (>200 saturates); a <1 / non-numeric tail is ignored as absent and falls
+	// through to the default pagination path below, so an absent-or-garbage
+	// tail is byte-identical to the pre-tail behaviour.
+	if tailStr := r.URL.Query().Get("tail"); tailStr != "" {
+		if r.URL.Query().Get("offset") != "" ||
+			r.URL.Query().Get("limit") != "" ||
+			r.URL.Query().Get("locate") != "" {
+			http.Error(w, "tail cannot be combined with offset, limit, or locate", http.StatusBadRequest)
+			return
+		}
+		if n, err := strconv.Atoi(tailStr); err == nil && n >= 1 {
+			if n > 200 {
+				n = 200
+			}
+			total := len(out)
+			offset := 0
+			if total > n {
+				offset = total - n
+			}
+			writeJSON(w, map[string]any{
+				"session_id": sessionID,
+				"messages":   out[offset:],
+				"total":      total,
+				"limit":      n,
+				"offset":     offset,
+			})
+			return
 		}
 	}
 

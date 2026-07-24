@@ -58,6 +58,13 @@ type Props = {
   onOpenFiles?: () => void;
   onOpenGit?: () => void;
   /**
+   * Open the per-terminal session cockpit panel (the Session Cockpit — cost,
+   * tokens, live activity). Wired by the host (TerminalHost / grid tile); the
+   * panel itself is owned by LaunchDockProvider. Header-button only — no
+   * effect on the ws bridge.
+   */
+  onOpenSession?: () => void;
+  /**
    * Register/unregister the paste-into-terminal callback for this token while
    * this seat is live + write-capable. The callback routes text through xterm's
    * OWN paste pipeline (`term.paste`) — identical to a manual Ctrl+V — so
@@ -72,6 +79,12 @@ type Props = {
    * render disabled with an honest title. Absent → treated as false.
    */
   projectPanelEnabled?: boolean;
+  /**
+   * False when this terminal's run can't correlate to an observer session
+   * (e.g. a plain shell run with no AI tool attached) — the Session button
+   * renders disabled with an honest title. Absent → treated as false.
+   */
+  sessionPanelEnabled?: boolean;
 };
 
 export type Status = "connecting" | "open" | "exited" | "error";
@@ -137,8 +150,10 @@ export function LaunchTerminal({
   onAddToGrid,
   onOpenFiles,
   onOpenGit,
+  onOpenSession,
   registerPaste,
   projectPanelEnabled,
+  sessionPanelEnabled,
 }: Props) {
   const companion = useCompanionRegistry();
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -1103,6 +1118,24 @@ export function LaunchTerminal({
                 !isLiveStatus(status)
                   ? "This session is no longer running — its project can no longer be browsed"
                   : undefined
+              }
+            />
+          )}
+          {/* Session cockpit: cost / tokens / live activity for the AI tool
+              attached to this terminal. Disabled (honest title) for a run-shape
+              that can never correlate to an observer session (a plain shell
+              run) or once the session is no longer live. Header button only —
+              the panel is provider-owned and this never touches the ws bridge. */}
+          {onOpenSession && (
+            <ProjectPanelButton
+              label="⊙ Session"
+              enabled={!!sessionPanelEnabled && isLiveStatus(status)}
+              onClick={onOpenSession}
+              enabledTitle="View this session's cost, tokens, and live activity"
+              disabledTitle={
+                !isLiveStatus(status)
+                  ? "This session is no longer running — its activity can no longer be shown"
+                  : "No AI tool running in this terminal"
               }
             />
           )}

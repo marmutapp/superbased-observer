@@ -124,57 +124,69 @@ func (r *Registry) Installed() []string {
 	return tools
 }
 
+// allHomes and homeOwnedByCurrentWindowsUser are the crossmount seams (package
+// vars, mirroring internal/proxyroute) so tests can inject a fixed multi-home
+// layout AND a deterministic ownership verdict without a real /mnt/c mount or
+// a cmd.exe interop shell (restore them in a defer).
+var (
+	allHomes                      = crossmount.AllHomes
+	homeOwnedByCurrentWindowsUser = crossmount.HomeOwnedByCurrentWindowsUser
+)
+
 // detectWindowsClaudeHome returns the resolved Windows-side .claude
 // directory used by the claude-code-windows registration target, or
 // "" if none. Honors Options.WindowsClaudeHome when set; otherwise
-// picks the first crossmount-detected OS=windows home that has a
-// `.claude/` subdirectory. Mirrors detectWindowsCursorHome.
+// accepts an auto-detected OS=windows home that has a `.claude/`
+// subdirectory ONLY when crossmount can prove it belongs to the current
+// Windows user. Mirrors detectWindowsCursorHome and the proxy-route
+// side's resolveWindowsHome R1 guard.
 func (r *Registry) detectWindowsClaudeHome() string {
-	if r.opts.WindowsClaudeHome != "" {
-		dir := filepath.Join(r.opts.WindowsClaudeHome, ".claude")
-		if r.dirExists(dir) {
-			return dir
-		}
-		// Treat the option as authoritative even if the dir doesn't
-		// exist yet — the registrar can mkdir on first install.
-		return dir
-	}
-	for _, h := range crossmount.AllHomes() {
-		if h.OS != crossmount.OSWindows {
-			continue
-		}
-		dir := filepath.Join(h.Path, ".claude")
-		if r.dirExists(dir) {
-			return dir
-		}
-	}
-	return ""
+	return r.detectWindowsHome(r.opts.WindowsClaudeHome, ".claude")
 }
 
 // detectWindowsCursorHome returns the resolved Windows-side .cursor
 // directory used by the cursor-windows registration target, or "" if
-// none. Honors Options.WindowsCursorHome when set; otherwise picks the
-// first crossmount-detected OS=windows home that has a `.cursor/`
-// subdirectory.
+// none. Honors Options.WindowsCursorHome when set; otherwise accepts an
+// auto-detected OS=windows home carrying `.cursor/` only when
+// crossmount-ownership-verified.
 func (r *Registry) detectWindowsCursorHome() string {
-	if r.opts.WindowsCursorHome != "" {
-		dir := filepath.Join(r.opts.WindowsCursorHome, ".cursor")
-		if r.dirExists(dir) {
-			return dir
-		}
-		// Treat it as authoritative even when missing — the caller
-		// may want to bootstrap a fresh hook config there. The
-		// register path will mkdir the parent.
-		return dir
+	return r.detectWindowsHome(r.opts.WindowsCursorHome, ".cursor")
+}
+
+// detectWindowsHome resolves the Windows-side <subdir> directory for a
+// cross-OS registration target. Ownership discipline mirrors the proxy-route
+// writer's resolveWindowsHome (security finding R1/F1): a WSL daemon must NOT
+// install hooks into another Windows user's config just because theirs is the
+// only `.claude`/`.cursor` mounted.
+//
+//   - An explicit override wins unconditionally — the operator named the home,
+//     so ownership verification is moot; returned even if the dir doesn't exist
+//     yet (the registrar mkdir's on first install).
+//   - Otherwise an auto-detected OS=windows home carrying <subdir> is accepted
+//     ONLY when crossmount proves it belongs to the current Windows user
+//     (base name matches %USERNAME%). Zero owned homes — or an ambiguous
+//     several — resolve to "" so the virtual target simply doesn't surface in
+//     Installed() (the honest floor: no behaviour change on a single-user
+//     machine where the name matches; a refusal to guess otherwise).
+func (r *Registry) detectWindowsHome(override, subdir string) string {
+	if override != "" {
+		return filepath.Join(override, subdir)
 	}
-	for _, h := range crossmount.AllHomes() {
+	var owned []string
+	for _, h := range allHomes() {
 		if h.OS != crossmount.OSWindows {
 			continue
 		}
-		dir := filepath.Join(h.Path, ".cursor")
-		if r.dirExists(dir) {
-			return dir
+		dir := filepath.Join(h.Path, subdir)
+		if !r.dirExists(dir) {
+			continue
 		}
+		if homeOwnedByCurrentWindowsUser(h.Path) {
+			owned = append(owned, dir)
+		}
+	}
+	if len(owned) == 1 {
+		return owned[0]
 	}
 	return ""
 }

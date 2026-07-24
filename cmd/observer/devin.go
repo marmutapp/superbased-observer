@@ -47,7 +47,7 @@ func newDevinCmd() *cobra.Command {
 			"to separate observer flags from devin flags. NEVER touches API keys.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			bin, err := resolveToolBin("devin", binPath, "--devin-path")
+			bin, err := resolveToolBin("devin", binPath, "--devin-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}

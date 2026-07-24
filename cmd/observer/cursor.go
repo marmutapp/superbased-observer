@@ -77,7 +77,7 @@ func newCursorCmd() *cobra.Command {
 			"Use `--` to separate observer flags from cursor-agent flags.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			bin, err := resolveToolBin("cursor-agent", binPath, "--cursor-agent-path")
+			bin, err := resolveToolBin("cursor", binPath, "--cursor-agent-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}

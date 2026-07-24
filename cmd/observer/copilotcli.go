@@ -60,7 +60,7 @@ func newCopilotCLICmd() *cobra.Command {
 				return fmt.Errorf("load config: %w", err)
 			}
 			resolved := resolveProxyURL(cfg.Proxy.Port, proxyURL)
-			bin, err := resolveToolBin("copilot", binPath, "--copilot-path")
+			bin, err := resolveToolBin("copilot-cli", binPath, "--copilot-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}

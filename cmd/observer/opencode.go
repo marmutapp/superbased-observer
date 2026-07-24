@@ -131,7 +131,7 @@ func runOpencodeLauncher(opts opencodeLauncherOptions) error {
 
 	proxyURL := resolveProxyURL(cfg.Proxy.Port, opts.proxyURL)
 
-	bin, err := resolveToolBin("opencode", opts.opencodePath, "--opencode-path")
+	bin, err := resolveToolBin("opencode", opts.opencodePath, "--opencode-path", opts.configPath, opts.stderr)
 	if err != nil {
 		return err
 	}

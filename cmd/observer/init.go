@@ -78,6 +78,9 @@ func newInitCmd() *cobra.Command {
 		flagSkipGuardDialect bool
 		flagProxyPort        int
 		flagConfigPath       string
+		flagWinClaudeHome    string
+		flagWinCodexHome     string
+		flagWinCursorHome    string
 	)
 	cmd := &cobra.Command{
 		Use:   "init",
@@ -176,6 +179,9 @@ func newInitCmd() *cobra.Command {
 					OnlyCursor:          flagCursor,
 					OnlyCline:           flagCline,
 					All:                 flagAll,
+					WindowsClaudeHome:   flagWinClaudeHome,
+					WindowsCodexHome:    flagWinCodexHome,
+					WindowsCursorHome:   flagWinCursorHome,
 					WindowsBrowserHomes: winHomes,
 					WSLDistro:           winDistro,
 					NewWindowsRegistry:  newReg,
@@ -267,6 +273,9 @@ func newInitCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&flagSkipGuardDialect, "skip-guard-dialect", false, "Skip writing native guard permission rules into tool configs (narrower than --guard=false)")
 	cmd.Flags().IntVar(&flagProxyPort, "proxy-port", 8820, "Observer proxy port to wire into per-tool routing config")
 	cmd.Flags().StringVar(&flagConfigPath, "config", "", "Path to observer config.toml — when set, registered hook + MCP commands include --config so they read the same config as the proxy you'll run against this install")
+	cmd.Flags().StringVar(&flagWinClaudeHome, "windows-claude-home", "", "Windows user home (e.g. /mnt/c/Users/<you>) holding the .claude to route/hook when a WSL daemon can't safely auto-pick among several Windows homes (see `observer doctor`)")
+	cmd.Flags().StringVar(&flagWinCodexHome, "windows-codex-home", "", "Windows user home (e.g. /mnt/c/Users/<you>) holding the .codex to route when a WSL daemon can't safely auto-pick among several Windows homes")
+	cmd.Flags().StringVar(&flagWinCursorHome, "windows-cursor-home", "", "Windows user home (e.g. /mnt/c/Users/<you>) holding the .cursor to hook when a WSL daemon can't safely auto-pick among several Windows homes (cursor-windows is hooks-only — no proxy route)")
 	return cmd
 }
 
@@ -284,7 +293,7 @@ func initSelectedTools(binary, configPath string, all, cc, codex, cursor, cline 
 	if err != nil {
 		return nil
 	}
-	return selectTools(all, cc, codex, cursor, cline, unionStrings(hookReg.Installed(), mcpReg.Installed()))
+	return selectToolsForInit(all, cc, codex, cursor, cline, unionStrings(hookReg.Installed(), mcpReg.Installed()))
 }
 
 // initGuardDialects compiles the effective guard policy into the
@@ -463,6 +472,23 @@ type WireAIClientsOptions struct {
 	OnlyClaudeCode, OnlyCodex, OnlyCursor, OnlyCline bool
 	// All is a convenience flag matching --all on `observer init`.
 	All bool
+	// WindowsClaudeHome / WindowsCodexHome disambiguate the cross-OS route
+	// (a WSL daemon writing into a Windows-side .claude/.codex) when the
+	// registrar refuses to auto-pick among several Windows homes or can't
+	// verify ownership (R1/F3). Each is the Windows USER home (e.g.
+	// /mnt/c/Users/<you>) — the registrar appends .claude/.codex. The claude
+	// value ALSO feeds the hook registrar's WindowsClaudeHome so the two
+	// Windows writers agree on the same home; codex has no hook-side option.
+	// Empty = auto-detect (the production default). Fed by the
+	// --windows-claude-home / --windows-codex-home flags.
+	WindowsClaudeHome string
+	WindowsCodexHome  string
+	// WindowsCursorHome disambiguates the cross-OS cursor-windows HOOK write
+	// (cursor is hooks-only for the cross-OS surface — no proxy-route writer),
+	// mirroring the claude/codex overrides. It is the Windows USER home; the
+	// hook registrar appends .cursor. Empty = auto-detect. Fed by the
+	// --windows-cursor-home flag.
+	WindowsCursorHome string
 	// WindowsBrowserHomes / WSLDistro / NewWindowsRegistry carry the
 	// registry-based Windows browser path INJECTED by the cobra entry point
 	// (productionWindowsBrowserInputs). wireAIClients never reads ambient
@@ -491,11 +517,13 @@ func wireAIClients(opts WireAIClientsOptions) (lines []string, claudeProxyHint, 
 		port = 8820
 	}
 	hookReg, err := hook.NewRegistry(hook.Options{
-		BinaryPath: binary,
-		DryRun:     opts.DryRun,
-		Force:      opts.Force,
-		ConfigPath: opts.ConfigPath,
-		HomeDir:    opts.HomeDir,
+		BinaryPath:        binary,
+		DryRun:            opts.DryRun,
+		Force:             opts.Force,
+		ConfigPath:        opts.ConfigPath,
+		HomeDir:           opts.HomeDir,
+		WindowsClaudeHome: opts.WindowsClaudeHome,
+		WindowsCursorHome: opts.WindowsCursorHome,
 	})
 	if err != nil {
 		return nil, "", "", false, err
@@ -510,23 +538,33 @@ func wireAIClients(opts WireAIClientsOptions) (lines []string, claudeProxyHint, 
 	if err != nil {
 		return nil, "", "", false, err
 	}
-	installed := unionStrings(hookReg.Installed(), mcpReg.Installed())
-	tools := selectTools(opts.All, opts.OnlyClaudeCode, opts.OnlyCodex, opts.OnlyCursor, opts.OnlyCline, installed)
-	if len(tools) == 0 {
-		return nil, "", "", false, nil
-	}
-
 	var routeReg *proxyroute.Registrar
 	if !opts.SkipProxy {
 		routeReg, err = proxyroute.NewRegistrar(proxyroute.RegisterOptions{
-			ProxyPort: port,
-			DryRun:    opts.DryRun,
-			Force:     opts.Force,
-			HomeDir:   opts.HomeDir,
+			ProxyPort:         port,
+			DryRun:            opts.DryRun,
+			Force:             opts.Force,
+			HomeDir:           opts.HomeDir,
+			WindowsClaudeHome: opts.WindowsClaudeHome,
+			WindowsCodexHome:  opts.WindowsCodexHome,
 		})
 		if err != nil {
 			return nil, "", "", false, err
 		}
+	}
+
+	installed := unionStrings(hookReg.Installed(), mcpReg.Installed())
+	if routeReg != nil {
+		// Surface the cross-OS "<tool>-windows" route targets (a WSL daemon
+		// writing the route into a Windows-side .claude/.codex) the same way
+		// hook.Registry.Installed surfaces claude-code-windows. Empty on a
+		// native host; skipped entirely under --skip-proxy-route (routeReg
+		// stays nil).
+		installed = unionStrings(installed, routeReg.WindowsRouteTargets())
+	}
+	tools := selectToolsForInit(opts.All, opts.OnlyClaudeCode, opts.OnlyCodex, opts.OnlyCursor, opts.OnlyCline, installed)
+	if len(tools) == 0 {
+		return nil, "", "", false, nil
 	}
 
 	var buf strings.Builder
@@ -556,12 +594,25 @@ func wireAIClients(opts WireAIClientsOptions) (lines []string, claudeProxyHint, 
 			// The main step's kind-switch only knows the codex/claude-code
 			// writers — running RegisterCodex() for kimi-code would write the
 			// wrong config file.
-			ic, _ := integration.For(t)
+			//
+			// The "-windows" virtual target (WindowsRouteTargets) resolves to
+			// its BASE adapter's capability KIND, then dispatches the cross-OS
+			// writer — mirroring how the hook step handles claude-code-windows.
+			base, isWindows := strings.CutSuffix(t, "-windows")
+			ic, _ := integration.For(base)
 			switch ic.Proxy.Kind {
 			case integration.RouteConfigFile:
-				printProxyRouteResult(&buf, t, routeReg.RegisterCodex(), opts.DryRun)
+				if isWindows {
+					printProxyRouteResult(&buf, t, routeReg.RegisterCodexWindows(), opts.DryRun)
+				} else {
+					printProxyRouteResult(&buf, t, routeReg.RegisterCodex(), opts.DryRun)
+				}
 			case integration.RouteEnvSettings:
-				printProxyRouteResult(&buf, t, routeReg.RegisterClaudeCode(), opts.DryRun)
+				if isWindows {
+					printProxyRouteResult(&buf, t, routeReg.RegisterClaudeCodeWindows(), opts.DryRun)
+				} else {
+					printProxyRouteResult(&buf, t, routeReg.RegisterClaudeCode(), opts.DryRun)
+				}
 			}
 		}
 		if t == "claude-code" {
@@ -802,9 +853,18 @@ func mcpSupported(tool string) bool {
 // `observer <x>` launcher, not persisted by init, so they're false here.
 // Proxy-exempt tools (Proxy == nil) are likewise false. A new routable
 // client is a registry row + (if a new kind) one writer.
+//
+// The cross-OS "-windows" virtual target (a WSL daemon writing the route
+// into a Windows-side .claude/.codex) is resolved to its base adapter and
+// gated on the registry's Proxy.CrossOSBridge flag — the exact template
+// hookSupported/mcpSupported use for their own "-windows" variants.
 func routeSupported(tool string) bool {
-	c, ok := integration.For(tool)
+	base, isWindows := strings.CutSuffix(tool, "-windows")
+	c, ok := integration.For(base)
 	if !ok || c.Proxy == nil {
+		return false
+	}
+	if isWindows && !c.Proxy.CrossOSBridge {
 		return false
 	}
 	switch c.Proxy.Kind {
@@ -1420,24 +1480,73 @@ func unionStrings(a, b []string) []string {
 	return out
 }
 
+// selectTools resolves the requested tool set from flags + detection with
+// BASE-ONLY semantics: an explicit --claude-code selects exactly "claude-code"
+// (plus whatever `installed` already lists under --all / auto-detect). It does
+// NOT fan an explicit base selector out to its cross-OS "<base>-windows"
+// virtual target — that union is init-only (see selectToolsForInit).
+//
+// `observer uninstall` calls THIS directly (F3): `uninstall --claude-code` must
+// keep its pre-existing scope and never silently strip the Windows-side hooks
+// too. Uninstalling a Windows-side target stays reachable only via the explicit
+// mechanisms (e.g. --all, or a direct Windows-side uninstall path).
 func selectTools(all, cc, codex, cursor, cline bool, installed []string) []string {
+	return resolveTools(all, cc, codex, cursor, cline, installed, false)
+}
+
+// selectToolsForInit is selectTools plus the init-only cross-OS union: an
+// explicit --claude-code / --codex / --cursor / --cline ALSO selects its
+// detected, wireable "<base>-windows" virtual target so `observer init` writes
+// the Windows-side home too. Init is the ONLY place this widening is safe: init
+// writes are additive + consented, whereas widening it in uninstall would be a
+// destructive scope change (F3).
+func selectToolsForInit(all, cc, codex, cursor, cline bool, installed []string) []string {
+	return resolveTools(all, cc, codex, cursor, cline, installed, true)
+}
+
+// resolveTools is the shared core. crossOSWindows gates the init-only union of
+// an explicit base selector with its "<base>-windows" cross-OS target.
+func resolveTools(all, cc, codex, cursor, cline bool, installed []string, crossOSWindows bool) []string {
+	installedSet := map[string]bool{}
+	for _, t := range installed {
+		installedSet[t] = true
+	}
 	requested := map[string]bool{}
 	if all {
 		for _, t := range installed {
 			requested[t] = true
 		}
 	}
+	// selectBase requests a base tool AND (init-only) its cross-OS
+	// "<base>-windows" virtual target when that target was detected/resolvable
+	// (present in installed) and is actually wireable for a cross-OS surface
+	// (route OR hook capable). F3: without this, `observer init --codex
+	// --windows-codex-home=…` would select only "codex" and write NOTHING to
+	// the Windows home. The union is gated on detection + the capability
+	// predicates (CLAUDE.md #3), never a bare name switch beyond the
+	// established "-windows" suffix convention — AND it is init-only, so
+	// `observer uninstall --codex` keeps base-only scope.
+	selectBase := func(base string) {
+		requested[base] = true
+		if !crossOSWindows {
+			return
+		}
+		win := base + "-windows"
+		if installedSet[win] && (routeSupported(win) || hookSupported(win)) {
+			requested[win] = true
+		}
+	}
 	if cc {
-		requested["claude-code"] = true
+		selectBase("claude-code")
 	}
 	if codex {
-		requested["codex"] = true
+		selectBase("codex")
 	}
 	if cursor {
-		requested["cursor"] = true
+		selectBase("cursor")
 	}
 	if cline {
-		requested["cline"] = true
+		selectBase("cline")
 	}
 	if len(requested) == 0 && !all {
 		for _, t := range installed {
@@ -1447,7 +1556,7 @@ func selectTools(all, cc, codex, cursor, cline bool, installed []string) []strin
 	supported := map[string]bool{
 		"claude-code": true, "claude-code-windows": true,
 		"cursor": true, "cursor-windows": true,
-		"codex":    true,
+		"codex": true, "codex-windows": true,
 		"opencode": true,
 		"cline":    true, "cline-windows": true,
 	}

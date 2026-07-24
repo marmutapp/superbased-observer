@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 // OS tags emitted on HomeRoot.
@@ -161,6 +162,40 @@ func (d *detector) windowsWSLHomes() []HomeRoot {
 		}
 	}
 	return out
+}
+
+// IsWSL reports whether this process runs inside WSL2 with Windows interop —
+// the environment where a Linux daemon can reach Windows-installed tools over
+// the /mnt bind and, conversely, where a native tool binary may be shadowed by
+// a Windows npm interop shim on PATH. It returns true when the binfmt interop
+// registration (/proc/sys/fs/binfmt_misc/WSLInterop) exists OR /proc/version
+// names a Microsoft kernel (case-insensitive). Safe on any platform: on a
+// non-WSL host both probes miss and it returns false.
+//
+// TODO(consolidation): internal/processobs/bridge.isWSL and internal/launch's
+// inline WSL probe (launch.Detect) implement the same check; a follow-up should
+// route both through this exported detector so there is one owner.
+func IsWSL() bool {
+	return isWSL(fileExists, os.ReadFile)
+}
+
+// isWSL is the injectable core of IsWSL: exists reports whether a path exists,
+// readFile reads a file's bytes. Split out so a test can stage /proc contents
+// without touching the host.
+func isWSL(exists func(string) bool, readFile func(string) ([]byte, error)) bool {
+	if exists("/proc/sys/fs/binfmt_misc/WSLInterop") {
+		return true
+	}
+	if b, err := readFile("/proc/version"); err == nil {
+		return strings.Contains(strings.ToLower(string(b)), "microsoft")
+	}
+	return false
+}
+
+// fileExists reports whether path exists (of any type).
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func isExistingDir(path string) bool {

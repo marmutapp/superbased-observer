@@ -97,6 +97,17 @@ type ProxyRoute struct {
 	// Note documents config-file-routed tools (EnvVar == ""), where the
 	// base URL lives in a config file rather than an env var.
 	Note string
+	// CrossOSBridge mirrors HookSpec.CrossOSBridge for the proxy route: this
+	// persisted route's config file can ALSO be written into a foreign
+	// Windows home from a WSL daemon — the `<tool>-windows` virtual-target
+	// convention. When true, the `<tool>-windows` target resolves the
+	// Windows-side config path through crossmount and writes the base-URL
+	// route (env settings / config file) pointing at the WSL proxy's
+	// localhost-forwarded port, so a Windows-installed claude/codex routes
+	// through the WSL proxy. A capability FLAG, not a tool branch
+	// (CLAUDE.md #3); meaningful only for the persisted RouteKinds
+	// (RouteEnvSettings / RouteConfigFile).
+	CrossOSBridge bool
 }
 
 // Capability is one adapter's row in the registry: everything observer
@@ -163,6 +174,14 @@ type Capability struct {
 	// tool is launchable, else a disabled affordance. A ResumeNative row is
 	// declared only after the native-resume argv is verified live.
 	Resume ResumeSpec
+	// Binary, when non-nil, declares how the `observer <x>` launcher resolves
+	// the tool's executable across OSes plus the grounded one-click install
+	// hints (BinaryResolveSpec). Nil = no grounded resolution row (the honest
+	// floor). Populated for every launchable tool (Handoff.Launch != nil),
+	// pinned by registry_coverage_test.go. Consumers (the toolresolve ladder,
+	// the dashboard install endpoint, the doctor) dispatch on the SHAPE of
+	// this field, never on tool name (CLAUDE.md #3).
+	Binary *BinaryResolveSpec
 }
 
 // registry is the capability table, keyed by the adapter's canonical tool
@@ -177,7 +196,7 @@ var registry = map[string]Capability{
 	// Full-capability flagships: proxy + hook + MCP + all native rails.
 	"claude-code": {
 		Tool:        "claude-code",
-		Proxy:       &ProxyRoute{Kind: RouteEnvSettings, EnvVar: "ANTHROPIC_BASE_URL", Suffix: "", Launcher: "observer claude"},
+		Proxy:       &ProxyRoute{Kind: RouteEnvSettings, EnvVar: "ANTHROPIC_BASE_URL", Suffix: "", Launcher: "observer claude", CrossOSBridge: true},
 		Routability: RouteStatusRoutableNow,
 		Hook:        HookSpec{Mechanism: HookClaudeSettings, CrossOSBridge: true, AutoWired: true},
 		MCP:         &MCPTarget{Format: MCPServersJSON, PathHint: ".claude.json", Implemented: true},
@@ -186,6 +205,24 @@ var registry = map[string]Capability{
 		// P0.1 FULL: ~/.claude/projects/<slug>/<sid>.jsonl; reader derives
 		// the path by session-id glob (hook-fed rows carry a sentinel).
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectMCP, InjectHook, InjectPrompt}, Launch: &LaunchSpec{Subcommand: "claude"}},
+		// Binary resolution + grounded installs. Unix launcher resolves
+		// "claude"; the npm shim + the official curl installer are both
+		// grounded (npm @anthropic-ai/claude-code; claude.ai/install.sh).
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{
+				Unix:    []string{"claude"},
+				Windows: []string{"claude.exe", "claude.cmd", "claude"},
+			},
+			ProbeDirs: []ProbeDir{
+				{OS: ProbeUnix, Rel: ".claude/local"},
+				{OS: ProbeUnix, Rel: ".local/bin"},
+			},
+			Installs: []InstallHint{
+				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "@anthropic-ai/claude-code"}, Display: "npm install -g @anthropic-ai/claude-code"},
+				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://claude.ai/install.sh | bash"}, Display: "curl -fsSL https://claude.ai/install.sh | bash"},
+				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://claude.ai/install.sh | bash"}, Display: "curl -fsSL https://claude.ai/install.sh | bash"},
+			},
+		},
 		// Attachable: `observer claude --attach` hands the PTY to the daemon
 		// (session-attach v1 scope).
 		Attach: &AttachSpec{Subcommand: "claude"},
@@ -201,7 +238,7 @@ var registry = map[string]Capability{
 	},
 	"codex": {
 		Tool:        "codex",
-		Proxy:       &ProxyRoute{Kind: RouteConfigFile, EnvVar: "", Launcher: "observer codex", Note: "codex routes through ~/.codex/config.toml openai_base_url (not an env var)"},
+		Proxy:       &ProxyRoute{Kind: RouteConfigFile, EnvVar: "", Launcher: "observer codex", Note: "codex routes through ~/.codex/config.toml openai_base_url (not an env var)", CrossOSBridge: true},
 		Routability: RouteStatusRoutableNow,
 		Hook:        HookSpec{Mechanism: HookCodexConfig, AutoWired: true},
 		MCP:         &MCPTarget{Format: MCPCodexTOML, PathHint: ".codex/config.toml", Implemented: true},
@@ -210,6 +247,18 @@ var registry = map[string]Capability{
 		// P0.1 FULL: rollout JSONL (event_msg text lane + function_call
 		// pairing); reader derives the path by session-id glob.
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectMCP, InjectPrompt}, Launch: &LaunchSpec{Subcommand: "codex"}},
+		// Binary resolution + grounded installs. Unix launcher resolves
+		// "codex"; npm @openai/codex (any OS) + brew on macOS.
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{
+				Unix:    []string{"codex"},
+				Windows: []string{"codex.exe", "codex.cmd", "codex"},
+			},
+			Installs: []InstallHint{
+				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "@openai/codex"}, Display: "npm install -g @openai/codex"},
+				{OS: "darwin", Channel: "brew", Argv: []string{"brew", "install", "codex"}, Display: "brew install codex"},
+			},
+		},
 		// Attachable: `observer codex --attach` hands the PTY to the daemon
 		// (session-attach v1 scope).
 		Attach: &AttachSpec{Subcommand: "codex"},
@@ -244,6 +293,25 @@ var registry = map[string]Capability{
 		TokenTier: TokenTier{Best: "sqlite"},
 		// P0.1 FULL: opencode.db message+part tables (reader = P2 tranche).
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectMCP, InjectPrompt}, Launch: &LaunchSpec{Subcommand: "opencode"}},
+		// Binary resolution + grounded installs. Unix launcher resolves
+		// "opencode"; npm opencode-ai@latest (any OS) + the official curl
+		// installer on linux/darwin. Its own bin dir (.opencode/bin) is a
+		// per-tool extra on both OSes.
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{
+				Unix:    []string{"opencode"},
+				Windows: []string{"opencode.exe", "opencode.cmd", "opencode"},
+			},
+			ProbeDirs: []ProbeDir{
+				{OS: ProbeUnix, Rel: ".opencode/bin"},
+				{OS: ProbeWindows, Rel: ".opencode/bin"},
+			},
+			Installs: []InstallHint{
+				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "opencode-ai@latest"}, Display: "npm install -g opencode-ai@latest"},
+				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://opencode.ai/install | bash"}, Display: "curl -fsSL https://opencode.ai/install | bash"},
+				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://opencode.ai/install | bash"}, Display: "curl -fsSL https://opencode.ai/install | bash"},
+			},
+		},
 	},
 
 	// IDE/extension adapters that talk only to their own backend → no proxy
@@ -270,6 +338,23 @@ var registry = map[string]Capability{
 		// source_file (sentinel) — derive by session id. IDE state.vscdb
 		// unmeasured on this corpus. Reader = P2 tranche.
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectMCP, InjectPrompt}, Launch: &LaunchSpec{Subcommand: "cursor"}, Note: "CLI grounded; IDE surface unmeasured"},
+		// Binary resolution + grounded install. Unix launcher resolves
+		// "cursor-agent"; the installer drops versioned binaries under
+		// .local/share/cursor-agent/versions/*. Official installer script
+		// (cursor.com/docs/cli/installation); Windows hint is display-only
+		// (no Windows binary spelling grounded yet).
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{Unix: []string{"cursor-agent"}},
+			ProbeDirs: []ProbeDir{
+				{OS: ProbeUnix, Rel: ".local/bin"},
+				{OS: ProbeUnix, Rel: ".local/share/cursor-agent/versions/*"},
+			},
+			Installs: []InstallHint{
+				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl https://cursor.com/install -fsS | bash"}, Display: "curl https://cursor.com/install -fsS | bash"},
+				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl https://cursor.com/install -fsS | bash"}, Display: "curl https://cursor.com/install -fsS | bash"},
+				{OS: "windows", Channel: "script", Argv: []string{"powershell", "-Command", "irm 'https://cursor.com/install?win32=true' | iex"}, Display: "irm 'https://cursor.com/install?win32=true' | iex"},
+			},
+		},
 	},
 	"cline": {
 		Tool: "cline",
@@ -341,6 +426,23 @@ var registry = map[string]Capability{
 		// P0.1 FULL: ~/.copilot/session-store.db turns(user_message,
 		// assistant_response) (reader = P2 tranche).
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectPrompt}, Launch: &LaunchSpec{Subcommand: "copilot-cli"}},
+		// Binary resolution + grounded installs. Unix launcher resolves
+		// "copilot"; npm @github/copilot (any OS) + the cask/script/winget
+		// channels (docs.github.com copilot-cli install).
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{
+				Unix:    []string{"copilot"},
+				Windows: []string{"copilot.exe", "copilot.cmd", "copilot"},
+			},
+			Installs: []InstallHint{
+				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "@github/copilot"}, Display: "npm install -g @github/copilot"},
+				{OS: "darwin", Channel: "brew", Argv: []string{"brew", "install", "--cask", "copilot-cli"}, Display: "brew install --cask copilot-cli"},
+				{OS: "linux", Channel: "brew", Argv: []string{"brew", "install", "--cask", "copilot-cli"}, Display: "brew install --cask copilot-cli"},
+				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://gh.io/copilot-install | bash"}, Display: "curl -fsSL https://gh.io/copilot-install | bash"},
+				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://gh.io/copilot-install | bash"}, Display: "curl -fsSL https://gh.io/copilot-install | bash"},
+				{OS: "windows", Channel: "winget", Argv: []string{"winget", "install", "GitHub.Copilot"}, Display: "winget install GitHub.Copilot"},
+			},
+		},
 	},
 	"kilo-code": {
 		Tool: "kilo-code",
@@ -381,6 +483,22 @@ var registry = map[string]Capability{
 		TokenTier: TokenTier{Best: "sqlite"},
 		// P0.1 FULL: kilo.db message+part tables (reader = P2 tranche).
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectPrompt}, Launch: &LaunchSpec{Subcommand: "kilo"}},
+		// Binary resolution + grounded installs. Unix launcher resolves
+		// "kilo"; npm @kilocode/cli (any OS) + the script/brew channels
+		// (kilo.ai/docs/cli). Windows shim grounded at
+		// %APPDATA%\npm\kilo.cmd (docs/kilo-code-adapter.md).
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{
+				Unix:    []string{"kilo"},
+				Windows: []string{"kilo.exe", "kilo.cmd", "kilo"},
+			},
+			Installs: []InstallHint{
+				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "@kilocode/cli"}, Display: "npm install -g @kilocode/cli"},
+				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://kilo.ai/cli/install | bash"}, Display: "curl -fsSL https://kilo.ai/cli/install | bash"},
+				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://kilo.ai/cli/install | bash"}, Display: "curl -fsSL https://kilo.ai/cli/install | bash"},
+				{OS: "darwin", Channel: "brew", Argv: []string{"brew", "install", "Kilo-Org/tap/kilo"}, Display: "brew install Kilo-Org/tap/kilo"},
+			},
+		},
 	},
 
 	// CLI adapters captured via watcher/SQLite (+ opt-in receivers).
@@ -410,6 +528,17 @@ var registry = map[string]Capability{
 		// P0.1 FULL: <id>.messages.json, Anthropic-shaped (reader = P2
 		// tranche).
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectPrompt}, Launch: &LaunchSpec{Subcommand: "cline-cli"}},
+		// Binary resolution + grounded install. Unix launcher resolves
+		// "cline"; npm-distributed `cline` 3.x (docs/clinecli-adapter.md).
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{
+				Unix:    []string{"cline"},
+				Windows: []string{"cline.exe", "cline.cmd", "cline"},
+			},
+			Installs: []InstallHint{
+				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "cline"}, Display: "npm install -g cline"},
+			},
+		},
 	},
 	"hermes": {
 		Tool: "hermes",
@@ -477,6 +606,25 @@ var registry = map[string]Capability{
 		// gap, NousResearch/hermes-agent Issue #19675). So it is launchable
 		// only in DocAssisted mode: write the doc + open `hermes --tui`.
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectMCP}, Launch: &LaunchSpec{Subcommand: "hermes", Mode: LaunchDocAssisted}, Note: "TUI has no initial-prompt seed (upstream gap); launch writes the handover doc + opens hermes --tui"},
+		// Binary resolution + grounded install. Unix launcher resolves
+		// "hermes"; its bundled node prefix (.hermes/node/bin) + .hermes/bin
+		// are per-tool extras (the off-PATH hermes-bundled npm prefix from
+		// the opencode-WSL incident). Official install script
+		// (github.com/NousResearch/hermes-agent README; no official pip
+		// path). Windows hint is display-only (no Windows binary spelling
+		// grounded yet).
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{Unix: []string{"hermes"}},
+			ProbeDirs: []ProbeDir{
+				{OS: ProbeUnix, Rel: ".hermes/bin"},
+				{OS: ProbeUnix, Rel: ".hermes/node/bin"},
+			},
+			Installs: []InstallHint{
+				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"}, Display: "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"},
+				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"}, Display: "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"},
+				{OS: "windows", Channel: "script", Argv: []string{"powershell", "-Command", "iex (irm https://hermes-agent.nousresearch.com/install.ps1)"}, Display: "iex (irm https://hermes-agent.nousresearch.com/install.ps1)"},
+			},
+		},
 	},
 	"cowork": {
 		Tool: "cowork",
@@ -514,6 +662,17 @@ var registry = map[string]Capability{
 		// P0.1 FULL: ~/.gemini/tmp/<proj>/chats/session-*.jsonl user/gemini
 		// records (reader = P2 tranche).
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectPrompt}, Launch: &LaunchSpec{Subcommand: "gemini"}},
+		// Binary resolution + grounded install. Unix launcher resolves
+		// "gemini"; npm @google/gemini-cli (any OS).
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{
+				Unix:    []string{"gemini"},
+				Windows: []string{"gemini.exe", "gemini.cmd", "gemini"},
+			},
+			Installs: []InstallHint{
+				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "@google/gemini-cli"}, Display: "npm install -g @google/gemini-cli"},
+			},
+		},
 	},
 	"openclaw": {
 		Tool: "openclaw",
@@ -569,6 +728,21 @@ var registry = map[string]Capability{
 		// block); token capture stays on the trajectory adapter, so seeding is
 		// orthogonal to capture.
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectPrompt}, Launch: &LaunchSpec{Subcommand: "openclaw"}, Note: "seeded via chat --message; --continue-from launches non-proxied to avoid the --local proxy stall"},
+		// Binary resolution + grounded installs. Unix launcher resolves
+		// "openclaw"; the vendor script is primary (docs.openclaw.ai/install),
+		// npm is an alternate (needs `openclaw onboard --install-daemon`
+		// after, so script leads).
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{
+				Unix:    []string{"openclaw"},
+				Windows: []string{"openclaw.exe", "openclaw.cmd", "openclaw"},
+			},
+			Installs: []InstallHint{
+				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://openclaw.ai/install.sh | bash"}, Display: "curl -fsSL https://openclaw.ai/install.sh | bash"},
+				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://openclaw.ai/install.sh | bash"}, Display: "curl -fsSL https://openclaw.ai/install.sh | bash"},
+				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "openclaw@latest"}, Display: "npm install -g openclaw@latest"},
+			},
+		},
 	},
 	"pi": {
 		Tool: "pi",
@@ -600,6 +774,20 @@ var registry = map[string]Capability{
 		// P0.1 FULL: sessions/<slug>/<ts>_<id>.jsonl message records
 		// (reader = P2 tranche).
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectPrompt}, Launch: &LaunchSpec{Subcommand: "pi"}},
+		// Binary resolution + grounded installs. Unix launcher resolves
+		// "pi"; npm @earendil-works/pi-coding-agent (earendil-works/pi,
+		// pi.dev — NOT Inflection) + the official install script.
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{
+				Unix:    []string{"pi"},
+				Windows: []string{"pi.exe", "pi.cmd", "pi"},
+			},
+			Installs: []InstallHint{
+				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "--ignore-scripts", "@earendil-works/pi-coding-agent"}, Display: "npm install -g --ignore-scripts @earendil-works/pi-coding-agent"},
+				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://pi.dev/install.sh | sh"}, Display: "curl -fsSL https://pi.dev/install.sh | sh"},
+				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://pi.dev/install.sh | sh"}, Display: "curl -fsSL https://pi.dev/install.sh | sh"},
+			},
+		},
 	},
 	"antigravity": {
 		Tool: "antigravity",
@@ -632,6 +820,18 @@ var registry = map[string]Capability{
 			Inject:     []InjectKind{InjectFile, InjectPrompt},
 			Launch:     &LaunchSpec{Subcommand: "antigravity-cli"},
 			Note:       "CLI (agy) .db readable + -i seed",
+		},
+		// Binary resolution + grounded install. Unix launcher resolves "agy"
+		// (the agy CLI); official install script (antigravity.google/docs/
+		// cli/install). Windows hint is display-only (no Windows binary
+		// spelling grounded yet).
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{Unix: []string{"agy"}},
+			Installs: []InstallHint{
+				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://antigravity.google/cli/install.sh | bash"}, Display: "curl -fsSL https://antigravity.google/cli/install.sh | bash"},
+				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://antigravity.google/cli/install.sh | bash"}, Display: "curl -fsSL https://antigravity.google/cli/install.sh | bash"},
+				{OS: "windows", Channel: "script", Argv: []string{"powershell", "-Command", "irm https://antigravity.google/cli/install.ps1 | iex"}, Display: "irm https://antigravity.google/cli/install.ps1 | iex"},
+			},
 		},
 	},
 	"qwen-code": {
@@ -694,6 +894,21 @@ var registry = map[string]Capability{
 			Launch:     &LaunchSpec{Subcommand: "qwen"},
 			Note:       "-i/--prompt-interactive seed verified live",
 		},
+		// Binary resolution + grounded installs. Unix launcher resolves
+		// "qwen"; npm @qwen-code/qwen-code@latest (any OS) + the standalone
+		// install script + brew (QwenLM/qwen-code + official docs).
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{
+				Unix:    []string{"qwen"},
+				Windows: []string{"qwen.exe", "qwen.cmd", "qwen"},
+			},
+			Installs: []InstallHint{
+				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "@qwen-code/qwen-code@latest"}, Display: "npm install -g @qwen-code/qwen-code@latest"},
+				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen-standalone.sh | bash"}, Display: "curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen-standalone.sh | bash"},
+				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen-standalone.sh | bash"}, Display: "curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen-standalone.sh | bash"},
+				{OS: "darwin", Channel: "brew", Argv: []string{"brew", "install", "qwen-code"}, Display: "brew install qwen-code"},
+			},
+		},
 	},
 	"kiro-cli": {
 		Tool: "kiro-cli",
@@ -719,6 +934,19 @@ var registry = map[string]Capability{
 			Inject:     []InjectKind{InjectFile, InjectPrompt},
 			Launch:     &LaunchSpec{Subcommand: "kiro"},
 			Note:       "chat positional seed verified live; dual-store reader",
+		},
+		// Binary resolution + grounded install. Unix launcher resolves
+		// "kiro-cli"; official install script (kiro.dev/docs/cli/
+		// installation). Homebrew is explicitly NOT supported per vendor
+		// docs. Windows hint is display-only (no Windows binary spelling
+		// grounded yet).
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{Unix: []string{"kiro-cli"}},
+			Installs: []InstallHint{
+				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://cli.kiro.dev/install | bash"}, Display: "curl -fsSL https://cli.kiro.dev/install | bash"},
+				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://cli.kiro.dev/install | bash"}, Display: "curl -fsSL https://cli.kiro.dev/install | bash"},
+				{OS: "windows", Channel: "script", Argv: []string{"powershell", "-Command", "irm 'https://cli.kiro.dev/install.ps1' | iex"}, Display: "irm 'https://cli.kiro.dev/install.ps1' | iex"},
+			},
 		},
 	},
 	"grok": {
@@ -761,6 +989,21 @@ var registry = map[string]Capability{
 			Inject:     []InjectKind{InjectFile, InjectPrompt},
 			Launch:     &LaunchSpec{Subcommand: "grok"},
 			Note:       "positional seed verified live; tool-exec capture still owed (plan-agent default)",
+		},
+		// Binary resolution + grounded installs. Unix launcher resolves
+		// "grok"; npm @xai-official/grok (any OS) + the official install
+		// script (docs.x.ai/build/overview).
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{
+				Unix:    []string{"grok"},
+				Windows: []string{"grok.exe", "grok.cmd", "grok"},
+			},
+			Installs: []InstallHint{
+				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "@xai-official/grok"}, Display: "npm install -g @xai-official/grok"},
+				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://x.ai/cli/install.sh | bash"}, Display: "curl -fsSL https://x.ai/cli/install.sh | bash"},
+				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://x.ai/cli/install.sh | bash"}, Display: "curl -fsSL https://x.ai/cli/install.sh | bash"},
+				{OS: "windows", Channel: "script", Argv: []string{"powershell", "-Command", "irm https://x.ai/cli/install.ps1 | iex"}, Display: "irm https://x.ai/cli/install.ps1 | iex"},
+			},
 		},
 	},
 	"kimi-code": {
@@ -817,6 +1060,9 @@ var registry = map[string]Capability{
 			Launch:     &LaunchSpec{Subcommand: "kimi", Mode: LaunchDocAssisted},
 			Note:       "no seed lane (-p prints+exits; TUI seedless) — doc-assisted launch",
 		},
+		// Binary resolution. Unix launcher resolves "kimi". No grounded
+		// install channel yet (research pending) → Installs nil, Windows nil.
+		Binary: &BinaryResolveSpec{Names: BinaryNames{Unix: []string{"kimi"}}},
 	},
 	"crush": {
 		Tool: "crush",
@@ -896,6 +1142,16 @@ var registry = map[string]Capability{
 			Launch:     &LaunchSpec{Subcommand: "devin"},
 			Note:       "positional seed contract operator-verified on a real TTY 2026-07-09 (`devin -- \"<prompt>\"`, clap last-only positional after the `--` separator); launcher `observer devin` seed-only/non-proxied (native_exempt, no base-URL knob)",
 		},
+		// Binary resolution + grounded install. Unix launcher resolves
+		// "devin"; official install script (devin.ai/cli). No official
+		// Windows path — the winget listing is third-party, not shipped.
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{Unix: []string{"devin"}},
+			Installs: []InstallHint{
+				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://cli.devin.ai/install.sh | bash"}, Display: "curl -fsSL https://cli.devin.ai/install.sh | bash"},
+				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://cli.devin.ai/install.sh | bash"}, Display: "curl -fsSL https://cli.devin.ai/install.sh | bash"},
+			},
+		},
 	},
 	"qoder": {
 		Tool: "qoder",
@@ -923,6 +1179,21 @@ var registry = map[string]Capability{
 			Inject:     []InjectKind{InjectFile, InjectPrompt},
 			Launch:     &LaunchSpec{Subcommand: "qoder"},
 			Note:       "seeds via -i flag value (binary is `qodercli`)",
+		},
+		// Binary resolution + grounded installs. Unix launcher resolves
+		// "qodercli" (the binary is qodercli, not qoder); npm
+		// @qoder-ai/qodercli (any OS) + the official install script
+		// (qoder.com/cli + npm).
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{
+				Unix:    []string{"qodercli"},
+				Windows: []string{"qodercli.exe", "qodercli.cmd", "qodercli"},
+			},
+			Installs: []InstallHint{
+				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "@qoder-ai/qodercli"}, Display: "npm install -g @qoder-ai/qodercli"},
+				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://qoder.com/install | bash"}, Display: "curl -fsSL https://qoder.com/install | bash"},
+				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://qoder.com/install | bash"}, Display: "curl -fsSL https://qoder.com/install | bash"},
+			},
 		},
 	},
 	"aider": {
@@ -998,6 +1269,21 @@ var registry = map[string]Capability{
 			Inject:     []InjectKind{InjectFile, InjectPrompt},
 			Launch:     &LaunchSpec{Subcommand: "goose"},
 			Note:       "seeds via `run -t <seed> -s` (seed-then-interactive verified live)",
+		},
+		// Binary resolution + grounded installs. Unix launcher resolves
+		// "goose"; its installer drops the binary under .local/bin (a
+		// per-tool extra). Official install script + brew (repo moved
+		// block/goose → aaif-goose/goose, Linux Foundation AAIF, Dec 2025 —
+		// goose-docs.ai installation page).
+		Binary: &BinaryResolveSpec{
+			Names:     BinaryNames{Unix: []string{"goose"}},
+			ProbeDirs: []ProbeDir{{OS: ProbeUnix, Rel: ".local/bin"}},
+			Installs: []InstallHint{
+				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash"}, Display: "curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash"},
+				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash"}, Display: "curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash"},
+				{OS: "darwin", Channel: "brew", Argv: []string{"brew", "install", "block-goose-cli"}, Display: "brew install block-goose-cli"},
+				{OS: "linux", Channel: "brew", Argv: []string{"brew", "install", "block-goose-cli"}, Display: "brew install block-goose-cli"},
+			},
 		},
 	},
 

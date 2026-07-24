@@ -333,3 +333,87 @@ type ResumeSpec struct {
 	// Non-empty when Kind == ResumeNative.
 	IDMechanism string
 }
+
+// BinaryNames lists the executable spellings a launcher looks for, split by
+// host OS. Unix carries the plain binary name(s) resolved on a Linux/macOS
+// PATH (usually one, e.g. "claude"); Windows carries the LAUNCHABLE shim
+// spellings an npm-style install lays down, in PATHEXT-resolution order
+// (`x.exe`/`x.cmd`/`x`). A `.ps1` is intentionally NOT listed: it cannot be
+// launched by exec.Command / CreateProcess (a PowerShell script is not an
+// executable image), so it is not a candidate. A nil/empty Windows slice is
+// the honest floor: "no grounded Windows
+// spelling" — it does NOT mean the tool is Linux-only, only that we have not
+// confirmed how it installs on Windows, so the cross-OS resolver has nothing
+// to try. Unix is required for every launchable tool (pinned by the coverage
+// test); a zero-value BinaryNames carries no grounded resolution.
+type BinaryNames struct {
+	Unix    []string
+	Windows []string
+}
+
+// ProbeOS names which host OS a ProbeDir applies to — the resolver only walks
+// a probe dir whose OS matches the home it is scanning (a native probe dir on
+// the daemon OS, or a foreign Windows home reached over crossmount).
+type ProbeOS string
+
+const (
+	// ProbeUnix: the dir is HOME-relative under a Linux/macOS home.
+	ProbeUnix ProbeOS = "unix"
+	// ProbeWindows: the dir is HOME-relative under a Windows user profile
+	// (reached over crossmount from a WSL daemon, or native on a Windows
+	// daemon).
+	ProbeWindows ProbeOS = "windows"
+)
+
+// ProbeDir is a single per-tool EXTRA directory the resolver scans for the
+// tool's binary when it is not first on PATH. Rel is HOME-RELATIVE (never
+// absolute) and may contain ONE `*` glob segment (e.g.
+// ".local/share/cursor-agent/versions/*") which the resolver expands. OS
+// gates which home the dir belongs under. The zero value carries no probe
+// dir.
+type ProbeDir struct {
+	OS  ProbeOS
+	Rel string
+}
+
+// InstallHint is a single grounded, one-click install command for a tool on a
+// given OS + channel. Argv is a COMPILE-TIME CONSTANT the dashboard install
+// endpoint spawns VERBATIM in a visible PTY — it is NEVER interpolated with
+// request data (the request contributes only a registry map key; argv
+// injection surface is zero by construction). Display is the human-readable
+// command surfaced to the operator PRE-CONSENT (shown before the click that
+// runs Argv); it is prose for the doctor/dashboard, not what is executed.
+//
+// The honesty rule is strict (operator directive, 2026-07-23): a tool ships
+// an InstallHint ONLY when its official install channel has been grounded. A
+// tool with no grounded channel carries an EMPTY Installs slice — the
+// doctor/dashboard then render "no grounded install command — see vendor
+// docs", never a fabricated command.
+type InstallHint struct {
+	// OS scopes the hint: "linux" | "darwin" | "windows" | "" (any OS).
+	OS string
+	// Channel names the install method: "npm" | "script" | "brew".
+	Channel string
+	// Argv is the compile-time-constant command spawned verbatim (never
+	// interpolated with request data).
+	Argv []string
+	// Display is the human-readable command surfaced pre-consent.
+	Display string
+}
+
+// BinaryResolveSpec is a tool's grounded binary-resolution row: the executable
+// spellings to look for, the per-tool EXTRA probe dirs to scan, and the
+// grounded install hints. A nil *BinaryResolveSpec on a Capability means "no
+// grounded resolution row" (the honest floor); a non-nil spec always carries
+// at least Names.Unix (pinned by the coverage test).
+//
+// COMMON probe dirs are NOT listed here: the ~/.local/bin, npm/volta/pnpm/bun
+// prefixes, and nvm/node version dirs shared across tools live in
+// internal/toolresolve, walked for every tool. ProbeDirs on this spec carries
+// ONLY the per-tool EXTRAS (e.g. cursor's versions/* dir, hermes' .hermes/bin)
+// that the common ladder would miss.
+type BinaryResolveSpec struct {
+	Names     BinaryNames
+	ProbeDirs []ProbeDir
+	Installs  []InstallHint
+}

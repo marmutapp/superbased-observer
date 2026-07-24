@@ -636,6 +636,58 @@ func (s *Service) SessionForRun(runID string) (string, bool) {
 	return link.sessionID, ok
 }
 
+// SessionLinkForRun returns the observer session id a run has been correlated
+// to AND the confidence that link was established at, once the correlation is
+// established (>= termrun.MinLinkConfidence). ok=false when the run has no
+// established link yet — correlation is scored and asynchronous, so a
+// freshly-spawned attach session legitimately has none. It is the
+// confidence-carrying companion of SessionForRun (which drops the field):
+// same in-memory map, same opportunistic burst-shed, same no-store-read
+// contract on the Snapshot hot path. The confidence honors the MAX-upgrade
+// semantics Correlate maintains, so a caller sees the strongest evidence
+// scored so far.
+func (s *Service) SessionLinkForRun(runID string) (sessionID string, confidence float64, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Same opportunistic burst-shed as SessionForRun — this is another per-run
+	// read the Snapshot hot path can drive, so a live daemon reclaims a
+	// past-grace ended-entry burst here even when no PruneEndedHandles ever runs.
+	s.gcEndedMetaLocked()
+	link, ok := s.bySession[runID]
+	return link.sessionID, link.confidence, ok
+}
+
+// ResolveHandleLink resolves a PTY handle to its full Session-Cockpit link in
+// ONE lock acquisition: liveness (byHandle), run identity (byMeta Kind+Tool),
+// and the correlated observer session id + confidence (bySession) are read
+// ATOMICALLY. The three-call chain it replaces (RunIDForHandle → KindForHandle
+// → SessionLinkForRun) took s.mu three separate times, so a run ending between
+// the first and third call could return known=true carrying a correlation that
+// EndRunByHandle had already deleted (a live=true answer with a stale/deleted
+// session link). Reading all three maps under the single lock closes that race.
+// ok=false for an unknown/exited handle (byHandle tracks LIVE runs only — same
+// liveness posture as RunIDForHandle). The composed methods are left untouched
+// for their existing callers.
+func (s *Service) ResolveHandleLink(handle string) (runID string, kind termrun.Kind, tool, sessionID string, confidence float64, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	runID, live := s.byHandle[handle]
+	if !live {
+		return "", "", "", "", 0, false
+	}
+	// Opportunistic burst-shed, matching KindForHandle/SessionLinkForRun — this
+	// read is on the same Snapshot/gate hot path. It never sheds the live handle
+	// resolved here (GC only reaps ended entries past grace).
+	s.gcEndedMetaLocked()
+	if m, mok := s.byMeta[handle]; mok {
+		kind, tool = m.Kind, m.Tool
+	}
+	if link, lok := s.bySession[runID]; lok {
+		sessionID, confidence = link.sessionID, link.confidence
+	}
+	return runID, kind, tool, sessionID, confidence, true
+}
+
 // HandleForRun returns the PTY handle a run currently maps to, if live.
 func (s *Service) HandleForRun(runID string) (string, bool) {
 	s.mu.Lock()

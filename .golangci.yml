@@ -64,6 +64,10 @@ issues:
     - testdata
     - bin
     - scripts
+    # Vendored npm packages can ship Go source (e.g. flatted's golang/ port
+    # under vscode/node_modules); third-party code isn't ours to lint and CI
+    # never installs node_modules for the Go job.
+    - node_modules
     # oapi-codegen output (DO NOT EDIT). Declaring security schemes used only
     # by documentation-tagged operations emits unused context-key types that
     # `unused` would flag; generated code is regenerated deterministically and

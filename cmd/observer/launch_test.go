@@ -1,8 +1,16 @@
 package main
 
 import (
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/marmutapp/superbased-observer/internal/integration"
+	"github.com/marmutapp/superbased-observer/internal/toolresolve"
 )
 
 func TestResolveProxyURL(t *testing.T) {
@@ -26,17 +34,163 @@ func TestResolveProxyURL(t *testing.T) {
 	}
 }
 
+// fakeBinInfo is a minimal fs.FileInfo for the map-backed resolver env.
+type fakeBinInfo struct {
+	name string
+	mode fs.FileMode
+}
+
+func (f fakeBinInfo) Name() string       { return f.name }
+func (f fakeBinInfo) Size() int64        { return 0 }
+func (f fakeBinInfo) Mode() fs.FileMode  { return f.mode }
+func (f fakeBinInfo) ModTime() time.Time { return time.Time{} }
+func (f fakeBinInfo) IsDir() bool        { return f.mode.IsDir() }
+func (f fakeBinInfo) Sys() any           { return nil }
+
+// swapResolveEnv installs a map-backed fake toolresolve.Env for the duration of
+// a test, restoring the production memoized env on cleanup. files maps an
+// absolute path to its mode bits (0o755 = executable regular file).
+func swapResolveEnv(t *testing.T, env toolresolve.Env) {
+	t.Helper()
+	orig := resolveEnv
+	resolveEnv = func() toolresolve.Env { return env }
+	t.Cleanup(func() { resolveEnv = orig })
+}
+
+// fakeEnv builds a toolresolve.Env whose filesystem is the files map (path ->
+// mode). EvalSymlinks is identity for present files; Glob is empty.
+func fakeEnv(goos string, wsl bool, home string, foreignHomes, processPath []string, files map[string]fs.FileMode) toolresolve.Env {
+	return toolresolve.Env{
+		GOOS:         goos,
+		WSL:          wsl,
+		Home:         home,
+		ForeignHomes: foreignHomes,
+		ProcessPath:  processPath,
+		LoginPath:    nil,
+		Stat: func(p string) (fs.FileInfo, error) {
+			m, ok := files[p]
+			if !ok {
+				return nil, fs.ErrNotExist
+			}
+			return fakeBinInfo{name: filepath.Base(p), mode: m}, nil
+		},
+		EvalSymlinks: func(p string) (string, error) {
+			if _, ok := files[p]; ok {
+				return p, nil
+			}
+			return "", fs.ErrNotExist
+		},
+		Glob: func(string) ([]string, error) { return nil, nil },
+	}
+}
+
+// writeLaunchConfig writes a temp config.toml pinning [launch.tools.<tool>].path
+// and returns its path.
+func writeLaunchConfig(t *testing.T, tool, path string) string {
+	t.Helper()
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	body := "[launch.tools." + tool + "]\npath = \"" + path + "\"\n"
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return cfgPath
+}
+
+const exeBin = fs.FileMode(0o755)
+
 func TestResolveToolBin(t *testing.T) {
-	t.Run("override path returned verbatim", func(t *testing.T) {
-		got, err := resolveToolBin("cline", "/opt/cline", "--cline-path")
-		if err != nil || got != "/opt/cline" {
-			t.Fatalf("got (%q, %v), want (/opt/cline, nil)", got, err)
+	// The install Display surfaced when opencode is unresolvable — asserted in
+	// the foreign_only / not_found error text so the tests stay grounded in the
+	// registry data rather than a hardcoded string.
+	row, ok := integration.For("opencode")
+	if !ok || row.Binary == nil || len(row.Binary.Installs) == 0 {
+		t.Fatalf("registry precondition: opencode needs a Binary row with install hints")
+	}
+	wantInstall := row.Binary.Installs[0].Display
+
+	t.Run("override flag wins over config and ladder", func(t *testing.T) {
+		cfgPath := writeLaunchConfig(t, "opencode", "/opt/config/opencode")
+		got, err := resolveToolBin("opencode", "/opt/flag/opencode", "--opencode-path", cfgPath, io.Discard)
+		if err != nil || got != "/opt/flag/opencode" {
+			t.Fatalf("got (%q, %v), want (/opt/flag/opencode, nil)", got, err)
 		}
 	})
-	t.Run("missing binary errors name the flag", func(t *testing.T) {
-		_, err := resolveToolBin("definitely-not-a-real-binary-xyz", "", "--x-path")
-		if err == nil || !strings.Contains(err.Error(), "--x-path") {
-			t.Fatalf("err = %v, want one mentioning --x-path", err)
+
+	t.Run("config path wins over ladder", func(t *testing.T) {
+		// A real temp file so the stat-check passes.
+		binDir := t.TempDir()
+		binPath := filepath.Join(binDir, "opencode")
+		if err := os.WriteFile(binPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfgPath := writeLaunchConfig(t, "opencode", binPath)
+		// Even with an OK ladder available, config wins.
+		swapResolveEnv(t, fakeEnv("linux", false, "/home/u", nil,
+			[]string{"/usr/bin"}, map[string]fs.FileMode{"/usr/bin/opencode": exeBin}))
+		got, err := resolveToolBin("opencode", "", "--opencode-path", cfgPath, io.Discard)
+		if err != nil || got != binPath {
+			t.Fatalf("got (%q, %v), want (%q, nil)", got, err, binPath)
+		}
+	})
+
+	t.Run("config path set-but-missing errors name the key", func(t *testing.T) {
+		cfgPath := writeLaunchConfig(t, "opencode", "/no/such/opencode")
+		_, err := resolveToolBin("opencode", "", "--opencode-path", cfgPath, io.Discard)
+		if err == nil || !strings.Contains(err.Error(), "[launch.tools.opencode].path") {
+			t.Fatalf("err = %v, want one naming [launch.tools.opencode].path", err)
+		}
+	})
+
+	t.Run("verdict ok returns bin silently", func(t *testing.T) {
+		swapResolveEnv(t, fakeEnv("linux", false, "/home/u", nil,
+			[]string{"/usr/bin"}, map[string]fs.FileMode{"/usr/bin/opencode": exeBin}))
+		var stderr strings.Builder
+		got, err := resolveToolBin("opencode", "", "--opencode-path", "", &stderr)
+		if err != nil || got != "/usr/bin/opencode" {
+			t.Fatalf("got (%q, %v), want (/usr/bin/opencode, nil)", got, err)
+		}
+		if stderr.Len() != 0 {
+			t.Errorf("ok verdict wrote to stderr: %q", stderr.String())
+		}
+	})
+
+	t.Run("shadowed prints a note and returns the native bin", func(t *testing.T) {
+		swapResolveEnv(t, fakeEnv("linux", true, "/home/u", nil,
+			[]string{"/mnt/c/npm", "/usr/bin"},
+			map[string]fs.FileMode{
+				"/mnt/c/npm/opencode": exeBin, // Windows interop shim, earlier on PATH
+				"/usr/bin/opencode":   exeBin, // native install
+			}))
+		var stderr strings.Builder
+		got, err := resolveToolBin("opencode", "", "--opencode-path", "", &stderr)
+		if err != nil || got != "/usr/bin/opencode" {
+			t.Fatalf("got (%q, %v), want (/usr/bin/opencode, nil)", got, err)
+		}
+		if !strings.Contains(stderr.String(), "shim") {
+			t.Errorf("shadowed verdict stderr = %q, want a shim note", stderr.String())
+		}
+	})
+
+	t.Run("foreign_only errors with the install command", func(t *testing.T) {
+		swapResolveEnv(t, fakeEnv("linux", true, "/home/u", nil,
+			[]string{"/mnt/c/npm"},
+			map[string]fs.FileMode{"/mnt/c/npm/opencode": exeBin}))
+		_, err := resolveToolBin("opencode", "", "--opencode-path", "", io.Discard)
+		if err == nil {
+			t.Fatal("want an error for a Windows-only install")
+		}
+		if !strings.Contains(err.Error(), "Windows") || !strings.Contains(err.Error(), wantInstall) {
+			t.Fatalf("err = %v, want one naming Windows + the install %q", err, wantInstall)
+		}
+	})
+
+	t.Run("not_found errors with the install command", func(t *testing.T) {
+		swapResolveEnv(t, fakeEnv("linux", false, "/home/u", nil,
+			[]string{"/usr/bin"}, map[string]fs.FileMode{}))
+		_, err := resolveToolBin("opencode", "", "--opencode-path", "", io.Discard)
+		if err == nil || !strings.Contains(err.Error(), wantInstall) {
+			t.Fatalf("err = %v, want one naming the install %q", err, wantInstall)
 		}
 	})
 }

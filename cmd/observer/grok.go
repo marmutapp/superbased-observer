@@ -47,7 +47,7 @@ func newGrokCmd() *cobra.Command {
 			"to separate observer flags from grok flags. NEVER touches API keys.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			bin, err := resolveToolBin("grok", binPath, "--grok-path")
+			bin, err := resolveToolBin("grok", binPath, "--grok-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}
