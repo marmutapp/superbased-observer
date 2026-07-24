@@ -266,15 +266,20 @@ async function mockCockpit(page: import("@playwright/test").Page, opts: SetupOpt
 // Restore the terminal from its dock pill so its header (with the ⊙ Session
 // button) is on screen. Returns after the header button is visible.
 async function restoreTerminal(page: import("@playwright/test").Page, tool = "claude-code") {
-  const pill = page.getByTitle(`Restore ${tool} terminal`);
+  const pill = page.getByLabel(`Restore ${tool} terminal`);
   await expect(pill).toBeVisible({ timeout: 10000 });
   await pill.click();
 }
 
-// The ⊙ Session header button (glyph is part of the accessible name, so a
-// substring "Session" match is stable).
+// The ⊙ Session header button. When enabled its accessible name is the
+// visible glyph+word ("⊙ Session"); when disabled it carries an aria-label
+// with the honest reason (which replaces the name), so match on the stable
+// visible text content instead of the accessible name.
 function sessionButton(page: import("@playwright/test").Page) {
-  return page.getByRole("button", { name: "Session", exact: false }).first();
+  return page
+    .getByRole("button")
+    .filter({ hasText: "Session" })
+    .first();
 }
 
 // The cockpit floating panel landmark (FloatingPanel aria-label "Session
@@ -406,7 +411,7 @@ test("Files panel and cockpit coexist on one terminal; clicking raises each", as
   await expect(files).toBeVisible();
 });
 
-test("plain-shell terminal disables the ⊙ Session button with an honest title", async ({ page }) => {
+test("plain-shell terminal disables the ⊙ Session button with an honest label", async ({ page }) => {
   await mockCockpit(page, { tool: "terminal", correlated: false });
   await page.goto("/", { waitUntil: "domcontentloaded" });
   await restoreTerminal(page, "terminal");
@@ -414,7 +419,7 @@ test("plain-shell terminal disables the ⊙ Session button with an honest title"
   const btn = sessionButton(page);
   await expect(btn).toBeVisible({ timeout: 10000 });
   await expect(btn).toBeDisabled();
-  await expect(btn).toHaveAttribute("title", "No AI tool running in this terminal");
+  await expect(btn).toHaveAttribute("aria-label", "No AI tool running in this terminal");
 });
 
 // A processes payload with network capture OFF — drives the honest

@@ -62,10 +62,10 @@ async function mockTerminal(
 // Bring the injected session on-screen: click its dock pill to restore the
 // floating terminal, then focus the xterm grid so keystrokes route through it.
 async function openTerminal(page: import("@playwright/test").Page) {
-  // The restore control's ACCESSIBLE NAME is the pill's text ("claude-code
-  // live ▴"), which changes with connection status — so target the stable
-  // title attribute instead.
-  const pill = page.getByTitle("Restore claude-code terminal");
+  // The restore pill carries a stable aria-label ("Restore <tool> terminal")
+  // so it can be targeted independent of its visible text ("claude-code live ▴"),
+  // which changes with connection status.
+  const pill = page.getByLabel("Restore claude-code terminal");
   await expect(pill).toBeVisible({ timeout: 10000 });
   await pill.click();
   const xterm = page.locator(".xterm").first();

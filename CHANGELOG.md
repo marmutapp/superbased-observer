@@ -2,6 +2,56 @@
 
 All notable changes to SuperBased Observer are documented here.
 
+## [1.24.1] — 2026-07-24
+
+### Added
+
+- **feat(terminal): generic terminal→session correlation sweep.** Closes the
+  Session Cockpit gap where only claude-code (out-of-band, 0.95 confidence)
+  and codex (rollout discovery, 0.75) could link a dashboard-launched
+  terminal to its observer session — every other launcher stayed
+  uncorrelated. A 10s daemon-side, tool-agnostic discovery pass
+  (`termsvc.Correlate`) now links any LIVE uncorrelated run to a UNIQUE
+  candidate session (matched on tool + project root + a launch-time window
+  of [−5s, +30m]) at `SourceDiscovered` 0.75 confidence — unique-or-abstain
+  with a 2-tick dwell before committing a link, and tick-wide abstention on
+  any unsound tick (hit caps, transient failures) rather than a partial or
+  best-guess link. Both sides are revalidated immediately before a link
+  commits; store queries use julianday-precise window arithmetic;
+  dashboard-handoff runs are resolved via the source session's own project
+  root; a new integration reverse map (launcher-verb → tool) normalizes the
+  match. Open Session Cockpit panels self-heal through the existing 15s
+  link poll — no frontend change needed.
+- **feat(dashboard): themed tooltips.** Finished the migration to the
+  existing floating-ui `Tooltip` primitive across the sidebar collapsed
+  rail, terminal toolbars (⊙ Session/Files/Git, focus/grid/minimize/close,
+  size-mode, standing-secret), the Launch Dock, and the New Terminal
+  dialog — aria-labels preserved or added throughout, and the Playwright
+  specs flipped from `title` to `aria-label` assertions in lockstep. Native
+  `<option>` titles are deliberately kept as-is, and the terminal-resize
+  modal hint deliberately stays a native `title` (a persistent tooltip
+  hovering a live terminal is worse than a native one).
+- **feat(dashboard): Tailscale setup flow.** The Configuration card's "Pair
+  a device" action now gates on tailnet reachability: disabled with the
+  exact missing step plus a "Go to Tailscale setup" scroll-link when the
+  tailnet is known-unreachable, and enabled-with-caution when serve status
+  can't be detected on older Tailscale CLIs. Device-side guidance was added
+  to the serve-active step and the QR reveal ("install Tailscale on your
+  phone/device and sign into the same tailnet", with iOS/Android/download
+  links). The HTTPS-consent (`enable_url`) path now states plainly that
+  approval alone does not start serving, and offers a Retry serve action.
+  `docs/remote-access.md` updated to match.
+
+### Notes
+
+- Adversarial review: two codex GPT-5.6 passes (all findings fixed) plus an
+  independent Claude Opus pass (verdict SHIP; its remaining findings —
+  bounding the forward correlation window at 30 minutes, reconciling the
+  remote-language e2e case, reverting the resize-hint tooltip, and a
+  watcher-lag accessibility fix — were all applied). codex usage stayed
+  capped through this work (resets 2026-07-28); the Opus substitution was
+  operator-approved.
+
 ## [1.24.0] — 2026-07-24
 
 ### Added

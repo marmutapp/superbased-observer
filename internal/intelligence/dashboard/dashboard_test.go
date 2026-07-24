@@ -4579,7 +4579,11 @@ func TestAPIActions_MalformedUntilKeepsToDate(t *testing.T) {
 
 	st := store.New(database)
 	root := t.TempDir()
-	now := time.Now().UTC()
+	// Fixed historical anchor (not wall-clock): the now-2h row must land on
+	// the SAME date as `now` so `to_date=yesterday` excludes it. A real
+	// time.Now() anchor fails in the first ~2h after UTC midnight, when
+	// now-2h falls on yesterday's date (observed on CI at 00:48 UTC).
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
 	for i, ts := range []time.Time{now.Add(-2 * time.Hour), now.Add(-2 * 24 * time.Hour), now.Add(-60 * 24 * time.Hour)} {
 		if _, err := st.Ingest(context.Background(), []models.ToolEvent{{
 			SourceFile: fmt.Sprintf("f%d", i), SourceEventID: fmt.Sprintf("e%d", i),

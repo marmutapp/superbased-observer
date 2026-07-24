@@ -176,7 +176,7 @@ async function openFilesPanel(
   tool: string,
   index = 0,
 ) {
-  const pill = page.getByTitle(`Restore ${tool} terminal`);
+  const pill = page.getByLabel(`Restore ${tool} terminal`);
   await expect(pill).toBeVisible({ timeout: 10000 });
   await pill.click();
   const files = page.getByRole("button", { name: "Files", exact: false }).nth(index);

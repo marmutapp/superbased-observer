@@ -84,15 +84,22 @@ const (
 	// deterministically reattached `--resume <id>`). Highest confidence: the
 	// child cannot forge this channel (§2.1b) and the id is not a guess.
 	SourceOOB Source = "oob"
-	// SourceDiscovered — the run's session id was echoed on the SAME trusted
-	// out-of-band channel, but the launcher LEARNED it by a heuristic post-launch
-	// scan (e.g. codex has no `--session-id`, so the launcher discovers the new
-	// rollout file this run produced). The channel is still unforgeable, so this
-	// outranks a transcript marker; but the id itself rests on a
-	// filesystem/timing inference (the launcher already abstains on any
-	// ambiguity), so it sits below a KNOWN-id OOB echo. Still comfortably above
-	// MinLinkConfidence, so a discovered link attaches downstream links — until a
-	// stronger KNOWN-id OOB observation upgrades it.
+	// SourceDiscovered — the run's session id was not KNOWN at launch but was
+	// inferred by a corroborated discovery pass. It comes from EITHER of two
+	// mechanisms, both of which already abstain on any ambiguity:
+	//   - the launcher's post-launch artifact scan — codex has no `--session-id`,
+	//     so the launcher discovers the new rollout file this run produced and
+	//     echoes the id on the SAME trusted, unforgeable out-of-band channel; or
+	//   - the daemon's periodic project+time+uniqueness sweep — for a launcher
+	//     with no OOB id echo at all (opencode, gemini, …), the daemon links a
+	//     live, still-uncorrelated run to a UNIQUE candidate session that agrees
+	//     on tool + git root + launch time (unique-or-abstain, held across a
+	//     dwell; internal/termsvc via cmd's terminalDiscoverer).
+	// Either way the id itself rests on a filesystem/timing/uniqueness inference
+	// rather than a forced or launcher-known id, so it sits below a KNOWN-id OOB
+	// echo. Still comfortably above MinLinkConfidence, so a discovered link
+	// attaches downstream links — until a stronger KNOWN-id OOB observation
+	// upgrades it.
 	SourceDiscovered Source = "discovered"
 	// SourceMarker — a superbased-handoff marker (or equivalent) was observed in
 	// the tool's transcript/output identifying the session. Strong but the

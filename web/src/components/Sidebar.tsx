@@ -22,6 +22,7 @@ import {
   SparklesIcon,
   WrenchIcon,
 } from "@/components/icons";
+import { Tooltip } from "@/components/primitives";
 import type { StatusSnapshot, SetupClaude, WatcherHealth } from "@/lib/types";
 
 function NavIconSvg({ icon }: { icon: NavIcon }) {
@@ -157,45 +158,50 @@ export function Sidebar({
                 {g.label}
               </div>
               {g.items.map((it) => (
-                <NavLink
+                // Collapsed-rail affordance: a themed tooltip (side="right"
+                // reads naturally on a left rail) shows the label only when
+                // the rail is collapsed; the expanded rail stays tooltip-free
+                // (content={null} makes Tooltip a no-op passthrough).
+                <Tooltip
                   key={it.id}
-                  to={it.path}
-                  end={it.path === "/"}
-                  onClick={onClose}
-                  data-tour={`nav-${it.id}`}
-                  // Native title tooltip is the collapsed-rail affordance
-                  // (no in-repo hover primitive on NavLink); only when
-                  // collapsed so the expanded rail stays tooltip-free.
-                  title={collapsed ? it.label : undefined}
-                  className={({ isActive }) =>
-                    clsx(
-                      "flex items-center gap-2 rounded-2 px-2 py-1.5 text-[12.5px] transition-colors",
-                      collapsed && "lg:justify-center",
-                      isActive
-                        ? "bg-bg-3 text-fg-0"
-                        : "text-fg-2 hover:bg-bg-2 hover:text-fg-1",
-                    )
-                  }
+                  content={collapsed ? it.label : null}
+                  side="right"
                 >
-                  <span className="shrink-0 text-fg-3">
-                    <NavIconSvg icon={it.icon} />
-                  </span>
-                  <span
-                    className={clsx("flex-1 truncate", collapsed && "lg:hidden")}
+                  <NavLink
+                    to={it.path}
+                    end={it.path === "/"}
+                    onClick={onClose}
+                    data-tour={`nav-${it.id}`}
+                    className={({ isActive }) =>
+                      clsx(
+                        "flex items-center gap-2 rounded-2 px-2 py-1.5 text-[12.5px] transition-colors",
+                        collapsed && "lg:justify-center",
+                        isActive
+                          ? "bg-bg-3 text-fg-0"
+                          : "text-fg-2 hover:bg-bg-2 hover:text-fg-1",
+                      )
+                    }
                   >
-                    {it.label}
-                  </span>
-                  {counts[it.id] != null && (
-                    <span
-                      className={clsx(
-                        "shrink-0 font-mono text-[10px] tabular-nums text-fg-4",
-                        collapsed && "lg:hidden",
-                      )}
-                    >
-                      {fmtCompact(counts[it.id] as number)}
+                    <span className="shrink-0 text-fg-3">
+                      <NavIconSvg icon={it.icon} />
                     </span>
-                  )}
-                </NavLink>
+                    <span
+                      className={clsx("flex-1 truncate", collapsed && "lg:hidden")}
+                    >
+                      {it.label}
+                    </span>
+                    {counts[it.id] != null && (
+                      <span
+                        className={clsx(
+                          "shrink-0 font-mono text-[10px] tabular-nums text-fg-4",
+                          collapsed && "lg:hidden",
+                        )}
+                      >
+                        {fmtCompact(counts[it.id] as number)}
+                      </span>
+                    )}
+                  </NavLink>
+                </Tooltip>
               ))}
             </div>
           ))}
@@ -203,21 +209,25 @@ export function Sidebar({
         {/* Desktop-only collapse toggle — always reachable (visible in
             both expanded and collapsed states). Centered on the rail
             when collapsed; labeled when expanded. */}
-        <button
-          type="button"
-          onClick={toggleCollapsed}
-          aria-label={collapsed ? "Expand navigation" : "Collapse navigation"}
-          title={collapsed ? "Expand navigation" : "Collapse navigation"}
-          className={clsx(
-            "hidden items-center gap-2 border-t border-line-1 px-3 py-2 text-[11px] text-fg-3 transition-colors hover:bg-bg-2 hover:text-fg-1 lg:flex",
-            collapsed && "lg:justify-center",
-          )}
+        <Tooltip
+          content={collapsed ? "Expand navigation" : "Collapse navigation"}
+          side="right"
         >
-          <span className="grid h-6 w-6 shrink-0 place-items-center">
-            <ChevronCollapseIcon collapsed={collapsed} />
-          </span>
-          {!collapsed && <span>Collapse</span>}
-        </button>
+          <button
+            type="button"
+            onClick={toggleCollapsed}
+            aria-label={collapsed ? "Expand navigation" : "Collapse navigation"}
+            className={clsx(
+              "hidden items-center gap-2 border-t border-line-1 px-3 py-2 text-[11px] text-fg-3 transition-colors hover:bg-bg-2 hover:text-fg-1 lg:flex",
+              collapsed && "lg:justify-center",
+            )}
+          >
+            <span className="grid h-6 w-6 shrink-0 place-items-center">
+              <ChevronCollapseIcon collapsed={collapsed} />
+            </span>
+            {!collapsed && <span>Collapse</span>}
+          </button>
+        </Tooltip>
         {/* Footer detail overflows the 56px rail — hide it at lg+ when
             collapsed. The mobile drawer (always full width) keeps it. */}
         <div className={clsx(collapsed && "lg:hidden")}>
@@ -385,9 +395,9 @@ function Foot({
         ) : null}
       </div>
       {(lagging || misrouted) && (
-        <div
-          className="mb-0.5 flex items-center gap-1.5 text-[10px] text-warn"
-          title={
+        <Tooltip
+          maxWidth={320}
+          content={
             (lagging
               ? `Watcher is behind on ${watcher!.behind_count} file(s) (${fmtBytes(watcher!.behind_total_bytes)} unread) — recent activity may not be captured yet. A rescan (Settings → Backfill) catches up if it persists. `
               : "") +
@@ -396,11 +406,15 @@ function Foot({
               : "")
           }
         >
-          <span className="h-1.5 w-1.5 rounded-full bg-warn" />
-          {lagging && <>behind {watcher!.behind_count} file{watcher!.behind_count === 1 ? "" : "s"}</>}
-          {lagging && misrouted && " · "}
-          {misrouted && <>{watcher!.suspected_misrouted_count} misrouted</>}
-        </div>
+          {/* tabIndex={0} makes the warning keyboard-focusable so the Tooltip
+              (which opens on focus) is reachable without a pointer. */}
+          <div tabIndex={0} className="mb-0.5 flex items-center gap-1.5 text-[10px] text-warn">
+            <span className="h-1.5 w-1.5 rounded-full bg-warn" />
+            {lagging && <>behind {watcher!.behind_count} file{watcher!.behind_count === 1 ? "" : "s"}</>}
+            {lagging && misrouted && " · "}
+            {misrouted && <>{watcher!.suspected_misrouted_count} misrouted</>}
+          </div>
+        </Tooltip>
       )}
       {status && (
         <div className="font-mono text-[10px] text-fg-4">

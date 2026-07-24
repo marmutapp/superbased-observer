@@ -7,10 +7,12 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/marmutapp/superbased-observer/internal/attachsock"
 	"github.com/marmutapp/superbased-observer/internal/config"
+	"github.com/marmutapp/superbased-observer/internal/git"
 	"github.com/marmutapp/superbased-observer/internal/intelligence/dashboard"
 	"github.com/marmutapp/superbased-observer/internal/remotenotify"
 	"github.com/marmutapp/superbased-observer/internal/store"
@@ -230,6 +232,52 @@ func buildTerminalStack(cfg config.Config, database *sql.DB, logger *slog.Logger
 	// mutually referential — the same shape as the OnExit/scanHub closures).
 	launcher.correlate = svc.Correlate
 
+	// Generic terminal-run discovery sweep (Session Cockpit part C). A
+	// daemon-resident, tool-AGNOSTIC pass that periodically links a LIVE
+	// uncorrelated run to a UNIQUE candidate observer session — agreeing on tool +
+	// git root + launch time, unique-or-abstain, held across a dwell — at
+	// termrun.SourceDiscovered (0.75). It closes the correlation gap for every
+	// launcher that has no OOB id echo (only claude-code and codex correlate
+	// today; every other launcher's Session Cockpit otherwise waits forever). It
+	// reads the SAME svc seams the OOB path uses (HandleForRun = liveness truth;
+	// ProjectRoot = the validated launch dir; Correlate = the one scored-link
+	// seam) so a stale crash-orphan run from a previous boot simply misses the
+	// live-handle lookup and is skipped. Gated on a wired DB, and run on its OWN
+	// context so the stack's close func can stop it FIRST — before the H2 shutdown
+	// stamps and mgr.Shutdown() — so no in-flight tick write can race the
+	// defer-LIFO DB close (the same ordering discipline the H2 stamps rely on).
+	stopDiscover := func() {}
+	if database != nil {
+		disc := newTerminalDiscoverer(
+			store.New(database),
+			svc.HandleForRun,
+			svc.SessionLinkForRun,
+			svc.ProjectRoot,
+			svc.Correlate,
+			func(dir string) string {
+				info, gerr := git.Resolve(dir)
+				if gerr != nil {
+					return dir // unreadable dir: fall back to the raw path (store filter still applies)
+				}
+				return info.Root
+			},
+			nil, // now → time.Now (the link timestamp is now().UTC())
+			logger,
+			defaultTerminalDiscoverConfig(),
+		)
+		dctx, dcancel := context.WithCancel(context.Background())
+		var dwg sync.WaitGroup
+		dwg.Add(1)
+		go func() {
+			defer dwg.Done()
+			disc.run(dctx)
+		}()
+		stopDiscover = func() {
+			dcancel()
+			dwg.Wait()
+		}
+	}
+
 	// F4 agent-status hub: fuses the feed (OSC hints + OOB/lifecycle) with
 	// termsession output-recency/exit into a per-run status. Gated by
 	// [terminal.status].enabled; when off, no provider is wired (endpoints 503).
@@ -320,6 +368,11 @@ func buildTerminalStack(cfg config.Config, database *sql.DB, logger *slog.Logger
 		resumeAuthority:  resumeAuthority,
 		reclaimOnInput:   cfg.Terminal.Attach.ReclaimOnInput,
 		close: func() {
+			// Stop the discovery sweep FIRST — before ANY DB write below and before
+			// mgr.Shutdown() — and WAIT for its goroutine to drain, so no in-flight
+			// tick's Correlate write can race the defer-LIFO DB close that start.go
+			// runs after this. No-op when no DB was wired.
+			stopDiscover()
 			// H2: stamp every LIVE attach run 'daemon_shutdown' SYNCHRONOUSLY,
 			// BEFORE mgr.Shutdown() kills the PTYs (whose async OnExit would
 			// otherwise race the DB close) and before start.go's defer-LIFO closes

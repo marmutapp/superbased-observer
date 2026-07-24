@@ -8,6 +8,7 @@ import {
   isTerminalCapabilityError,
   useRemoteTerminalGate,
 } from "@/lib/remoteTerminal";
+import { Tooltip, TooltipSpan } from "@/components/primitives";
 
 // Sentinel <select> value for the "type a path by hand" escape hatch. A NUL
 // byte can never be a real project root, so it can't collide with one. The NUL
@@ -350,6 +351,8 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
           onChange={(e) => setRootSel(e.target.value)}
           className="w-full rounded-2 border bg-bg-0 px-2 py-1.5 text-[12px] text-fg-1"
         >
+          {/* Native <option> can't host a React tooltip (the browser owns
+              the select popup rendering) — keep the native title= here. */}
           <option
             value=""
             title="No project root: the fresh agent runs in the SuperBased daemon's own working directory (where observer start / observer dashboard was launched from)."
@@ -359,6 +362,8 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
           {permittedRoots.length > 0 && (
             <optgroup label="Permitted">
               {permittedRoots.map((r) => (
+                // Native <option> — title= stays (React tooltip can't render
+                // inside the browser-owned select popup).
                 <option key={r} value={r} title={r}>
                   {shortenPath(r)}
                 </option>
@@ -368,6 +373,8 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
           {blockedProjects.length > 0 && (
             <optgroup label="Not permitted (configure in Terminals → launch policy)">
               {blockedProjects.map((p) => (
+                // Native <option> — title= stays (React tooltip can't render
+                // inside the browser-owned select popup).
                 <option
                   key={p.root_path}
                   value={p.root_path}
@@ -401,12 +408,11 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
             className="mt-2 w-full rounded-2 border bg-bg-0 px-2 py-1.5 font-mono text-[12px] text-fg-1"
           />
         ) : rootSel ? (
-          <div
-            className="mt-1 break-all font-mono text-[10.5px] text-fg-3"
-            title={rootSel}
-          >
-            {rootSel}
-          </div>
+          <Tooltip content={rootSel}>
+            <div className="mt-1 break-all font-mono text-[10.5px] text-fg-3">
+              {rootSel}
+            </div>
+          </Tooltip>
         ) : null}
         {rootSel === CUSTOM_ROOT && (
           <p className="mt-1 text-[10.5px] leading-relaxed text-fg-3">
@@ -480,23 +486,33 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
           >
             Cancel
           </button>
-          <button
-            type="button"
-            disabled={busy || !tool || remoteBlocked || launchBlockedByVerdict}
-            onClick={submit}
-            title={
-              remoteBlocked
-                ? REMOTE_TERMINAL_OFF_MSG
-                : launchBlockedByVerdict
-                  ? verdict === "foreign_only"
-                    ? `${tool} is installed on Windows, not in WSL — the daemon can't launch it`
-                    : `${tool} is not installed`
-                  : undefined
-            }
-            className="rounded-2 bg-accent px-3 py-1.5 text-[12px] font-medium text-white disabled:opacity-50"
-          >
-            {busy ? "Starting…" : "Start"}
-          </button>
+          {(() => {
+            const tip = remoteBlocked
+              ? REMOTE_TERMINAL_OFF_MSG
+              : launchBlockedByVerdict
+                ? verdict === "foreign_only"
+                  ? `${tool} is installed on Windows, not in WSL — the daemon can't launch it`
+                  : `${tool} is not installed`
+                : null;
+            const startBtn = (
+              <button
+                type="button"
+                disabled={busy || !tool || remoteBlocked || launchBlockedByVerdict}
+                onClick={submit}
+                className="rounded-2 bg-accent px-3 py-1.5 text-[12px] font-medium text-white disabled:opacity-50"
+              >
+                {busy ? "Starting…" : "Start"}
+              </button>
+            );
+            // The tip only shows while the button is disabled (blocked), and a
+            // disabled <button> swallows pointer events — TooltipSpan gives it a
+            // hoverable span reference. No tip → bare button (no extra tab stop).
+            return tip ? (
+              <TooltipSpan content={tip}>{startBtn}</TooltipSpan>
+            ) : (
+              startBtn
+            );
+          })()}
         </div>
       </div>
     </div>

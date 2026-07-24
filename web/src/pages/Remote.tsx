@@ -220,6 +220,34 @@ export function RemotePage() {
   const maskTimer = useRef<number | null>(null);
 
   const c = cfg.data;
+
+  // Pairing reachability gate. The everyday "Pair a device" button used to
+  // appear the moment remote was armed, ignoring whether the dashboard is
+  // actually reachable over the tailnet — so users minted QR codes that could
+  // never connect. Compute reachability from the SAME tailscale status the
+  // Tailscale card consumes (one shared fetch at this level, `tailscale.data`):
+  //   - reachable      → serve is confirmed exposing the backend over HTTPS.
+  //   - indeterminate  → we CANNOT read serve state (fetch failed, or an older
+  //                      tailscale CLI can't report serve). Never hard-block on
+  //                      a signal we can't read — keep pairing enabled, warn.
+  //   - known-unreachable → we CAN read the state and it says not-yet-reachable
+  //                      (tailscale absent / logged out / serve not configured).
+  const ts = tailscale.data;
+  const serveReachable = Boolean(ts?.present && ts?.logged_in && ts?.serve_configured);
+  const serveIndeterminate =
+    !ts ||
+    (Boolean(ts.present) &&
+      Boolean(ts.logged_in) &&
+      (ts.serve_detectable === false ||
+        (ts.serve_configured === undefined && ts.serve_detectable === undefined)));
+  // The exact missing step, named honestly (house rule: the disabled-control
+  // copy names the precise missing dependency).
+  const pairMissingStep = !ts?.present
+    ? "install Tailscale"
+    : !ts?.logged_in
+      ? "log in to Tailscale"
+      : "start Tailscale serve";
+  const pairKnownUnreachable = !serveReachable && !serveIndeterminate;
   const confirmToken = c?.confirm_token ?? "";
 
   const reloadAll = useCallback(() => {
@@ -554,6 +582,14 @@ export function RemotePage() {
     document.getElementById("remote-arm")?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
+  // Scroll to the Tailscale setup card — the destination for the "finish the
+  // Tailscale step" hint under a gated "Pair a device" button.
+  function goToTailscaleSetup() {
+    document
+      .getElementById("tailscale-setup")
+      ?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
   async function revoke(fingerprint: string) {
     if (
       !window.confirm(
@@ -655,6 +691,13 @@ export function RemotePage() {
                   Done
                 </button>
               </div>
+              {/* Device-side prerequisite reminder — the QR is useless unless
+                  the scanning device is on the same tailnet. */}
+              <p className="text-[11px] leading-relaxed text-fg-3">
+                Scan from a device that has Tailscale installed and is signed
+                into the same tailnet — otherwise this link won’t load. Get the
+                app: <DeviceTailscaleLinks />.
+              </p>
               {pairing.tailscale_serve && (
                 <div className="pt-2">
                   <div className="mb-1 text-[11px] text-fg-3">
@@ -775,8 +818,13 @@ export function RemotePage() {
               <div className="flex flex-wrap gap-2 pt-1">
                 <button
                   type="button"
-                  disabled={busy !== null}
+                  disabled={busy !== null || pairKnownUnreachable}
                   onClick={pairDevice}
+                  title={
+                    pairKnownUnreachable
+                      ? `Pairing is unavailable until you ${pairMissingStep} — this dashboard isn't reachable over your tailnet yet.`
+                      : undefined
+                  }
                   className="rounded-2 border border-accent/50 bg-accent/15 px-3 py-1 text-[12px] font-medium text-accent hover:bg-accent/25 disabled:opacity-50"
                 >
                   {busy === "add-device" ? "generating QR…" : "Pair a device"}
@@ -798,6 +846,37 @@ export function RemotePage() {
                   {busy === "rotate" ? "resetting…" : "Reset & unpair all devices"}
                 </button>
               </div>
+              {/* Honest pair-gating hint: name the exact missing Tailscale step
+                  (known-unreachable → button disabled above) or warn that serve
+                  status can't be verified (indeterminate → button stays live). */}
+              {pairKnownUnreachable && (
+                <p className="text-[11px] leading-relaxed text-warn">
+                  Pairing is unavailable until this dashboard is reachable over
+                  your tailnet — finish the Tailscale step:{" "}
+                  <span className="font-medium">{pairMissingStep}</span>.{" "}
+                  <button
+                    type="button"
+                    onClick={goToTailscaleSetup}
+                    className="text-accent underline"
+                  >
+                    Go to Tailscale setup →
+                  </button>
+                </p>
+              )}
+              {!serveReachable && serveIndeterminate && (
+                <p className="text-[11px] leading-relaxed text-fg-3">
+                  Serve status can’t be verified on this Tailscale version — if
+                  the pairing link doesn’t load on the device, finish the
+                  Tailscale serve step.{" "}
+                  <button
+                    type="button"
+                    onClick={goToTailscaleSetup}
+                    className="text-accent underline"
+                  >
+                    Go to Tailscale setup →
+                  </button>
+                </p>
+              )}
               <p className="text-[11px] leading-relaxed text-fg-3">
                 <span className="font-medium text-fg-2">Pair a device</span> shows
                 a one-time QR to connect a new phone or laptop — devices you’ve
@@ -893,6 +972,7 @@ export function RemotePage() {
           expected outcome. When serve needs the operator grant it runs in an
           embedded terminal (the sudo password is typed here, not in a bounced
           shell). */}
+      <div id="tailscale-setup">
       <TailscaleCard
         data={tailscale.data}
         onServe={setupServe}
@@ -919,6 +999,7 @@ export function RemotePage() {
         onGoToPairing={goToPairing}
         onPairDevice={pairDevice}
       />
+      </div>
 
       {/* Live device sessions. */}
       <ChartShell
@@ -1272,6 +1353,25 @@ function TailscaleCard({
               the read-only view of this dashboard. It takes effect immediately;
               devices you’ve already paired stay connected.
             </p>
+            {/* Device-side prerequisite: the phone/other device must have
+                Tailscale installed AND be signed into the SAME tailnet, or the
+                pairing URL won't resolve at all. */}
+            <div className="rounded-2 border border-line-2 bg-bg-2 px-3 py-2">
+              <p className="text-[11px] font-medium text-fg-2">On your phone or other device</p>
+              <p className="mt-0.5 text-[11px] leading-relaxed text-fg-3">
+                Install Tailscale on that device and sign in to the same tailnet
+                {data.host ? (
+                  <>
+                    {" "}
+                    as this machine (<span className="font-mono text-fg-2">{data.host}</span>)
+                  </>
+                ) : (
+                  " account as this machine"
+                )}{" "}
+                — otherwise the dashboard URL simply won’t load. Get the app:{" "}
+                <DeviceTailscaleLinks />.
+              </p>
+            </div>
             <button
               type="button"
               onClick={onPairDevice}
@@ -1340,15 +1440,38 @@ function TailscaleCard({
               />
             )}
 
-            {/* Control-plane consent Observer cannot perform. */}
+            {/* Control-plane consent Observer cannot perform. Approving HTTPS in
+                the Tailscale admin console does NOT start serving — the user must
+                come back and re-fire serve, so we say so explicitly and put a
+                Retry button right here (re-runs the same serve POST, which also
+                refetches status on completion). */}
             {serveResult?.enable_url && (
-              <p className="text-[11px] text-warn">
-                One-time step SuperBased can't do for you — enable Serve in your Tailscale account, then click
-                again:{" "}
-                <a href={serveResult.enable_url} target="_blank" rel="noreferrer" className="text-accent underline">
-                  enable Serve →
-                </a>
-              </p>
+              <div className="space-y-1.5 rounded-2 border border-warn/40 bg-warn/10 px-3 py-2">
+                <p className="text-[11px] text-warn">
+                  One-time step SuperBased can't do for you — enable Serve in your Tailscale account:{" "}
+                  <a
+                    href={serveResult.enable_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-accent underline"
+                  >
+                    enable Serve →
+                  </a>
+                </p>
+                <p className="text-[11px] text-fg-2">
+                  After you approve HTTPS in the Tailscale admin console, click{" "}
+                  <span className="font-medium">Set up Tailscale serve for me</span> again —
+                  approval alone does not start serving.
+                </p>
+                <button
+                  type="button"
+                  disabled={serveBusy}
+                  onClick={onServe}
+                  className="rounded-2 border border-accent/50 bg-accent/15 px-3 py-1 text-[12px] text-accent hover:bg-accent/25 disabled:opacity-50"
+                >
+                  {serveBusy ? "retrying serve…" : "Retry serve"}
+                </button>
+              </div>
             )}
             {serveResult?.ok && (
               <p className="text-[11px] text-success">Serve is set — reachable over your tailnet.</p>
@@ -1409,6 +1532,42 @@ function SetupTerminalEmbed({
         />
       </div>
     </div>
+  );
+}
+
+// DeviceTailscaleLinks renders the three Tailscale-app install links (the phone
+// or other remote device must have Tailscale installed AND be signed into the
+// SAME tailnet, or the dashboard URL simply won't resolve). Shared by the
+// reachable Tailscale card and the pairing-QR reveal so the device-side
+// prerequisite is stated in both places a user might act.
+function DeviceTailscaleLinks() {
+  return (
+    <span className="inline-flex flex-wrap gap-x-2 gap-y-0.5">
+      <a
+        href="https://apps.apple.com/app/tailscale/id1470499037"
+        target="_blank"
+        rel="noreferrer"
+        className="text-accent underline"
+      >
+        iOS
+      </a>
+      <a
+        href="https://play.google.com/store/apps/details?id=com.tailscale.ipn"
+        target="_blank"
+        rel="noreferrer"
+        className="text-accent underline"
+      >
+        Android
+      </a>
+      <a
+        href="https://tailscale.com/download"
+        target="_blank"
+        rel="noreferrer"
+        className="text-accent underline"
+      >
+        other platforms
+      </a>
+    </span>
   );
 }
 

@@ -128,7 +128,7 @@ async function openPanel(
   page: import("@playwright/test").Page,
   which: "Files" | "Git",
 ) {
-  const pill = page.getByTitle("Restore claude-code terminal");
+  const pill = page.getByLabel("Restore claude-code terminal");
   await expect(pill).toBeVisible({ timeout: 10000 });
   await pill.click();
   // Header buttons read "▤ Files" / "⎇ Git" (glyph is aria-hidden, so the

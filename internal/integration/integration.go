@@ -1418,3 +1418,23 @@ func Capabilities() []Capability {
 	}
 	return out
 }
+
+// ToolForLaunchSubcommand resolves an `observer <verb>` launcher verb (the
+// Handoff.Launch.Subcommand a dashboard-handoff terminal_run row stores as its
+// tool label) back to the canonical registry tool key (== sessions.tool).
+// ok=false for an unknown or empty verb.
+func ToolForLaunchSubcommand(sub string) (string, bool) {
+	if sub == "" {
+		return "", false
+	}
+	// Walk tool keys in sorted order so that IF a future row ever collides
+	// on verb (registry_coverage_test.go pins that none do today), the
+	// resolution is still deterministic — first match by tool-key order —
+	// rather than depending on Go's randomized map iteration.
+	for _, tool := range Tools() {
+		if launch := registry[tool].Handoff.Launch; launch != nil && launch.Subcommand == sub {
+			return tool, true
+		}
+	}
+	return "", false
+}

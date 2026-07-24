@@ -27,6 +27,7 @@ import {
 import { usePointerDrag } from "@/lib/useDrag";
 import type { ProjectPanelTab } from "@/components/ProjectPanel";
 import { CompanionProvider } from "@/components/primitives/companion";
+import { Tooltip, TooltipSpan } from "@/components/primitives";
 
 // Lazy so the per-terminal project panel (file tree + git graph) stays out of
 // the critical chunk — it loads only when a terminal's Files/Git button fires.
@@ -774,8 +775,13 @@ function TerminalHost({
       aria-hidden={showModal ? undefined : true}
       aria-label={showModal ? `${session.tool} terminal` : undefined}
     >
+      {/* Deliberate: the resize hint stays a NATIVE title attribute here. A
+          custom floating Tooltip would persist while the pointer rests over the
+          live terminal (worse than the auto-dismissing native hint), so this one
+          site keeps the browser's own tooltip. */}
       <div
         ref={boxRef}
+        title={showModal ? "Drag the corner to resize — the terminal refits" : undefined}
         style={{ width: floatSize.w, height: floatSize.h }}
         className={
           showModal
@@ -783,7 +789,6 @@ function TerminalHost({
             : "flex flex-col"
         }
         onClick={(e) => e.stopPropagation()}
-        title={showModal ? "Drag the corner to resize — the terminal refits" : undefined}
       />
       {createPortal(
         <LaunchTerminal
@@ -840,7 +845,20 @@ function Dock({
       style={drag.style}
       className="fixed bottom-4 right-4 z-[70] flex flex-col-reverse items-end gap-2"
     >
-      <button type="button" onClick={onNew} disabled={remoteBlocked} title={remoteBlocked ? REMOTE_TERMINAL_OFF_MSG : "Start a fresh agent in the embedded terminal"} className="flex items-center gap-1.5 rounded-full border bg-bg-1 px-3 py-1.5 text-[11px] font-medium text-fg-2 shadow-lg hover:text-fg-1 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:text-fg-2"><span aria-hidden className="text-[13px] leading-none">+</span>New terminal</button>
+      {/* When remoteBlocked the button is disabled and swallows pointer
+          events, so hover would never fire — TooltipSpan wraps it in a
+          hoverable span; the enabled button is its own reference. */}
+      {(() => {
+        const newBtn = (
+          <button type="button" onClick={onNew} disabled={remoteBlocked} className="flex items-center gap-1.5 rounded-full border bg-bg-1 px-3 py-1.5 text-[11px] font-medium text-fg-2 shadow-lg hover:text-fg-1 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:text-fg-2"><span aria-hidden className="text-[13px] leading-none">+</span>New terminal</button>
+        );
+        const tip = remoteBlocked ? REMOTE_TERMINAL_OFF_MSG : "Start a fresh agent in the embedded terminal";
+        return remoteBlocked ? (
+          <TooltipSpan content={tip}>{newBtn}</TooltipSpan>
+        ) : (
+          <Tooltip content={tip}>{newBtn}</Tooltip>
+        );
+      })()}
       {pills.map((s) => (
         <DockPill
           key={s.token}
@@ -854,18 +872,18 @@ function Dock({
       {/* Drag grip (rendered last so flex-col-reverse floats it to the TOP of
           the dock). Dragging only the grip keeps the "New terminal" button a
           plain click target — no click-vs-drag ambiguity. Double-click resets. */}
-      <button
-        type="button"
-        aria-label="Drag to move the terminal dock (double-click to reset)"
-        title="Drag to move · double-click to reset"
-        onPointerDown={drag.gripHandlers.onPointerDown}
-        onPointerMove={drag.gripHandlers.onPointerMove}
-        onPointerUp={drag.gripHandlers.onPointerUp}
-        onPointerCancel={drag.gripHandlers.onPointerCancel}
-        onLostPointerCapture={drag.gripHandlers.onLostPointerCapture}
-        onDoubleClick={drag.onReset}
-        className="flex h-4 w-9 touch-none cursor-grab select-none items-center justify-center rounded-full border bg-bg-1 text-fg-4 shadow-lg hover:text-fg-2 active:cursor-grabbing"
-      >
+      <Tooltip content="Drag to move · double-click to reset">
+        <button
+          type="button"
+          aria-label="Drag to move the terminal dock (double-click to reset)"
+          onPointerDown={drag.gripHandlers.onPointerDown}
+          onPointerMove={drag.gripHandlers.onPointerMove}
+          onPointerUp={drag.gripHandlers.onPointerUp}
+          onPointerCancel={drag.gripHandlers.onPointerCancel}
+          onLostPointerCapture={drag.gripHandlers.onLostPointerCapture}
+          onDoubleClick={drag.onReset}
+          className="flex h-4 w-9 touch-none cursor-grab select-none items-center justify-center rounded-full border bg-bg-1 text-fg-4 shadow-lg hover:text-fg-2 active:cursor-grabbing"
+        >
         <svg width="14" height="6" viewBox="0 0 14 6" fill="none" aria-hidden>
           <circle cx="2" cy="2" r="1" fill="currentColor" />
           <circle cx="7" cy="2" r="1" fill="currentColor" />
@@ -874,7 +892,8 @@ function Dock({
           <circle cx="7" cy="5" r="1" fill="currentColor" />
           <circle cx="12" cy="5" r="1" fill="currentColor" />
         </svg>
-      </button>
+        </button>
+      </Tooltip>
     </div>
   );
 }
@@ -1019,44 +1038,52 @@ function DockPill({
   const st = status ?? "connecting";
   return (
     <div className="flex items-center gap-2 rounded-full border bg-bg-1 py-1 pl-3 pr-1.5 shadow-lg">
-      <button
-        type="button"
-        onClick={onRestore}
-        title={`Restore ${session.tool} terminal`}
-        className="flex items-center gap-2 text-[11px] text-fg-2 hover:text-fg-1 focus:outline-none"
-      >
-        <span className={`h-2 w-2 rounded-full ${dot[st]}`} />
-        <span className="font-mono text-fg-1">{session.tool}</span>
-        <AgentStatusBadge info={agent} />
-        <span className="text-[9.5px] uppercase tracking-[0.05em] text-fg-3">
-          {label[st]}
-        </span>
-        <span aria-hidden className="text-fg-3">
-          ▴
-        </span>
-      </button>
-      <button
-        type="button"
-        onClick={() => {
-          // Closing kills the process — confirm while it's still live, same
-          // as the terminal header's "Stop & close".
-          if (
-            (st === "open" || st === "connecting") &&
-            !window.confirm(
-              `Stop the running ${session.tool} session? This ends the process.`,
-            )
-          ) {
-            return;
-          }
-          onClose();
-        }}
-        title={
+      <Tooltip content={`Restore ${session.tool} terminal`}>
+        <button
+          type="button"
+          onClick={onRestore}
+          aria-label={`Restore ${session.tool} terminal`}
+          className="flex items-center gap-2 text-[11px] text-fg-2 hover:text-fg-1 focus:outline-none"
+        >
+          <span className={`h-2 w-2 rounded-full ${dot[st]}`} />
+          <span className="font-mono text-fg-1">{session.tool}</span>
+          <AgentStatusBadge info={agent} />
+          <span className="text-[9.5px] uppercase tracking-[0.05em] text-fg-3">
+            {label[st]}
+          </span>
+          <span aria-hidden className="text-fg-3">
+            ▴
+          </span>
+        </button>
+      </Tooltip>
+      <Tooltip
+        content={
           st === "open" ? "Stop the running process and close" : "Close"
         }
-        className="rounded-full px-1.5 text-[11px] text-fg-3 hover:bg-white/10 hover:text-fg-1 focus:outline-none"
       >
-        ✕
-      </button>
+        <button
+          type="button"
+          onClick={() => {
+            // Closing kills the process — confirm while it's still live, same
+            // as the terminal header's "Stop & close".
+            if (
+              (st === "open" || st === "connecting") &&
+              !window.confirm(
+                `Stop the running ${session.tool} session? This ends the process.`,
+              )
+            ) {
+              return;
+            }
+            onClose();
+          }}
+          aria-label={
+            st === "open" ? "Stop the running process and close" : "Close"
+          }
+          className="rounded-full px-1.5 text-[11px] text-fg-3 hover:bg-white/10 hover:text-fg-1 focus:outline-none"
+        >
+          ✕
+        </button>
+      </Tooltip>
     </div>
   );
 }

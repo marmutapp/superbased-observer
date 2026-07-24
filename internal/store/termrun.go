@@ -524,3 +524,136 @@ func (s *Store) ResolveRunForSession(ctx context.Context, sessionID string) (run
 	}
 	return runID, confidence, true, nil
 }
+
+// UncorrelatedTerminalRun is one live terminal run with no established
+// correlation — a candidate for the daemon-side terminal→session discovery
+// sweep to attempt matching against recent sessions.
+type UncorrelatedTerminalRun struct {
+	RunID           string
+	Tool            string
+	Kind            string
+	SourceSessionID string
+	LaunchedAt      time.Time
+}
+
+// ListLiveUncorrelatedRuns returns LIVE terminal runs (ended_at IS NULL AND
+// end_reason = ”) that have no correlation at or above minConfidence,
+// newest-launched first, capped at limit — the discovery sweep's work list.
+// minConfidence is passed in by the caller (termrun.MinLinkConfidence) so the
+// store stays free of the pure termrun package, the same posture as
+// LiveRunForSessionExcluding. Both terminal_run and terminal_run_session are
+// NODE-LOCAL (never on the org-push wire). Ordering uses julianday(), not raw
+// text order: launched_at mixes RFC3339 ('...T08:00:00Z') and SQLite-default
+// ('...  10:00:00') stamp shapes across the corpus, and those sort WRONG
+// against each other as text (the 'T...Z' row can sort before or after a
+// same-instant space-separated row depending on the literal bytes) — so
+// under LIMIT the truncation must be julianday-chronological, matching
+// CandidateSessionsForTerminalRun's ASC ordering fix.
+func (s *Store) ListLiveUncorrelatedRuns(ctx context.Context, minConfidence float64, limit int) ([]UncorrelatedTerminalRun, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT r.run_id, r.tool, r.kind, r.source_session_id, r.launched_at
+		   FROM terminal_run r
+		  WHERE r.ended_at IS NULL
+		    AND r.end_reason = ''
+		    AND NOT EXISTS (SELECT 1 FROM terminal_run_session trs
+		                     WHERE trs.run_id = r.run_id AND trs.confidence >= ?)
+		  ORDER BY julianday(r.launched_at) DESC
+		  LIMIT ?`, minConfidence, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store.ListLiveUncorrelatedRuns: %w", err)
+	}
+	defer rows.Close()
+	var out []UncorrelatedTerminalRun
+	for rows.Next() {
+		var u UncorrelatedTerminalRun
+		var launched string
+		if scanErr := rows.Scan(&u.RunID, &u.Tool, &u.Kind, &u.SourceSessionID, &launched); scanErr != nil {
+			return nil, fmt.Errorf("store.ListLiveUncorrelatedRuns scan: %w", scanErr)
+		}
+		u.LaunchedAt = parseStamp(launched)
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// SessionLinkedToAnyRun reports whether the session already carries a
+// correlation at/above minConfidence to ANY terminal run (live or ended).
+// It is the point-in-time re-check the discovery sweep runs immediately
+// before linking, mirroring the candidate query's NOT EXISTS guard: a
+// session claimed by another source mid-tick (e.g. an OOB echo) must not
+// be linked a second time. minConfidence is caller-supplied
+// (termrun.MinLinkConfidence) so the store stays free of the pure package.
+func (s *Store) SessionLinkedToAnyRun(ctx context.Context, sessionID string, minConfidence float64) (bool, error) {
+	if sessionID == "" {
+		return false, nil
+	}
+	var one int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM terminal_run_session WHERE session_id = ? AND confidence >= ?)`,
+		sessionID, minConfidence).Scan(&one)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("store.SessionLinkedToAnyRun: %w", err)
+	}
+	return one == 1, nil
+}
+
+// DiscoveryCandidateSession is a session that could be a live run's child —
+// the discovery sweep's per-run candidate result.
+type DiscoveryCandidateSession struct {
+	SessionID string
+	StartedAt time.Time
+}
+
+// CandidateSessionsForTerminalRun lists sessions of tool started within the
+// window [after, until] (both bounds caller-supplied and inclusive), scoped to
+// the project whose projects.root_path equals gitRoot OR rawDir (a MANDATORY
+// filter — there is no empty-root escape, unlike CandidateTargetSessions),
+// excluding excludeSessionID and any session already linked to some run at or
+// above minConfidence, oldest-first, capped at limit. The `until` ceiling
+// keeps a long-idle uncorrelated run from claiming a bare-launch session that
+// started hours later: daemon-launched tools start at spawn, so a legit
+// session begins within launch + tool-startup + ingest lag, and the caller
+// sizes the window to cover exactly that. minConfidence is passed in by the
+// caller (termrun.MinLinkConfidence) so the store stays free of the pure
+// termrun package, the same posture as LiveRunForSessionExcluding.
+// julianday() — NOT datetime() — bridges the RFC3339 / RFC3339Nano /
+// SQLite-default stamp formats the corpus mixes: datetime() truncates to whole
+// seconds, so a fractional-second stamp up to ~1s before `after` would
+// otherwise compare equal to the boundary and slip through (e.g.
+// datetime('...01.100Z') >= datetime('...01.900Z') is TRUE — both truncate to
+// :01). julianday() returns a float that preserves subsecond precision while
+// still parsing the same mixed formats.
+func (s *Store) CandidateSessionsForTerminalRun(ctx context.Context, tool, gitRoot, rawDir string, after, until time.Time, excludeSessionID string, minConfidence float64, limit int) ([]DiscoveryCandidateSession, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT s.id, s.started_at
+		   FROM sessions s
+		   LEFT JOIN projects p ON p.id = s.project_id
+		  WHERE s.tool = ?
+		    AND julianday(s.started_at) >= julianday(?)
+		    AND julianday(s.started_at) <= julianday(?)
+		    AND (COALESCE(p.root_path,'') = ? OR COALESCE(p.root_path,'') = ?)
+		    AND s.id != ?
+		    AND NOT EXISTS (SELECT 1 FROM terminal_run_session trs
+		                     WHERE trs.session_id = s.id AND trs.confidence >= ?)
+		  ORDER BY julianday(s.started_at) ASC, s.id ASC
+		  LIMIT ?`,
+		tool, timestamp(after), timestamp(until), gitRoot, rawDir, excludeSessionID, minConfidence, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store.CandidateSessionsForTerminalRun: %w", err)
+	}
+	defer rows.Close()
+	var out []DiscoveryCandidateSession
+	for rows.Next() {
+		var c DiscoveryCandidateSession
+		var started string
+		if scanErr := rows.Scan(&c.SessionID, &started); scanErr != nil {
+			return nil, fmt.Errorf("store.CandidateSessionsForTerminalRun scan: %w", scanErr)
+		}
+		c.StartedAt = parseStamp(started)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}

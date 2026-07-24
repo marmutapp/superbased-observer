@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { isRemoteView } from "@/lib/remote";
 import { pushToast } from "@/components/Toast";
 import { useCompanionRegistry } from "@/components/primitives/companion";
+import { Tooltip, TooltipSpan } from "@/components/primitives";
 import {
   STANDING_REMEMBER_RISK,
   type TerminalControlDenialReason,
@@ -1152,54 +1153,63 @@ export function LaunchTerminal({
           )}
           {/* Feature C4: focus mode (Chromium-only; hidden where unsupported). */}
           {focusModeSupported && (
-            <button
-              type="button"
-              onClick={focusMode ? exitFocusMode : enterFocusMode}
-              title={
+            <Tooltip
+              maxWidth={320}
+              content={
                 focusMode
                   ? "Exit focus mode — release keyboard capture and leave fullscreen"
                   : "Focus mode — fullscreen + capture browser shortcuts (Ctrl-W/T/N) so they reach the TUI. Chromium only; exit with this button (Esc is captured)."
               }
-              className={
-                "rounded-2 px-2 py-0.5 text-[11px] focus:outline-none " +
-                (focusMode
-                  ? "bg-accent/20 text-accent hover:bg-accent/30"
-                  : "text-fg-3 hover:bg-white/10 hover:text-fg-1")
-              }
             >
-              {focusMode ? "⤢ Exit focus" : "⤢ Focus mode"}
-            </button>
+              <button
+                type="button"
+                onClick={focusMode ? exitFocusMode : enterFocusMode}
+                className={
+                  "rounded-2 px-2 py-0.5 text-[11px] focus:outline-none " +
+                  (focusMode
+                    ? "bg-accent/20 text-accent hover:bg-accent/30"
+                    : "text-fg-3 hover:bg-white/10 hover:text-fg-1")
+                }
+              >
+                {focusMode ? "⤢ Exit focus" : "⤢ Focus mode"}
+              </button>
+            </Tooltip>
           )}
           {onAddToGrid && (
+            <Tooltip content="Add to grid — dock this terminal on the Terminals workspace. The session keeps running.">
+              <button
+                type="button"
+                onClick={onAddToGrid}
+                className="rounded-2 px-2 py-0.5 text-[11px] text-fg-3 hover:bg-white/10 hover:text-fg-1 focus:outline-none"
+              >
+                ⊞ Add to grid
+              </button>
+            </Tooltip>
+          )}
+          <Tooltip content="Minimize — keeps the session running; restore it from the dock">
             <button
               type="button"
-              onClick={onAddToGrid}
-              title="Add to grid — dock this terminal on the Terminals workspace. The session keeps running."
+              onClick={onMinimize}
               className="rounded-2 px-2 py-0.5 text-[11px] text-fg-3 hover:bg-white/10 hover:text-fg-1 focus:outline-none"
             >
-              ⊞ Add to grid
+              ▾ Minimize
             </button>
-          )}
-          <button
-            type="button"
-            onClick={onMinimize}
-            title="Minimize — keeps the session running; restore it from the dock"
-            className="rounded-2 px-2 py-0.5 text-[11px] text-fg-3 hover:bg-white/10 hover:text-fg-1 focus:outline-none"
-          >
-            ▾ Minimize
-          </button>
-          <button
-            type="button"
-            onClick={requestClose}
-            title={
+          </Tooltip>
+          <Tooltip
+            content={
               status === "open"
                 ? "Stop the running process and close"
                 : "Close"
             }
-            className="rounded-2 px-2 py-0.5 text-[11px] text-fg-3 hover:bg-white/10 hover:text-fg-1 focus:outline-none"
           >
-            {status === "open" ? "✕ Stop & close" : "✕ Close"}
-          </button>
+            <button
+              type="button"
+              onClick={requestClose}
+              className="rounded-2 px-2 py-0.5 text-[11px] text-fg-3 hover:bg-white/10 hover:text-fg-1 focus:outline-none"
+            >
+              {status === "open" ? "✕ Stop & close" : "✕ Close"}
+            </button>
+          </Tooltip>
         </span>
       </div>
       {isRemote && (
@@ -1281,12 +1291,17 @@ function ProjectPanelButton({
   enabledTitle: string;
   disabledTitle?: string;
 }) {
-  return (
+  const tip = enabled ? enabledTitle : disabledTitle;
+  const btn = (
     <button
       type="button"
       disabled={!enabled}
       onClick={onClick}
-      title={enabled ? enabledTitle : disabledTitle}
+      // Enabled: accessible name stays the visible glyph+word label
+      // ("▤ Files" / "⊙ Session"). Disabled: a disabled control can't
+      // carry a title tooltip a screen reader announces, so surface the
+      // honest reason as the accessible name (the 417 e2e asserts this).
+      aria-label={enabled ? undefined : tip}
       className={
         "rounded-2 px-2 py-0.5 text-[11px] focus:outline-none " +
         (enabled
@@ -1296,6 +1311,15 @@ function ProjectPanelButton({
     >
       {label}
     </button>
+  );
+  // A disabled <button> swallows pointer events, so hover would never
+  // fire on it directly — wrap the disabled case in TooltipSpan (a
+  // focusable/hoverable span reference) so the honest tooltip still
+  // shows. The enabled button is its own hover/focus reference.
+  return enabled ? (
+    <Tooltip content={tip}>{btn}</Tooltip>
+  ) : (
+    <TooltipSpan content={tip}>{btn}</TooltipSpan>
   );
 }
 
@@ -1316,37 +1340,45 @@ function SizeModeControl({
 }) {
   if (mode === "original") {
     return (
-      <button
-        type="button"
-        onClick={onFit}
-        title="Pinned to the native terminal's original size — click to refit to the panel."
-        className="rounded-2 bg-accent/20 px-2 py-0.5 text-[11px] text-accent hover:bg-accent/30 focus:outline-none"
-      >
-        ⤢ Fit
-      </button>
+      <Tooltip content="Pinned to the native terminal's original size — click to refit to the panel.">
+        <button
+          type="button"
+          onClick={onFit}
+          className="rounded-2 bg-accent/20 px-2 py-0.5 text-[11px] text-accent hover:bg-accent/30 focus:outline-none"
+        >
+          ⤢ Fit
+        </button>
+      </Tooltip>
     );
   }
   if (!hasOriginal) {
+    // Disabled button swallows pointer events — TooltipSpan keeps the
+    // honest hover hint reachable.
     return (
-      <button
-        type="button"
-        disabled
-        title="Original size unknown for this session"
-        className="cursor-not-allowed rounded-2 px-2 py-0.5 text-[11px] text-fg-4 opacity-60"
-      >
-        ↺ Original size
-      </button>
+      <TooltipSpan content="Original size unknown for this session">
+        <button
+          type="button"
+          disabled
+          className="cursor-not-allowed rounded-2 px-2 py-0.5 text-[11px] text-fg-4 opacity-60"
+        >
+          ↺ Original size
+        </button>
+      </TooltipSpan>
     );
   }
   return (
-    <button
-      type="button"
-      onClick={onOriginal}
-      title="Restore the native terminal's original size — fixes a TUI that garbled after a resize. Stops auto-refit until you switch back to Fit."
-      className="rounded-2 px-2 py-0.5 text-[11px] text-fg-3 hover:bg-white/10 hover:text-fg-1 focus:outline-none"
+    <Tooltip
+      maxWidth={320}
+      content="Restore the native terminal's original size — fixes a TUI that garbled after a resize. Stops auto-refit until you switch back to Fit."
     >
-      ↺ Original size
-    </button>
+      <button
+        type="button"
+        onClick={onOriginal}
+        className="rounded-2 px-2 py-0.5 text-[11px] text-fg-3 hover:bg-white/10 hover:text-fg-1 focus:outline-none"
+      >
+        ↺ Original size
+      </button>
+    </Tooltip>
   );
 }
 
@@ -1443,14 +1475,15 @@ function RemoteControlBar({
           <span className="text-[10.5px] text-fg-3">
             Standing access is saved on this device — control is re-acquired automatically on refresh.
           </span>
-          <button
-            type="button"
-            onClick={onForgetStanding}
-            title="Remove the saved standing secret from this browser (stops auto-acquiring on refresh)"
-            className="shrink-0 rounded-2 border border-danger/40 bg-danger/10 px-2 py-0.5 text-[10.5px] text-danger hover:bg-danger/20"
-          >
-            Forget standing secret on this device
-          </button>
+          <Tooltip content="Remove the saved standing secret from this browser (stops auto-acquiring on refresh)">
+            <button
+              type="button"
+              onClick={onForgetStanding}
+              className="shrink-0 rounded-2 border border-danger/40 bg-danger/10 px-2 py-0.5 text-[10.5px] text-danger hover:bg-danger/20"
+            >
+              Forget standing secret on this device
+            </button>
+          </Tooltip>
         </div>
       )}
       {showAcquire && !writer && (

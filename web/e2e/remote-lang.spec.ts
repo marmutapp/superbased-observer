@@ -7,6 +7,42 @@ import { test, expect } from "@playwright/test";
 test.use({ viewport: { width: 1280, height: 1000 } });
 
 test("turn on remote access → Pair a device reveals a QR", async ({ page }) => {
+  // The pairKnownUnreachable gate disables "Pair a device" whenever Tailscale
+  // is absent / logged-out / serve-unconfigured — which is the clean-env
+  // default here. Mock the status endpoint to a fully-reachable tailnet so the
+  // pairing controls stay enabled; field names/shape match the TailscaleStatus
+  // type in web/src/pages/Remote.tsx.
+  await page.route("**/api/remote/tailscale/status", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        present: true,
+        logged_in: true,
+        host: "test.tailnet.ts.net",
+        state: "Running",
+        install_url: "https://tailscale.com/download",
+        daemon_runs_serve: false,
+        armed: true,
+        backend_addr: "127.0.0.1:8099",
+        serve_command: "tailscale serve --bg 8099",
+        serve_configured: true,
+        serve_detectable: true,
+      }),
+    }),
+  );
+
+  // Suppress the first-run tour: its full-viewport overlay would otherwise
+  // intercept the "Turn on remote access" / "Pair a device" clicks (see
+  // tour.spec.ts and the sibling e2e specs that do the same).
+  await page.addInitScript(() => {
+    try {
+      localStorage.setItem("sb_tour_completed", "1");
+    } catch {
+      /* private mode — ignore */
+    }
+  });
+
   await page.goto("/remote", { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(600);
 
