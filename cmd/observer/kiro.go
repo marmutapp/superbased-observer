@@ -37,6 +37,8 @@ func newKiroCmd() *cobra.Command {
 		carry        string
 		fromMessage  int
 		fromTime     string
+		attach       *bool
+		noAttach     *bool
 	)
 	cmd := &cobra.Command{
 		Use:     "kiro [-- kiro-cli-args...]",
@@ -56,6 +58,25 @@ func newKiroCmd() *cobra.Command {
 			"API keys or AWS credentials.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Attach gate (attach-all-launchers): default-on attach hands the PTY
+			// to the daemon. Seed-only spec (kiro-cli is native-exempt — no proxy
+			// env, no escape-hatch flag); kiro's chat is interactive with no
+			// headless one-shot leading verb, so the handoff-fork family is the
+			// only incompatible mode (the both-TTY guard covers scripted runs).
+			outcome, aErr := launcherAttach(cmd.Context(), launcherAttachSpec{
+				tool:         "kiro-cli",
+				configPath:   configPath,
+				flagAttach:   *attach,
+				flagNoAttach: *noAttach,
+				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime),
+				passthrough:  kiroAttachPassthrough(binPath),
+				toolArgs:     args,
+				stderr:       cmd.ErrOrStderr(),
+			})
+			if outcome.handled {
+				return aErr
+			}
+
 			bin, err := resolveToolBin("kiro-cli", binPath, "--kiro-cli-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
@@ -111,8 +132,18 @@ func newKiroCmd() *cobra.Command {
 	cmd.Flags().StringVar(&carry, "carry", "", "Carry mode for --continue-from: metadata|distilled|distilled_tail|full|full_cache (default from [handoff] config)")
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
+	attach, noAttach = registerAttachFlags(cmd, "kiro-cli")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
+}
+
+// kiroAttachPassthrough forwards the --kiro-cli-path wrapper flag to the
+// daemon-spawned inner `observer kiro` launcher when set (nil otherwise).
+func kiroAttachPassthrough(kiroPath string) []string {
+	if kiroPath != "" {
+		return []string{"--kiro-cli-path", kiroPath}
+	}
+	return nil
 }
 
 // kiroSubcommands are the kiro-cli argv tokens that are subcommands, not a

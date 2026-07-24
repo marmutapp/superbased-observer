@@ -28,6 +28,8 @@ func newQoderCmd() *cobra.Command {
 		carry        string
 		fromMessage  int
 		fromTime     string
+		attach       *bool
+		noAttach     *bool
 	)
 	cmd := &cobra.Command{
 		Use:   "qoder [-- qoder-args...]",
@@ -46,6 +48,27 @@ func newQoderCmd() *cobra.Command {
 			"keys or auth state.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Attach gate (attach-all-launchers): default-on attach hands the PTY
+			// to the daemon. Seed-only spec (qoder is native-exempt — no proxy
+			// env, no escape-hatch flag); incompatible when a handoff fork is
+			// engaged or qoder's headless one-shot form is forwarded. Grounded
+			// headless spelling here is -p/--print (matching this launcher's
+			// ConflictFlags), NOT the -p/--prompt the plan table named.
+			outcome, aErr := launcherAttach(cmd.Context(), launcherAttachSpec{
+				tool:         "qoder",
+				configPath:   configPath,
+				flagAttach:   *attach,
+				flagNoAttach: *noAttach,
+				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
+					argsContainHeadlessFlag(args, "-p", "--print"),
+				passthrough: qoderAttachPassthrough(binPath),
+				toolArgs:    args,
+				stderr:      cmd.ErrOrStderr(),
+			})
+			if outcome.handled {
+				return aErr
+			}
+
 			bin, err := resolveToolBin("qoder", binPath, "--qoder-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
@@ -95,8 +118,18 @@ func newQoderCmd() *cobra.Command {
 	cmd.Flags().StringVar(&carry, "carry", "", "Carry mode for --continue-from: metadata|distilled|distilled_tail|full|full_cache (default from [handoff] config)")
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
+	attach, noAttach = registerAttachFlags(cmd, "qoder")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
+}
+
+// qoderAttachPassthrough forwards the --qoder-path wrapper flag to the
+// daemon-spawned inner `observer qoder` launcher when set (nil otherwise).
+func qoderAttachPassthrough(qoderPath string) []string {
+	if qoderPath != "" {
+		return []string{"--qoder-path", qoderPath}
+	}
+	return nil
 }
 
 // qoderSubcommands are the qodercli argv tokens that are subcommands, not a

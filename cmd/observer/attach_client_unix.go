@@ -77,6 +77,16 @@ func runAttachSession(ctx context.Context, in attachLaunch) error {
 	}
 	subcommand := capab.Attach.Subcommand
 
+	// canAutoResume gates the daemon-death AUTO-resume loop on the tool's native
+	// resume capability (attach-all-launchers §3). Only a ResumeNative tool has
+	// an inner launcher that registers `--resume` and can reattach its REAL
+	// transcript, so injectResumeArg's `--resume <id>` argv is only parseable
+	// there. For the 17 ResumeNone launchers a daemon restart ENDS the session
+	// (honest mortality) — offerAutoResume/resumeSpawn stay unreachable and the
+	// ResumeNone hint (nativeResumeHint → `--continue-from`) lands instead.
+	// Dispatch on the capability SHAPE, never a tool-name branch (CLAUDE.md #3).
+	canAutoResume := capab.Resume.Kind == integration.ResumeNative
+
 	// Attach drives a live TUI: require a real terminal on both ends.
 	stdinFd := int(os.Stdin.Fd())
 	stdoutFd := int(os.Stdout.Fd())
@@ -141,9 +151,12 @@ func runAttachSession(ctx context.Context, in attachLaunch) error {
 		}
 
 		// Daemon-death. Auto-resume only with a REAL correlated id (the abstain
-		// rule — no fabricated target) and within the retry cap; otherwise the
-		// honest resume hint.
-		if currentID == "" || autoResumes >= maxAutoResumes {
+		// rule — no fabricated target), a tool that can natively resume
+		// (canAutoResume — a ResumeNone tool's inner launcher can't parse the
+		// injected `--resume`), and within the retry cap; otherwise the honest
+		// resume hint (nativeResumeHint degrades to `--continue-from` for a
+		// ResumeNone launcher).
+		if currentID == "" || !canAutoResume || autoResumes >= maxAutoResumes {
 			return reportAttachResult(in.stderr, subcommand, capab, res.status, res.attachErr)
 		}
 		if !offerAutoResume(ctx, in.stderr, sockPath, subcommand, currentID, attachsock.Dial) {

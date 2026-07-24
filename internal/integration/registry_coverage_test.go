@@ -132,6 +132,32 @@ func TestAttachImpliesLauncher(t *testing.T) {
 	}
 }
 
+// TestLaunchableImpliesAttach pins the attach-all-launchers invariant
+// (2026-07-24): every row with a wired launcher (Handoff.Launch != nil) must
+// ALSO declare an AttachSpec whose Subcommand equals the launcher's — because
+// every `observer <verb>` launcher now attaches-by-default, so a launchable
+// tool without a grounded Attach row would be a launcher the daemon refuses to
+// spawn a PTY for (validateAttachCapability). Together with
+// TestAttachImpliesLauncher (Attach ⇒ Launchable + verb equality) this makes
+// Launch-grounded ⇔ Attach-grounded with equal verbs. Non-launcher rows
+// (Handoff.Launch == nil — the *-web rows, legacy IDE adapters, aider, crush,
+// cowork) are skipped: nothing to attach to.
+func TestLaunchableImpliesAttach(t *testing.T) {
+	for _, c := range integration.Capabilities() {
+		if !c.Handoff.Launchable() {
+			continue
+		}
+		if c.Attach == nil {
+			t.Errorf("adapter %q: Launchable but no AttachSpec — every `observer <verb>` launcher attaches by default; add Attach: &AttachSpec{Subcommand: %q}", c.Tool, c.Handoff.Launch.Subcommand)
+			continue
+		}
+		if c.Attach.Subcommand != c.Handoff.Launch.Subcommand {
+			t.Errorf("adapter %q: Attach.Subcommand %q != Launch.Subcommand %q (must name the same wired launcher)",
+				c.Tool, c.Attach.Subcommand, c.Handoff.Launch.Subcommand)
+		}
+	}
+}
+
 // TestNativeResumeGrounded pins the native-resume grounding rule: any row
 // declaring Resume.Kind == ResumeNative must name a non-empty Subcommand
 // AND IDMechanism — native resume is declared only for a tool whose

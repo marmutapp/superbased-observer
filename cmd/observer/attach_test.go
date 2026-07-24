@@ -364,7 +364,7 @@ func TestAttachHostRejectsUncapableTool(t *testing.T) {
 }
 
 // TestAttachExtraArgs pins the allow-listed argv the CLI attach client forwards
-// to the inner launcher (B2/B3): the escape-hatch flag, the --proxy/--config
+// to the inner launcher (B2/B3): the escape-hatch flag, the proxy/--config
 // overrides, and the operator's `--` tool remainder — in that order, and never
 // a blind argv copy.
 func TestAttachExtraArgs(t *testing.T) {
@@ -372,30 +372,31 @@ func TestAttachExtraArgs(t *testing.T) {
 		name          string
 		noProxyRoute  bool
 		proxyOverride string
+		proxyFlag     string
 		configPath    string
 		passthrough   []string
 		toolArgs      []string
 		want          []string
 	}{
-		{"nothing", false, "", "", nil, nil, nil},
-		{"escape hatch only", true, "", "", nil, nil, []string{"--no-proxy-route"}},
+		{"nothing", false, "", "", "", nil, nil, nil},
+		{"escape hatch only", true, "", "", "", nil, nil, []string{"--no-proxy-route"}},
 		{
-			"proxy + config", false, "http://127.0.0.1:9999", "/etc/o.toml", nil, nil,
+			"proxy + config", false, "http://127.0.0.1:9999", "--proxy", "/etc/o.toml", nil, nil,
 			[]string{"--proxy", "http://127.0.0.1:9999", "--config", "/etc/o.toml"},
 		},
 		{
-			"passthrough wrapper flags", false, "", "",
+			"passthrough wrapper flags", false, "", "", "",
 			[]string{"--claude-path", "/opt/claude"},
 			nil,
 			[]string{"--claude-path", "/opt/claude"},
 		},
 		{
-			"tool remainder", false, "", "", nil,
+			"tool remainder", false, "", "", "", nil,
 			[]string{"--model", "x"},
 			[]string{"--", "--model", "x"},
 		},
 		{
-			"all", true, "http://p", "/c.toml",
+			"all", true, "http://p", "--proxy", "/c.toml",
 			[]string{"--codex-path", "/opt/codex", "--no-app-server-check"},
 			[]string{"exec", "hi"},
 			[]string{"--no-proxy-route", "--proxy", "http://p", "--config", "/c.toml", "--codex-path", "/opt/codex", "--no-app-server-check", "--", "exec", "hi"},
@@ -403,7 +404,41 @@ func TestAttachExtraArgs(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := attachExtraArgs(tc.noProxyRoute, tc.proxyOverride, tc.configPath, tc.passthrough, tc.toolArgs)
+			got := attachExtraArgs(tc.noProxyRoute, tc.proxyOverride, tc.proxyFlag, tc.configPath, tc.passthrough, tc.toolArgs)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("arg[%d] = %q, want %q (got %v)", i, got[i], tc.want[i], got)
+				}
+			}
+		})
+	}
+}
+
+// TestAttachExtraArgsProxyFlagName pins the proxyFlag parameterization
+// (attach-all-launchers): the proxy override is emitted under the inner
+// launcher's OWN flag spelling — `--proxy` for most, `--proxy-url` for
+// hermes/pi — and is dropped entirely when the launcher has no proxy flag
+// (proxyFlag=="", the seed-only tools) so a stray override never lands on a
+// launcher that can't parse it. Both proxyOverride AND proxyFlag must be
+// non-empty for the pair to appear.
+func TestAttachExtraArgsProxyFlagName(t *testing.T) {
+	cases := []struct {
+		name          string
+		proxyOverride string
+		proxyFlag     string
+		want          []string
+	}{
+		{"default --proxy spelling", "http://p", "--proxy", []string{"--proxy", "http://p"}},
+		{"hermes/pi --proxy-url spelling", "http://p", "--proxy-url", []string{"--proxy-url", "http://p"}},
+		{"seed-only tool drops override (empty flag)", "http://p", "", nil},
+		{"no override, flag set — nothing emitted", "", "--proxy", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := attachExtraArgs(false, tc.proxyOverride, tc.proxyFlag, "", nil, nil)
 			if len(got) != len(tc.want) {
 				t.Fatalf("got %v, want %v", got, tc.want)
 			}

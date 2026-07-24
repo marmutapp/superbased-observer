@@ -132,6 +132,7 @@ func (m *fakeLaunchManager) AcquireWriterRemote(RemoteWriterRequest) (LaunchWrit
 }
 
 func (m *fakeLaunchManager) Close(string)                                   {}
+func (m *fakeLaunchManager) SessionForRun(string) (string, bool)            { return "", false }
 func (m *fakeLaunchManager) Snapshot() []LaunchInfo                         { return m.snapshot }
 func (m *fakeLaunchManager) RevokeAllRemoteWriters(string) int              { return 0 }
 func (m *fakeLaunchManager) RevokeRemoteWriterByHolder(string, string) bool { return false }

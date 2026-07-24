@@ -65,6 +65,9 @@ type recordingLaunchManager struct {
 	subscribeLocalCalls  atomic.Int32
 	subscribeRemoteCalls atomic.Int32
 	snapshot             []LaunchInfo
+	// sessionForRun is the fake run→correlated-session table SessionForRun
+	// returns from (nil ⇒ no link for any run).
+	sessionForRun map[string]string
 }
 
 func newRecordingLaunchManager(remoteWriter *recordingWriter) *recordingLaunchManager {
@@ -179,7 +182,12 @@ func TestControlDeniedReasonWireTaxonomy(t *testing.T) {
 		})
 	}
 }
-func (m *recordingLaunchManager) Close(string)                                   {}
+func (m *recordingLaunchManager) Close(string) {}
+func (m *recordingLaunchManager) SessionForRun(runID string) (string, bool) {
+	sid, ok := m.sessionForRun[runID]
+	return sid, ok
+}
+
 func (m *recordingLaunchManager) Snapshot() []LaunchInfo                         { return m.snapshot }
 func (m *recordingLaunchManager) RevokeAllRemoteWriters(string) int              { return 0 }
 func (m *recordingLaunchManager) RevokeRemoteWriterByHolder(string, string) bool { return false }

@@ -9,30 +9,77 @@ import { pushToast } from "@/components/Toast";
 import type { AttachSessionsResponse, AttachInfo } from "@/lib/types";
 
 // JumpInButton — the dashboard "second seat" affordance (session-attach
-// Phase 2, docs/plans/session-attach-design-2026-07-19.md). Offered ONLY
-// for a LIVE `observer <tool> --attach` session the daemon owns (exact
-// liveness, §4) — matched by session_id against GET /api/attach/sessions.
-// The session already exists, so there is NO POST: enabled → hand the
+// Phase 2, docs/plans/session-attach-design-2026-07-19.md). Offered for ANY
+// LIVE, non-setup daemon-owned terminal run bound to this session — kind
+// fresh/handoff/attach/resume, not attach-only (GET /api/attach/sessions was
+// widened to cover all of them, so a dashboard-launched "new terminal"
+// becomes joinable once the correlation sweep links it, ~10-30s after
+// launch) — matched by session_id against that endpoint (exact liveness,
+// §4). The session already exists, so there is NO POST: enabled → hand the
 // existing ws handle straight to the app-level LaunchDock (same terminal
-// bridge as HandoffCard's "Launch here"). No matching live attach row →
-// honest-disabled with the exact re-launch instruction (§3.4,
-// feedback_honest_disable_copy): Jump in is never faked from recency.
+// bridge as HandoffCard's "Launch here"). No matching live row → honest-
+// disabled, naming the actual gap (no live daemon-owned terminal bound to
+// this session right now) with the fallback re-launch instruction for a
+// session running outside the dashboard (§3.4, feedback_honest_disable_copy):
+// Jump in is never faked from recency. When more than one live row matches
+// the session (e.g. a fresh dashboard terminal plus a stale attach row),
+// the newest by created_at wins.
 
 // ATTACH_SUBCOMMANDS maps a canonical tool name to the observer LAUNCHER VERB
 // the operator types to make it joinable (P2-5). The tooltip must never present
 // a canonical tool NAME ("claude-code") as a CLI verb — the real command is
 // `observer claude --attach`. This mirrors the integration registry's Attach
-// rows (internal/integration): keep the two in step when a second tool grounds
-// an Attach capability. The generic fallback keeps the copy honest for an
-// ungrounded tool rather than inventing a verb.
+// rows (internal/integration) — one row per Launch-grounded tool, pinned
+// Go-side by TestLaunchableImpliesAttach in
+// internal/integration/registry_coverage_test.go — keep the two in lockstep
+// whenever the registry gains or loses an Attach row. The generic fallback
+// keeps the copy honest for an ungrounded tool rather than inventing a verb.
 const ATTACH_SUBCOMMANDS: Record<string, string> = {
   "claude-code": "claude",
   codex: "codex",
+  opencode: "opencode",
+  cursor: "cursor",
+  "copilot-cli": "copilot-cli",
+  "kilo-code-cli": "kilo",
+  "cline-cli": "cline-cli",
+  hermes: "hermes",
+  "gemini-cli": "gemini",
+  openclaw: "openclaw",
+  pi: "pi",
+  "antigravity-cli": "antigravity-cli",
+  "qwen-code": "qwen",
+  "kiro-cli": "kiro",
+  grok: "grok",
+  "kimi-code": "kimi",
+  devin: "devin",
+  qoder: "qoder",
+  goose: "goose",
 };
 
 function relaunchCommand(tool: string): string {
   const sub = ATTACH_SUBCOMMANDS[tool];
   return sub ? `observer ${sub} --attach` : "observer <tool> --attach";
+}
+
+// newestLiveRow picks the single row to jump into when more than one live,
+// non-exited row is bound to the same session_id (now possible since
+// /api/attach/sessions covers every live kind, not attach-only — e.g. a
+// stale attach row lingering alongside a freshly-correlated dashboard
+// terminal). AttachInfo.created_at is an ISO timestamp set by the daemon at
+// row creation, so "newest" is well-defined; ties keep the first row seen
+// (stable, matches Array.find's prior behavior for the single-row case).
+function newestLiveRow(rows: AttachInfo[]): AttachInfo | undefined {
+  let best: AttachInfo | undefined;
+  let bestTime = -Infinity;
+  for (const r of rows) {
+    const t = Date.parse(r.created_at);
+    const ts = Number.isNaN(t) ? -Infinity : t;
+    if (!best || ts > bestTime) {
+      best = r;
+      bestTime = ts;
+    }
+  }
+  return best;
 }
 
 export function JumpInButton({
@@ -66,7 +113,9 @@ export function JumpInButton({
   const [clickDisabled, setClickDisabled] = useState(false);
 
   const rows = attach.data?.sessions ?? [];
-  const match = rows.find((r) => r.session_id === sessionId && !r.exited);
+  const match = newestLiveRow(
+    rows.filter((r) => r.session_id === sessionId && !r.exited),
+  );
 
   // Three honest states (P2-4b), never conflated:
   //   - loading:   first fetch in flight, nothing decided yet.
@@ -82,7 +131,7 @@ export function JumpInButton({
     ? "Couldn't check whether this session is attachable — the dashboard's attach endpoint didn't respond. This is NOT a verdict that the session can't be joined; retry, or confirm `observer start` is running."
     : loading
       ? "Checking whether this session is attachable…"
-      : `Jump in unavailable — this session isn't running as an attachable session. Launch with \`${relaunch}\` to make it joinable.`;
+      : `Jump in unavailable — no live daemon-owned terminal is bound to this session. A terminal just launched from the dashboard can take ~30s to link; if the session is running in your own terminal, launch it with \`${relaunch}\` to make it joinable.`;
   const enabledTitle =
     "Open this live session as a second seat in an embedded terminal — the same TUI, drivable from here.";
 
@@ -96,8 +145,8 @@ export function JumpInButton({
       const fresh = await fetchJSON<AttachSessionsResponse>(
         "/api/attach/sessions",
       );
-      const live = fresh.sessions.find(
-        (r) => r.session_id === sessionId && !r.exited,
+      const live = newestLiveRow(
+        fresh.sessions.filter((r) => r.session_id === sessionId && !r.exited),
       );
       if (!live) {
         pushToast("Session ended before you could jump in", "warn");
@@ -163,7 +212,7 @@ export function JumpInButton({
           ? "Couldn't check attachability — the attach endpoint didn't respond. Retry or confirm the daemon is running; this is not a verdict that the session can't be joined."
           : enabled
             ? "This session is running as an attachable terminal. Jump in to view and drive the same live TUI from the dashboard — a second seat on the running agent."
-            : `Only sessions launched with \`${relaunch}\` can be joined from the dashboard. A bare launch can't be re-parented — its terminal belongs to the shell that started it.`}
+            : `No live daemon-owned terminal is bound to this session right now. Any live terminal launched from the dashboard, or an \`${relaunch}\` session, can be joined once it's running.`}
       </p>
       {/* Read-only fallback for a bare BUT live session: you can't drive it,
           but you can watch the conversation. Only on a COMPLETED no-match

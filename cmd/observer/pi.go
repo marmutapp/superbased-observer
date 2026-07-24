@@ -42,6 +42,8 @@ func newPiCmd() *cobra.Command {
 		carry        string
 		fromMessage  int
 		fromTime     string
+		attach       *bool
+		noAttach     *bool
 	)
 	cmd := &cobra.Command{
 		Use:   "pi [-- pi-args...]",
@@ -61,6 +63,31 @@ func newPiCmd() *cobra.Command {
 			"proxy (`observer start`).",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Attach-by-default (attach-all-launchers): hand the PTY to the
+			// daemon when attach resolves. pi routes via the `observer` provider
+			// in ~/.pi/agent/models.json (written by the daemon-spawned inner
+			// launcher), so forward NO proxy env (attachEnv nil) and no
+			// --no-proxy-route flag exists (noProxyRoute nil). pi registers
+			// --proxy-url (NOT --proxy), so proxyFlag is "--proxy-url". A
+			// -p/--print headless one-shot or the continue-from family forces the
+			// bare path. toolArgs is the RAW operator remainder — the inner
+			// launcher re-applies the `--provider observer` prepend.
+			outcome, err := launcherAttach(cmd.Context(), launcherAttachSpec{
+				tool:          "pi",
+				configPath:    configPath,
+				proxyOverride: proxyURL,
+				proxyFlag:     "--proxy-url",
+				flagAttach:    *attach,
+				flagNoAttach:  *noAttach,
+				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
+					argsContainHeadlessFlag(args, "-p", "--print"),
+				passthrough: piAttachPassthrough(binPath),
+				toolArgs:    args,
+				stderr:      cmd.ErrOrStderr(),
+			})
+			if outcome.handled {
+				return err
+			}
 			cfg, err := config.Load(config.LoadOptions{GlobalPath: configPath})
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
@@ -120,8 +147,19 @@ func newPiCmd() *cobra.Command {
 	cmd.Flags().StringVar(&carry, "carry", "", "Carry mode for --continue-from: metadata|distilled|distilled_tail|full|full_cache (default from [handoff] config)")
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
+	attach, noAttach = registerAttachFlags(cmd, "pi")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
+}
+
+// piAttachPassthrough forwards --pi-path to the daemon-spawned inner
+// `observer pi` launcher when the operator overrode the binary path; nil
+// otherwise.
+func piAttachPassthrough(binPath string) []string {
+	if binPath != "" {
+		return []string{"--pi-path", binPath}
+	}
+	return nil
 }
 
 // ensurePiObserverProvider idempotently writes/merges the `observer` provider

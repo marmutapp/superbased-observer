@@ -38,6 +38,8 @@ func newCopilotCLICmd() *cobra.Command {
 		carry        string
 		fromMessage  int
 		fromTime     string
+		attach       *bool
+		noAttach     *bool
 	)
 	cmd := &cobra.Command{
 		Use:   "copilot-cli [-- copilot-args...]",
@@ -55,6 +57,31 @@ func newCopilotCLICmd() *cobra.Command {
 			"running observer proxy (`observer start`).",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Attach-by-default (attach-all-launchers): hand the PTY to the
+			// daemon when attach resolves. copilot-cli self-routes via the
+			// COPILOT_PROVIDER_* env the daemon-spawned inner launcher sets, so
+			// forward NO proxy env (attachEnv nil) and no --no-proxy-route flag
+			// exists (noProxyRoute nil). A -p/--prompt headless one-shot, a
+			// leading utility subcommand (login/mcp/…), or the continue-from
+			// family forces the bare path. toolArgs is the RAW operator remainder
+			// — the inner launcher re-applies its own env + --model.
+			outcome, err := launcherAttach(cmd.Context(), launcherAttachSpec{
+				tool:          "copilot-cli",
+				configPath:    configPath,
+				proxyOverride: proxyURL,
+				proxyFlag:     "--proxy",
+				flagAttach:    *attach,
+				flagNoAttach:  *noAttach,
+				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
+					argsContainHeadlessFlag(args, "-p", "--prompt") ||
+					argsLeadWithSubcommand(args, copilotSubcommands),
+				passthrough: copilotAttachPassthrough(binPath, model),
+				toolArgs:    args,
+				stderr:      cmd.ErrOrStderr(),
+			})
+			if outcome.handled {
+				return err
+			}
 			cfg, err := config.Load(config.LoadOptions{GlobalPath: configPath})
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
@@ -129,8 +156,23 @@ func newCopilotCLICmd() *cobra.Command {
 	cmd.Flags().StringVar(&carry, "carry", "", "Carry mode for --continue-from: metadata|distilled|distilled_tail|full|full_cache (default from [handoff] config)")
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
+	attach, noAttach = registerAttachFlags(cmd, "copilot-cli")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
+}
+
+// copilotAttachPassthrough forwards --copilot-path and --model to the
+// daemon-spawned inner `observer copilot-cli` launcher when the operator set
+// them; nil when neither is set.
+func copilotAttachPassthrough(binPath, model string) []string {
+	var p []string
+	if binPath != "" {
+		p = append(p, "--copilot-path", binPath)
+	}
+	if model != "" {
+		p = append(p, "--model", model)
+	}
+	return p
 }
 
 // copilotSubcommands are the copilot argv tokens that are subcommands, not a

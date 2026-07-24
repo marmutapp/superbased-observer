@@ -77,11 +77,24 @@ type attachLaunch struct {
 
 // nativeResumeHint composes the daemon-exit resume guidance from the tool's
 // grounded ResumeSpec (session-attach design §2.4). When native resume is not
-// yet grounded it degrades to a generic, honest phrase rather than asserting a
-// resume command the tool may not support. Dispatch is on the ResumeSpec shape,
-// never a tool-name branch (CLAUDE.md #3).
+// yet grounded — the ResumeNone case that now covers 17 of the 19 attachable
+// launchers (attach-all-launchers) — it degrades HONESTLY: for a launchable
+// tool it points at the manual `observer <verb> --continue-from <id>` handover
+// fork (the real mortality backstop for a daemon-restart-ends-the-session
+// tool), and only falls back to the fully-generic phrase when even the launch
+// verb is unknown. Dispatch is on the capability SHAPE (ResumeSpec kind +
+// Handoff.Launch presence), never a tool-name branch (CLAUDE.md #3). This is
+// the ONE seam where the "daemon restart = session over" reality lands for a
+// ResumeNone tool — reportAttachResult's daemon-exit / conn-lost / input-stall
+// branches interpolate it.
 func nativeResumeHint(capab integration.Capability) string {
 	if capab.Resume.Kind != integration.ResumeNative || capab.Resume.Subcommand == "" {
+		if capab.Handoff.Launch != nil && capab.Handoff.Launch.Subcommand != "" {
+			return fmt.Sprintf(
+				"start a new session (`observer %s --continue-from <session-id>` carries a distilled handover)",
+				capab.Handoff.Launch.Subcommand,
+			)
+		}
 		return "resume it natively to continue"
 	}
 	switch capab.Resume.IDMechanism {
@@ -103,20 +116,25 @@ func nativeResumeHint(capab integration.Capability) string {
 //
 //   - --no-proxy-route  when the escape hatch is engaged (the inner launcher
 //     then skips base-URL / `-c openai_base_url` injection);
-//   - --proxy <url>     when the operator overrode the proxy URL;
+//   - <proxyFlag> <url> when the operator overrode the proxy URL — the flag
+//     NAME is the inner launcher's own proxy-override spelling (`--proxy` for
+//     most, `--proxy-url` for hermes/pi), passed in so shared code never
+//     branches on tool identity (CLAUDE.md #3); emitted only when BOTH
+//     proxyFlag and proxyOverride are non-empty (a seed-only launcher with no
+//     proxy flag passes proxyFlag="" and the override is dropped);
 //   - --config <path>   when the outer invocation used a non-default config;
 //   - passthrough...    launcher-specific wrapper flags the inner launcher
 //     should honor (e.g. --claude-path/--codex-path, --no-app-server-check),
 //     enumerated explicitly by each launcher (B2-6);
 //   - -- <toolArgs...>  the operator's trailing tool args (`observer codex
 //     --attach -- --model X`), so launcher state is not dropped.
-func attachExtraArgs(noProxyRoute bool, proxyOverride, configPath string, passthrough, toolArgs []string) []string {
+func attachExtraArgs(noProxyRoute bool, proxyOverride, proxyFlag, configPath string, passthrough, toolArgs []string) []string {
 	var args []string
 	if noProxyRoute {
 		args = append(args, "--no-proxy-route")
 	}
-	if proxyOverride != "" {
-		args = append(args, "--proxy", proxyOverride)
+	if proxyOverride != "" && proxyFlag != "" {
+		args = append(args, proxyFlag, proxyOverride)
 	}
 	if configPath != "" {
 		args = append(args, "--config", configPath)

@@ -34,6 +34,8 @@ func newGeminiCmd() *cobra.Command {
 		carry        string
 		fromMessage  int
 		fromTime     string
+		attach       *bool
+		noAttach     *bool
 	)
 	cmd := &cobra.Command{
 		Use:   "gemini [-- gemini-args...]",
@@ -51,6 +53,30 @@ func newGeminiCmd() *cobra.Command {
 			"the API key. Requires a running observer proxy (`observer start`).",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Attach-by-default (attach-all-launchers): hand the PTY to the
+			// daemon when attach resolves. gemini-cli self-routes via
+			// GOOGLE_GEMINI_BASE_URL in the daemon-spawned inner launcher, so
+			// forward NO proxy env (attachEnv nil) and no --no-proxy-route flag
+			// exists to forward (noProxyRoute nil). A -p/--prompt headless
+			// one-shot or the continue-from family forces the bare path. toolArgs
+			// is the RAW operator remainder — the inner launcher re-applies its
+			// own base-URL injection.
+			outcome, err := launcherAttach(cmd.Context(), launcherAttachSpec{
+				tool:          "gemini-cli",
+				configPath:    configPath,
+				proxyOverride: proxyURL,
+				proxyFlag:     "--proxy",
+				flagAttach:    *attach,
+				flagNoAttach:  *noAttach,
+				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
+					argsContainHeadlessFlag(args, "-p", "--prompt"),
+				passthrough: geminiAttachPassthrough(binPath),
+				toolArgs:    args,
+				stderr:      cmd.ErrOrStderr(),
+			})
+			if outcome.handled {
+				return err
+			}
 			cfg, err := config.Load(config.LoadOptions{GlobalPath: configPath})
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
@@ -113,6 +139,17 @@ func newGeminiCmd() *cobra.Command {
 	cmd.Flags().StringVar(&carry, "carry", "", "Carry mode for --continue-from: metadata|distilled|distilled_tail|full|full_cache (default from [handoff] config)")
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
+	attach, noAttach = registerAttachFlags(cmd, "gemini-cli")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
+}
+
+// geminiAttachPassthrough forwards --gemini-path to the daemon-spawned inner
+// `observer gemini` launcher when the operator overrode the binary path; nil
+// otherwise.
+func geminiAttachPassthrough(binPath string) []string {
+	if binPath != "" {
+		return []string{"--gemini-path", binPath}
+	}
+	return nil
 }

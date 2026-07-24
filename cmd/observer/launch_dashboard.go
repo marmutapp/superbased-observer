@@ -536,6 +536,15 @@ func (a *launchManagerAdapter) RevokeRemoteWriterByHolder(holderKey, reason stri
 	return a.mgr.RevokeRemoteWriterByHolder(holderKey, reason)
 }
 
+// SessionForRun delegates the run→correlated-session lookup to termsvc so the
+// dashboard's /api/attach/sessions handler can key a handoff row by the FORKED
+// session it is driving rather than the SOURCE session the spec stamped at
+// spawn. Returns ("", false) when no correlation link exists yet — the caller
+// fails open to an empty session id.
+func (a *launchManagerAdapter) SessionForRun(runID string) (string, bool) {
+	return a.svc.SessionForRun(runID)
+}
+
 func (a *launchManagerAdapter) Snapshot() []dashboard.LaunchInfo {
 	live := a.mgr.Snapshot()
 	// GC retained run classification (termsvc.byMeta) for handles the Manager no

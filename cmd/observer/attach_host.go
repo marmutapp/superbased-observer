@@ -248,6 +248,17 @@ func validateAttachCapability(req attachsock.SpawnRequest) error {
 		return fmt.Errorf("attach: subcommand %q does not match tool %q's grounded attach subcommand %q",
 			req.Subcommand, req.Tool, capab.Attach.Subcommand)
 	}
+	// Resume defense in depth (attach-all-launchers §3): a socket client is
+	// untrusted, so refuse a resume spawn (manual --resume OR an AutoResume) for
+	// a tool with no grounded native resume. The 17 ResumeNone launchers now
+	// attachable have no `--resume` argv, so composing one for their inner
+	// launcher would fail with a cobra unknown-flag error inside the PTY. Branch
+	// on the capability SHAPE, never the tool name (CLAUDE.md #3). The client
+	// gate + resumableSessionSet already prevent this; this is the daemon-side
+	// backstop against a spoofed request.
+	if req.ResumeSession != "" && capab.Resume.Kind != integration.ResumeNative {
+		return fmt.Errorf("attach: tool %q has no native resume capability", req.Tool)
+	}
 	return nil
 }
 

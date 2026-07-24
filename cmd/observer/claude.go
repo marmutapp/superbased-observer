@@ -32,7 +32,6 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"golang.org/x/term"
 
 	"github.com/marmutapp/superbased-observer/internal/config"
 	"github.com/marmutapp/superbased-observer/internal/integration"
@@ -186,33 +185,50 @@ func runClaudeLauncher(ctx context.Context, opts claudeLauncherOptions) error {
 	// incompatible-mode, and a lazily-dialed reachability probe). On the
 	// daemon-unreachable fallback it prints ONE notice and continues to the bare
 	// launch below (exit codes preserved). This runs before any bare-launch prep.
-	claudeCap, _ := integration.For("claude-code")
-	decision := decideAttach(attachDecisionInputs{
-		enabled:       cfg.Terminal.Attach.Enabled,
-		defaultOn:     cfg.Terminal.Attach.DefaultOn,
-		grounded:      claudeCap.Attach != nil,
+	// The attach gate is now the shared launcherAttach (attach-all-launchers):
+	// it walks the SAME decideAttach table, prints the SAME notice, and on an
+	// attach verdict runs the SAME runAttachSession — the claude-specific pieces
+	// (the reject-flags list, the base-URL-unless-escape-hatch + profile env, the
+	// --claude-path/--resume passthrough, the --no-proxy/--no-proxy-route
+	// escape-hatch resolution) are expressed as spec closures so shared code
+	// never branches on tool identity (CLAUDE.md #3). Byte-equal to the prior
+	// inline block + runClaudeAttach.
+	outcome, attachErr := launcherAttach(ctx, launcherAttachSpec{
+		tool:          "claude-code",
+		configPath:    opts.configPath,
+		proxyOverride: opts.proxyURL,
+		proxyFlag:     "--proxy",
 		flagAttach:    opts.attach,
 		flagNoAttach:  opts.noAttach,
-		stdinTTY:      term.IsTerminal(int(os.Stdin.Fd())),
-		stdoutTTY:     term.IsTerminal(int(os.Stdout.Fd())),
 		incompatible:  claudeAttachIncompatible(opts),
-		daemonChild:   runningAsDaemonChild(),
-		daemonSpawned: oobChannelActive(),
-		reachable:     func() bool { return attachSocketReachable(cfg.Observer.DBPath) },
+		rejectFlags:   func() error { return rejectIncompatibleClaudeAttachFlags(opts) },
+		// Escape hatch: skip proxy routing when the operator asked (--no-proxy OR
+		// the outer --no-proxy-route, B2-4) or config opted out.
+		noProxyRoute: func(rp bool) bool { return opts.noProxyRoute || opts.noProxy || !rp },
+		// R2-5: forward ANTHROPIC_BASE_URL (unless the escape hatch is engaged)
+		// AND the caller's own claude PROFILE env (CLAUDE_CONFIG_DIR /
+		// ANTHROPIC_CONFIG_DIR) regardless of routing, so the daemon-spawned inner
+		// launcher resolves the caller's profile, not the daemon's.
+		attachEnv: func(u string, npr bool) []string {
+			var e []string
+			if !npr {
+				e = append(e, "ANTHROPIC_BASE_URL="+u)
+			}
+			return append(e, claudeAttachEnv(os.Environ())...)
+		},
+		passthrough: claudeAttachPassthrough(opts),
+		toolArgs:    opts.claudeArgs,
+		stderr:      opts.stderr,
 	})
+	if outcome.handled {
+		return attachErr
+	}
 	// F3(a): remember when the attach layer already emitted its daemon-unreachable
 	// notice, so a downstream empty-unset proxy-down notice (same root cause — the
 	// daemon IS the proxy) doesn't print a redundant SECOND line, and the
 	// bare-direct neutralize notice condenses to its no-"unreachable"-prefix form
 	// (capture-loss info survives; the redundant half doesn't).
-	attachDownNoticed := false
-	if decision.notice != "" {
-		fmt.Fprintln(opts.stderr, decision.notice)
-		attachDownNoticed = decision.notice == attachDaemonUnreachableNotice
-	}
-	if decision.attach() {
-		return runClaudeAttach(ctx, opts, cfg.Terminal.Attach.RouteProxy, proxyURL)
-	}
+	attachDownNoticed := outcome.daemonUnreachableNoticed
 
 	// Native resume (session-attach design Phase 3): `observer claude --resume
 	// <id>` injects `--resume <id>` at the front of the claude child argv so
@@ -451,50 +467,6 @@ func runClaudeRoutedLaunch(opts claudeLauncherOptions, bin, proxyURL string, lau
 	}
 
 	return execClaudeChild(bin, launchArgs, env, continueDir)
-}
-
-// runClaudeAttach is the attach-mode path of `observer claude` (session-attach
-// design Phase 1): hand the PTY to the daemon instead of exec'ing claude as a
-// child of this shell. The daemon spawns the inner `observer claude` launcher
-// (which does its own OAuth wiring), so we forward only the proxy-routing var
-// ANTHROPIC_BASE_URL — and omit it under the escape hatch. Extracted from
-// runClaudeLauncher to keep that function's cyclomatic complexity in bounds.
-func runClaudeAttach(ctx context.Context, opts claudeLauncherOptions, routeProxy bool, proxyURL string) error {
-	// B2-6: no wrapper flag is silently dropped under --attach. Reject the ones
-	// the daemon-spawned inner launcher cannot honor (naming each); forward the
-	// ones it should (--claude-path below, plus --proxy/--config via
-	// attachExtraArgs and the `--` tool remainder).
-	if aerr := rejectIncompatibleClaudeAttachFlags(opts); aerr != nil {
-		fmt.Fprintln(opts.stderr, aerr)
-		return aerr
-	}
-	// Escape hatch: skip proxy routing when the operator asked (--no-proxy OR
-	// the outer --no-proxy-route, B2-4) or config opted out. Expressed BOTH
-	// ways — the env var (now that launchChildEnv honours ExtraEnv) AND the
-	// forwarded --no-proxy-route argv — because the inner `observer claude`
-	// self-routes unless the argv flag tells it not to (B2). When routing,
-	// forward the proxy env too so the fixed ExtraEnv plumbing carries it.
-	noProxyRoute := opts.noProxyRoute || opts.noProxy || !routeProxy
-	var penv []string
-	if !noProxyRoute {
-		penv = []string{"ANTHROPIC_BASE_URL=" + proxyURL}
-	}
-	// R2-5: forward the caller's own claude PROFILE env (CLAUDE_CONFIG_DIR /
-	// ANTHROPIC_CONFIG_DIR) across the socket too, regardless of proxy routing.
-	// The bare `observer claude` launcher honors both (claudeCredentialsPath),
-	// and claude itself honors CLAUDE_CONFIG_DIR, so the daemon-spawned inner
-	// launcher must run under the caller's profile — not the daemon's — to read
-	// the right credentials/config. Layered after the daemon's inherited env by
-	// launchChildEnv, so the caller's value wins.
-	penv = append(penv, claudeAttachEnv(os.Environ())...)
-	return runAttachSession(ctx, attachLaunch{
-		tool:       "claude-code",
-		configPath: opts.configPath,
-		proxyURL:   proxyURL,
-		proxyEnv:   penv,
-		extraArgs:  attachExtraArgs(noProxyRoute, opts.proxyURL, opts.configPath, claudeAttachPassthrough(opts), opts.claudeArgs),
-		stderr:     opts.stderr,
-	})
 }
 
 // claudeAttachEnv builds the profile env forwarded across the attach socket to

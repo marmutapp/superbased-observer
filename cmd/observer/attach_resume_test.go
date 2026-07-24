@@ -7,12 +7,14 @@ import (
 	"io"
 	"net"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/marmutapp/superbased-observer/internal/attachsock"
 	"github.com/marmutapp/superbased-observer/internal/db"
+	"github.com/marmutapp/superbased-observer/internal/integration"
 	"github.com/marmutapp/superbased-observer/internal/store"
 	"github.com/marmutapp/superbased-observer/internal/termfeed"
 	"github.com/marmutapp/superbased-observer/internal/termrun"
@@ -218,9 +220,11 @@ func TestResumableSessionSet(t *testing.T) {
 	ended := time.Now().UTC()
 	runs := []store.TerminalRunSummary{
 		// (1) crash-orphaned attach (no reason, no end), correlated → RESUMABLE.
-		{RunID: "r1", Kind: string(termrun.KindAttach), EndedAt: nil, BestSessionID: "sess-orphan"},
+		// Tool is a ResumeNative tool (claude-code) so the capability gate admits
+		// it (attach-all-launchers §3 — only natively-resumable tools are offered).
+		{RunID: "r1", Tool: "claude-code", Kind: string(termrun.KindAttach), EndedAt: nil, BestSessionID: "sess-orphan"},
 		// (2) attach that recorded a natural child-exit → NOT resumable.
-		{RunID: "r2", Kind: string(termrun.KindAttach), EndedAt: &ended, EndReason: store.EndReasonChildExit, BestSessionID: "sess-exited"},
+		{RunID: "r2", Tool: "claude-code", Kind: string(termrun.KindAttach), EndedAt: &ended, EndReason: store.EndReasonChildExit, BestSessionID: "sess-exited"},
 		// (3) attach, no correlation yet → nothing to resume.
 		{RunID: "r3", Kind: string(termrun.KindAttach), EndedAt: nil, BestSessionID: ""},
 		// (4) a non-attach kind (fresh) orphan → not an attach, excluded.
@@ -229,16 +233,16 @@ func TestResumableSessionSet(t *testing.T) {
 		{RunID: "r5", Kind: string(termrun.KindResume), EndedAt: nil, BestSessionID: "sess-resume"},
 		// (6) graceful-shutdown orphan whose racing OnExit ALSO set ended_at:
 		//     the durable reason makes it RESUMABLE despite ended_at != nil (H2).
-		{RunID: "r6", Kind: string(termrun.KindAttach), EndedAt: &ended, EndReason: store.EndReasonDaemonShutdown, BestSessionID: "sess-shutdown"},
+		{RunID: "r6", Tool: "claude-code", Kind: string(termrun.KindAttach), EndedAt: &ended, EndReason: store.EndReasonDaemonShutdown, BestSessionID: "sess-shutdown"},
 		// (7) an already-superseded orphan (resumed) → NEVER re-offer, even
 		//     though ended_at is nil (H2).
-		{RunID: "r7", Kind: string(termrun.KindAttach), EndedAt: nil, EndReason: store.EndReasonResumed, BestSessionID: "sess-resumed"},
+		{RunID: "r7", Tool: "claude-code", Kind: string(termrun.KindAttach), EndedAt: nil, EndReason: store.EndReasonResumed, BestSessionID: "sess-resumed"},
 		// (8)+(9) TWO eligible orphans for the SAME session (a historical
 		//     duplicate / a prior stamp failure): both must be collected, newest
 		//     first, so a successful resume supersedes ALL of them (round-4
 		//     multi-orphan finding). Input is newest-first, so r8 precedes r9.
-		{RunID: "r8", Kind: string(termrun.KindAttach), EndedAt: nil, BestSessionID: "sess-multi"},
-		{RunID: "r9", Kind: string(termrun.KindAttach), EndedAt: &ended, EndReason: store.EndReasonDaemonShutdown, BestSessionID: "sess-multi"},
+		{RunID: "r8", Tool: "claude-code", Kind: string(termrun.KindAttach), EndedAt: nil, BestSessionID: "sess-multi"},
+		{RunID: "r9", Tool: "claude-code", Kind: string(termrun.KindAttach), EndedAt: &ended, EndReason: store.EndReasonDaemonShutdown, BestSessionID: "sess-multi"},
 		// (10) a resume-kind run the FIX-2 sibling sweep stamped 'daemon_shutdown'
 		//      at graceful shutdown. Offerability is UNAFFECTED: the resume-offer
 		//      gate is kind='attach'-scoped, so a non-attach run carrying the same
@@ -272,6 +276,94 @@ func TestResumableSessionSet(t *testing.T) {
 	}
 	if len(set) != 3 {
 		t.Fatalf("resumable set = %v, want exactly {sess-orphan, sess-shutdown, sess-multi}", set)
+	}
+}
+
+// TestResumableSessionSetSkipsResumeNoneTools pins the attach-all-launchers §3
+// capability gate: a KindAttach orphan with a correlated session id is offered
+// for auto-resume ONLY when its tool grounds native resume. A ResumeNone tool
+// (opencode — now attachable but with no native-resume argv) is excluded even
+// though its run is a correlated crash orphan, so the daemon never composes a
+// `--resume` its inner launcher can't parse. A ResumeNative tool (claude-code)
+// in the same shape is still offered.
+func TestResumableSessionSetSkipsResumeNoneTools(t *testing.T) {
+	// Sanity-pin the fixture's capability assumptions so this test fails loudly
+	// if the registry grounding ever changes underneath it.
+	if c, _ := integration.For("opencode"); c.Resume.Kind == integration.ResumeNative {
+		t.Fatal("fixture assumes opencode is ResumeNone")
+	}
+	if c, _ := integration.For("claude-code"); c.Resume.Kind != integration.ResumeNative {
+		t.Fatal("fixture assumes claude-code is ResumeNative")
+	}
+	runs := []store.TerminalRunSummary{
+		// ResumeNone tool, correlated crash orphan → EXCLUDED by the gate.
+		{RunID: "op1", Tool: "opencode", Kind: string(termrun.KindAttach), EndedAt: nil, BestSessionID: "sess-opencode"},
+		// ResumeNative tool, same shape → INCLUDED.
+		{RunID: "cc1", Tool: "claude-code", Kind: string(termrun.KindAttach), EndedAt: nil, BestSessionID: "sess-claude"},
+		// A tool with no registry row at all → EXCLUDED (For returns ok=false).
+		{RunID: "zz1", Tool: "not-a-real-tool", Kind: string(termrun.KindAttach), EndedAt: nil, BestSessionID: "sess-unknown"},
+	}
+	set := resumableSessionSet(runs)
+	if _, ok := set["sess-opencode"]; ok {
+		t.Error("a ResumeNone tool's orphan must NOT be auto-resumable")
+	}
+	if _, ok := set["sess-unknown"]; ok {
+		t.Error("an unknown tool's orphan must NOT be auto-resumable")
+	}
+	if got := set["sess-claude"]; len(got) != 1 || got[0] != "cc1" {
+		t.Errorf("claude-code orphan = %v, want [cc1]", got)
+	}
+	if len(set) != 1 {
+		t.Fatalf("resumable set = %v, want exactly {sess-claude}", set)
+	}
+}
+
+// TestValidateAttachCapabilityRejectsResumeForResumeNone pins the daemon-side
+// defense in depth (attach-all-launchers §3): an untrusted socket spawn that
+// carries a ResumeSession for a ResumeNone tool is refused BEFORE launch, so a
+// spoofed AutoResume/ResumeSession can't drive the daemon to compose a
+// `--resume` argv the inner launcher can't parse. A non-resume spawn for the
+// same tool passes; a resume spawn for a ResumeNative tool passes.
+func TestValidateAttachCapabilityRejectsResumeForResumeNone(t *testing.T) {
+	// A ResumeNone tool with a resume request → refused.
+	err := validateAttachCapability(attachsock.SpawnRequest{
+		Tool: "opencode", Subcommand: "opencode", ResumeSession: "sess-x",
+	})
+	if err == nil || !strings.Contains(err.Error(), "no native resume capability") {
+		t.Fatalf("resume spawn for a ResumeNone tool err = %v, want a no-native-resume rejection", err)
+	}
+	// The SAME tool WITHOUT a resume request → allowed (plain attach is fine).
+	if err := validateAttachCapability(attachsock.SpawnRequest{
+		Tool: "opencode", Subcommand: "opencode",
+	}); err != nil {
+		t.Fatalf("plain (non-resume) attach for a ResumeNone tool must pass, got %v", err)
+	}
+	// A ResumeNative tool WITH a resume request → allowed.
+	if err := validateAttachCapability(attachsock.SpawnRequest{
+		Tool: "claude-code", Subcommand: "claude", ResumeSession: "sess-y",
+	}); err != nil {
+		t.Fatalf("resume spawn for a ResumeNative tool must pass, got %v", err)
+	}
+}
+
+// TestNativeResumeHintResumeNoneMentionsContinueFrom pins the honest
+// degraded-mortality copy (attach-all-launchers §3): for a launchable ResumeNone
+// tool the daemon-exit hint points at the manual `observer <verb> --continue-from`
+// handover fork (the real mortality backstop), not a native-resume command the
+// tool doesn't have. A ResumeNative tool still gets its native `--resume` hint.
+func TestNativeResumeHintResumeNoneMentionsContinueFrom(t *testing.T) {
+	// opencode: launchable, ResumeNone → the --continue-from degraded hint,
+	// naming its launch verb.
+	oc, _ := integration.For("opencode")
+	got := nativeResumeHint(oc)
+	if !strings.Contains(got, "--continue-from") || !strings.Contains(got, "observer opencode") {
+		t.Errorf("opencode hint = %q, want it to mention `observer opencode --continue-from`", got)
+	}
+	// claude-code: ResumeNative → the native --resume hint, NOT --continue-from.
+	cc, _ := integration.For("claude-code")
+	got = nativeResumeHint(cc)
+	if !strings.Contains(got, "--resume") || strings.Contains(got, "--continue-from") {
+		t.Errorf("claude-code hint = %q, want a native `--resume` hint", got)
 	}
 }
 

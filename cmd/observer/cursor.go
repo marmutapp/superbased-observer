@@ -59,6 +59,8 @@ func newCursorCmd() *cobra.Command {
 		carry        string
 		fromMessage  int
 		fromTime     string
+		attach       *bool
+		noAttach     *bool
 	)
 	cmd := &cobra.Command{
 		Use:   "cursor [-- cursor-agent-args...]",
@@ -77,6 +79,31 @@ func newCursorCmd() *cobra.Command {
 			"Use `--` to separate observer flags from cursor-agent flags.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Attach-by-default (attach-all-launchers): hand the PTY to the
+			// daemon when attach resolves. cursor is a PURE SEEDING wrapper with
+			// NO proxy routing, so proxyFlag is "" (no proxy override forwarded),
+			// attachEnv nil, and no --no-proxy-route flag exists (noProxyRoute
+			// nil) — capture stays on the cursor hook + store.db watcher adapter.
+			// A -p/--print headless one-shot, a leading utility subcommand
+			// (login/status/…), or the continue-from family forces the bare path.
+			// toolArgs is the RAW operator remainder.
+			outcome, aerr := launcherAttach(cmd.Context(), launcherAttachSpec{
+				tool:         "cursor",
+				configPath:   configPath,
+				proxyFlag:    "",
+				flagAttach:   *attach,
+				flagNoAttach: *noAttach,
+				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
+					argsContainHeadlessFlag(args, "-p", "--print") ||
+					argsLeadWithSubcommand(args, cursorSubcommands),
+				passthrough: cursorAttachPassthrough(binPath),
+				toolArgs:    args,
+				stderr:      cmd.ErrOrStderr(),
+			})
+			if outcome.handled {
+				return aerr
+			}
+
 			bin, err := resolveToolBin("cursor", binPath, "--cursor-agent-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
@@ -134,6 +161,17 @@ func newCursorCmd() *cobra.Command {
 	cmd.Flags().StringVar(&carry, "carry", "", "Carry mode for --continue-from: metadata|distilled|distilled_tail|full|full_cache (default from [handoff] config)")
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
+	attach, noAttach = registerAttachFlags(cmd, "cursor")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
+}
+
+// cursorAttachPassthrough forwards --cursor-agent-path to the daemon-spawned
+// inner `observer cursor` launcher when the operator overrode the binary path;
+// nil otherwise.
+func cursorAttachPassthrough(binPath string) []string {
+	if binPath != "" {
+		return []string{"--cursor-agent-path", binPath}
+	}
+	return nil
 }

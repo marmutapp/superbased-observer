@@ -13,6 +13,7 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/attachsock"
 	"github.com/marmutapp/superbased-observer/internal/config"
 	"github.com/marmutapp/superbased-observer/internal/git"
+	"github.com/marmutapp/superbased-observer/internal/integration"
 	"github.com/marmutapp/superbased-observer/internal/intelligence/dashboard"
 	"github.com/marmutapp/superbased-observer/internal/remotenotify"
 	"github.com/marmutapp/superbased-observer/internal/store"
@@ -479,6 +480,18 @@ func resumableSessionSet(runs []store.TerminalRunSummary) map[string][]string {
 		}
 		if r.BestSessionID == "" {
 			continue // no correlated session ⇒ nothing to resume
+		}
+		// Defense in depth (attach-all-launchers §3): only a tool with grounded
+		// native resume can be auto-resumed — its inner launcher registers
+		// `--resume` and reattaches the REAL transcript. The 17 ResumeNone
+		// launchers now grounded as attachable have no native resume argv, so an
+		// orphaned attach run for one must NEVER enter the offer set (the daemon
+		// would compose a `--resume` the inner launcher can't parse). The client
+		// gate already refuses, but the registry is static data so this pure
+		// gate stays cheap; dispatch on the capability SHAPE, not the tool name
+		// (CLAUDE.md #3). Such orphans simply age out via the shutdown stamps.
+		if c, ok := integration.For(r.Tool); !ok || c.Resume.Kind != integration.ResumeNative {
+			continue
 		}
 		switch r.EndReason {
 		case store.EndReasonResumed, store.EndReasonChildExit:

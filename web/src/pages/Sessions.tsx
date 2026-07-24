@@ -164,12 +164,15 @@ export function SessionsPage() {
 
   // Live attach sessions (session-attach Phase 2): polled every 15s WHILE the
   // page is visible (P2-4a) so a "live · joinable" chip clears when the child
-  // exits and appears when a new `observer <tool> --attach` lands — the badge
+  // exits and appears when a new daemon-owned terminal run lands — the badge
   // must not stay stuck live on a one-shot snapshot. useApi pauses the loop when
   // the tab is hidden and clears the interval on unmount. Drives the
-  // informational chip on rows whose session id is a daemon-owned attach session
-  // (exact liveness, §4). A dashboard without the attach seam 503s → empty set →
-  // no chips.
+  // informational chip on rows whose session id has a live daemon-owned terminal
+  // run bound to it — /api/attach/sessions now covers every live kind
+  // (fresh/handoff/attach/resume), not attach-only, so a dashboard-launched
+  // "new terminal" session gets the chip too once the correlation sweep links
+  // it (~10-30s after launch). A dashboard without the attach seam 503s →
+  // empty set → no chips.
   const attach = useApi<AttachSessionsResponse>(
     "/api/attach/sessions",
     undefined,

@@ -31,7 +31,6 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"golang.org/x/term"
 
 	"github.com/marmutapp/superbased-observer/internal/codexipc"
 	"github.com/marmutapp/superbased-observer/internal/config"
@@ -214,25 +213,52 @@ func runCodexLauncher(ctx context.Context, opts codexLauncherOptions) error {
 	// socket is unreachable. We branch here, before the client-side app-server
 	// detection, so an attach runs that preflight once (in the daemon child), not
 	// twice; a bare verdict flows on to the detection + launch below.
-	codexCap, _ := integration.For("codex")
-	decision := decideAttach(attachDecisionInputs{
-		enabled:       cfg.Terminal.Attach.Enabled,
-		defaultOn:     cfg.Terminal.Attach.DefaultOn,
-		grounded:      codexCap.Attach != nil,
+	// The attach gate is now the shared launcherAttach (attach-all-launchers):
+	// it walks the SAME decideAttach table, prints the SAME notice, and on an
+	// attach verdict runs the SAME runAttachSession — the codex-specific pieces
+	// (the reject-flags list + the B3-1 fail-closed conflict check, the CODEX_HOME
+	// profile env, the --codex-path/--no-app-server-check/--resume passthrough,
+	// the --no-proxy/--no-proxy-route escape-hatch resolution) are expressed as
+	// spec closures so shared code never branches on tool identity (CLAUDE.md #3).
+	// Byte-equal to the prior inline block + runCodexAttach. attachProxyURL is
+	// the resolved base URL the B3-1 closure and the attach spawn both use — the
+	// SAME value launcherAttach resolves internally.
+	attachProxyURL := resolveProxyURL(cfg.Proxy.Port, opts.proxyURL)
+	outcome, attachErr := launcherAttach(ctx, launcherAttachSpec{
+		tool:          "codex",
+		configPath:    opts.configPath,
+		proxyOverride: opts.proxyURL,
+		proxyFlag:     "--proxy",
 		flagAttach:    opts.attach,
 		flagNoAttach:  opts.noAttach,
-		stdinTTY:      term.IsTerminal(int(os.Stdin.Fd())),
-		stdoutTTY:     term.IsTerminal(int(os.Stdout.Fd())),
 		incompatible:  codexAttachIncompatible(opts),
-		daemonChild:   runningAsDaemonChild(),
-		daemonSpawned: oobChannelActive(),
-		reachable:     func() bool { return attachSocketReachable(cfg.Observer.DBPath) },
+		rejectFlags: func() error {
+			// B2-6: reject wrapper flags the daemon-spawned inner launcher cannot
+			// honor (naming each).
+			if aerr := rejectIncompatibleCodexAttachFlags(opts); aerr != nil {
+				return aerr
+			}
+			// B3-1: FAIL CLOSED client-side when the escape hatch is engaged but a
+			// persistent $CODEX_HOME/config.toml still routes to the proxy — the
+			// inner launcher would refuse anyway, but that failure would surface as
+			// PTY output/exit inside the attach session, so fail fast here (same
+			// machine in v1; effective home + active profile resolve identically).
+			if opts.noProxyRoute || opts.noProxy || !cfg.Terminal.Attach.RouteProxy {
+				return codexNoProxyRouteConflict(effectiveCodexHomeRoots(), attachProxyURL, codexActiveProfile(opts.codexArgs))
+			}
+			return nil
+		},
+		noProxyRoute: func(rp bool) bool { return opts.noProxyRoute || opts.noProxy || !rp },
+		// Codex routes via argv (`-c openai_base_url`), so there is NO proxy env
+		// to forward — but the caller's per-invocation CODEX_HOME IS forwarded
+		// (R2-5) so the inner launcher discovers/routes the right profile.
+		attachEnv:   func(_ string, _ bool) []string { return codexAttachEnv(os.Environ()) },
+		passthrough: codexAttachPassthrough(opts),
+		toolArgs:    opts.codexArgs,
+		stderr:      opts.stderr,
 	})
-	if decision.notice != "" {
-		fmt.Fprintln(opts.stderr, decision.notice)
-	}
-	if decision.attach() {
-		return runCodexAttach(ctx, opts, cfg.Terminal.Attach.RouteProxy, resolveProxyURL(cfg.Proxy.Port, opts.proxyURL))
+	if outcome.handled {
+		return attachErr
 	}
 
 	// Native resume (session-attach design Phase 3): `observer codex --resume
@@ -591,60 +617,6 @@ func runCodexConfigPreflight(opts codexLauncherOptions, proxyURL string) {
 				"observer codex: re-run with --write-config to auto-fix (creates a .bak before mutating).")
 		}
 	}
-}
-
-// runCodexAttach is the attach-mode path of `observer codex` (session-attach
-// design Phase 1): hand the PTY to the daemon instead of exec'ing codex as a
-// child of this shell. The daemon spawns the inner `observer codex` launcher,
-// which runs the app-server preflight AND injects `-c openai_base_url` itself —
-// so codex routing is config/argv based, NOT env-based: we forward NO proxy env
-// (design §6, and the task's codex carve-out). Extracted from runCodexLauncher
-// to keep that function's cyclomatic complexity in bounds; it also runs before
-// the client-side app-server detection so that runs once (in the daemon child),
-// not twice.
-func runCodexAttach(ctx context.Context, opts codexLauncherOptions, routeProxy bool, proxyURL string) error {
-	// B2-6: no wrapper flag is silently dropped under --attach. Reject the ones
-	// the daemon-spawned inner launcher cannot honor (naming each); forward
-	// --codex-path and --no-app-server-check (which the inner launcher runs),
-	// plus --proxy/--config via attachExtraArgs and the `--` tool remainder.
-	if aerr := rejectIncompatibleCodexAttachFlags(opts); aerr != nil {
-		fmt.Fprintln(opts.stderr, aerr)
-		return aerr
-	}
-	// Codex routes via `-c openai_base_url` injected by the inner launcher
-	// (argv, not env), so there is no proxy env to forward. The escape hatch is
-	// therefore purely argv: forward --no-proxy-route (which makes the inner
-	// launcher skip the override) when opted out — honoring the outer
-	// --no-proxy-route too, B2-4 — plus any --proxy/--config override and the
-	// operator's `--` tool remainder (B2/B3).
-	noProxyRoute := opts.noProxyRoute || opts.noProxy || !routeProxy
-	// B3-1: FAIL CLOSED here too. The daemon-spawned inner launcher would itself
-	// refuse under --no-proxy-route, but that failure would surface as PTY
-	// output/exit inside the attach session — fail fast client-side instead
-	// (same machine in v1, so the effective CODEX_HOME resolves the same files).
-	// Scoped to the effective home + active profile (finding 3), same as the bare
-	// launcher, so a stale cross-mount route can't refuse the attach.
-	if noProxyRoute {
-		if cerr := codexNoProxyRouteConflict(effectiveCodexHomeRoots(), proxyURL, codexActiveProfile(opts.codexArgs)); cerr != nil {
-			fmt.Fprintln(opts.stderr, cerr)
-			return cerr
-		}
-	}
-
-	return runAttachSession(ctx, attachLaunch{
-		tool:       "codex",
-		configPath: opts.configPath,
-		proxyURL:   proxyURL,
-		// Codex routes via argv (`-c openai_base_url`), so there is NO proxy env
-		// to forward — but a per-invocation CODEX_HOME IS forwarded (R2-5). The
-		// daemon otherwise spawns the inner launcher under its OWN environment, so
-		// `CODEX_HOME=/profile observer codex --attach` would discover + route the
-		// wrong profile's sessions dir/config/credentials. Layered after the
-		// daemon's inherited env by launchChildEnv, so the caller's value wins.
-		proxyEnv:  codexAttachEnv(os.Environ()),
-		extraArgs: attachExtraArgs(noProxyRoute, opts.proxyURL, opts.configPath, codexAttachPassthrough(opts), opts.codexArgs),
-		stderr:    opts.stderr,
-	})
 }
 
 // codexAttachEnv builds the profile env forwarded across the attach socket to

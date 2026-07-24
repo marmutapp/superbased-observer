@@ -119,6 +119,15 @@ type LaunchManager interface {
 	Close(handle string)
 	// Snapshot lists live sessions (Phase 3 running-session list).
 	Snapshot() []LaunchInfo
+	// SessionForRun resolves a durable run id to the observer session id that
+	// correlation has linked the run's PTY to, if any. It is the run→"driving
+	// session" lookup handleAttachSessions uses to key a handoff row by its
+	// FORKED session (the session the PTY is actually driving) rather than the
+	// SOURCE session the spec stamped at spawn. Returns ("", false) when no link
+	// exists yet (~10–30 s post-spawn) or the run is unknown — the caller
+	// fails open to an empty session id, never crashing the list. Delegates to
+	// termsvc.SessionForRun; the dashboard never imports termsvc.
+	SessionForRun(runID string) (sessionID string, ok bool)
 	// RevokeAllRemoteWriters revokes every live session's REMOTE-held writer
 	// lease (leaving any owner-LOCAL loopback writer untouched) through the ONE
 	// termsession revocation funnel — the manager-level global kill the admin
@@ -246,11 +255,12 @@ type LaunchInfo struct {
 	Subcommand string `json:"subcommand"`
 	SessionID  string `json:"session_id"`
 	// Kind is the terminal_run kind this PTY handle belongs to ("attach" /
-	// "handoff" / "fresh"), resolved from the run identity (session-attach
-	// design Phase 2). Empty when the session predates run-identity wiring. It
-	// drives the dashboard's "Jump in" gating: only Kind=="attach" sessions are
-	// daemon-owned externals a dashboard tab can join (design §4 — the sole
-	// class with exact daemon-owned liveness).
+	// "handoff" / "fresh" / "resume"), resolved from the run identity
+	// (session-attach design Phase 2). Empty when the session predates
+	// run-identity wiring. It drives the dashboard's "Jump in" gating: ANY valid
+	// kind on a live, non-setup handle is joinable, because every such row is a
+	// real daemon-owned PTY with exact liveness. A kindless (empty) row is not a
+	// joinable run.
 	Kind string `json:"kind,omitempty"`
 	// Tool is the target tool NAME (e.g. "claude-code") the run launched, as
 	// distinct from Subcommand (the observer launcher verb). Empty when unknown.
@@ -1193,25 +1203,49 @@ func (s *Server) handleTerminalInstall(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAttachSessions serves GET /api/attach/sessions — the live
-// LIVE-ATTACHABLE session list (session-attach design Phase 2, dashboard "Jump
-// in"). It returns exactly the visibleSnapshot(ctx) rows whose run Kind is
-// "attach" and which have NOT exited: daemon-owned external sessions the
-// operator launched with `observer <tool> --attach`, which a dashboard tab can
-// join as viewer #2 over the existing /ws/launch/<handle> bridge. Classified
-// VIEW (§9): metadata only, no content.
+// LIVE-JOINABLE session list (session-attach design Phase 2, dashboard "Jump
+// in"). It returns the visibleSnapshot(ctx) rows that are LIVE daemon-owned PTY
+// runs of ANY valid terminal_run kind (fresh / handoff / attach / resume) and
+// are not setup: every dashboard-launched terminal PLUS every
+// `observer <tool> --attach` session. Each such row is a daemon-owned PTY a
+// dashboard tab (local or remote) can join as an extra seat over the existing
+// /ws/launch/<handle> bridge. Classified VIEW (§9): metadata only, no content.
 //
-// Only Kind=="attach" is offered because attach sessions are the sole class
-// with EXACT daemon-owned liveness (design §4); a bare external session's stdio
-// belongs to the user's shell and is never re-parentable, so it is deliberately
-// excluded here rather than presented with a dishonest "Jump in" affordance.
+// The filter is a capability test, not a source-identity test (CLAUDE.md #3):
+// any run with a VALID kind on a live, non-setup handle is joinable, because it
+// is a real daemon-owned PTY with exact liveness. A kindless row predates the
+// run-identity wiring and is not treated as a joinable run. A BARE external
+// session (no daemon PTY at all) is excluded honestly — its stdio belongs to
+// the user's own shell and is never re-parentable, and it has no launch-snapshot
+// row in the first place, so it never appears here. `observer <tool> --attach`
+// remains the way to make a session running in the operator's OWN terminal
+// daemon-owned and therefore joinable.
+//
+// A fresh run carries session_id only once correlation links it (SessionForRun;
+// the generic sweep links within ~10–30s). Until then the row appears with an
+// empty session_id and the frontend keeps its "Jump in" button disabled.
+//
+// session_id on THIS endpoint always means "the session this PTY is driving".
+// For a handoff row that is the FORKED session — NOT the SOURCE session the
+// spec stamped at spawn (which Snapshot preserves for /api/terminal/sessions
+// source labeling). So a handoff row's SessionID is overridden here with the
+// run's correlated session id (empty until correlation links it), keeping the
+// row LISTED but matched to the fork's session detail, never the source's. This
+// override is endpoint-scoped: Snapshot/visibleSnapshot are unchanged.
+//
+// The explicit info.Setup skip is defense in depth: visibleSnapshot already
+// redacts setup rows for REMOTE callers, but a LOCAL caller's snapshot still
+// carries them; a privileged local-only setup PTY must never be offered here
+// (SubscribeRemote refuses SpecSetup, but a local subscribe would not).
 //
 // Each row is the LaunchInfo JSON verbatim (no bespoke struct) — the frontend
 // "Jump in" affordance builds against that shape directly.
 //
-// Remote callers get the SAME visibleSnapshot semantics as
-// /api/terminal/sessions today (setup rows already redacted; attach rows are
-// never setup). Phase 4 tightens remote VIEW of attach sessions behind
-// [remote].allow_terminal_view — deliberately NOT built here.
+// Remote callers keep visibleSnapshot semantics: attach/resume rows are the
+// remote-VIEW-sensitive class and are redacted when
+// [remote].allow_terminal_view = false, while fresh/handoff dashboard terminals
+// are the non-sensitive floor a remote caller always sees. That gate is built
+// now (see visibleSnapshot / allowTerminalView), not deferred.
 func (s *Server) handleAttachSessions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1224,8 +1258,27 @@ func (s *Server) handleAttachSessions(w http.ResponseWriter, r *http.Request) {
 	all := s.visibleSnapshot(r.Context())
 	out := make([]LaunchInfo, 0, len(all))
 	for _, info := range all {
-		if info.Kind != string(termrun.KindAttach) || info.Exited {
-			continue
+		if info.Exited || info.Setup {
+			continue // dead handle / privileged local-only setup PTY
+		}
+		if !termrun.Kind(info.Kind).Valid() {
+			continue // kindless row predates run-identity wiring — not a joinable run
+		}
+		// On THIS endpoint session_id ALWAYS means "the session this PTY is
+		// driving". For a handoff that is the FORKED session, not the SOURCE
+		// session the spec stamps at spawn (which Snapshot preserves for the
+		// source-labeling /api/terminal/sessions consumers). Override the local
+		// copy with the run's CORRELATED session id — known only once correlation
+		// links it (~10–30 s) — or "" pre-link, so the row is still LISTED but
+		// matches no session-detail page until the fork is known. Endpoint-scoped:
+		// Snapshot/visibleSnapshot semantics are untouched.
+		if termrun.Kind(info.Kind) == termrun.KindHandoff {
+			info.SessionID = ""
+			if info.RunID != "" {
+				if sid, ok := s.opts.LaunchManager.SessionForRun(info.RunID); ok {
+					info.SessionID = sid
+				}
+			}
 		}
 		out = append(out, info)
 	}

@@ -2325,13 +2325,16 @@ export type ToolPreflight = {
   can_install: boolean;
 };
 
-// AttachInfo is one row of GET /api/attach/sessions — a LIVE
-// `observer <tool> --attach` session the daemon owns and the dashboard can
-// join as a second seat over the existing /ws/launch/<token> bridge
-// (docs/plans/session-attach-design-2026-07-19.md §4). The list only ever
-// carries kind=="attach", non-exited rows; session_id is "" until the row
-// correlates to an observer session. Jump-in is offered ONLY for these
-// rows (exact liveness — daemon-owned PTY), never inferred from recency.
+// AttachInfo is one row of GET /api/attach/sessions — a LIVE, non-setup
+// daemon-owned terminal run the dashboard can join as a second seat over the
+// existing /ws/launch/<token> bridge (docs/plans/session-attach-design-2026-07-19.md
+// §4). The list now covers every live daemon-owned run — kind fresh, handoff,
+// attach, and resume — not attach-only; non-exited rows; session_id is "" until
+// the row correlates to an observer session (a dashboard-launched terminal
+// typically takes ~10-30s for the correlation sweep to fill this in). A given
+// session_id can now have more than one live row; callers that need a single
+// row pick the newest by created_at. Jump-in is offered ONLY for these rows
+// (exact liveness — daemon-owned PTY), never inferred from recency.
 export type AttachInfo = {
   token: string;
   subcommand: string;

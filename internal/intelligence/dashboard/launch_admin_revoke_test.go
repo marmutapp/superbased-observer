@@ -144,7 +144,8 @@ func (a *realManagerAdapter) AcquireWriterRemote(req RemoteWriterRequest) (Launc
 	a.lastMu.Unlock()
 	return l, nil
 }
-func (a *realManagerAdapter) Close(handle string) { a.mgr.Close(handle) }
+func (a *realManagerAdapter) Close(handle string)                 { a.mgr.Close(handle) }
+func (a *realManagerAdapter) SessionForRun(string) (string, bool) { return "", false }
 func (a *realManagerAdapter) Snapshot() []LaunchInfo {
 	var out []LaunchInfo
 	for _, s := range a.mgr.Snapshot() {

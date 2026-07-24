@@ -30,6 +30,8 @@ func newAntigravityCmd() *cobra.Command {
 		carry        string
 		fromMessage  int
 		fromTime     string
+		attach       *bool
+		noAttach     *bool
 	)
 	cmd := &cobra.Command{
 		Use:     "antigravity-cli [-- agy-args...]",
@@ -46,6 +48,27 @@ func newAntigravityCmd() *cobra.Command {
 			"to separate observer flags from agy flags. NEVER touches API keys.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Attach gate (attach-all-launchers): default-on attach hands the PTY
+			// to the daemon. Seed-only spec (agy is native-exempt — no proxy env,
+			// no escape-hatch flag). No -p/--prompt headless predicate: this
+			// launcher only grounds -i/--prompt-interactive + a bare positional
+			// seed, so a headless one-shot flag is NOT grounded here — the
+			// handoff-fork family is the only incompatible mode (both-TTY guard
+			// covers scripted runs).
+			outcome, aErr := launcherAttach(cmd.Context(), launcherAttachSpec{
+				tool:         "antigravity-cli",
+				configPath:   configPath,
+				flagAttach:   *attach,
+				flagNoAttach: *noAttach,
+				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime),
+				passthrough:  antigravityAttachPassthrough(binPath),
+				toolArgs:     args,
+				stderr:       cmd.ErrOrStderr(),
+			})
+			if outcome.handled {
+				return aErr
+			}
+
 			bin, err := resolveToolBin("antigravity-cli", binPath, "--agy-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
@@ -92,6 +115,17 @@ func newAntigravityCmd() *cobra.Command {
 	cmd.Flags().StringVar(&carry, "carry", "", "Carry mode for --continue-from: metadata|distilled|distilled_tail|full|full_cache (default from [handoff] config)")
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
+	attach, noAttach = registerAttachFlags(cmd, "antigravity-cli")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
+}
+
+// antigravityAttachPassthrough forwards the --agy-path wrapper flag to the
+// daemon-spawned inner `observer antigravity-cli` launcher when set (nil
+// otherwise).
+func antigravityAttachPassthrough(agyPath string) []string {
+	if agyPath != "" {
+		return []string{"--agy-path", agyPath}
+	}
+	return nil
 }

@@ -126,7 +126,10 @@ func (a *svcManagerAdapter) AcquireWriterLocal(handle string) (LaunchWriter, err
 func (a *svcManagerAdapter) AcquireWriterRemote(RemoteWriterRequest) (LaunchWriter, error) {
 	return nil, ErrLaunchExecuteUnavailable
 }
-func (a *svcManagerAdapter) Close(handle string)                            { a.mgr.Close(handle) }
+func (a *svcManagerAdapter) Close(handle string) { a.mgr.Close(handle) }
+func (a *svcManagerAdapter) SessionForRun(runID string) (string, bool) {
+	return a.svc.SessionForRun(runID)
+}
 func (a *svcManagerAdapter) RevokeAllRemoteWriters(string) int              { return 0 }
 func (a *svcManagerAdapter) RevokeRemoteWriterByHolder(string, string) bool { return false }
 

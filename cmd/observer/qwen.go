@@ -35,6 +35,8 @@ func newQwenCmd() *cobra.Command {
 		carry        string
 		fromMessage  int
 		fromTime     string
+		attach       *bool
+		noAttach     *bool
 	)
 	cmd := &cobra.Command{
 		Use:   "qwen [-- qwen-args...]",
@@ -51,6 +53,25 @@ func newQwenCmd() *cobra.Command {
 			"to separate observer flags from qwen flags. NEVER touches API keys.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Attach gate (attach-all-launchers): default-on attach hands the PTY
+			// to the daemon. Seed-only spec (qwen is launched non-proxied — no
+			// proxy env, no escape-hatch flag); incompatible when a handoff fork
+			// is engaged or a headless -p/--prompt one-shot is forwarded.
+			outcome, aErr := launcherAttach(cmd.Context(), launcherAttachSpec{
+				tool:         "qwen-code",
+				configPath:   configPath,
+				flagAttach:   *attach,
+				flagNoAttach: *noAttach,
+				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
+					argsContainHeadlessFlag(args, "-p", "--prompt"),
+				passthrough: qwenAttachPassthrough(binPath),
+				toolArgs:    args,
+				stderr:      cmd.ErrOrStderr(),
+			})
+			if outcome.handled {
+				return aErr
+			}
+
 			bin, err := resolveToolBin("qwen-code", binPath, "--qwen-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
@@ -98,8 +119,18 @@ func newQwenCmd() *cobra.Command {
 	cmd.Flags().StringVar(&carry, "carry", "", "Carry mode for --continue-from: metadata|distilled|distilled_tail|full|full_cache (default from [handoff] config)")
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
+	attach, noAttach = registerAttachFlags(cmd, "qwen-code")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
+}
+
+// qwenAttachPassthrough forwards the --qwen-path wrapper flag to the
+// daemon-spawned inner `observer qwen` launcher when set (nil otherwise).
+func qwenAttachPassthrough(qwenPath string) []string {
+	if qwenPath != "" {
+		return []string{"--qwen-path", qwenPath}
+	}
+	return nil
 }
 
 // runSeedOnlyLaunch execs a tool NON-PROXIED (child inherits os.Environ()

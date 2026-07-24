@@ -34,6 +34,8 @@ func newOpencodeCmd() *cobra.Command {
 		carry        string
 		fromMessage  int
 		fromTime     string
+		attach       *bool
+		noAttach     *bool
 	)
 	cmd := &cobra.Command{
 		Use:   "opencode [-- opencode-args...]",
@@ -55,6 +57,31 @@ func newOpencodeCmd() *cobra.Command {
 			"start` or `observer proxy start` first.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Attach-by-default (attach-all-launchers): when attach resolves,
+			// hand the PTY to the daemon so the dashboard can view/drive this
+			// SAME live opencode session. opencode self-routes via
+			// OPENAI_BASE_URL in the daemon-spawned inner launcher, so we forward
+			// NO proxy env (attachEnv nil) and there is no --no-proxy-route flag
+			// to forward (noProxyRoute nil). A leading `run` subcommand (headless
+			// one-shot) or the continue-from family forces the bare path. toolArgs
+			// is the RAW operator remainder — the inner launcher re-applies its
+			// own OPENAI_BASE_URL injection and arg-build.
+			outcome, err := launcherAttach(cmd.Context(), launcherAttachSpec{
+				tool:          "opencode",
+				configPath:    configPath,
+				proxyOverride: proxyURL,
+				proxyFlag:     "--proxy",
+				flagAttach:    *attach,
+				flagNoAttach:  *noAttach,
+				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
+					argsLeadWithSubcommand(args, opencodeHeadlessSubcommands),
+				passthrough: opencodeAttachPassthrough(opencodePath),
+				toolArgs:    args,
+				stderr:      cmd.ErrOrStderr(),
+			})
+			if outcome.handled {
+				return err
+			}
 			// --continue-from: distill a handover from the source session and
 			// seed it via opencode's --prompt flag before the launcher builds
 			// the child argv. The proxy env (OPENAI_BASE_URL) is injected
@@ -107,8 +134,25 @@ func newOpencodeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&carry, "carry", "", "Carry mode for --continue-from: metadata|distilled|distilled_tail|full|full_cache (default from [handoff] config)")
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
+	attach, noAttach = registerAttachFlags(cmd, "opencode")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
+}
+
+// opencodeHeadlessSubcommands are the opencode leading verbs whose mode is a
+// non-interactive one-shot (no interactive PTY to attach) — currently just
+// `run`. A leading `run` classifies the launch incompatible with attach, so it
+// takes the bare path (attach-all-launchers §4).
+var opencodeHeadlessSubcommands = map[string]bool{"run": true}
+
+// opencodeAttachPassthrough forwards --opencode-path to the daemon-spawned
+// inner `observer opencode` launcher when the operator overrode the binary
+// path; nil otherwise.
+func opencodeAttachPassthrough(opencodePath string) []string {
+	if opencodePath != "" {
+		return []string{"--opencode-path", opencodePath}
+	}
+	return nil
 }
 
 type opencodeLauncherOptions struct {

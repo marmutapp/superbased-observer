@@ -68,11 +68,13 @@ export function ResumeButton({
   );
   const [posting, setPosting] = useState(false);
   // Set when the server refuses a resume with 409 because the session already
-  // has a live terminal run (F5). A live KindResume run does NOT appear in
-  // /api/attach/sessions (that list is KindAttach only), so the button can't
-  // know pre-click; on the 409 we flip it to a disabled "already running" state
-  // and surface the server's message rather than let repeated clicks spawn
-  // concurrent processes on the same transcript.
+  // has a live terminal run (F5). /api/attach/sessions now covers every live
+  // daemon-owned run (fresh/handoff/attach/resume, not attach-only), so a live
+  // KindResume run DOES normally appear there and liveMatch below already hides
+  // this card before the click. We still keep the 409 handling as the backstop
+  // for the race window between the last poll and the click, flipping to a
+  // disabled "already running" state and surfacing the server's message rather
+  // than let repeated clicks spawn concurrent processes on the same transcript.
   const [alreadyRunning, setAlreadyRunning] = useState(false);
 
   const liveMatch = (attach.data?.sessions ?? []).some(

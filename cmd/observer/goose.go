@@ -36,6 +36,8 @@ func newGooseCmd() *cobra.Command {
 		carry        string
 		fromMessage  int
 		fromTime     string
+		attach       *bool
+		noAttach     *bool
 	)
 	cmd := &cobra.Command{
 		Use:   "goose [-- goose-args...]",
@@ -55,6 +57,26 @@ func newGooseCmd() *cobra.Command {
 			"API keys or ~/.config/goose/secrets.yaml.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Attach gate (attach-all-launchers): default-on attach hands the PTY
+			// to the daemon. Seed-only spec (goose is launched non-proxied — no
+			// proxy env, no escape-hatch flag); incompatible when a handoff fork
+			// is engaged or a leading `run` subcommand is the headless one-shot
+			// form.
+			outcome, aErr := launcherAttach(cmd.Context(), launcherAttachSpec{
+				tool:         "goose",
+				configPath:   configPath,
+				flagAttach:   *attach,
+				flagNoAttach: *noAttach,
+				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
+					argsLeadWithSubcommand(args, gooseAttachHeadlessSubcommands),
+				passthrough: gooseAttachPassthrough(binPath),
+				toolArgs:    args,
+				stderr:      cmd.ErrOrStderr(),
+			})
+			if outcome.handled {
+				return aErr
+			}
+
 			bin, err := resolveToolBin("goose", binPath, "--goose-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
@@ -118,8 +140,23 @@ func newGooseCmd() *cobra.Command {
 	cmd.Flags().StringVar(&carry, "carry", "", "Carry mode for --continue-from: metadata|distilled|distilled_tail|full|full_cache (default from [handoff] config)")
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
+	attach, noAttach = registerAttachFlags(cmd, "goose")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
+}
+
+// gooseAttachHeadlessSubcommands are the leading goose subcommands whose
+// headless one-shot form cannot compose with attach (`goose run` executes and
+// exits, so an attach notice + daemon-owned PTY would be spam).
+var gooseAttachHeadlessSubcommands = map[string]bool{"run": true}
+
+// gooseAttachPassthrough forwards the --goose-path wrapper flag to the
+// daemon-spawned inner `observer goose` launcher when set (nil otherwise).
+func gooseAttachPassthrough(goosePath string) []string {
+	if goosePath != "" {
+		return []string{"--goose-path", goosePath}
+	}
+	return nil
 }
 
 // gooseSubcommands are the goose argv tokens that are subcommands, not a

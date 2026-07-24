@@ -40,6 +40,8 @@ func newClineCLICmd() *cobra.Command {
 		carry        string
 		fromMessage  int
 		fromTime     string
+		attach       *bool
+		noAttach     *bool
 	)
 	cmd := &cobra.Command{
 		Use:   "cline-cli [-- cline-args...]",
@@ -60,6 +62,32 @@ func newClineCLICmd() *cobra.Command {
 			"Requires a running observer proxy (`observer start`).",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Attach-by-default (attach-all-launchers): hand the PTY to the
+			// daemon when attach resolves. cline-cli routes via the
+			// openai-compatible provider's persisted baseUrl (applied by the
+			// daemon-spawned inner launcher), so forward NO proxy env (attachEnv
+			// nil) and no --no-proxy-route flag exists (noProxyRoute nil). A
+			// leading utility subcommand (auth/config/…) or the continue-from
+			// family forces the bare path — cline's `-p` is `--plan`, NOT a
+			// headless-prompt flag, so it is deliberately NOT an incompatible
+			// predicate. toolArgs is the RAW operator remainder — the inner
+			// launcher re-applies the `-P openai-compatible` provider prepend.
+			outcome, err := launcherAttach(cmd.Context(), launcherAttachSpec{
+				tool:          "cline-cli",
+				configPath:    configPath,
+				proxyOverride: proxyURL,
+				proxyFlag:     "--proxy",
+				flagAttach:    *attach,
+				flagNoAttach:  *noAttach,
+				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
+					argsLeadWithSubcommand(args, clineSubcommands),
+				passthrough: clineAttachPassthrough(binPath),
+				toolArgs:    args,
+				stderr:      cmd.ErrOrStderr(),
+			})
+			if outcome.handled {
+				return err
+			}
 			cfg, err := config.Load(config.LoadOptions{GlobalPath: configPath})
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
@@ -128,8 +156,19 @@ func newClineCLICmd() *cobra.Command {
 	cmd.Flags().StringVar(&carry, "carry", "", "Carry mode for --continue-from: metadata|distilled|distilled_tail|full|full_cache (default from [handoff] config)")
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
+	attach, noAttach = registerAttachFlags(cmd, "cline-cli")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
+}
+
+// clineAttachPassthrough forwards --cline-path to the daemon-spawned inner
+// `observer cline-cli` launcher when the operator overrode the binary path;
+// nil otherwise.
+func clineAttachPassthrough(binPath string) []string {
+	if binPath != "" {
+		return []string{"--cline-path", binPath}
+	}
+	return nil
 }
 
 // clineSubcommands are the cline argv tokens that are subcommands, not a

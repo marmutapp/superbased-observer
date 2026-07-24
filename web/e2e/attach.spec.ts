@@ -16,13 +16,19 @@ fs.mkdirSync(OUTDIR, { recursive: true });
 
 test.use({ viewport: { width: 1360, height: 940 } });
 
-// attachRow builds a stub GET /api/attach/sessions row. The ws-handle field
-// is set by member assignment (a bare object key gets mangled by the
-// harness Write-filter; feedback_write_filter_token_patterns).
-function attachRow(sessionId: string): Record<string, unknown> {
+// attachRow builds a stub GET /api/attach/sessions row. `kind` defaults to
+// "attach" but the endpoint now returns every live, non-setup daemon-owned
+// terminal run (fresh/handoff/attach/resume) — callers pass the other kinds
+// to cover the widened contract. The ws-handle field is set by member
+// assignment (a bare object key gets mangled by the harness Write-filter;
+// feedback_write_filter_token_patterns).
+function attachRow(
+  sessionId: string,
+  kind: string = "attach",
+): Record<string, unknown> {
   const row: Record<string, unknown> = {
     subcommand: "claude",
-    kind: "attach",
+    kind,
     tool: "claude-code",
     session_id: sessionId,
     run_id: "run-demo-1",
@@ -48,11 +54,30 @@ async function firstSessionId(request: {
   return id;
 }
 
+// Suppress the first-run guided tour: its full-viewport overlay (fixed
+// inset-0 z-[130], floating-ui portal) intercepts hover/click and would
+// otherwise block this spec's Jump in / Resume interactions (see
+// remote-lang.spec.ts and tour.spec.ts for the established pattern). MUST be
+// registered before page.goto — addInitScript only takes effect for
+// navigations that happen after it's added.
+async function suppressTour(
+  page: import("@playwright/test").Page,
+): Promise<void> {
+  await page.addInitScript(() => {
+    try {
+      localStorage.setItem("sb_tour_completed", "1");
+    } catch {
+      /* private mode — ignore */
+    }
+  });
+}
+
 test("Jump in ENABLED on a live attachable session", async ({ page }) => {
   const id = await firstSessionId(page.request);
   await page.route("**/api/attach/sessions", (route) =>
     route.fulfill({ json: { sessions: [attachRow(id)] } }),
   );
+  await suppressTour(page);
   await page.goto(`/sessions?session=${id}`, { waitUntil: "domcontentloaded" });
   const btn = page.getByRole("button", { name: "Jump in" });
   await btn.scrollIntoViewIfNeeded();
@@ -62,11 +87,32 @@ test("Jump in ENABLED on a live attachable session", async ({ page }) => {
   await page.screenshot({ path: `${OUTDIR}/1-jumpin-enabled.png` });
 });
 
+test("Jump in ENABLED on a live 'fresh' dashboard-launched terminal", async ({
+  page,
+}) => {
+  // GET /api/attach/sessions was widened past kind=="attach" — a plain
+  // dashboard "new terminal" (kind "fresh") that the correlation sweep has
+  // linked to this session must enable Jump in too.
+  const id = await firstSessionId(page.request);
+  await page.route("**/api/attach/sessions", (route) =>
+    route.fulfill({ json: { sessions: [attachRow(id, "fresh")] } }),
+  );
+  await suppressTour(page);
+  await page.goto(`/sessions?session=${id}`, { waitUntil: "domcontentloaded" });
+  const btn = page.getByRole("button", { name: "Jump in" });
+  await btn.scrollIntoViewIfNeeded();
+  await expect(btn).toBeVisible();
+  await expect(btn).toBeEnabled();
+  await page.waitForTimeout(400);
+  await page.screenshot({ path: `${OUTDIR}/1b-jumpin-enabled-fresh.png` });
+});
+
 test("Jump in DISABLED (honest-disabled tooltip)", async ({ page }) => {
   const id = await firstSessionId(page.request);
   await page.route("**/api/attach/sessions", (route) =>
     route.fulfill({ json: { sessions: [] } }),
   );
+  await suppressTour(page);
   await page.goto(`/sessions?session=${id}`, { waitUntil: "domcontentloaded" });
   const btn = page.getByRole("button", { name: "Jump in" });
   await btn.scrollIntoViewIfNeeded();
@@ -90,6 +136,7 @@ test("Jump in FETCH-ERROR (honest 'couldn't check' state, P2-4b)", async ({
   await page.route("**/api/attach/sessions", (route) =>
     route.fulfill({ status: 500, json: { error: "boom" } }),
   );
+  await suppressTour(page);
   await page.goto(`/sessions?session=${id}`, { waitUntil: "domcontentloaded" });
   const btn = page.getByRole("button", { name: "Jump in" });
   await btn.scrollIntoViewIfNeeded();
@@ -107,6 +154,7 @@ test("Sessions list shows the live · joinable badge", async ({ page }) => {
   await page.route("**/api/attach/sessions", (route) =>
     route.fulfill({ json: { sessions: [attachRow(id)] } }),
   );
+  await suppressTour(page);
   await page.goto(`/sessions`, { waitUntil: "domcontentloaded" });
   await expect(page.getByText("live · joinable").first()).toBeVisible();
   await page.waitForTimeout(400);
@@ -148,6 +196,7 @@ test("Resume NATIVE button on a closed grounded session", async ({ page }) => {
     route.fulfill({ json: { sessions: [] } }),
   );
   await patchDetailResume(page, id, { kind: "native", subcommand: "claude" });
+  await suppressTour(page);
   await page.goto(`/sessions?session=${id}`, { waitUntil: "domcontentloaded" });
   const btn = page.getByRole("button", { name: "Resume", exact: true });
   await btn.scrollIntoViewIfNeeded();
@@ -155,6 +204,33 @@ test("Resume NATIVE button on a closed grounded session", async ({ page }) => {
   await expect(btn).toBeEnabled();
   await page.waitForTimeout(400);
   await page.screenshot({ path: `${P3OUT}/1-resume-native-enabled.png` });
+});
+
+test("Live 'resume' row hides the Resume card and enables Jump in", async ({
+  page,
+}) => {
+  // A live kind=="resume" row (a dashboard-launched native-resume terminal)
+  // now shows up in /api/attach/sessions. ResumeButton's liveMatch check
+  // must hide the card (avoiding a duplicate second process on the same
+  // transcript), and JumpInButton must treat the same row as joinable.
+  const id = await firstSessionId(page.request);
+  await page.route("**/api/attach/sessions", (route) =>
+    route.fulfill({ json: { sessions: [attachRow(id, "resume")] } }),
+  );
+  // Native resume would otherwise render a "Resume" button — proves the
+  // card is hidden BECAUSE of the live row, not because resume is ungrounded.
+  await patchDetailResume(page, id, { kind: "native", subcommand: "claude" });
+  await suppressTour(page);
+  await page.goto(`/sessions?session=${id}`, { waitUntil: "domcontentloaded" });
+  const jumpBtn = page.getByRole("button", { name: "Jump in" });
+  await jumpBtn.scrollIntoViewIfNeeded();
+  await expect(jumpBtn).toBeVisible();
+  await expect(jumpBtn).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "Resume", exact: true }),
+  ).toHaveCount(0);
+  await page.waitForTimeout(400);
+  await page.screenshot({ path: `${P3OUT}/4-resume-hidden-live-resume-row.png` });
 });
 
 test("Resume HANDOFF hint points at Continue-in… (no duplicate UI)", async ({
@@ -165,6 +241,7 @@ test("Resume HANDOFF hint points at Continue-in… (no duplicate UI)", async ({
     route.fulfill({ json: { sessions: [] } }),
   );
   await patchDetailResume(page, id, { kind: "handoff", subcommand: "" });
+  await suppressTour(page);
   await page.goto(`/sessions?session=${id}`, { waitUntil: "domcontentloaded" });
   // The hint text is present; there is NO native Resume button in this state.
   const hint = page.getByText("Native resume isn't grounded for this tool");
@@ -183,6 +260,7 @@ test("Resume NONE honest-disabled", async ({ page }) => {
     route.fulfill({ json: { sessions: [] } }),
   );
   await patchDetailResume(page, id, { kind: "none", subcommand: "" });
+  await suppressTour(page);
   await page.goto(`/sessions?session=${id}`, { waitUntil: "domcontentloaded" });
   const btn = page.getByRole("button", { name: "Resume", exact: true });
   await btn.scrollIntoViewIfNeeded();
@@ -194,8 +272,20 @@ test("Resume NONE honest-disabled", async ({ page }) => {
 });
 
 test("Toast render (writer takeover notices)", async ({ page }) => {
+  await suppressTour(page);
   await page.goto(`/`, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(600);
+  // window.__sbPushToast is a DEV-only test seam (src/components/Toast.tsx,
+  // gated on import.meta.env.DEV) that's intentionally tree-shaken out of
+  // built bundles — absent against a built dashboard (e.g. :8092), present
+  // against the vite dev server; skip honestly rather than fail by design.
+  const hasSeam = await page.evaluate(
+    () => typeof (window as unknown as Record<string, unknown>).__sbPushToast,
+  );
+  test.skip(
+    hasSeam === "undefined",
+    "DEV-only toast seam (__sbPushToast) absent in built bundle — run against the vite dev server to exercise this test",
+  );
   await page.evaluate(() => {
     const w = window as unknown as {
       __sbPushToast?: (t: string, v?: string) => void;

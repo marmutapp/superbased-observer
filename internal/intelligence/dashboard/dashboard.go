@@ -618,11 +618,13 @@ func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[st
 	// PTY — a machine-reaching mutation a remote principal must never drive.
 	reg("/api/terminal/install", L, s.handleTerminalInstall)
 	reg("/api/terminal/sessions", V, s.handleTerminalSessions)
-	// Live-attachable session list (session-attach design Phase 2, "Jump in"):
-	// the daemon-owned external (Kind=="attach") sessions a dashboard tab can
-	// join. VIEW — metadata only, no content. Same visibleSnapshot semantics as
-	// /api/terminal/sessions; Phase 4 tightens remote view behind
-	// [remote].allow_terminal_view.
+	// Live-joinable session list (session-attach design Phase 2, "Jump in"):
+	// every LIVE, non-setup daemon-owned PTY run of any valid terminal_run kind
+	// (fresh/handoff/attach/resume) a dashboard tab can join as an extra seat.
+	// VIEW — metadata only, no content. Same visibleSnapshot semantics as
+	// /api/terminal/sessions; remote callers see attach/resume rows gated by
+	// [remote].allow_terminal_view (built now), with fresh/handoff the
+	// non-sensitive floor.
 	reg("/api/attach/sessions", V, s.handleAttachSessions)
 	// F4 agent status: point-in-time (GET /api/terminal/<handle>/status) via the
 	// prefix route, and the multiplexed live stream — both VIEW (read-only). The

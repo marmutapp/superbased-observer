@@ -34,6 +34,8 @@ func newKiloCmd() *cobra.Command {
 		carry        string
 		fromMessage  int
 		fromTime     string
+		attach       *bool
+		noAttach     *bool
 	)
 	cmd := &cobra.Command{
 		Use:   "kilo [-- kilo-args...]",
@@ -52,6 +54,26 @@ func newKiloCmd() *cobra.Command {
 			"one-shot form is the `run` subcommand). See docs/session-handoff.md.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Attach gate (attach-all-launchers): default-on attach hands the PTY
+			// to the daemon so the dashboard can drive this session. Seed-only
+			// spec — kilo-code-cli is native-exempt, so NO proxy env, NO
+			// escape-hatch flag; incompatible when a handoff fork is engaged or a
+			// leading `run` subcommand is the headless one-shot form.
+			outcome, aErr := launcherAttach(cmd.Context(), launcherAttachSpec{
+				tool:         "kilo-code-cli",
+				configPath:   configPath,
+				flagAttach:   *attach,
+				flagNoAttach: *noAttach,
+				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
+					argsLeadWithSubcommand(args, kiloAttachHeadlessSubcommands),
+				passthrough: kiloAttachPassthrough(kiloPath),
+				toolArgs:    args,
+				stderr:      cmd.ErrOrStderr(),
+			})
+			if outcome.handled {
+				return aErr
+			}
+
 			bin, err := resolveToolBin("kilo-code-cli", kiloPath, "--kilo-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
@@ -95,8 +117,23 @@ func newKiloCmd() *cobra.Command {
 	cmd.Flags().StringVar(&carry, "carry", "", "Carry mode for --continue-from: metadata|distilled|distilled_tail|full|full_cache (default from [handoff] config)")
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
+	attach, noAttach = registerAttachFlags(cmd, "kilo-code-cli")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
+}
+
+// kiloAttachHeadlessSubcommands are the leading kilo subcommands whose headless
+// one-shot form cannot compose with attach (the `run` subcommand answers and
+// exits, so an attach notice + daemon-owned PTY would be spam).
+var kiloAttachHeadlessSubcommands = map[string]bool{"run": true}
+
+// kiloAttachPassthrough forwards the --kilo-path wrapper flag to the
+// daemon-spawned inner `observer kilo` launcher when set (nil otherwise).
+func kiloAttachPassthrough(kiloPath string) []string {
+	if kiloPath != "" {
+		return []string{"--kilo-path", kiloPath}
+	}
+	return nil
 }
 
 // runKiloLauncher execs `kilo` with the (optionally seeded) argv, wiring the

@@ -64,6 +64,7 @@ func (m *leaseAuditManager) AcquireWriterRemote(req RemoteWriterRequest) (Launch
 	return newFakeWriter(), nil
 }
 func (m *leaseAuditManager) Close(string)                                   {}
+func (m *leaseAuditManager) SessionForRun(string) (string, bool)            { return "", false }
 func (m *leaseAuditManager) Snapshot() []LaunchInfo                         { return nil }
 func (m *leaseAuditManager) RevokeAllRemoteWriters(string) int              { return 0 }
 func (m *leaseAuditManager) RevokeRemoteWriterByHolder(string, string) bool { return false }

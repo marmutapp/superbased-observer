@@ -29,6 +29,8 @@ func newDevinCmd() *cobra.Command {
 		carry        string
 		fromMessage  int
 		fromTime     string
+		attach       *bool
+		noAttach     *bool
 	)
 	cmd := &cobra.Command{
 		Use:   "devin [-- devin-args...]",
@@ -47,6 +49,25 @@ func newDevinCmd() *cobra.Command {
 			"to separate observer flags from devin flags. NEVER touches API keys.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Attach gate (attach-all-launchers): default-on attach hands the PTY
+			// to the daemon. Seed-only spec (devin is native-exempt — no proxy
+			// env, no escape-hatch flag); devin's TUI is interactive with no
+			// headless leading verb, so the handoff-fork family is the only
+			// incompatible mode (the both-TTY guard covers scripted runs).
+			outcome, aErr := launcherAttach(cmd.Context(), launcherAttachSpec{
+				tool:         "devin",
+				configPath:   configPath,
+				flagAttach:   *attach,
+				flagNoAttach: *noAttach,
+				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime),
+				passthrough:  devinAttachPassthrough(binPath),
+				toolArgs:     args,
+				stderr:       cmd.ErrOrStderr(),
+			})
+			if outcome.handled {
+				return aErr
+			}
+
 			bin, err := resolveToolBin("devin", binPath, "--devin-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
@@ -92,8 +113,18 @@ func newDevinCmd() *cobra.Command {
 	cmd.Flags().StringVar(&carry, "carry", "", "Carry mode for --continue-from: metadata|distilled|distilled_tail|full|full_cache (default from [handoff] config)")
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
+	attach, noAttach = registerAttachFlags(cmd, "devin")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
+}
+
+// devinAttachPassthrough forwards the --devin-path wrapper flag to the
+// daemon-spawned inner `observer devin` launcher when set (nil otherwise).
+func devinAttachPassthrough(devinPath string) []string {
+	if devinPath != "" {
+		return []string{"--devin-path", devinPath}
+	}
+	return nil
 }
 
 // devinSubcommands are the devin argv tokens that are subcommands, not a

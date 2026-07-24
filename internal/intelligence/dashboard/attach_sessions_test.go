@@ -50,37 +50,47 @@ func TestAttachSessionsDisabledWhenNilManager(t *testing.T) {
 	}
 }
 
-// TestAttachSessionsOnlyLiveAttachRows pins the core filter: only Kind=="attach"
-// rows that have NOT exited are returned; handoff / fresh / kindless rows and an
-// exited attach row are excluded.
-func TestAttachSessionsOnlyLiveAttachRows(t *testing.T) {
+// TestAttachSessionsLiveDaemonOwnedRows pins the core filter: any LIVE,
+// non-setup daemon-owned PTY row of a VALID terminal_run kind (fresh / handoff /
+// attach / resume) is joinable and returned; an exited row, a local-only setup
+// row, and a kindless (legacy) row are all excluded. The test is a table so the
+// per-row include/exclude decision is one case each.
+func TestAttachSessionsLiveDaemonOwnedRows(t *testing.T) {
+	rows := []struct {
+		row  LaunchInfo
+		want bool // expected to appear in /api/attach/sessions
+	}{
+		{LaunchInfo{ID: "attach-live", Kind: "attach", Tool: "claude-code", Subcommand: "claude"}, true},
+		{LaunchInfo{ID: "fresh-live", Kind: "fresh", Subcommand: "claude"}, true},
+		{LaunchInfo{ID: "handoff-live", Kind: "handoff", Subcommand: "codex", SessionID: "sess-h"}, true},
+		{LaunchInfo{ID: "resume-live", Kind: "resume", Tool: "codex", Subcommand: "codex", SessionID: "sess-r"}, true},
+		{LaunchInfo{ID: "attach-exited", Kind: "attach", Tool: "codex", Subcommand: "codex", Exited: true, ExitCode: 0}, false},
+		{LaunchInfo{ID: "setup-live", Kind: "fresh", Subcommand: "claude", Setup: true}, false},
+		{LaunchInfo{ID: "legacy-nokind", Subcommand: "claude"}, false}, // predates run-identity wiring
+	}
+
 	lm := newRecordingLaunchManager(nil)
-	lm.snapshot = []LaunchInfo{
-		{ID: "attach-live", Kind: "attach", Tool: "claude-code", Subcommand: "claude"},
-		{ID: "attach-exited", Kind: "attach", Tool: "codex", Subcommand: "codex", Exited: true, ExitCode: 0},
-		{ID: "handoff-1", Kind: "handoff", Subcommand: "codex", SessionID: "sess-h"},
-		{ID: "fresh-1", Kind: "fresh", Subcommand: "claude"},
-		{ID: "legacy-nokind", Subcommand: "claude"}, // predates run-identity wiring
+	for _, tc := range rows {
+		lm.snapshot = append(lm.snapshot, tc.row)
 	}
 	s := newLaunchTestServer(t, lm)
 
-	rows := getAttachSessions(t, s, false)
-	if len(rows) != 1 {
-		t.Fatalf("got %d rows, want 1 (only the live attach session): %+v", len(rows), rows)
+	byID := idsOf(getAttachSessions(t, s, false))
+	for _, tc := range rows {
+		_, present := byID[tc.row.ID]
+		if present != tc.want {
+			t.Errorf("row %q present=%v, want %v", tc.row.ID, present, tc.want)
+		}
 	}
-	got := rows[0]
-	if got.ID != "attach-live" {
-		t.Fatalf("returned row = %q, want attach-live", got.ID)
+	// The included rows are the LaunchInfo JSON verbatim — Kind + Tool ride the wire.
+	if got, ok := byID["attach-live"]; ok {
+		if got.Kind != "attach" || got.Tool != "claude-code" || got.Subcommand != "claude" {
+			t.Fatalf("attach-live wire shape = %+v, want kind=attach tool=claude-code subcommand=claude", got)
+		}
 	}
-	// The row is the LaunchInfo JSON verbatim — Kind + Tool ride the wire.
-	if got.Kind != "attach" || got.Tool != "claude-code" || got.Subcommand != "claude" {
-		t.Fatalf("row wire shape = %+v, want kind=attach tool=claude-code subcommand=claude", got)
-	}
-	// An exited attach + handoff/fresh/kindless rows never appear.
-	byID := idsOf(rows)
-	for _, absent := range []string{"attach-exited", "handoff-1", "fresh-1", "legacy-nokind"} {
-		if _, ok := byID[absent]; ok {
-			t.Errorf("row %q must not appear in the attach-sessions list", absent)
+	if got, ok := byID["resume-live"]; ok {
+		if got.Kind != "resume" || got.SessionID != "sess-r" {
+			t.Fatalf("resume-live wire shape = %+v, want kind=resume session_id=sess-r", got)
 		}
 	}
 }
@@ -92,45 +102,114 @@ func TestAttachSessionsCarriesCorrelatedSessionID(t *testing.T) {
 	lm := newRecordingLaunchManager(nil)
 	lm.snapshot = []LaunchInfo{
 		{ID: "attach-corr", Kind: "attach", Tool: "claude-code", Subcommand: "claude", SessionID: "sess-xyz", RunID: "run-1"},
+		// A fresh run carries session_id only once correlation links it
+		// (SessionForRun); the populated id must ride the wire verbatim too.
+		{ID: "fresh-corr", Kind: "fresh", Tool: "claude-code", Subcommand: "claude", SessionID: "sess-fresh", RunID: "run-2"},
 	}
 	s := newLaunchTestServer(t, lm)
-	rows := getAttachSessions(t, s, false)
-	if len(rows) != 1 || rows[0].SessionID != "sess-xyz" {
-		t.Fatalf("rows = %+v, want one row with session_id=sess-xyz", rows)
+	byID := idsOf(getAttachSessions(t, s, false))
+	attach, ok := byID["attach-corr"]
+	if !ok || attach.SessionID != "sess-xyz" {
+		t.Fatalf("attach-corr = %+v, want session_id=sess-xyz", attach)
 	}
-	if rows[0].RunID != "run-1" {
-		t.Fatalf("run_id = %q, want run-1", rows[0].RunID)
+	if attach.RunID != "run-1" {
+		t.Fatalf("attach-corr run_id = %q, want run-1", attach.RunID)
+	}
+	fresh, ok := byID["fresh-corr"]
+	if !ok || fresh.SessionID != "sess-fresh" {
+		t.Fatalf("fresh-corr = %+v, want session_id=sess-fresh", fresh)
+	}
+	if fresh.RunID != "run-2" {
+		t.Fatalf("fresh-corr run_id = %q, want run-2", fresh.RunID)
 	}
 }
 
-// TestAttachSessionsRemoteDenied pins the deny-by-default remote VIEW of attach
-// sessions (§3.2, Phase-4 read gate pulled forward, P2-2): an owner-local caller
-// sees every live attach row, but a REMOTE-exposed caller sees NONE — an
-// external `observer <tool> --attach` PTY (which can echo secrets) is not even
-// disclosed to a paired remote device until the Phase-4 [remote].allow_terminal_view
-// opt-in exists. visibleSnapshot redacts attach rows on run KIND, so the deny is
-// uniform across /api/attach/sessions, /api/terminal/sessions, /api/launch/sessions.
+// TestAttachSessionsHandoffKeysByForkedSession pins the P2 fix: a handoff PTY's
+// spec-set SessionID is the SOURCE session (the session forked FROM), but on
+// /api/attach/sessions session_id must mean "the session this PTY is driving" —
+// the FORKED session. When correlation has linked the run, the response row
+// carries the FORK id, never the source id the snapshot stamped.
+func TestAttachSessionsHandoffKeysByForkedSession(t *testing.T) {
+	lm := newRecordingLaunchManager(nil)
+	// Snapshot stamps the SOURCE session id (sess-source) as the spec set it at
+	// spawn; correlation has since linked run run-h to the forked session.
+	lm.snapshot = []LaunchInfo{
+		{ID: "handoff-linked", Kind: "handoff", Subcommand: "codex", SessionID: "sess-source", RunID: "run-h"},
+	}
+	lm.sessionForRun = map[string]string{"run-h": "sess-fork"}
+	s := newLaunchTestServer(t, lm)
+
+	byID := idsOf(getAttachSessions(t, s, false))
+	got, ok := byID["handoff-linked"]
+	if !ok {
+		t.Fatalf("handoff-linked must be listed, got %+v", byID)
+	}
+	if got.SessionID != "sess-fork" {
+		t.Fatalf("handoff row session_id = %q, want sess-fork (the FORK, not the source)", got.SessionID)
+	}
+}
+
+// TestAttachSessionsHandoffPreLinkEmptySessionID pins that a handoff run with no
+// correlation link yet is STILL listed but carries an EMPTY session_id — it
+// matches no session-detail page (so the source's page never claims the fork's
+// PTY) until the fork is known (~10–30s). The spec's source id must NOT leak.
+func TestAttachSessionsHandoffPreLinkEmptySessionID(t *testing.T) {
+	lm := newRecordingLaunchManager(nil)
+	lm.snapshot = []LaunchInfo{
+		{ID: "handoff-unlinked", Kind: "handoff", Subcommand: "codex", SessionID: "sess-source", RunID: "run-h"},
+	}
+	// sessionForRun left nil ⇒ no link for run-h.
+	s := newLaunchTestServer(t, lm)
+
+	byID := idsOf(getAttachSessions(t, s, false))
+	got, ok := byID["handoff-unlinked"]
+	if !ok {
+		t.Fatalf("pre-link handoff row must still be listed, got %+v", byID)
+	}
+	if got.SessionID != "" {
+		t.Fatalf("pre-link handoff row session_id = %q, want empty (source id must not leak)", got.SessionID)
+	}
+}
+
+// TestAttachSessionsRemoteDenied pins the remote-VIEW redaction of the
+// remote-sensitive kinds (§3.2): with [remote].allow_terminal_view OFF (the
+// nil-controller state of newLaunchTestServer), a REMOTE-exposed caller sees
+// ONLY the non-sensitive floor — fresh + handoff dashboard terminals — while the
+// attach + resume rows (whose TUI can echo secrets) are redacted by
+// visibleSnapshot on run KIND. An owner-local caller still sees all four.
 func TestAttachSessionsRemoteDenied(t *testing.T) {
 	lm := newRecordingLaunchManager(nil)
 	lm.snapshot = []LaunchInfo{
 		{ID: "attach-a", Kind: "attach", Tool: "claude-code", Subcommand: "claude"},
-		{ID: "attach-b", Kind: "attach", Tool: "codex", Subcommand: "codex"},
+		{ID: "resume-a", Kind: "resume", Tool: "codex", Subcommand: "codex", SessionID: "sess-r"},
+		{ID: "fresh-a", Kind: "fresh", Subcommand: "claude"},
+		{ID: "handoff-a", Kind: "handoff", Subcommand: "codex", SessionID: "sess-h"},
 	}
 	s := newLaunchTestServer(t, lm)
 
-	// Owner-local caller sees both live attach rows.
+	// Owner-local caller sees every live row.
 	local := idsOf(getAttachSessions(t, s, false))
-	if _, ok := local["attach-a"]; !ok {
-		t.Error("local caller must see attach-a")
-	}
-	if _, ok := local["attach-b"]; !ok {
-		t.Error("local caller must see attach-b")
+	for _, id := range []string{"attach-a", "resume-a", "fresh-a", "handoff-a"} {
+		if _, ok := local[id]; !ok {
+			t.Errorf("local caller must see %q", id)
+		}
 	}
 
-	// Remote-exposed caller: DENY — no attach row is disclosed at all.
-	remote := getAttachSessions(t, s, true)
-	if len(remote) != 0 {
-		t.Fatalf("remote caller must see NO attach rows (deny-by-default §3.2), got %+v", remote)
+	// Remote-exposed caller with the view gate OFF: only the non-sensitive
+	// fresh + handoff floor is disclosed; attach + resume are redacted.
+	remote := idsOf(getAttachSessions(t, s, true))
+	if len(remote) != 2 {
+		t.Fatalf("remote caller must see exactly the fresh+handoff floor, got %+v", remote)
+	}
+	for _, id := range []string{"fresh-a", "handoff-a"} {
+		if _, ok := remote[id]; !ok {
+			t.Errorf("remote caller must see non-sensitive row %q", id)
+		}
+	}
+	for _, id := range []string{"attach-a", "resume-a"} {
+		if _, ok := remote[id]; ok {
+			t.Errorf("remote caller must NOT see remote-sensitive row %q (view gate off)", id)
+		}
 	}
 }
 

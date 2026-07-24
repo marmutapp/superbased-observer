@@ -2,6 +2,37 @@
 
 All notable changes to SuperBased Observer are documented here.
 
+## [1.25.0] — 2026-07-24
+
+### Added
+
+- **feat(terminal): dashboard-launched terminals joinable by default.**
+  `/api/attach/sessions` widened to every live daemon-owned run kind
+  (fresh/handoff/attach/resume) — a terminal launched from the dashboard is
+  now itself a Jump-in candidate, not just an `--attach` session. A handoff
+  terminal's row keys by the FORKED session (not the source it continued
+  from), so it's joined from the fork's session detail once correlation links
+  it. `JumpInButton`'s copy and newest-row selection (picking the most
+  recently created live row when more than one matches a session) were
+  updated to match the wider row set.
+- **feat(attach): attach-by-default for all 19 CLI launchers.** Every
+  `observer <verb>` launcher (claude, codex, opencode, cursor, copilot-cli,
+  kilo, cline-cli, hermes, gemini, openclaw, pi, antigravity-cli, qwen, kiro,
+  grok, kimi, devin, qoder, goose) now attaches by default the same way
+  claude/codex have — a shared launcher gate plus 19 new integration-registry
+  Attach rows (tool key → launcher verb). Auto-resume-on-daemon-restart stays
+  gated to the two tools with a verified native resume (claude, codex) — every
+  other launcher gets an honest degraded-mortality notice instead (a daemon
+  restart ends the session outright; `observer <verb> --continue-from
+  <session-id>` is the manual fork fallback). Proxy env forwarding and
+  `[terminal.attach].route_proxy` / `--no-proxy` remain claude/codex-scoped —
+  every other tool's daemon-spawned inner launcher handles its own
+  base-URL routing itself. Note the attached child inherits the DAEMON's
+  environment, not the launching shell's — a credential exported only in the
+  launching shell won't reach it (config-file/OAuth auth unaffected; export
+  it where `observer start` runs, or use `--no-attach`). `JumpInButton`'s verb map extended to cover
+  all 19 tools.
+
 ## [1.24.1] — 2026-07-24
 
 ### Added

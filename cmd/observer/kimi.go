@@ -32,6 +32,8 @@ func newKimiCmd() *cobra.Command {
 		carry        string
 		fromMessage  int
 		fromTime     string
+		attach       *bool
+		noAttach     *bool
 	)
 	cmd := &cobra.Command{
 		Use:     "kimi [-- kimi-args...]",
@@ -52,6 +54,31 @@ func newKimiCmd() *cobra.Command {
 			"to separate observer flags from kimi flags. NEVER touches API keys.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Attach gate (attach-all-launchers): default-on attach hands the PTY
+			// to the daemon. Seed-only spec (kimi is launched non-proxied — no
+			// proxy env, no escape-hatch flag). kimi-code is DocAssisted, so
+			// --continue-from writes a doc + opens the TUI rather than seeding a
+			// prompt — but that lives under the handoff-fork family (incompatible)
+			// anyway; plain attach launches the TUI with no seed. The both-TTY
+			// guard covers scripted runs.
+			outcome, aErr := launcherAttach(cmd.Context(), launcherAttachSpec{
+				tool:         "kimi-code",
+				configPath:   configPath,
+				flagAttach:   *attach,
+				flagNoAttach: *noAttach,
+				// `-p` is a genuine headless one-shot (kimi-code's `-p` prints
+				// and EXITS — the registry note), so guard it: attaching a
+				// print-and-exit run would be spam.
+				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
+					argsContainHeadlessFlag(args, "-p"),
+				passthrough: kimiAttachPassthrough(binPath),
+				toolArgs:    args,
+				stderr:      cmd.ErrOrStderr(),
+			})
+			if outcome.handled {
+				return aErr
+			}
+
 			bin, err := resolveToolBin("kimi-code", binPath, "--kimi-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
@@ -90,6 +117,16 @@ func newKimiCmd() *cobra.Command {
 	cmd.Flags().StringVar(&carry, "carry", "", "Carry mode for --continue-from: metadata|distilled|distilled_tail|full|full_cache (default from [handoff] config)")
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
+	attach, noAttach = registerAttachFlags(cmd, "kimi-code")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
+}
+
+// kimiAttachPassthrough forwards the --kimi-path wrapper flag to the
+// daemon-spawned inner `observer kimi` launcher when set (nil otherwise).
+func kimiAttachPassthrough(kimiPath string) []string {
+	if kimiPath != "" {
+		return []string{"--kimi-path", kimiPath}
+	}
+	return nil
 }

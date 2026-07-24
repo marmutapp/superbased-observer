@@ -293,6 +293,9 @@ var registry = map[string]Capability{
 		TokenTier: TokenTier{Best: "sqlite"},
 		// P0.1 FULL: opencode.db message+part tables (reader = P2 tranche).
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectMCP, InjectPrompt}, Launch: &LaunchSpec{Subcommand: "opencode"}},
+		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
+		// — no prompt seeding, token capture path unchanged.
+		Attach: &AttachSpec{Subcommand: "opencode"},
 		// Binary resolution + grounded installs. Unix launcher resolves
 		// "opencode"; npm opencode-ai@latest (any OS) + the official curl
 		// installer on linux/darwin. Its own bin dir (.opencode/bin) is a
@@ -338,6 +341,9 @@ var registry = map[string]Capability{
 		// source_file (sentinel) — derive by session id. IDE state.vscdb
 		// unmeasured on this corpus. Reader = P2 tranche.
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectMCP, InjectPrompt}, Launch: &LaunchSpec{Subcommand: "cursor"}, Note: "CLI grounded; IDE surface unmeasured"},
+		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
+		// — no prompt seeding, token capture path unchanged.
+		Attach: &AttachSpec{Subcommand: "cursor"},
 		// Binary resolution + grounded install. Unix launcher resolves
 		// "cursor-agent"; the installer drops versioned binaries under
 		// .local/share/cursor-agent/versions/*. Official installer script
@@ -426,6 +432,9 @@ var registry = map[string]Capability{
 		// P0.1 FULL: ~/.copilot/session-store.db turns(user_message,
 		// assistant_response) (reader = P2 tranche).
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectPrompt}, Launch: &LaunchSpec{Subcommand: "copilot-cli"}},
+		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
+		// — no prompt seeding, token capture path unchanged.
+		Attach: &AttachSpec{Subcommand: "copilot-cli"},
 		// Binary resolution + grounded installs. Unix launcher resolves
 		// "copilot"; npm @github/copilot (any OS) + the cask/script/winget
 		// channels (docs.github.com copilot-cli install).
@@ -483,6 +492,9 @@ var registry = map[string]Capability{
 		TokenTier: TokenTier{Best: "sqlite"},
 		// P0.1 FULL: kilo.db message+part tables (reader = P2 tranche).
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectPrompt}, Launch: &LaunchSpec{Subcommand: "kilo"}},
+		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
+		// — no prompt seeding, token capture path unchanged.
+		Attach: &AttachSpec{Subcommand: "kilo"},
 		// Binary resolution + grounded installs. Unix launcher resolves
 		// "kilo"; npm @kilocode/cli (any OS) + the script/brew channels
 		// (kilo.ai/docs/cli). Windows shim grounded at
@@ -528,6 +540,9 @@ var registry = map[string]Capability{
 		// P0.1 FULL: <id>.messages.json, Anthropic-shaped (reader = P2
 		// tranche).
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectPrompt}, Launch: &LaunchSpec{Subcommand: "cline-cli"}},
+		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
+		// — no prompt seeding, token capture path unchanged.
+		Attach: &AttachSpec{Subcommand: "cline-cli"},
 		// Binary resolution + grounded install. Unix launcher resolves
 		// "cline"; npm-distributed `cline` 3.x (docs/clinecli-adapter.md).
 		Binary: &BinaryResolveSpec{
@@ -606,6 +621,11 @@ var registry = map[string]Capability{
 		// gap, NousResearch/hermes-agent Issue #19675). So it is launchable
 		// only in DocAssisted mode: write the doc + open `hermes --tui`.
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectMCP}, Launch: &LaunchSpec{Subcommand: "hermes", Mode: LaunchDocAssisted}, Note: "TUI has no initial-prompt seed (upstream gap); launch writes the handover doc + opens hermes --tui"},
+		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
+		// — no prompt seeding, token capture path unchanged. DocAssisted only
+		// gates --continue-from seeding (incompatible with attach); plain attach
+		// opens the TUI seedless.
+		Attach: &AttachSpec{Subcommand: "hermes"},
 		// Binary resolution + grounded install. Unix launcher resolves
 		// "hermes"; its bundled node prefix (.hermes/node/bin) + .hermes/bin
 		// are per-tool extras (the off-PATH hermes-bundled npm prefix from
@@ -662,6 +682,9 @@ var registry = map[string]Capability{
 		// P0.1 FULL: ~/.gemini/tmp/<proj>/chats/session-*.jsonl user/gemini
 		// records (reader = P2 tranche).
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectPrompt}, Launch: &LaunchSpec{Subcommand: "gemini"}},
+		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
+		// — no prompt seeding, token capture path unchanged.
+		Attach: &AttachSpec{Subcommand: "gemini"},
 		// Binary resolution + grounded install. Unix launcher resolves
 		// "gemini"; npm @google/gemini-cli (any OS).
 		Binary: &BinaryResolveSpec{
@@ -728,6 +751,9 @@ var registry = map[string]Capability{
 		// block); token capture stays on the trajectory adapter, so seeding is
 		// orthogonal to capture.
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectPrompt}, Launch: &LaunchSpec{Subcommand: "openclaw"}, Note: "seeded via chat --message; --continue-from launches non-proxied to avoid the --local proxy stall"},
+		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
+		// — no prompt seeding, token capture path unchanged.
+		Attach: &AttachSpec{Subcommand: "openclaw"},
 		// Binary resolution + grounded installs. Unix launcher resolves
 		// "openclaw"; the vendor script is primary (docs.openclaw.ai/install),
 		// npm is an alternate (needs `openclaw onboard --install-daemon`
@@ -774,6 +800,9 @@ var registry = map[string]Capability{
 		// P0.1 FULL: sessions/<slug>/<ts>_<id>.jsonl message records
 		// (reader = P2 tranche).
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectPrompt}, Launch: &LaunchSpec{Subcommand: "pi"}},
+		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
+		// — no prompt seeding, token capture path unchanged.
+		Attach: &AttachSpec{Subcommand: "pi"},
 		// Binary resolution + grounded installs. Unix launcher resolves
 		// "pi"; npm @earendil-works/pi-coding-agent (earendil-works/pi,
 		// pi.dev — NOT Inflection) + the official install script.
@@ -821,6 +850,9 @@ var registry = map[string]Capability{
 			Launch:     &LaunchSpec{Subcommand: "antigravity-cli"},
 			Note:       "CLI (agy) .db readable + -i seed",
 		},
+		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
+		// — no prompt seeding, token capture path unchanged.
+		Attach: &AttachSpec{Subcommand: "antigravity-cli"},
 		// Binary resolution + grounded install. Unix launcher resolves "agy"
 		// (the agy CLI); official install script (antigravity.google/docs/
 		// cli/install). Windows hint is display-only (no Windows binary
@@ -894,6 +926,9 @@ var registry = map[string]Capability{
 			Launch:     &LaunchSpec{Subcommand: "qwen"},
 			Note:       "-i/--prompt-interactive seed verified live",
 		},
+		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
+		// — no prompt seeding, token capture path unchanged.
+		Attach: &AttachSpec{Subcommand: "qwen"},
 		// Binary resolution + grounded installs. Unix launcher resolves
 		// "qwen"; npm @qwen-code/qwen-code@latest (any OS) + the standalone
 		// install script + brew (QwenLM/qwen-code + official docs).
@@ -935,6 +970,9 @@ var registry = map[string]Capability{
 			Launch:     &LaunchSpec{Subcommand: "kiro"},
 			Note:       "chat positional seed verified live; dual-store reader",
 		},
+		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
+		// — no prompt seeding, token capture path unchanged.
+		Attach: &AttachSpec{Subcommand: "kiro"},
 		// Binary resolution + grounded install. Unix launcher resolves
 		// "kiro-cli"; official install script (kiro.dev/docs/cli/
 		// installation). Homebrew is explicitly NOT supported per vendor
@@ -990,6 +1028,9 @@ var registry = map[string]Capability{
 			Launch:     &LaunchSpec{Subcommand: "grok"},
 			Note:       "positional seed verified live; tool-exec capture still owed (plan-agent default)",
 		},
+		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
+		// — no prompt seeding, token capture path unchanged.
+		Attach: &AttachSpec{Subcommand: "grok"},
 		// Binary resolution + grounded installs. Unix launcher resolves
 		// "grok"; npm @xai-official/grok (any OS) + the official install
 		// script (docs.x.ai/build/overview).
@@ -1060,6 +1101,11 @@ var registry = map[string]Capability{
 			Launch:     &LaunchSpec{Subcommand: "kimi", Mode: LaunchDocAssisted},
 			Note:       "no seed lane (-p prints+exits; TUI seedless) — doc-assisted launch",
 		},
+		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
+		// — no prompt seeding, token capture path unchanged. DocAssisted only
+		// gates --continue-from seeding (incompatible with attach); plain attach
+		// opens the TUI seedless.
+		Attach: &AttachSpec{Subcommand: "kimi"},
 		// Binary resolution. Unix launcher resolves "kimi". No grounded
 		// install channel yet (research pending) → Installs nil, Windows nil.
 		Binary: &BinaryResolveSpec{Names: BinaryNames{Unix: []string{"kimi"}}},
@@ -1142,6 +1188,9 @@ var registry = map[string]Capability{
 			Launch:     &LaunchSpec{Subcommand: "devin"},
 			Note:       "positional seed contract operator-verified on a real TTY 2026-07-09 (`devin -- \"<prompt>\"`, clap last-only positional after the `--` separator); launcher `observer devin` seed-only/non-proxied (native_exempt, no base-URL knob)",
 		},
+		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
+		// — no prompt seeding, token capture path unchanged.
+		Attach: &AttachSpec{Subcommand: "devin"},
 		// Binary resolution + grounded install. Unix launcher resolves
 		// "devin"; official install script (devin.ai/cli). No official
 		// Windows path — the winget listing is third-party, not shipped.
@@ -1180,6 +1229,9 @@ var registry = map[string]Capability{
 			Launch:     &LaunchSpec{Subcommand: "qoder"},
 			Note:       "seeds via -i flag value (binary is `qodercli`)",
 		},
+		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
+		// — no prompt seeding, token capture path unchanged.
+		Attach: &AttachSpec{Subcommand: "qoder"},
 		// Binary resolution + grounded installs. Unix launcher resolves
 		// "qodercli" (the binary is qodercli, not qoder); npm
 		// @qoder-ai/qodercli (any OS) + the official install script
@@ -1270,6 +1322,9 @@ var registry = map[string]Capability{
 			Launch:     &LaunchSpec{Subcommand: "goose"},
 			Note:       "seeds via `run -t <seed> -s` (seed-then-interactive verified live)",
 		},
+		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
+		// — no prompt seeding, token capture path unchanged.
+		Attach: &AttachSpec{Subcommand: "goose"},
 		// Binary resolution + grounded installs. Unix launcher resolves
 		// "goose"; its installer drops the binary under .local/bin (a
 		// per-tool extra). Official install script + brew (repo moved

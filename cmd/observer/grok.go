@@ -30,6 +30,8 @@ func newGrokCmd() *cobra.Command {
 		carry        string
 		fromMessage  int
 		fromTime     string
+		attach       *bool
+		noAttach     *bool
 	)
 	cmd := &cobra.Command{
 		Use:   "grok [-- grok-args...]",
@@ -47,6 +49,25 @@ func newGrokCmd() *cobra.Command {
 			"to separate observer flags from grok flags. NEVER touches API keys.",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Attach gate (attach-all-launchers): default-on attach hands the PTY
+			// to the daemon. Seed-only spec (grok is launched non-proxied — no
+			// proxy env, no escape-hatch flag); grok's headless surface is
+			// unverified, so the handoff-fork family is the only incompatible mode
+			// (the both-TTY guard covers scripted runs).
+			outcome, aErr := launcherAttach(cmd.Context(), launcherAttachSpec{
+				tool:         "grok",
+				configPath:   configPath,
+				flagAttach:   *attach,
+				flagNoAttach: *noAttach,
+				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime),
+				passthrough:  grokAttachPassthrough(binPath),
+				toolArgs:     args,
+				stderr:       cmd.ErrOrStderr(),
+			})
+			if outcome.handled {
+				return aErr
+			}
+
 			bin, err := resolveToolBin("grok", binPath, "--grok-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
@@ -91,8 +112,18 @@ func newGrokCmd() *cobra.Command {
 	cmd.Flags().StringVar(&carry, "carry", "", "Carry mode for --continue-from: metadata|distilled|distilled_tail|full|full_cache (default from [handoff] config)")
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
+	attach, noAttach = registerAttachFlags(cmd, "grok")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
+}
+
+// grokAttachPassthrough forwards the --grok-path wrapper flag to the
+// daemon-spawned inner `observer grok` launcher when set (nil otherwise).
+func grokAttachPassthrough(grokPath string) []string {
+	if grokPath != "" {
+		return []string{"--grok-path", grokPath}
+	}
+	return nil
 }
 
 // grokSubcommands are the grok argv tokens that are subcommands, not a

@@ -49,6 +49,8 @@ func newOpenclawCmd() *cobra.Command {
 		carry        string
 		fromMessage  int
 		fromTime     string
+		attach       *bool
+		noAttach     *bool
 	)
 	cmd := &cobra.Command{
 		Use:   "openclaw [-- openclaw-args...]",
@@ -70,6 +72,30 @@ func newOpenclawCmd() *cobra.Command {
 			"API keys. Requires a running observer proxy (`observer start`).",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Attach-by-default (attach-all-launchers): hand the PTY to the
+			// daemon when attach resolves. openclaw self-routes via
+			// OPENAI_BASE_URL in the daemon-spawned inner launcher, so forward NO
+			// proxy env (attachEnv nil) and no --no-proxy-route flag exists
+			// (noProxyRoute nil). ONLY the continue-from family forces the bare
+			// path (its non-proxied `chat --message` seed is continue-from-gated
+			// and never reached under a plain attach). toolArgs is the RAW
+			// operator remainder — the inner launcher re-applies OPENAI_BASE_URL.
+			outcome, aerr := launcherAttach(cmd.Context(), launcherAttachSpec{
+				tool:          "openclaw",
+				configPath:    configPath,
+				proxyOverride: proxyURL,
+				proxyFlag:     "--proxy",
+				flagAttach:    *attach,
+				flagNoAttach:  *noAttach,
+				incompatible:  continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime),
+				passthrough:   openclawAttachPassthrough(binPath),
+				toolArgs:      args,
+				stderr:        cmd.ErrOrStderr(),
+			})
+			if outcome.handled {
+				return aerr
+			}
+
 			bin, err := resolveToolBin("openclaw", binPath, "--openclaw-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
 				return err
@@ -111,8 +137,19 @@ func newOpenclawCmd() *cobra.Command {
 	cmd.Flags().StringVar(&carry, "carry", "", "Carry mode for --continue-from: metadata|distilled|distilled_tail|full|full_cache (default from [handoff] config)")
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
+	attach, noAttach = registerAttachFlags(cmd, "openclaw")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
+}
+
+// openclawAttachPassthrough forwards --openclaw-path to the daemon-spawned
+// inner `observer openclaw` launcher when the operator overrode the binary
+// path; nil otherwise.
+func openclawAttachPassthrough(binPath string) []string {
+	if binPath != "" {
+		return []string{"--openclaw-path", binPath}
+	}
+	return nil
 }
 
 // openclawContinueParams carries what runOpenclawContinue needs to seed and

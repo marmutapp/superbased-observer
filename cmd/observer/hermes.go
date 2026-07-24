@@ -68,6 +68,8 @@ func newHermesCmd() *cobra.Command {
 		carry        string
 		fromMessage  int
 		fromTime     string
+		attach       *bool
+		noAttach     *bool
 	)
 	cmd := &cobra.Command{
 		Use:   "hermes [-- hermes-args...]",
@@ -90,6 +92,33 @@ func newHermesCmd() *cobra.Command {
 			"observer proxy (`observer start`).",
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Attach-by-default (attach-all-launchers): hand the PTY to the
+			// daemon when attach resolves. hermes routes via the `observer`
+			// provider in ~/.hermes/config.yaml (written by the daemon-spawned
+			// inner launcher), so forward NO proxy env (attachEnv nil) and no
+			// --no-proxy-route flag exists (noProxyRoute nil). hermes registers
+			// --proxy-url (NOT --proxy), so proxyFlag is "--proxy-url"; the inner
+			// launcher's --upstream/--key-env are forwarded only when overridden
+			// off their defaults. A -z headless one-shot or the continue-from
+			// family (a DocAssisted TUI open) forces the bare path. toolArgs is
+			// the RAW operator remainder — the inner launcher re-applies the
+			// `--provider observer` prepend.
+			outcome, err := launcherAttach(cmd.Context(), launcherAttachSpec{
+				tool:          "hermes",
+				configPath:    configPath,
+				proxyOverride: proxyURL,
+				proxyFlag:     "--proxy-url",
+				flagAttach:    *attach,
+				flagNoAttach:  *noAttach,
+				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
+					argsContainHeadlessFlag(args, "-z"),
+				passthrough: hermesAttachPassthrough(binPath, upstream, keyEnv),
+				toolArgs:    args,
+				stderr:      cmd.ErrOrStderr(),
+			})
+			if outcome.handled {
+				return err
+			}
 			cfg, err := config.Load(config.LoadOptions{GlobalPath: configPath})
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
@@ -159,8 +188,27 @@ func newHermesCmd() *cobra.Command {
 	cmd.Flags().StringVar(&carry, "carry", "", "Carry mode for --continue-from: metadata|distilled|distilled_tail|full|full_cache (default from [handoff] config)")
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
+	attach, noAttach = registerAttachFlags(cmd, "hermes")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
+}
+
+// hermesAttachPassthrough forwards the hermes wrapper flags to the
+// daemon-spawned inner `observer hermes` launcher: --hermes-path when the
+// operator overrode the binary path, and --upstream/--key-env only when they
+// differ from their defaults (so an unchanged default is not re-asserted).
+func hermesAttachPassthrough(binPath, upstream, keyEnv string) []string {
+	var p []string
+	if binPath != "" {
+		p = append(p, "--hermes-path", binPath)
+	}
+	if upstream != hermesDefaultUpstream {
+		p = append(p, "--upstream", upstream)
+	}
+	if keyEnv != hermesDefaultKeyEnv {
+		p = append(p, "--key-env", keyEnv)
+	}
+	return p
 }
 
 // ensureHermesTUIFlag appends `--tui` to args unless it (or the HERMES_TUI
