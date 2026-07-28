@@ -175,7 +175,12 @@ func newDBImportCmd() *cobra.Command {
 
 			// Migrate the foreign file to the current schema so the
 			// set-based merge reads matching columns, then release it.
-			fdb, err := db.Open(cmd.Context(), db.Options{Path: foreign})
+			// IntegrityCheck: the ONLY caller that opts in. `foreign` is an
+			// untrusted file handed to us on the command line and its rows
+			// are about to be merged into the live database, so verifying it
+			// before the merge is worth a full-file checksum. Every other
+			// open in this binary reads a database we already own.
+			fdb, err := db.Open(cmd.Context(), db.Options{Path: foreign, IntegrityCheck: true})
 			if err != nil {
 				return fmt.Errorf("open source database: %w", err)
 			}

@@ -68,6 +68,97 @@ import type {
 const MESSAGES_LIMIT = 25;
 const RAW_EVENTS_LIMIT = 50;
 
+// ----- Messages table sort ----------------------------------------
+//
+// Sorting is SERVER-SIDE (/api/session/<id>/messages?sort_by&sort_dir) so it
+// addresses the whole timeline rather than the current page — the point of
+// the feature is that "time descending" puts the newest message at row 1 of
+// page 1 while a live session is running, instead of appending it to the
+// last page.
+type MessageSortKey =
+  | "seq"
+  | "timestamp"
+  | "message_id"
+  | "role"
+  | "model"
+  | "effort_level"
+  | "input"
+  | "cache_read"
+  | "cache_creation"
+  | "output"
+  | "elapsed_ms"
+  | "tokens_per_sec"
+  | "tool_call_count"
+  | "ai_cost_usd"
+  | "tool_cost_usd"
+  | "cost_usd"
+  | "content";
+type SortDir = "asc" | "desc";
+
+// The default reproduces the endpoint's historical chronological order; the
+// server treats it as the identity permutation.
+const DEFAULT_MSG_SORT: MessageSortKey = "seq";
+const DEFAULT_MSG_DIR: SortDir = "asc";
+
+// MESSAGE_COLUMNS is the single source of truth for the Messages table
+// header: one row per column, in table order, carrying its sort key, label,
+// alignment and optional tooltip. Adding a column is one row here plus one
+// row in the server's messageSortKeys table — never a new conditional.
+const MESSAGE_COLUMNS: {
+  key: MessageSortKey;
+  label: string;
+  right?: boolean;
+  className?: string;
+  tooltip?: string;
+  tooltipMaxWidth?: number;
+}[] = [
+  { key: "seq", label: "#", className: "pl-3" },
+  { key: "timestamp", label: "Time" },
+  { key: "message_id", label: "Msg ID" },
+  { key: "role", label: "Role" },
+  { key: "model", label: "Model" },
+  {
+    key: "effort_level",
+    label: "Effort",
+    tooltip:
+      "Reasoning effort — codex collaboration_mode.settings.reasoning_effort, antigravity SKU-encoded low/medium/high, etc. Empty for adapters that don't expose an effort knob (Anthropic models, copilot, etc.); those rows sort to the bottom in both directions. Sorts by intensity (low → high), not alphabetically.",
+    tooltipMaxWidth: 420,
+  },
+  { key: "input", label: "In", right: true },
+  { key: "cache_read", label: "Cache R", right: true },
+  { key: "cache_creation", label: "Cache W", right: true },
+  { key: "output", label: "Out", right: true },
+  { key: "elapsed_ms", label: "Elapsed", right: true },
+  {
+    key: "tokens_per_sec",
+    label: "Tok/s",
+    right: true,
+    tooltip:
+      "Output tokens per second — this turn's output tokens ÷ its elapsed time. Only output (generated) tokens count. Blank for turns with no output or no timing; those rows sort to the bottom in both directions.",
+    tooltipMaxWidth: 420,
+  },
+  { key: "tool_call_count", label: "Tools", right: true },
+  { key: "ai_cost_usd", label: "API $", right: true },
+  { key: "tool_cost_usd", label: "Tool $", right: true },
+  { key: "cost_usd", label: "Total $", right: true },
+  { key: "content", label: "Content", className: "pl-3 pr-3" },
+];
+
+// watchFollowEdge decides which edge of the table live watch-mode should
+// track under the active sort. The chat-follow default assumes "newest is
+// last" — true only for the chronological ascending orders. Under a
+// chronological DESCENDING sort the newest row is at the TOP (page 1), which
+// is the whole point of sorting time descending during a live session. Under
+// any other sort the position of a new row is unpredictable, so we follow
+// nothing rather than yank the operator's viewport around.
+function watchFollowEdge(
+  sortBy: MessageSortKey,
+  sortDir: SortDir,
+): "bottom" | "top" | "none" {
+  if (sortBy !== "seq" && sortBy !== "timestamp") return "none";
+  return sortDir === "asc" ? "bottom" : "top";
+}
+
 export function SessionDetailPanel({
   sessionId,
   open,
@@ -95,14 +186,16 @@ export function SessionDetailPanel({
   useEffect(() => {
     setWatchMode(watch);
   }, [watch, sessionId]);
-  // stickToBottom drives chat-follow etiquette: auto-scroll to the newest
-  // message only while the reader is pinned to the bottom. Scrolling up
-  // releases the stick; scrolling back re-engages it. Reset on session
-  // change or when (re)entering watch mode.
-  const [stickToBottom, setStickToBottom] = useState(true);
-  useEffect(() => {
-    setStickToBottom(true);
-  }, [sessionId, watchMode]);
+  // stickToEdge drives chat-follow etiquette: auto-scroll to the newest
+  // message only while the reader is pinned to the followed edge (the bottom
+  // under the chronological default, the TOP under a time-descending sort —
+  // see watchFollowEdge). Scrolling away releases the stick; scrolling back
+  // re-engages it. Reset on session change, when (re)entering watch mode, and
+  // on any SORT change — a sort change re-windows the whole timeline (it also
+  // resets to page 1), and under follow="none" sorts handleScroll early-returns
+  // so the flag would otherwise freeze at whatever it held when the operator
+  // left the chronological order and never re-engage on the way back.
+  const [stickToEdge, setStickToEdge] = useState(true);
   // Live-capture refresh while the slide-over is open: 8s on both
   // the detail rollup and the message stream. Calmer than the 2s
   // first-pass cadence — 2s was visibly choppy because every
@@ -143,13 +236,40 @@ export function SessionDetailPanel({
   const [focusMid, setFocusMid] = useState<string | null>(null);
   const [showRawEvents, setShowRawEvents] = useState(false);
   const [rawPage, setRawPage] = useState(1);
+  // Messages-table sort. Lifted here (next to msgPage) so it survives the
+  // auto-refresh poll and so it can be fed into the request params. Held as
+  // one object so the click handler's updater stays pure (a nested setState
+  // would double-toggle under StrictMode).
+  const [msgSort, setMsgSort] = useState<{ by: MessageSortKey; dir: SortDir }>({
+    by: DEFAULT_MSG_SORT,
+    dir: DEFAULT_MSG_DIR,
+  });
+  // See stickToEdge above: re-arm chat-follow on session / watch-mode / sort
+  // change. Declared here because it depends on msgSort.
+  useEffect(() => {
+    setStickToEdge(true);
+  }, [sessionId, watchMode, msgSort.by, msgSort.dir]);
   useEffect(() => {
     setMsgPage(1);
     setTokenDetail(null);
     setFocusMid(null);
     setShowRawEvents(false);
     setRawPage(1);
+    setMsgSort({ by: DEFAULT_MSG_SORT, dir: DEFAULT_MSG_DIR });
   }, [sessionId]);
+  // onSortMessages — click a header: a new column selects it (ascending,
+  // except Time which starts descending so "newest first" is one click
+  // away); clicking the active column toggles direction. Any change resets
+  // to page 1, since the sort re-windows the whole timeline.
+  const onSortMessages = useCallback((key: MessageSortKey) => {
+    setMsgSort((s) =>
+      s.by === key
+        ? { by: key, dir: s.dir === "asc" ? "desc" : "asc" }
+        : { by: key, dir: key === "timestamp" ? "desc" : "asc" },
+    );
+    setMsgPage(1);
+  }, []);
+  const followEdge = watchFollowEdge(msgSort.by, msgSort.dir);
   // Effective grain: an explicit toggle wins; otherwise codex defaults to
   // per-inference, everything else to turn rollup.
   const effectiveDetail: "turn" | "inference" =
@@ -169,10 +289,17 @@ export function SessionDetailPanel({
   if (effectiveDetail === "inference") {
     messageParams.detail = "inference";
   }
+  // Sort travels with every request (including the auto-refresh poll) so the
+  // live stream honours the operator's chosen order. Omitted entirely on the
+  // default so the request stays byte-identical to the pre-sort client.
+  if (msgSort.by !== DEFAULT_MSG_SORT || msgSort.dir !== DEFAULT_MSG_DIR) {
+    messageParams.sort_by = msgSort.by;
+    messageParams.sort_dir = msgSort.dir;
+  }
   const messages = useApi<SessionMessages>(
     sessionId ? `/api/session/${sessionId}/messages` : null,
     messageParams,
-    [sessionId, msgPage, effectiveDetail],
+    [sessionId, msgPage, effectiveDetail, msgSort.by, msgSort.dir],
     liveRefresh,
   );
   const rawOffset = (rawPage - 1) * RAW_EVENTS_LIMIT;
@@ -186,15 +313,34 @@ export function SessionDetailPanel({
   // onFocusMessage — a Processes-panel msg link: ensure the page containing the
   // message is loaded (the /messages ?locate= override returns its offset),
   // then highlight it. The highlight auto-clears after 3s.
+  //
+  // The probe MUST ask in the same shape as the rendered table, or the offset
+  // it returns addresses a page the table never shows: the server resolves
+  // ?locate= against its EFFECTIVE (post-sort, post-grain) row list, so a
+  // chronological probe under an active sort — or a turn-grain probe while the
+  // table is on inference grain — hands back an offset for a different row
+  // set, the target row is absent from the page that loads, and the
+  // scrollIntoView silently no-ops. Reuse the exact params the table's own
+  // request carries, minus offset (locate replaces it).
   const onFocusMessage = useCallback(
     async (mid: string) => {
       if (!sessionId) return;
       const onPage = messages.data?.messages.some((m) => m.message_id === mid);
       if (!onPage) {
         try {
+          const sorted =
+            msgSort.by !== DEFAULT_MSG_SORT || msgSort.dir !== DEFAULT_MSG_DIR;
           const r = await fetchJSON<SessionMessages>(
             `/api/session/${sessionId}/messages`,
-            { locate: mid, limit: MESSAGES_LIMIT },
+            {
+              locate: mid,
+              limit: MESSAGES_LIMIT,
+              // undefined params are dropped by buildUrl, so the default
+              // grain / default sort still send the historical query.
+              detail: effectiveDetail === "inference" ? "inference" : undefined,
+              sort_by: sorted ? msgSort.by : undefined,
+              sort_dir: sorted ? msgSort.dir : undefined,
+            },
           );
           setMsgPage(Math.floor((r.offset ?? 0) / MESSAGES_LIMIT) + 1);
         } catch {
@@ -203,7 +349,7 @@ export function SessionDetailPanel({
       }
       setFocusMid(mid);
     },
-    [sessionId, messages.data],
+    [sessionId, messages.data, effectiveDetail, msgSort.by, msgSort.dir],
   );
   useEffect(() => {
     if (!focusMid) return;
@@ -211,16 +357,21 @@ export function SessionDetailPanel({
     return () => clearTimeout(t);
   }, [focusMid]);
 
-  // Tail-follow: in watch mode, keep the messages view pinned to the last
-  // page as new rows land — but only while the reader is stuck to the
-  // bottom (paginating away releases it). total is the whole-session count
-  // the endpoint returns regardless of the current offset.
+  // Tail-follow: in watch mode, keep the messages view pinned to the page new
+  // rows land on — but only while the reader is stuck to the followed edge
+  // (paginating away releases it). Which page that is depends on the sort:
+  // the LAST page under the chronological default, page 1 under a
+  // time-descending sort (newest first). Under any other sort a new row's
+  // page is unpredictable, so we pin nothing. total is the whole-session
+  // count the endpoint returns regardless of the current offset.
   const totalMsgs = messages.data?.total ?? 0;
   const lastMsgPage = Math.max(1, Math.ceil(totalMsgs / MESSAGES_LIMIT));
+  const followPage = followEdge === "top" ? 1 : lastMsgPage;
   useEffect(() => {
-    if (!watchMode || !stickToBottom || totalMsgs === 0) return;
-    setMsgPage((p) => (p === lastMsgPage ? p : lastMsgPage));
-  }, [watchMode, stickToBottom, totalMsgs, lastMsgPage]);
+    if (!watchMode || !stickToEdge || totalMsgs === 0) return;
+    if (followEdge === "none") return;
+    setMsgPage((p) => (p === followPage ? p : followPage));
+  }, [watchMode, stickToEdge, totalMsgs, followPage, followEdge]);
 
   return (
     <SlideOver
@@ -402,8 +553,12 @@ export function SessionDetailPanel({
                 focusMid={focusMid}
                 browser={browserSession}
                 watch={watchMode}
-                stick={stickToBottom}
-                onStickChange={setStickToBottom}
+                stick={stickToEdge}
+                onStickChange={setStickToEdge}
+                follow={followEdge}
+                sortBy={msgSort.by}
+                sortDir={msgSort.dir}
+                onSort={onSortMessages}
               />
             )}
           </ChartState>
@@ -414,9 +569,14 @@ export function SessionDetailPanel({
               total={messages.data.total}
               onPage={(p) => {
                 setMsgPage(p);
-                // In watch mode, paginating off the last page releases the
-                // tail-follow stick; landing back on it re-engages.
-                if (watchMode) setStickToBottom(p >= lastMsgPage);
+                // In watch mode, paginating off the followed page releases
+                // the tail-follow stick; landing back on it re-engages.
+                // The followed page is page 1 under a time-descending sort.
+                if (watchMode) {
+                  setStickToEdge(
+                    followEdge === "top" ? p === 1 : p >= lastMsgPage,
+                  );
+                }
               }}
               loading={messages.loading}
             />
@@ -1575,9 +1735,25 @@ function PredictorBody({ data }: { data: PredictResponse }) {
       {est.has_estimate ? (
         <>
           <div className="grid grid-cols-3 gap-2">
-            <PredictBandStat label="Low" sub="quick reply" band={est.low} />
-            <PredictBandStat label="Typical" sub="median message" band={est.mid} highlight />
-            <PredictBandStat label="High" sub="agentic loop" band={est.high} />
+            <PredictBandStat
+              label="Low"
+              sub="quick reply"
+              band={est.low}
+              prefixTokens={est.prefix_tokens}
+            />
+            <PredictBandStat
+              label="Typical"
+              sub="median message"
+              band={est.mid}
+              prefixTokens={est.prefix_tokens}
+              highlight
+            />
+            <PredictBandStat
+              label="High"
+              sub="agentic loop"
+              band={est.high}
+              prefixTokens={est.prefix_tokens}
+            />
           </div>
           <div className="flex flex-wrap items-center gap-1.5">
             <PredictTurnsTierPill tier={est.turns_tier} />
@@ -1589,7 +1765,8 @@ function PredictorBody({ data }: { data: PredictResponse }) {
           </div>
           <div className="text-[10.5px] text-fg-3">
             <span className="font-mono text-fg-2">{est.model}</span> · cached
-            prefix {fmtCompact(est.prefix_tokens)} tok re-read each turn ·{" "}
+            prefix {fmtCompact(est.prefix_tokens)} tok re-read — and billed —
+            each turn ·{" "}
             {est.turns_tier === "observed"
               ? `${fmtInt(est.sample_messages)} messages observed`
               : "fan-out inferred (no per-message boundaries on this session)"}
@@ -1621,17 +1798,37 @@ function fmtPredictUSD(n: number): string {
   return fmtUSD(n);
 }
 
+// predictBilledTokens is the token counterpart of the priced formula
+// (per_turn = P·r_cache_read + S·r_input + O·r_output; message = T ×
+// per_turn). It counts exactly the dimensions the price counts, so the
+// tokens and the dollars agree: the cached prefix P is re-read — and
+// billed at the cache-read rate — on EVERY one of the T turns, so it is
+// counted T times. `fresh` is the genuinely-new half (S + O per turn).
+// Cache-WRITE tokens are not modelled by the estimator, so they are not
+// counted here either (disclosed in the tooltip + glossary).
+function predictBilledTokens(band: PredictBand, prefixTokens: number) {
+  const turns = Math.max(0, band.turns);
+  const cached = Math.round(turns * Math.max(0, prefixTokens));
+  const fresh = Math.round(
+    turns * (Math.max(0, band.fresh_input) + Math.max(0, band.output)),
+  );
+  return { billed: cached + fresh, cached, fresh };
+}
+
 function PredictBandStat({
   label,
   sub,
   band,
+  prefixTokens,
   highlight,
 }: {
   label: string;
   sub: string;
   band: PredictBand;
+  prefixTokens: number;
   highlight?: boolean;
 }) {
+  const tok = predictBilledTokens(band, prefixTokens);
   return (
     <div
       className={clsx(
@@ -1652,6 +1849,19 @@ function PredictBandStat({
       </span>
       <span className="mt-0.5 text-[10px] text-fg-3">
         ~{band.turns} turns · {fmtCompact(band.output)} out/turn
+      </span>
+      <span
+        className="text-[10px] tabular-nums text-fg-3"
+        title={
+          `Billed tokens = turns × (cached prefix + fresh input + output) = ` +
+          `${band.turns} × (${fmtInt(prefixTokens)} + ${fmtInt(band.fresh_input)} + ${fmtInt(band.output)}) ` +
+          `≈ ${fmtInt(tok.billed)}. Of that, ${fmtInt(tok.cached)} is the SAME cached prefix ` +
+          `re-read (and billed at the cache-read rate) on every turn — only ${fmtInt(tok.fresh)} is new. ` +
+          `This is throughput, not context size. Cache-WRITE tokens are not included.`
+        }
+      >
+        <span className="text-fg-2">{fmtCompact(tok.billed)} tok</span> billed ·{" "}
+        {fmtCompact(tok.fresh)} new
       </span>
       <span className="text-[10px] text-fg-3">{sub}</span>
     </div>
@@ -2228,6 +2438,67 @@ function fmtTps(tps: number): string {
   return `${tps >= 10 ? Math.round(tps).toString() : tps.toFixed(1)}/s`;
 }
 
+// SortableTh renders one Messages-table header as a control: clickable and
+// keyboard-operable (Enter / Space), carrying the DataTable indicator
+// convention (↑ active-ascending, ↓ active-descending, · inactive) and
+// aria-sort for assistive tech. A tooltip-bearing column keeps its tooltip by
+// wrapping the raw <th> — Tooltip clones its child, so it must stay a DOM
+// element rather than this component.
+function SortableTh({
+  col,
+  active,
+  dir,
+  onSort,
+}: {
+  col: (typeof MESSAGE_COLUMNS)[number];
+  active: boolean;
+  dir: SortDir;
+  onSort: (key: MessageSortKey) => void;
+}) {
+  const indicator = active ? (dir === "asc" ? "↑" : "↓") : "·";
+  const hint = `Sort by ${col.label}${
+    active ? (dir === "asc" ? " (ascending)" : " (descending)") : ""
+  }`;
+  const th = (
+    <th
+      tabIndex={0}
+      aria-sort={active ? (dir === "asc" ? "ascending" : "descending") : "none"}
+      // A tooltip-bearing column gets the hint through the Tooltip below; the
+      // native title= would fire a SECOND, overlapping popup on hover.
+      title={col.tooltip ? undefined : hint}
+      onClick={() => onSort(col.key)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onSort(col.key);
+        }
+      }}
+      className={clsx(
+        "cursor-pointer select-none py-1.5 font-medium hover:text-fg-1 focus:outline-none",
+        col.right && "text-right",
+        col.className,
+      )}
+    >
+      {col.label}
+      <span className="ml-1 text-fg-4">{indicator}</span>
+    </th>
+  );
+  if (!col.tooltip) return th;
+  return (
+    <Tooltip
+      content={
+        <>
+          {col.tooltip}
+          <span className="mt-1 block text-fg-3">{hint}.</span>
+        </>
+      }
+      maxWidth={col.tooltipMaxWidth}
+    >
+      {th}
+    </Tooltip>
+  );
+}
+
 function MessagesTable({
   rows,
   focusMid,
@@ -2235,6 +2506,10 @@ function MessagesTable({
   watch = false,
   stick = true,
   onStickChange,
+  follow = "bottom",
+  sortBy = DEFAULT_MSG_SORT,
+  sortDir = DEFAULT_MSG_DIR,
+  onSort,
 }: {
   rows: MessageRow[];
   focusMid?: string | null;
@@ -2248,7 +2523,15 @@ function MessagesTable({
   // scroll-position changes back via onStickChange.
   watch?: boolean;
   stick?: boolean;
-  onStickChange?: (atBottom: boolean) => void;
+  onStickChange?: (atEdge: boolean) => void;
+  // follow names which edge live watch-mode tracks under the active sort:
+  // "bottom" (chronological ascending — newest last), "top" (chronological
+  // descending — newest first), or "none" (any other sort, where a new row's
+  // position is unpredictable and yanking the viewport would be hostile).
+  follow?: "bottom" | "top" | "none";
+  sortBy?: MessageSortKey;
+  sortDir?: SortDir;
+  onSort?: (key: MessageSortKey) => void;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -2258,20 +2541,25 @@ function MessagesTable({
     const el = document.getElementById(`msg-row-${focusMid}`);
     el?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [focusMid, rows]);
-  // Chat-follow: after each rows update, if watching and stuck to bottom,
-  // pin the scroll container to the newest (last, ASC-ordered) message.
+  // Chat-follow: after each rows update, if watching and stuck to the
+  // followed edge, pin the scroll container to the newest message — the
+  // BOTTOM under the chronological default, the TOP under a time-descending
+  // sort. follow="none" (any non-chronological sort) never force-scrolls.
   useEffect(() => {
-    if (!watch || !stick) return;
+    if (!watch || !stick || follow === "none") return;
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [rows, watch, stick]);
+    if (el) el.scrollTop = follow === "top" ? 0 : el.scrollHeight;
+  }, [rows, watch, stick, follow]);
   function handleScroll() {
-    if (!watch) return;
+    if (!watch || follow === "none") return;
     const el = scrollRef.current;
     if (!el) return;
-    // 40px slack so a near-bottom position still counts as "stuck".
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-    onStickChange?.(atBottom);
+    // 40px slack so a near-edge position still counts as "stuck".
+    const atEdge =
+      follow === "top"
+        ? el.scrollTop < 40
+        : el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    onStickChange?.(atEdge);
   }
   return (
     <div
@@ -2285,45 +2573,27 @@ function MessagesTable({
       <table className="w-full min-w-[1460px] text-left text-[11px]">
         <thead className="bg-bg-3/40 text-[10px] uppercase tracking-[0.06em] text-fg-3">
           <tr className="whitespace-nowrap border-b border-line-2">
-            <th className="py-1.5 pl-3 font-medium">#</th>
-            <th className="py-1.5 font-medium">Time</th>
-            <th className="py-1.5 font-medium">Msg ID</th>
-            <th className="py-1.5 font-medium">Role</th>
-            <th className="py-1.5 font-medium">Model</th>
-            <Tooltip
-              content="Reasoning effort — codex collaboration_mode.settings.reasoning_effort, antigravity SKU-encoded low/medium/high, etc. Empty for adapters that don't expose an effort knob (Anthropic models, copilot, etc.)."
-              maxWidth={420}
-            >
-              <th tabIndex={0} className="cursor-help py-1.5 font-medium focus:outline-none">
-                Effort
-              </th>
-            </Tooltip>
-            <th className="py-1.5 text-right font-medium">In</th>
-            <th className="py-1.5 text-right font-medium">Cache R</th>
-            <th className="py-1.5 text-right font-medium">Cache W</th>
-            <th className="py-1.5 text-right font-medium">Out</th>
-            <th className="py-1.5 text-right font-medium">Elapsed</th>
-            <Tooltip
-              content="Output tokens per second — this turn's output tokens ÷ its elapsed time. Only output (generated) tokens count. Blank for turns with no output or no timing."
-              maxWidth={420}
-            >
-              <th
-                tabIndex={0}
-                className="cursor-help py-1.5 text-right font-medium focus:outline-none"
-              >
-                Tok/s
-              </th>
-            </Tooltip>
-            <th className="py-1.5 text-right font-medium">Tools</th>
-            <th className="py-1.5 text-right font-medium">API $</th>
-            <th className="py-1.5 text-right font-medium">Tool $</th>
-            <th className="py-1.5 text-right font-medium">Total $</th>
-            <th className="py-1.5 pl-3 pr-3 font-medium">Content</th>
+            {MESSAGE_COLUMNS.map((col) => (
+              <SortableTh
+                key={col.key}
+                col={col}
+                active={sortBy === col.key}
+                dir={sortDir}
+                onSort={onSort ?? (() => {})}
+              />
+            ))}
           </tr>
         </thead>
         <tbody>
-          {rows.map((m, i) => {
-            const key = m.message_id || `m${i}`;
+          {rows.map((m) => {
+            // Key on row IDENTITY, never on the page index: `expanded` is
+            // keyed by this, and an index-derived key hands one row's
+            // expanded state to whatever row later occupies that slot — which
+            // reordering (sort, page, live poll) now does routinely. seq is
+            // the server's whole-timeline ordinal, unique per row and carried
+            // through every reorder, so it is a safe fallback for the (rare)
+            // row with no message_id.
+            const key = m.message_id || `seq-${m.seq}`;
             const isOpen = !!expanded[key];
             const hasToolCalls = (m.tool_calls?.length ?? 0) > 0;
             return (
@@ -2342,7 +2612,9 @@ function MessagesTable({
                     setExpanded((s) => ({ ...s, [key]: !s[key] }))
                   }
                 >
-                  <td className="py-1 pl-3 tabular-nums text-fg-3">{i + 1}</td>
+                  {/* Chronological ordinal from the server — NOT the page
+                      index, which would renumber under a non-default sort. */}
+                  <td className="py-1 pl-3 tabular-nums text-fg-3">{m.seq}</td>
                   <td className="py-1 whitespace-nowrap tabular-nums text-fg-2" title={m.timestamp}>
                     {fmtClock(m.timestamp)}
                   </td>

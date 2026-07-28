@@ -214,6 +214,25 @@ type Service struct {
 	// without a store query. A run with no established link has no entry — an
 	// honest "not correlated yet" (correlation is scored + asynchronous).
 	bySession map[string]sessionLink
+	// launching is the set of run ids that have been minted and handed to the
+	// Launcher but whose PTY handle is not installed in byHandle/byRun yet — the
+	// LAUNCH RESERVATION. It exists because the Launcher starts the OOB drain
+	// goroutine INSIDE Spawn (cmd/observer/terminal_launch.go), so a trusted OOB
+	// session frame can reach Correlate BEFORE Spawn has even returned a handle.
+	// Correlate's liveness guard (rejecting a run byRun does not track) was
+	// written to stop an ENDED run being resurrected, but byRun is equally empty
+	// for a NOT-YET-REGISTERED one, so a legitimate early correlation was
+	// silently discarded — and because the OOB session frame is one-shot, the
+	// in-memory link was lost for the whole life of the run ("Jump in" stays
+	// blank). Correlate therefore accepts a run that is live in byRun OR still
+	// reserved here. A reservation is released by whichever path leaves launch():
+	// the registration critical section on success, releaseLaunching on the
+	// Spawn-error path, and a deferred releaseLaunching as the catch-all (panic /
+	// any future early return). Every release also drops any bySession entry an
+	// early Correlate wrote, so a failed Spawn can never strand a session link
+	// that nothing could delete (no handle was produced, so EndRunByHandle — the
+	// only deleter, keyed by handle — can never fire for it).
+	launching map[string]struct{}
 }
 
 // sessionLink is a run's established in-memory correlation: the observer
@@ -263,6 +282,7 @@ func New(opts Options) *Service {
 		byRun:      make(map[string]string),
 		byMeta:     make(map[string]runMeta),
 		bySession:  make(map[string]sessionLink),
+		launching:  make(map[string]struct{}),
 	}
 }
 
@@ -507,15 +527,40 @@ func (s *Service) launch(ctx context.Context, run termrun.Run, lr LaunchRequest)
 		return LaunchResult{}, fmt.Errorf("termsvc: record run: %w", err)
 	}
 
+	// Reserve the run BEFORE handing it to the Launcher. The Launcher starts the
+	// OOB drain goroutine inside Spawn, so a trusted session frame can reach
+	// Correlate before Spawn returns; without the reservation that correlation
+	// hits an empty byRun and is dropped forever (the frame is one-shot).
+	s.mu.Lock()
+	s.launching[runID] = struct{}{}
+	s.mu.Unlock()
+	// Catch-all release: a no-op on every path that already released (success
+	// releases inside the registration critical section, the Spawn-error path
+	// releases explicitly), and the ONLY release on a panicking Spawn or any
+	// future early return added between here and registration.
+	defer s.releaseLaunching(runID)
+
 	handle, err := s.launcher.Spawn(lr)
 	if err != nil {
 		// The run exists but never produced a process — close it out so it is
-		// not left dangling as "running".
+		// not left dangling as "running". Release the reservation FIRST: it also
+		// drops any bySession entry a Correlate wrote while the run was merely
+		// launching, which would otherwise be unreachable garbage (bySession is
+		// only ever deleted by EndRunByHandle, keyed by a handle that was never
+		// produced) — exactly the resurrection leak Correlate's guard exists to
+		// prevent.
+		s.releaseLaunching(runID)
 		_ = s.rec.EndRun(ctx, runID, s.now(), -1, reasonChildExit)
 		return LaunchResult{}, err
 	}
 
 	s.mu.Lock()
+	// Release the launch reservation in the SAME critical section that installs
+	// the live mappings. Doing it as a separate lock acquisition (before or
+	// after this one) would reopen a smaller version of the very window this
+	// reservation closes — a Correlate landing between the two acquisitions
+	// would see neither launching nor byRun and drop the link.
+	delete(s.launching, runID)
 	s.byHandle[handle] = runID
 	s.byRun[runID] = handle
 	// dir is lr.Dir — the canonical, already-validated project root each caller
@@ -566,6 +611,24 @@ func (s *Service) launch(ctx context.Context, run termrun.Run, lr LaunchRequest)
 		}
 	}
 	return LaunchResult{Handle: handle, RunID: runID}, nil
+}
+
+// releaseLaunching drops a run's launch reservation and, with it, any session
+// link an early Correlate established while the run was only reserved. It is
+// idempotent: a run whose reservation was already released (the success path
+// consumes it inside the registration critical section) is left completely
+// untouched — in particular a REGISTERED run's bySession entry is never
+// disturbed, which is what makes the deferred catch-all in launch() safe.
+func (s *Service) releaseLaunching(runID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, reserved := s.launching[runID]; !reserved {
+		return
+	}
+	delete(s.launching, runID)
+	// The run never reached byHandle/byRun, so no handle exists and
+	// EndRunByHandle can never clean this up — drop it here or it leaks.
+	delete(s.bySession, runID)
 }
 
 // RunIDForHandle returns the run id a PTY handle belongs to, if known.
@@ -895,20 +958,33 @@ func (s *Service) Correlate(ctx context.Context, runID, sessionID string, source
 	// matching the "links attach only once established" rule (design §2.1a).
 	//
 	// Two invariants enforced under mu (P2-3):
-	//   (a) LIFECYCLE — update only when byRun[runID] still tracks a LIVE run.
-	//       RecordCorrelation above ran WITHOUT the lock (a store write), so an
-	//       EndRunByHandle could have deleted this run's maps in the meantime.
-	//       Writing bySession here without the guard would resurrect an ended
-	//       run's entry that nothing can ever delete (EndRunByHandle already
-	//       fired). Gating on byRun keeps bySession a strict subset of live
-	//       runs, and rejects an observation for an unknown/never-launched run.
+	//   (a) LIFECYCLE — update only when the run is still LIVE: tracked in byRun,
+	//       OR still reserved in launching (minted + handed to the Launcher but
+	//       not yet registered). RecordCorrelation above ran WITHOUT the lock (a
+	//       store write), so an EndRunByHandle could have deleted this run's maps
+	//       in the meantime. Writing bySession here without the guard would
+	//       resurrect an ended run's entry that nothing can ever delete
+	//       (EndRunByHandle already fired). The launching arm is NOT a hole in
+	//       that invariant: every path out of launch() releases the reservation
+	//       and drops the bySession entry with it, so a Spawn that fails (no
+	//       handle → EndRunByHandle can never fire) leaves nothing behind. It IS
+	//       load-bearing: the Launcher starts the OOB drain goroutine inside
+	//       Spawn, so the one-shot trusted session frame routinely arrives before
+	//       registration, and gating on byRun alone silently discarded it for the
+	//       whole life of the run. Together the two arms keep bySession a strict
+	//       subset of live-or-launching runs, and still reject an observation for
+	//       an unknown/never-launched run.
 	//   (b) MAX-UPGRADE — replace an existing link only with strictly stronger
 	//       evidence, so a later marker/heuristic observation can never clobber
 	//       a stronger OOB link in memory (the store keeps its own MAX-upgrade;
 	//       this mirrors it for the in-memory hot-path copy).
 	if corr.Linkable() {
 		s.mu.Lock()
-		if _, live := s.byRun[runID]; live {
+		_, live := s.byRun[runID]
+		if !live {
+			_, live = s.launching[runID]
+		}
+		if live {
 			if cur, exists := s.bySession[runID]; !exists || corr.Confidence > cur.confidence {
 				s.bySession[runID] = sessionLink{sessionID: sessionID, confidence: corr.Confidence}
 			}

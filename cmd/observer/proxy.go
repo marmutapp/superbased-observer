@@ -67,7 +67,7 @@ func newProxyStartCmd() *cobra.Command {
 			}
 			defer cleanup()
 
-			// buildProxy opens the DB with SkipIntegrityCheck (fast bind);
+			// buildProxy opens the DB without the integrity probe (fast bind);
 			// run the one-time quick_check + path-hash backfill in the
 			// background so it never delays the listener on a large DB.
 			go runStartupDBMaintenance(ctx, configPath)
@@ -114,11 +114,11 @@ func buildProxy(ctx context.Context, configPath, recipeName string, portOverride
 	if err := os.MkdirAll(filepath.Dir(cfg.Observer.DBPath), 0o755); err != nil {
 		return nil, nil, "", nil, nil, fmt.Errorf("ensure db dir: %w", err)
 	}
-	// SkipIntegrityCheck: this is a long-running daemon open. The multi-GB
+	// No integrity probe here: this is a long-running daemon open. The multi-GB
 	// PRAGMA quick_check is deferred off the readiness path and run once via
 	// db.RunStartupMaintenance after the listener binds (start.go / proxy.go
-	// standalone). See db.Options.SkipIntegrityCheck.
-	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+	// standalone). See db.Options.IntegrityCheck.
+	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath})
 	if err != nil {
 		return nil, nil, "", nil, nil, fmt.Errorf("open db %s: %w", cfg.Observer.DBPath, err)
 	}

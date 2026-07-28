@@ -248,7 +248,13 @@ func newInitCmd() *cobra.Command {
 					return err
 				}
 			}
+			// Elevated-ETW-capturer setup surface (process-obs plan §W4).
+			// Writes nothing — it probes for the Scheduled Task and, when
+			// absent, emits the one elevated command observer is structurally
+			// unable to run itself. Silent unless [observer.process.etw] is
+			// enabled AND this host has schtasks.exe.
 			if !flagUninstall {
+				initProcessBridgeTaskStep(cmd.Context(), out, resolvedConfig)
 				printCommunityFooter(out)
 			}
 			return nil

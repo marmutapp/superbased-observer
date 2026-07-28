@@ -220,31 +220,73 @@ func TestTTLDuration(t *testing.T) {
 }
 
 // TestMinCacheableTokens pins the model-family → min-cacheable
-// table per research doc §2.1. One row per family; any future
-// provider update is a one-line table addition (§24.5
-// discipline).
+// table against the vendor page
+// (platform.claude.com/docs/en/build-with-claude/prompt-caching,
+// "Minimum cacheable prompt length", verified 2026-07-25). One row
+// per family; any future provider update is a one-line table
+// addition (§24.5 discipline).
+//
+// Every `want` here is a LITERAL, deliberately — including the
+// 1,024 rows that land on defaultMinCacheable. Writing those as
+// `defaultMinCacheable` would pin the identifier rather than the
+// value: the assertion would still pass if someone redefined the
+// constant to 512, which is exactly the regression the rows claim
+// to guard.
 func TestMinCacheableTokens(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		model string
 		want  int
 	}{
-		// Default 1024 — Opus 4.8, Sonnet 4.5/4.6, Opus 4/4.1.
-		{"claude-opus-4-8", defaultMinCacheable},
-		{"claude-sonnet-4-6", defaultMinCacheable},
-		{"claude-opus-4", defaultMinCacheable},
-		{"claude-opus-4-1", defaultMinCacheable},
-		// 4096 — Opus 4.5–4.7 family.
+		// 512 — Opus 5 / Fable 5 / Mythos 5. Opus 5 halved the Opus
+		// 4.8 minimum.
+		{"claude-opus-5", 512},
+		{"claude-opus-5-20260610", 512},
+		{"claude-fable-5", 512},
+		{"claude-mythos-5", 512},
+		// Case normalization: MinCacheableTokens lowercases before
+		// the scan, matching the pricing registry's family scan. An
+		// upper/mixed-case or vendor-decorated id must resolve to the
+		// same 512 tier, not silently fall through to 1,024.
+		{"CLAUDE-OPUS-5", 512},
+		{"us.anthropic.Claude-Opus-5-v1:0", 512},
+		{"Claude-Haiku-3-5", 2048},
+		// 1024 — the fall-through default: Sonnet 5, Opus 4.8,
+		// Sonnet 4.5/4.6, Sonnet 4, Opus 4/4.1. claude-sonnet-5 is
+		// the shadow guard for the 512 rows: a sloppier Match (e.g.
+		// "-5") would capture it.
+		{"claude-sonnet-5", 1024},
+		{"claude-opus-4-8", 1024},
+		{"claude-sonnet-4-6", 1024},
+		{"claude-sonnet-4-5", 1024},
+		{"claude-sonnet-4", 1024},
+		{"claude-opus-4", 1024},
+		{"claude-opus-4-1", 1024},
+		// 4096 — Opus 4.5 / 4.6 + Haiku 4.5. Regression guards:
+		// these must NOT be shadowed by the 512 rows placed above
+		// them.
 		{"claude-opus-4-5", 4096},
 		{"claude-opus-4-6-20250101", 4096},
-		{"claude-opus-4-7", 4096},
-		// 4096 — Haiku 4.5.
 		{"claude-haiku-4-5", 4096},
-		// 2048 — older Haiku 3.5.
+		// 2048 — Opus 4.7 + older Haiku 3.5. Opus 4.7 is NOT a 4,096
+		// model: it sat in the 4,096 group until 2026-07-25 on a
+		// stale research-doc figure, which made every
+		// 2,048–4,095-token Opus 4.7 prefix report below_min for a
+		// prefix the provider actually caches.
+		{"claude-opus-4-7", 2048},
+		{"claude-opus-4-7-20260401", 2048},
 		{"claude-haiku-3-5", 2048},
+		// 2048 — Mythos Preview. Distinct from claude-mythos-5
+		// (512): "mythos-5" does not substring-match
+		// "claude-mythos-preview", so without its own row this id
+		// fell through to 1,024 — the dangerous direction (engine
+		// predicts a write on a 1,024–2,047-token prefix the
+		// provider never caches, then grades a mispredict).
+		{"claude-mythos-preview", 2048},
+		{"claude-mythos-preview-20260501", 2048},
 		// Unknown model → default.
-		{"gpt-5", defaultMinCacheable},
-		{"", defaultMinCacheable},
+		{"gpt-5", 1024},
+		{"", 1024},
 	}
 	for _, tt := range tests {
 		if got := MinCacheableTokens(tt.model); got != tt.want {

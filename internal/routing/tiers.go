@@ -322,7 +322,12 @@ func normalizeUnplacedModel(model string) string {
 // will serve.
 var seedTiers = map[string]Tier{
 	// Anthropic. Family prefixes carry the placement; explicit minors
-	// pin the flagship SKUs the engine most often reasons about.
+	// pin the flagship SKUs the engine most often reasons about. The
+	// bare "claude-opus" family prefix already places every Opus SKU,
+	// so an explicit minor here is a statement of prominence, not a
+	// correctness fix — claude-opus-5 (2026-07-25) is the current
+	// flagship for complex agentic coding, hence the pin.
+	"claude-opus-5":     TierOpusClass,
 	"claude-opus-4-8":   TierOpusClass,
 	"claude-opus-4":     TierOpusClass,
 	"claude-opus-4-1":   TierOpusClass,
@@ -414,9 +419,60 @@ var seedTiers = map[string]Tier{
 // seedRepresentatives names the canonical downshift target per
 // (provider shape, tier). Selection stays same-shape (§R11.4); a cell
 // absent here means "no curated target — decline the move".
+//
+// The Anthropic Opus-class cell moved claude-opus-4-8 → claude-opus-5 on
+// 2026-07-25, operator-approved. This cell is live behaviour, not
+// documentation: it is what `[routing] mode = "enforce"` actually
+// rewrites an Opus-class request TO, so changing it changes traffic.
+// Both SKUs are Anthropic-shape, so the §R11.4 same-shape constraint is
+// unaffected, and they price identically ($5 in / $25 out per MTok,
+// cache read $0.50, 5m write $6.25, 1h write $10, fast 2×) — so there is
+// no per-token cost delta.
+//
+// Three things are load-bearing — the first is the one reviewers keep
+// getting wrong, so it is stated first and explicitly:
+//
+//  1. It does NOT churn incumbent Opus sessions. A reviewer reading
+//     applyPin naturally lands on `!ok || candidate == in.Shape.Model
+//     → ReasonNoCandidate` and concludes that a live claude-opus-4-8
+//     session under a `pin_tier = opus-class` rule now takes a
+//     same-tier rewrite that forfeits its warm prefix for zero gross
+//     saving. That is WRONG: applyPin returns at an EARLIER guard,
+//     `if tier == r.Action.PinTier`, which matches on TIER identity —
+//     an Opus-4.8 incumbent is already opus-class, so it returns with
+//     the rule's own reason before the representative is ever
+//     resolved. Verified empirically 2026-07-25 (and by mutation: the
+//     forfeit scenario appears only if that early return is deleted).
+//     The `candidate == in.Shape.Model` guard is in fact unreachable
+//     with a self-consistent tier table, since `tier != PinTier`
+//     already excludes the pinned tier's own representative; only an
+//     operator tier override can reach it.
+//  2. What DOES change is the upshift target: a lower-tier incumbent
+//     pinned to opus-class now lands on claude-opus-5 rather than
+//     claude-opus-4-8. Rates are identical, so that move costs the
+//     same as before — genuinely neutral, not merely claimed to be.
+//     Pinned by TestApplyPin_OpusFivePromotionEconomics.
+//  3. claude-opus-5 draws on a SEPARATE rate-limit / entitlement bucket
+//     from the combined Opus 4.x pool (per Anthropic's docs). An
+//     enforce-mode node whose account lacks Opus 5 access is now
+//     rewritten into a model that fails, where claude-opus-4-8 worked.
+//     This is the real operational risk of the swap.
+//
+// This cell has a SECOND consumer beyond the routing engine:
+// cmd/observer/handoff_target.go::resolveTargetModelViaTier uses it to
+// pick the cross-family handoff target, so changing it also changes
+// what a gpt-5.x → claude-code handoff seeds (pinned by
+// cmd/observer/handoff_target_test.go).
+//
+// Changing a shipped default this way is invasive rather than additive
+// (CLAUDE.md §6): it retargets existing behaviour — upshift pins and
+// cross-family handoffs — rather than merely making a new option
+// available. Incumbent Opus sessions are NOT retargeted (see 1 above).
+// Landed deliberately with operator approval; recorded here so the
+// trade-off is not rediscovered as a bug.
 var seedRepresentatives = map[ProviderShape]map[Tier]string{
 	ShapeAnthropic: {
-		TierOpusClass:   "claude-opus-4-8",
+		TierOpusClass:   "claude-opus-5",
 		TierSonnetClass: "claude-sonnet-4-6",
 		TierHaikuClass:  "claude-haiku-4-5",
 	},

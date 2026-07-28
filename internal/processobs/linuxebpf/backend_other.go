@@ -16,8 +16,18 @@ import (
 // enum_other.go).
 type backend struct{}
 
-// New builds the non-Linux stub Backend.
-func New(opts Options) processobs.Backend { return &backend{} }
+// New builds the non-Linux stub Backend. It records the network-accounting
+// status as UNAVAILABLE (rather than leaving it unset) so a non-Linux host
+// reports "not measured" honestly instead of implying a measured zero: eBPF
+// cannot see Windows or macOS processes, and per-process byte accounting there
+// needs ETW / EndpointSecurity, which are not implemented.
+func New(opts Options) processobs.Backend {
+	if opts.NetworkAccounting {
+		opts.NetworkStatus.Set(processobs.NetworkAccountingUnavailable,
+			"per-process network bytes need eBPF (Linux); Windows needs ETW, macOS EndpointSecurity — neither implemented")
+	}
+	return &backend{}
+}
 
 func (b *backend) Name() string { return "linux_ebpf" }
 

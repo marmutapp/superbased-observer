@@ -162,28 +162,25 @@ func newTailCmd() *cobra.Command {
 	return cmd
 }
 
-// loadConfigAndDB centralizes the config + DB open boilerplate the three
-// diag commands all need. Caller must invoke cleanup() to close the DB.
-func loadConfigAndDB(ctx context.Context, configPath string) (config.Config, *sql.DB, func(), error) {
-	return loadConfigAndDBOpts(ctx, configPath, false)
-}
-
-// loadConfigAndDBFast is loadConfigAndDB for callers INSIDE the long-running
-// daemon (`observer start` and its feature goroutines). It opens the DB with
-// SkipIntegrityCheck so the multi-GB `PRAGMA quick_check` never runs on the
-// hot open — the daemon runs that probe exactly once, off the readiness path,
-// via db.RunStartupMaintenance (see start.go). The daemon opens the same file
-// from a dozen goroutines; without this each would re-verify the whole DB,
-// serializing the readiness path and then hammering the disk after ready.
+// loadConfigAndDB centralizes the config + DB open boilerplate that every
+// command in this package needs. Caller must invoke cleanup() to close the DB.
 //
-// Do NOT use from one-shot CLI commands — keep loadConfigAndDB (integrity ON)
-// for `observer doctor` / `observer prune` / `observer backfill`, which want
-// the check and are not latency-sensitive.
-func loadConfigAndDBFast(ctx context.Context, configPath string) (config.Config, *sql.DB, func(), error) {
-	return loadConfigAndDBOpts(ctx, configPath, true)
-}
-
-func loadConfigAndDBOpts(ctx context.Context, configPath string, skipIntegrity bool) (config.Config, *sql.DB, func(), error) {
+// There is deliberately only ONE of these. It used to have a
+// `loadConfigAndDBFast` twin that differed solely in passing
+// SkipIntegrityCheck, and the split was the bug: `PRAGMA quick_check`
+// checksums every page of the file, so the "slow" variant made every
+// read-only reporting command's cost scale with the size of the database
+// rather than with the query. On the reference 14.7 GB install that was
+// >120s to print a table. Callers picked the wrong twin four separate times
+// (the MCP server, the daemon, `observer run`, and then the ~85 sites
+// reaching this function) because nothing at the call site signals which one
+// is correct.
+//
+// db.Open no longer verifies by default (see db.Options.IntegrityCheck), so
+// this is now uniformly the fast path. The probe still runs where it belongs:
+// once per daemon via db.RunStartupMaintenance, off the readiness path, and
+// as `observer doctor`'s reported `db.integrity` check.
+func loadConfigAndDB(ctx context.Context, configPath string) (config.Config, *sql.DB, func(), error) {
 	cfg, err := config.Load(config.LoadOptions{GlobalPath: configPath})
 	if err != nil {
 		return config.Config{}, nil, func() {}, fmt.Errorf("load config: %w", err)
@@ -191,7 +188,7 @@ func loadConfigAndDBOpts(ctx context.Context, configPath string, skipIntegrity b
 	if err := os.MkdirAll(filepath.Dir(cfg.Observer.DBPath), 0o755); err != nil {
 		return config.Config{}, nil, func() {}, fmt.Errorf("ensure db dir: %w", err)
 	}
-	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: skipIntegrity})
+	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath})
 	if err != nil {
 		return config.Config{}, nil, func() {}, fmt.Errorf("open db %s: %w", cfg.Observer.DBPath, err)
 	}
@@ -201,7 +198,7 @@ func loadConfigAndDBOpts(ctx context.Context, configPath string, skipIntegrity b
 
 // runStartupDBMaintenance runs the daemon's one-time DB integrity probe and
 // schema-034 path-hash backfill in the background, OFF the readiness path.
-// Every daemon db.Open now passes SkipIntegrityCheck (fast bind); this pays
+// db.Open never verifies by default (fast bind); this pays
 // the multi-GB `PRAGMA quick_check` exactly once, after the listener is
 // already serving. Called from a single goroutine per daemon process
 // (`observer start` / `observer proxy start` / `observer watch`).
@@ -211,7 +208,7 @@ func loadConfigAndDBOpts(ctx context.Context, configPath string, skipIntegrity b
 // and a false alarm from a transient read must not take it down. Uses its own
 // short-lived handle so it doesn't outlive on a component's pool.
 func runStartupDBMaintenance(ctx context.Context, configPath string) {
-	cfg, database, cleanup, err := loadConfigAndDBFast(ctx, configPath)
+	cfg, database, cleanup, err := loadConfigAndDB(ctx, configPath)
 	if err != nil {
 		return
 	}

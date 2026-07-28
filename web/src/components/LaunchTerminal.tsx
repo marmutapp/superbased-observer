@@ -3,6 +3,16 @@ import { isRemoteView } from "@/lib/remote";
 import { pushToast } from "@/components/Toast";
 import { useCompanionRegistry } from "@/components/primitives/companion";
 import { Tooltip, TooltipSpan } from "@/components/primitives";
+import { useMobileTerminal } from "@/lib/useMediaQuery";
+import { platformPrefLabel, useKeyPlatform } from "@/lib/keyPlatform";
+import {
+  NO_SOFT_MODS,
+  TerminalKeyBar,
+  applySoftMods,
+  clearOneShots,
+  softModsActive,
+  type SoftMods,
+} from "@/components/TerminalKeyBar";
 import {
   STANDING_REMEMBER_RISK,
   type TerminalControlDenialReason,
@@ -88,7 +98,12 @@ type Props = {
   sessionPanelEnabled?: boolean;
 };
 
-export type Status = "connecting" | "open" | "exited" | "error";
+export type Status =
+  | "connecting"
+  | "open"
+  | "reconnecting"
+  | "exited"
+  | "error";
 
 // isLiveStatus is the single predicate for "is this token still live?" — i.e.
 // its project can still be browsed and it can still be docked/paste-targeted. A
@@ -96,8 +111,55 @@ export type Status = "connecting" | "open" | "exited" | "error";
 // (P2-3): both must gate the project panel off, close an open panel, and revoke
 // the paste writer. Undefined/"connecting" count as live (optimistic, matching
 // the pre-existing disabled-gate semantics).
+//
+// "reconnecting" is LIVE by construction (2026-07-25, mobile terminal-continuity
+// arc): the PTY is a server-side object that outlives its viewers — the manager
+// removes a viewer WITHOUT killing the process — so a dropped websocket says
+// nothing at all about the session. Treating a transport drop as death is what
+// made a phone returning from its mail app find every terminal tombstoned.
 export function isLiveStatus(s: Status | undefined): boolean {
   return s !== "exited" && s !== "error";
+}
+
+// STANDING_REACQUIRE_COOLDOWN_MS bounds the automatic standing re-present that
+// answers an expiry demote (review B3). A writer lease ages out on the order of
+// minutes, so 5s never suppresses a legitimate re-acquire — it only stops a
+// pathological server (or a demote storm) from turning one open socket into a
+// stream of argon2 verifies.
+const STANDING_REACQUIRE_COOLDOWN_MS = 5000;
+
+// IMMEDIATE_RECONNECT_MIN_MS throttles the backoff-bypassing reconnect that a
+// visibilitychange/pageshow triggers. One second is far below any human
+// tab-switch cadence, so the intended "come back to the tab, terminal is there"
+// flow is untouched.
+const IMMEDIATE_RECONNECT_MIN_MS = 1000;
+
+// isPermanentAuthDenial reports whether a control_denied reason is a PERMANENT
+// verdict on the presented credential — the only condition under which a saved
+// standing secret may be destroyed.
+//
+// It is deliberately an allow-list rather than "not one of these transient
+// ones": a reason this client has never heard of (an older or newer daemon)
+// must fall on the safe side, because forgetting the secret is irreversible for
+// the user — the owner has to mint and convey a new one — while keeping a
+// genuinely dead secret costs nothing but one more denied attempt.
+//
+// Exactly two reasons qualify:
+//   - "auth"          the credential was compared and rejected (wrong/rotated).
+//   - "auth_revoked"  standing access was revoked and never re-provisioned, so
+//                     the server holds no secret at rest at all. Nothing was
+//                     wrong with what this device sent — but nothing can match
+//                     it again either, since a re-mint issues a different
+//                     secret. Without this reason a revoked-and-forgotten
+//                     secret sat in localStorage being retried forever.
+//
+// Everything else — notably "auth_transient" (standing access momentarily
+// disabled with the secret still at rest, rate-limited, or an acquire that
+// raced an admin transition) — keeps the secret.
+function isPermanentAuthDenial(
+  reason: TerminalControlDenialReason | undefined,
+): boolean {
+  return reason === "auth" || reason === "auth_revoked";
 }
 
 // keyboardApi returns the (Chromium-only) Keyboard Lock API surface without
@@ -157,6 +219,17 @@ export function LaunchTerminal({
   sessionPanelEnabled,
 }: Props) {
   const companion = useCompanionRegistry();
+  // Touch presentation gate (capability query — coarse pointer AND small
+  // viewport). EVERY branch keyed off this is additive: a desktop user, or a
+  // desktop user who merely narrows the window, gets the shipped rendering
+  // unchanged (CLAUDE.md rule 3).
+  const isTouch = useMobileTerminal();
+  // D13: which modifier VOCABULARY the on-screen key bar prints — the DAEMON's
+  // OS (/api/status.host_os), overridable from the ⋯ menu. The host, not the
+  // browser: the browser is often a phone that is not the machine whose PTY
+  // this is. ONE owner here; the resolved platform goes down to TerminalKeyBar
+  // as a plain string. Labels only — it changes no byte on the wire.
+  const keyPlatform = useKeyPlatform();
   const hostRef = useRef<HTMLDivElement | null>(null);
   // Mirrors `expanded` for the ws handlers (closure-stable): only the
   // currently-expanded floating panel may steal focus on socket open — a
@@ -193,6 +266,46 @@ export function LaunchTerminal({
   // no longer "open".
   const statusRef = useRef(status);
   statusRef.current = status;
+
+  // ── D3: sticky soft modifiers for the on-screen key bar ─────────────────
+  // ONE OWNER (CLAUDE.md #4). The state lives here, not in TerminalKeyBar,
+  // because an armed Ctrl must also apply to characters that arrive from the
+  // PHONE'S OWN soft keyboard — those land on `term.onData`, below, which is
+  // this component's single write seam. TerminalKeyBar owns the encoding table
+  // (applySoftMods / arrowSeq) and the presentation; it reads this state and
+  // reports changes back. The ref mirror is what the long-lived onData closure
+  // reads.
+  const [softMods, setSoftMods] = useState<SoftMods>(NO_SOFT_MODS);
+  const softModsRef = useRef(softMods);
+  softModsRef.current = softMods;
+  const setSoftModsBoth = (next: SoftMods) => {
+    softModsRef.current = next;
+    setSoftMods(next);
+  };
+  // consumeSoftMods is called from term.onData for EVERY outbound keystroke.
+  // With no modifier armed it is the identity function, so the desktop path is
+  // byte-for-byte what it was. With one armed it encodes the combination and
+  // retires the one-shot (a locked modifier survives).
+  const consumeSoftMods = (data: string): string => {
+    const m = softModsRef.current;
+    if (!softModsActive(m)) return data;
+    // ONLY a single printable character counts as "the keystroke this modifier
+    // applies to". Everything else must pass through AND leave the armed
+    // modifier alone, because onData also fires for
+    //   - sequences the key bar already emitted fully formed (an arrow carries
+    //     its own CSI modifier parameter), and — the sharp one —
+    //   - xterm's AUTO-GENERATED protocol replies to TUI queries (CPR/DA).
+    // A machine reply carries no human intent; spending the user's armed Ctrl
+    // on it would make the modifier evaporate at random, whenever the TUI
+    // happened to ask the terminal a question.
+    const code = data.length === 1 ? data.charCodeAt(0) : -1;
+    if (code < 0x20 || code > 0x7e) return data;
+    const out = applySoftMods(data, m);
+    const next = clearOneShots(m);
+    if (next.ctrl !== m.ctrl || next.alt !== m.alt) setSoftModsBoth(next);
+    return out;
+  };
+
   // Acquire-control form state. The capability + confirm are held ONLY in these
   // inputs, cleared the instant the frame is sent — never persisted, never put
   // in a URL/query (§8.1 #5).
@@ -215,9 +328,19 @@ export function LaunchTerminal({
   // (it is the risky part — the secret then lives in this browser).
   const [rememberStanding, setRememberStanding] = useState(false);
   // standingAttemptRef marks that the in-flight acquire used a standing secret.
-  // Only an explicit reason:"auth" denial may then clear the stored secret and
-  // show the revoked/rotated fallback; policy/lifecycle denials preserve it.
+  // Only a PERMANENT credential denial (isPermanentAuthDenial) may then clear
+  // the stored secret and show the revoked/rotated fallback; policy/lifecycle
+  // denials preserve it.
   const standingAttemptRef = useRef(false);
+  // lastStandingReacquireRef throttles the automatic standing re-present that
+  // answers an EXPIRY demote (review B3). The socket stays open across an
+  // aged-out lease, so `sock.onopen` — where the normal auto-present lives —
+  // never re-fires; without this the "silently re-acquire" behaviour the
+  // demote was built for did not exist and the user had to tap. A cooldown
+  // bounds it to one attempt per window even if a server ever emitted expiry
+  // demotes in a tight loop: the re-present is free for the user but costs the
+  // server an argon2 verify.
+  const lastStandingReacquireRef = useRef(0);
   // wasRevokedRef tracks whether THIS seat has lost control at least once, so a
   // later control_granted reads as REGAINING control (fire the "you have
   // control" toast) rather than a first-ever acquire (silent). Part of the
@@ -309,6 +432,43 @@ export function LaunchTerminal({
     let term: import("@xterm/xterm").Terminal | null = null;
     let fit: import("@xterm/addon-fit").FitAddon | null = null;
     let ro: ResizeObserver | null = null;
+
+    // ── Reconnect state (2026-07-25, mobile terminal-continuity arc) ────────
+    // The server keeps the PTY alive across a viewer disconnect (termsession
+    // Unsubscribe removes the viewer WITHOUT killing the child, and idle reaping
+    // is off by default), so a closed socket is a TRANSPORT event, not a session
+    // end. We therefore retry indefinitely while this component is mounted.
+    // Two states are the exceptions where retrying would be wrong:
+    //   ptyExited   — an authoritative {"t":"exit"} frame arrived: the child is
+    //                 genuinely gone, there is nothing to reconnect to.
+    //   sessionGone — a connect attempt was REJECTED with policy-violation 1008
+    //                 having delivered nothing: the handle no longer exists.
+    // Everything else backs off and tries again.
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let attempt = 0;
+    // Timestamp of the last backoff-BYPASSING reconnect (the visibility/pageshow
+    // path), used to throttle it — see reconnectNow.
+    let lastImmediateReconnect = 0;
+    let ptyExited = false;
+    let sessionGone = false;
+    // Assigned once the terminal is mounted; the visibility handler below is
+    // registered synchronously (so its removal in cleanup is unconditional) and
+    // is simply inert until then.
+    let reconnectNow: (() => void) | null = null;
+
+    // Returning to a backgrounded tab must restore the terminal IMMEDIATELY,
+    // bypassing whatever backoff delay is pending — this is the operator's exact
+    // flow (leave to copy a code from the mail app, come back). Mobile browsers
+    // FREEZE a backgrounded tab, so the socket is usually already dead by the
+    // time we get here. pageshow covers the iOS/Safari bfcache restore, which
+    // does not always fire visibilitychange.
+    const onVisible = () => {
+      if (disposed) return;
+      if (document.visibilityState !== "visible") return;
+      reconnectNow?.();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("pageshow", onVisible);
 
     (async () => {
       // Lazy chunk: JS + CSS only load when a terminal is actually opened.
@@ -474,10 +634,6 @@ export function LaunchTerminal({
         /* container not laid out yet — the ResizeObserver will fit shortly */
       }
 
-      const proto = window.location.protocol === "https:" ? "wss" : "ws";
-      ws = new WebSocket(`${proto}://${window.location.host}/ws/launch/${token}`);
-      ws.binaryType = "arraybuffer";
-      wsRef.current = ws;
       // A remote device is a read-only viewer until control is granted, so make
       // the terminal visually read-only up front (keystrokes are ALSO dropped
       // server-side; this is the client-side half + honest affordance).
@@ -490,242 +646,419 @@ export function LaunchTerminal({
         );
       };
 
-      ws.onopen = () => {
-        if (disposed) return;
-        setStatus("open");
-        // A read-only remote viewer must NEVER fit()/resize the PTY — only a
-        // writer tracks the container via fit() (Change 2b). The viewer's
-        // display geometry instead follows the writer's own dims once the
-        // pty_size frame arrives (applyViewerScale, below).
-        if (!(isRemote && !canWriteRef.current)) {
+      // scheduleReconnect arms the next attempt with exponential backoff +
+      // jitter (~1s → 15s cap), retrying for as long as the tab is open. The
+      // jitter keeps a grid of terminals from reconnecting in lockstep after a
+      // daemon restart. Mirrors the disposed-guard shape of useTerminalStatuses.
+      const scheduleReconnect = () => {
+        if (disposed || ptyExited || sessionGone || reconnectTimer) return;
+        attempt += 1;
+        const backoff = Math.min(15000, 1000 * 2 ** (attempt - 1));
+        const delay = Math.round(backoff * (0.7 + Math.random() * 0.6));
+        setStatus((s) => (s === "exited" || s === "error" ? s : "reconnecting"));
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          connect();
+        }, delay);
+      };
+
+      const connect = () => {
+        if (disposed || ptyExited || sessionGone) return;
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+        // Single-socket invariant: whoever calls connect() supersedes any
+        // existing socket, so close it rather than orphaning it (its handlers
+        // already no-op via the ws !== sock guard, but the connection itself
+        // would otherwise leak).
+        if (ws && ws.readyState !== WebSocket.CLOSED) {
+          const stale = ws;
+          ws = null; // suppress the stale socket's onclose retry
           try {
-            fit?.fit();
+            stale.close();
           } catch {
             /* ignore */
           }
-          sendResize();
         }
-        // Initial size frame: a read-only viewer scales to fit rather than
-        // riding the fit() geometry (Change 2b). The writer geometry may not
-        // be known yet — the pty_size handler below re-triggers this once it
-        // arrives.
-        applyViewerScale();
-        if (expandedRef.current) term?.focus();
-        // Standing-access auto-acquire (§B): on a remote device with a stored
-        // standing secret, present it ONCE now (confirm empty — the server
-        // routes it by its `standing.` prefix). This is the whole point of
-        // standing access: control is re-acquired on every fresh socket with no
-        // owner round-trip. Exactly one attempt per open — never a retry loop;
-        // a rejection (revoked/rotated) is handled in onmessage below.
-        if (isRemote && ws && ws.readyState === WebSocket.OPEN) {
-          const stored = getStoredStandingSecret();
-          if (stored) {
-            standingAttemptRef.current = true;
-            ws.send(JSON.stringify({ t: "acquire-writer", cap: stored, confirm: "" }));
-            setControl("requesting");
-          }
-        }
+        const proto = window.location.protocol === "https:" ? "wss" : "ws";
+        const sock = new WebSocket(
+          `${proto}://${window.location.host}/ws/launch/${token}`,
+        );
+        sock.binaryType = "arraybuffer";
+        ws = sock;
+        wsRef.current = sock;
+        // Per-SOCKET activity, not per-mount: the 1008 "session not found"
+        // discrimination below has to hold for a reconnect attempt too, and a
+        // reconnect to a live session always replays the output ring.
+        sawActivityRef.current = false;
+        // Every handler below guards `ws !== sock` so a superseded socket's late
+        // event can never mutate state that belongs to the current one.
+        wireSocket(sock, scheduleReconnect);
       };
 
-      ws.onmessage = (ev: MessageEvent) => {
-        if (!term) return;
-        if (typeof ev.data === "string") {
-          // Text frame = control message.
-          try {
-            const m = JSON.parse(ev.data) as {
-              t?: string;
-              code?: number;
-              rows?: number;
-              cols?: number;
-              initial_rows?: number;
-              initial_cols?: number;
-              gen?: number;
-              by?: "local" | "remote";
-              reason?: TerminalControlDenialReason;
-            };
-            if (m.t === "exit") {
-              sawActivityRef.current = true;
-              setExitCode(typeof m.code === "number" ? m.code : 0);
-              setStatus("exited");
-            } else if (m.t === "pty_size") {
-              // Feature A / Feature 2: the server's geometry frame (sent on open
-              // and re-sent on each control transition). It carries BOTH the
-              // writer's CURRENT dims (rows/cols) and the LAUNCH dims
-              // (initial_rows/initial_cols) — each may be 0/unknown.
-              const ir = m.initial_rows;
-              const ic = m.initial_cols;
-              if (typeof ir === "number" && typeof ic === "number" && ir > 0 && ic > 0) {
-                const dims = { rows: ir, cols: ic };
-                initialDimsRef.current = dims;
-                setInitialDims(dims);
-                // Persisted "original" from a prior mount: apply now that the
-                // geometry is known (open-time fit already ran in fit mode).
-                if (sizeModeRef.current === "original" && termRef.current) {
+      // reconnectNow is the bypass the visibility/pageshow handler calls: drop
+      // any pending backoff and reconnect on the spot, but only when the socket
+      // is genuinely not usable (a still-OPEN or in-flight CONNECTING socket is
+      // left alone).
+      reconnectNow = () => {
+        if (disposed || ptyExited || sessionGone) return;
+        if (
+          ws &&
+          (ws.readyState === WebSocket.OPEN ||
+            ws.readyState === WebSocket.CONNECTING)
+        ) {
+          return;
+        }
+        // Backoff-bypass throttle. Returning to the tab resets `attempt`, which
+        // is right for the human flow (one return, one immediate retry) but
+        // means repeated visibility flips against a DOWN server could each buy
+        // an immediate connect and hold the backoff at zero. The OPEN/CONNECTING
+        // guard above already makes that self-limiting (a flip during an
+        // in-flight attempt is a no-op), so this is belt-and-braces: at most one
+        // bypass per second, and a flip inside that window falls back to the
+        // normal exponential schedule rather than doing nothing.
+        const nowMs = Date.now();
+        if (nowMs - lastImmediateReconnect < IMMEDIATE_RECONNECT_MIN_MS) {
+          scheduleReconnect();
+          return;
+        }
+        lastImmediateReconnect = nowMs;
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+        attempt = 0; // a deliberate return to the tab is not a failure streak
+        connect();
+      };
+
+      function wireSocket(sock: WebSocket, onDrop: () => void) {
+        sock.onopen = () => {
+          if (disposed || ws !== sock) return;
+          attempt = 0;
+          setStatus("open");
+          setErrMsg(null);
+          // A read-only remote viewer must NEVER fit()/resize the PTY — only a
+          // writer tracks the container via fit() (Change 2b). The viewer's
+          // display geometry instead follows the writer's own dims once the
+          // pty_size frame arrives (applyViewerScale, below).
+          if (!(isRemote && !canWriteRef.current)) {
+            try {
+              fit?.fit();
+            } catch {
+              /* ignore */
+            }
+            sendResize();
+          }
+          // Initial size frame: a read-only viewer scales to fit rather than
+          // riding the fit() geometry (Change 2b). The writer geometry may not
+          // be known yet — the pty_size handler below re-triggers this once it
+          // arrives.
+          applyViewerScale();
+          if (expandedRef.current) term?.focus();
+          // Standing-access auto-acquire (§B): on a remote device with a stored
+          // standing secret, present it ONCE now (confirm empty — the server
+          // routes it by its `standing.` prefix). This is the whole point of
+          // standing access: control is re-acquired on every fresh socket with no
+          // owner round-trip. Exactly one attempt per open — never a retry loop;
+          // a rejection (revoked/rotated) is handled in onmessage below.
+          //
+          // This lives in onopen, which is wired per-SOCKET, so it re-runs on
+          // every RECONNECT as well as the first mount — that is what regains
+          // write control after a background/foreground round-trip with no user
+          // action at all.
+          if (isRemote && sock.readyState === WebSocket.OPEN) {
+            const stored = getStoredStandingSecret();
+            if (stored) {
+              standingAttemptRef.current = true;
+              sock.send(
+                JSON.stringify({ t: "acquire-writer", cap: stored, confirm: "" }),
+              );
+              setControl("requesting");
+            }
+          }
+        };
+
+        sock.onmessage = (ev: MessageEvent) => {
+          if (!term || ws !== sock) return;
+          if (typeof ev.data === "string") {
+            // Text frame = control message.
+            try {
+              const m = JSON.parse(ev.data) as {
+                t?: string;
+                code?: number;
+                rows?: number;
+                cols?: number;
+                initial_rows?: number;
+                initial_cols?: number;
+                gen?: number;
+                by?: "local" | "remote";
+                expiry?: boolean;
+                reason?: TerminalControlDenialReason;
+              };
+              if (m.t === "exit") {
+                // The AUTHORITATIVE "really exited" signal — the only thing that
+                // proves the child is gone. Latch it so the close that follows is
+                // not mistaken for a transport drop and retried forever.
+                sawActivityRef.current = true;
+                ptyExited = true;
+                setExitCode(typeof m.code === "number" ? m.code : 0);
+                setStatus("exited");
+              } else if (m.t === "pty_size") {
+                // Feature A / Feature 2: the server's geometry frame (sent on open
+                // and re-sent on each control transition). It carries BOTH the
+                // writer's CURRENT dims (rows/cols) and the LAUNCH dims
+                // (initial_rows/initial_cols) — each may be 0/unknown.
+                const ir = m.initial_rows;
+                const ic = m.initial_cols;
+                if (typeof ir === "number" && typeof ic === "number" && ir > 0 && ic > 0) {
+                  const dims = { rows: ir, cols: ic };
+                  initialDimsRef.current = dims;
+                  setInitialDims(dims);
+                  // Persisted "original" from a prior mount: apply now that the
+                  // geometry is known (open-time fit already ran in fit mode).
+                  if (sizeModeRef.current === "original" && termRef.current) {
+                    try {
+                      termRef.current.resize(ic, ir);
+                    } catch {
+                      /* ignore */
+                    }
+                    // A read-only viewer must never push a resize to the PTY
+                    // (that's a writer-only operation) — but it still resizes
+                    // its own display below, via applyViewerScale.
+                    if (!(isRemote && !canWriteRef.current)) {
+                      sendResizeNow(ir, ic);
+                    }
+                  }
+                }
+                // Track the writer's CURRENT geometry for the viewer downscale,
+                // preferring the live rows/cols over the launch dims so a writer
+                // that resized after launch is reflected (not the stale launch
+                // size). Falls back to initial when current is absent/zero.
+                const cr = typeof m.rows === "number" && m.rows > 0 ? m.rows : ir;
+                const cc = typeof m.cols === "number" && m.cols > 0 ? m.cols : ic;
+                if (
+                  typeof cr === "number" &&
+                  typeof cc === "number" &&
+                  cr > 0 &&
+                  cc > 0
+                ) {
+                  writerGeomRef.current = { rows: cr, cols: cc };
+                }
+                // The writer's geometry is now known — recompute the viewer
+                // downscale (Change 2b). onopen ran before this frame arrived, so
+                // this is the actual trigger that renders a viewer at the writer's
+                // size.
+                applyViewerScale();
+              } else if (m.t === "control_granted") {
+                const grantGen =
+                  typeof m.gen === "number" &&
+                  Number.isSafeInteger(m.gen) &&
+                  m.gen > 0
+                    ? m.gen
+                    : 0;
+                if (grantGen > 0) {
+                  latestGrantedGenRef.current = Math.max(
+                    latestGrantedGenRef.current,
+                    grantGen,
+                  );
+                  hasLiveGrantRef.current = true;
+                }
+                standingAttemptRef.current = false;
+                setRevokedBy(null);
+                // Regaining control after a prior revoke → surface it in this
+                // seat (§6 decision 5). A first-ever acquire stays silent.
+                if (wasRevokedRef.current) {
+                  wasRevokedRef.current = false;
+                  pushToast("You have terminal control", "success");
+                }
+                // Remote seats become the explicit "writer"; a local loopback seat
+                // returns to its always-on "local" writer state (Feature B).
+                setControl(isRemote ? "writer" : "local");
+                setShowAcquire(false);
+                setAcqErr(null);
+                // Re-assert THIS seat's geometry now that its resizes are
+                // unfenced: while demoted, every ResizeObserver resize was
+                // dropped server-side, so the PTY still carries the other seat's
+                // dims (e.g. the native terminal's after a reclaim). Original
+                // mode re-pins the launch dims; fit mode re-fits the container.
+                if (sizeModeRef.current === "original" && initialDimsRef.current) {
+                  const d = initialDimsRef.current;
                   try {
-                    termRef.current.resize(ic, ir);
+                    term.resize(d.cols, d.rows);
                   } catch {
                     /* ignore */
                   }
-                  // A read-only viewer must never push a resize to the PTY
-                  // (that's a writer-only operation) — but it still resizes
-                  // its own display below, via applyViewerScale.
-                  if (!(isRemote && !canWriteRef.current)) {
-                    sendResizeNow(ir, ic);
+                  sendResizeNow(d.rows, d.cols);
+                } else {
+                  try {
+                    fit?.fit();
+                  } catch {
+                    /* ignore */
+                  }
+                  sendResize();
+                }
+              } else if (m.t === "control_denied") {
+                hasLiveGrantRef.current = false;
+                const usedStanding = standingAttemptRef.current;
+                standingAttemptRef.current = false;
+                if (usedStanding && isPermanentAuthDenial(m.reason)) {
+                  // The stored/entered standing secret is permanently dead:
+                  // either it was JUDGED and rejected ("auth" — revoked or
+                  // rotated), or the server holds no standing secret at rest at
+                  // all ("auth_revoked" — revoked and never re-provisioned, so
+                  // nothing can match it again). Clear it and fall back to the
+                  // one-time flow with an honest message. We do NOT retry (one
+                  // attempt per socket open / per expiry demote).
+                  //
+                  // Destroying the user's saved secret is irreversible for them
+                  // (the owner must mint a new one), so it is gated on the two
+                  // reasons that PROVE the credential can never work again.
+                  // Every transient refusal — standing access momentarily
+                  // disabled with the secret still at rest, a rate-limited
+                  // attempt, an acquire that raced an admin transition, a
+                  // server too old to distinguish them — reports something else
+                  // and leaves the secret in place.
+                  forgetStandingSecret();
+                  setStandingStored(false);
+                }
+                setControl("denied");
+                setAcqErr(terminalControlDenialMessage(m.reason, usedStanding));
+              } else if (m.t === "control_revoked") {
+                const revokeGen =
+                  typeof m.gen === "number" &&
+                  Number.isSafeInteger(m.gen) &&
+                  m.gen > 0
+                    ? m.gen
+                    : 0;
+                // Equality is the revoke of the currently granted lease and must
+                // demote. Only a STRICTLY older generation is stale; missing gen
+                // keeps the legacy demotion behaviour.
+                if (
+                  hasLiveGrantRef.current &&
+                  revokeGen > 0 &&
+                  revokeGen < latestGrantedGenRef.current
+                ) {
+                  return;
+                }
+                hasLiveGrantRef.current = false;
+                // EXPIRY-DEMOTE (server sets expiry:true): the writer lease
+                // merely aged out — idle lifetime or hard cap — and the server
+                // deliberately kept the socket open instead of closing it. The
+                // device is not in doubt, so a seat holding a standing secret
+                // re-presents it here and carries on. This is the ONLY place
+                // that can do it: the normal auto-present lives in
+                // `sock.onopen`, which never re-fires while the socket stays
+                // up, so before this the promised "silently re-acquire" meant
+                // "tap the button again".
+                //
+                // Never on a takeover or a trust-withdrawing revoke (expiry is
+                // absent there): the owner or another device just took control,
+                // and auto-re-acquiring would fight them.
+                if (isRemote && m.expiry === true) {
+                  const stored = getStoredStandingSecret();
+                  const nowMs = Date.now();
+                  if (
+                    stored &&
+                    sock.readyState === WebSocket.OPEN &&
+                    nowMs - lastStandingReacquireRef.current >
+                      STANDING_REACQUIRE_COOLDOWN_MS
+                  ) {
+                    lastStandingReacquireRef.current = nowMs;
+                    standingAttemptRef.current = true;
+                    sock.send(
+                      JSON.stringify({
+                        t: "acquire-writer",
+                        cap: stored,
+                        confirm: "",
+                      }),
+                    );
+                    // No toast and no wasRevokedRef arming: an aged-out lease
+                    // answered by a stored secret is invisible maintenance, not
+                    // an event the user needs told about. A denial still
+                    // surfaces through the normal control_denied path.
+                    setControl("requesting");
+                    return;
                   }
                 }
-              }
-              // Track the writer's CURRENT geometry for the viewer downscale,
-              // preferring the live rows/cols over the launch dims so a writer
-              // that resized after launch is reflected (not the stale launch
-              // size). Falls back to initial when current is absent/zero.
-              const cr = typeof m.rows === "number" && m.rows > 0 ? m.rows : ir;
-              const cc = typeof m.cols === "number" && m.cols > 0 ? m.cols : ic;
-              if (
-                typeof cr === "number" &&
-                typeof cc === "number" &&
-                cr > 0 &&
-                cc > 0
-              ) {
-                writerGeomRef.current = { rows: cr, cols: cc };
-              }
-              // The writer's geometry is now known — recompute the viewer
-              // downscale (Change 2b). onopen ran before this frame arrived, so
-              // this is the actual trigger that renders a viewer at the writer's
-              // size.
-              applyViewerScale();
-            } else if (m.t === "control_granted") {
-              const grantGen =
-                typeof m.gen === "number" &&
-                Number.isSafeInteger(m.gen) &&
-                m.gen > 0
-                  ? m.gen
-                  : 0;
-              if (grantGen > 0) {
-                latestGrantedGenRef.current = Math.max(
-                  latestGrantedGenRef.current,
-                  grantGen,
+                // Taken over by another viewer, the owner/admin, OR — new daemon
+                // feature — the NATIVE terminal reclaiming its own session (fires
+                // for LOCAL seats too now). Input stops; toast it in this seat (§6
+                // decision 5) and arm the regain toast for the next grant. A local
+                // seat can take it back with a click/keystroke (Feature B).
+                wasRevokedRef.current = true;
+                const by = m.by === "local" || m.by === "remote" ? m.by : null;
+                setRevokedBy(by);
+                pushToast(
+                  m.expiry === true
+                    ? // An age-out, with no standing secret to answer it: say
+                      // so honestly rather than implying somebody took control.
+                      "Terminal control timed out — ask for control again"
+                    : isRemote
+                      ? by === "local"
+                        ? "The owner took terminal control"
+                        : by === "remote"
+                          ? "Another remote device took terminal control"
+                          : "Terminal control ended"
+                      : by === "remote"
+                        ? "A remote device took terminal control"
+                        : "The native terminal reclaimed control",
+                  "warn",
                 );
-                hasLiveGrantRef.current = true;
+                setControl("revoked");
               }
-              standingAttemptRef.current = false;
-              setRevokedBy(null);
-              // Regaining control after a prior revoke → surface it in this
-              // seat (§6 decision 5). A first-ever acquire stays silent.
-              if (wasRevokedRef.current) {
-                wasRevokedRef.current = false;
-                pushToast("You have terminal control", "success");
-              }
-              // Remote seats become the explicit "writer"; a local loopback seat
-              // returns to its always-on "local" writer state (Feature B).
-              setControl(isRemote ? "writer" : "local");
-              setShowAcquire(false);
-              setAcqErr(null);
-              // Re-assert THIS seat's geometry now that its resizes are
-              // unfenced: while demoted, every ResizeObserver resize was
-              // dropped server-side, so the PTY still carries the other seat's
-              // dims (e.g. the native terminal's after a reclaim). Original
-              // mode re-pins the launch dims; fit mode re-fits the container.
-              if (sizeModeRef.current === "original" && initialDimsRef.current) {
-                const d = initialDimsRef.current;
-                try {
-                  term.resize(d.cols, d.rows);
-                } catch {
-                  /* ignore */
-                }
-                sendResizeNow(d.rows, d.cols);
-              } else {
-                try {
-                  fit?.fit();
-                } catch {
-                  /* ignore */
-                }
-                sendResize();
-              }
-            } else if (m.t === "control_denied") {
-              hasLiveGrantRef.current = false;
-              const usedStanding = standingAttemptRef.current;
-              standingAttemptRef.current = false;
-              if (m.reason === "auth" && usedStanding) {
-                // A stored/entered standing secret was rejected — it was revoked
-                // or rotated. Clear it and fall back to the one-time flow with an
-                // honest message. We do NOT retry (one attempt per socket open).
-                forgetStandingSecret();
-                setStandingStored(false);
-              }
-              setControl("denied");
-              setAcqErr(terminalControlDenialMessage(m.reason, usedStanding));
-            } else if (m.t === "control_revoked") {
-              const revokeGen =
-                typeof m.gen === "number" &&
-                Number.isSafeInteger(m.gen) &&
-                m.gen > 0
-                  ? m.gen
-                  : 0;
-              // Equality is the revoke of the currently granted lease and must
-              // demote. Only a STRICTLY older generation is stale; missing gen
-              // keeps the legacy demotion behaviour.
-              if (
-                hasLiveGrantRef.current &&
-                revokeGen > 0 &&
-                revokeGen < latestGrantedGenRef.current
-              ) {
-                return;
-              }
-              hasLiveGrantRef.current = false;
-              // Taken over by another viewer, the owner/admin, OR — new daemon
-              // feature — the NATIVE terminal reclaiming its own session (fires
-              // for LOCAL seats too now). Input stops; toast it in this seat (§6
-              // decision 5) and arm the regain toast for the next grant. A local
-              // seat can take it back with a click/keystroke (Feature B).
-              wasRevokedRef.current = true;
-              const by = m.by === "local" || m.by === "remote" ? m.by : null;
-              setRevokedBy(by);
-              pushToast(
-                isRemote
-                  ? by === "local"
-                    ? "The owner took terminal control"
-                    : by === "remote"
-                      ? "Another remote device took terminal control"
-                      : "Terminal control ended"
-                  : by === "remote"
-                    ? "A remote device took terminal control"
-                    : "The native terminal reclaimed control",
-                "warn",
-              );
-              setControl("revoked");
+            } catch {
+              /* ignore malformed control frame */
             }
-          } catch {
-            /* ignore malformed control frame */
+            return;
           }
-          return;
-        }
-        sawActivityRef.current = true;
-        term.write(new Uint8Array(ev.data as ArrayBuffer));
-      };
+          sawActivityRef.current = true;
+          term.write(new Uint8Array(ev.data as ArrayBuffer));
+        };
 
-      ws.onerror = () => {
-        if (disposed) return;
-        setErrMsg("connection error");
-        setStatus((s) => (s === "exited" ? s : "error"));
-      };
-
-      ws.onclose = (ev: CloseEvent) => {
-        if (disposed) return;
-        // A policy-violation close (1008) with NO prior activity means the
-        // server refused the join outright — the handle was already gone (the
-        // child exited in the fetch→click race) or the session was never
-        // joinable. Surface that honestly instead of a bare "exited" terminal
-        // the user might read as "my agent just quit" (P2-4). Any close AFTER
-        // real output/exit is an ordinary session end. Copy is workflow-NEUTRAL
-        // (F7): LaunchTerminal is shared by Jump-in, fresh, handoff, setup, and
-        // resume, so it must not claim every failed launch was "Jump in".
-        if (ev.code === 1008 && !sawActivityRef.current) {
-          setStatus((s) => (s === "exited" ? s : "error"));
-          setErrMsg("Session ended before the terminal could connect — it was no longer running.");
-          return;
-        }
-        setStatus((s) => (s === "exited" ? s : "exited"));
-      };
+        // No onerror handler by design. A websocket `error` is ALWAYS followed
+        // by a `close`, and onclose below owns the whole retry-vs-give-up
+        // decision; painting "error" here would flip the tile to a tombstone
+        // for the one frame before the reconnect is armed. (Until 2026-07-25
+        // this was an empty guard-and-return handler — dead code that read as
+        // if it did something.)
+        sock.onclose = (ev: CloseEvent) => {
+          if (disposed || ws !== sock) return;
+          wsRef.current = null;
+          // A policy-violation close (1008) with NO activity on THIS socket means
+          // the server refused the join outright — the handle was already gone
+          // (the child exited in the fetch→click race) or the session was never
+          // joinable. Surface that honestly instead of a bare "exited" terminal
+          // the user might read as "my agent just quit" (P2-4). Copy is
+          // workflow-NEUTRAL (F7): LaunchTerminal is shared by Jump-in, fresh,
+          // handoff, setup, and resume, so it must not claim every failed launch
+          // was "Jump in".
+          //
+          // This is ALSO the "is the PTY really gone?" discriminator for a
+          // RECONNECT attempt: a reconnect to a live session always replays the
+          // output ring, so a 1008 that delivered nothing is the server telling us
+          // the handle no longer exists. Only then do we stop retrying and show
+          // the dead state.
+          if (ev.code === 1008 && !sawActivityRef.current) {
+            sessionGone = true;
+            setStatus((s) => (s === "exited" ? s : "error"));
+            setErrMsg("Session ended before the terminal could connect — it was no longer running.");
+            return;
+          }
+          // An authoritative exit frame already arrived — the child is gone.
+          if (ptyExited) {
+            setStatus("exited");
+            return;
+          }
+          // Everything else is a TRANSPORT drop. The PTY is server-side and
+          // survives it, so hold the seat and reconnect. A remote seat drops back
+          // to read-only meanwhile (the server released its writer lease with the
+          // socket); the standing-secret auto-present in onopen re-acquires it on
+          // the next successful connect with no user action.
+          if (isRemote) setControl("viewer");
+          onDrop();
+        };
+      }
 
       // Keystrokes → binary frames. Gated on canWriteRef so a read-only remote
       // viewer never even transmits input (it would be dropped server-side by
@@ -741,7 +1074,9 @@ export function LaunchTerminal({
           return;
         }
         if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(new TextEncoder().encode(data));
+          // D3: apply any armed on-screen modifier. Identity when none is
+          // armed, so this is a no-op for every desktop keystroke.
+          ws.send(new TextEncoder().encode(consumeSoftMods(data)));
         }
       });
 
@@ -770,6 +1105,10 @@ export function LaunchTerminal({
         sendResize();
       });
       ro.observe(hostRef.current);
+
+      // Open the first socket only once every handler + observer is wired, so a
+      // fast local connect can't deliver bytes before the terminal is ready.
+      connect();
     })().catch((e) => {
       if (!disposed) {
         setErrMsg(e instanceof Error ? e.message : String(e));
@@ -778,7 +1117,15 @@ export function LaunchTerminal({
     });
 
     return () => {
+      // Deliberate teardown (unmount / token change): set disposed FIRST so the
+      // close this triggers is not mistaken for a transport drop and retried.
       disposed = true;
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("pageshow", onVisible);
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
       ro?.disconnect();
       try {
         ws?.close();
@@ -791,6 +1138,320 @@ export function LaunchTerminal({
       fitRef.current = null;
     };
   }, [token, isRemote]);
+
+  // ── D2: touch scrolling that survives TUI mouse tracking ───────────────────
+  //
+  // THE DEFECT. xterm.js registers the ONLY touch-scroll path behind a gate:
+  //
+  //   addDisposableDomListener(el, "touchstart", e => {
+  //     if (!this.coreMouseService.areMouseEventsActive) { … }
+  //   })
+  //   addDisposableDomListener(el, "touchmove",  e => {
+  //     if (!this.coreMouseService.areMouseEventsActive) { … }
+  //   }, {passive:false})
+  //
+  // The moment a TUI enables mouse reporting (`ESC[?1000h ESC[?1002h
+  // ESC[?1006h` — which Claude Code, codex and any full-screen app do on
+  // startup) that gate closes and touch scrolling is simply gone. And there is
+  // no fallback: `.xterm-viewport` and `.xterm-screen` are SIBLINGS, never
+  // ancestor/descendant, so native scroll chaining from the touched element can
+  // never reach the scrollable viewport either. Measured at 393x852 with an
+  // identical 150px drag: mouse mode off -> scrollTop delta -30; mouse mode on
+  // -> delta 0; off again -> -30. This is presentation-independent, which is
+  // why full-viewport/focus-mode layout work does not fix it.
+  //
+  // THE FIX. Own the gesture ourselves, in the CAPTURE phase on the host (an
+  // ancestor of xterm's own listener target), and drive `term.scrollLines()`
+  // directly — a public API with no coreMouseService dependency.
+  //
+  // Claiming is deliberately conservative, because a TUI that asked for
+  // touch-as-mouse must still receive taps: we claim only when the gesture is
+  // predominantly VERTICAL *and* the buffer is genuinely scrollable (normal
+  // buffer with scrollback above the viewport). A tap never moves, so it is
+  // never claimed and falls through to xterm's mouse encoding unchanged. When
+  // we DO claim we stopPropagation, so xterm's own handler cannot double-scroll
+  // in the mouse-mode-off case.
+  //
+  // Gated on the touch capability query: a desktop terminal registers nothing.
+  useEffect(() => {
+    if (!isTouch) return;
+    const host = hostRef.current;
+    if (!host) return;
+
+    // Minimum travel before the vertical/horizontal verdict is taken. Small
+    // enough that at most a sub-row amount of movement reaches xterm first.
+    const DECIDE_PX = 4;
+    // Momentum cutoffs (px/ms and friction per frame at ~60fps).
+    const FLING_MIN_V = 0.25;
+    const FLING_FRICTION = 0.94;
+    const FLING_STOP_V = 0.02;
+
+    let startX = 0;
+    let startY = 0;
+    let lastX = 0;
+    let lastY = 0;
+    let lastT = 0;
+    let velocity = 0; // px/ms, positive = finger moving down
+    let tracking = false;
+    // The verdict, taken once per gesture at DECIDE_PX of travel:
+    //   null      undecided
+    //   "scroll"  ours — drive term.scrollLines() and swallow the event
+    //   "swallow" not ours to act on, but the BROWSER must not have it either
+    //             (D14: an unclaimed horizontal swipe became back-navigation)
+    //   "pass"    genuinely not ours — let it through untouched
+    let verdict: "scroll" | "wheel" | "swallow" | "pass" | null = null;
+    let residual = 0; // sub-row pixels carried between moves
+    let flingRaf = 0;
+
+    // D14 — SWIPE-LEFT USED TO DESTROY THE PAGE (operator-reported, phone,
+    // 2026-07-27). The rule below declined every horizontal gesture with the
+    // comment "horizontal swipe / no scrollback: not ours". Declining means not
+    // calling preventDefault, so the gesture reached the browser — which treats
+    // a horizontal drag near the edge as BACK-NAVIGATION and unloaded the whole
+    // dashboard, live PTY and all. Not-ours must not mean not-handled.
+    //
+    // Three layers, because no single one covers every engine:
+    //   1. `touch-action: pan-y` on the header + key bar — the browser never
+    //      starts a horizontal gesture that begins there at all.
+    //   2. `overscroll-behavior-x: contain` on the panel, the backdrop and (via
+    //      LaunchDock, while the mobile panel is up) the document element —
+    //      this is what governs Chrome's overscroll-to-navigate.
+    //   3. THIS: an explicit preventDefault on the first horizontal touchmove
+    //      over the terminal body, which is where the operator actually swiped.
+    //      The body cannot use layer 1 because `overflow-x-auto` is load-bearing
+    //      there (original-size mode is genuinely wider than a phone), so the
+    //      swallow is conditional: when the host really can scroll sideways the
+    //      gesture is left to it and layer 2 stops the chain at the end.
+    //
+    // NOT VERIFIED ON REAL HARDWARE: iOS Safari's interactive-pop starts as a
+    // system gesture when the touch begins within ~20px of the left edge, and
+    // no amount of preventDefault reclaims it. Layers 1-3 are what a page can
+    // do; the residual iOS edge case is documented, not fixed.
+    const hostScrollsX = () => host.scrollWidth > host.clientWidth + 1;
+
+    const stopFling = () => {
+      if (flingRaf) cancelAnimationFrame(flingRaf);
+      flingRaf = 0;
+    };
+
+    // rowPx derives the pixel height of one terminal row from the LAID-OUT
+    // grid, so it tracks font-size/zoom without reaching into xterm internals.
+    const rowPx = (term: import("@xterm/xterm").Terminal): number => {
+      const screen = host.querySelector<HTMLElement>(".xterm-screen");
+      if (screen && term.rows > 0) {
+        const h = screen.clientHeight / term.rows;
+        if (h > 1) return h;
+      }
+      return 17;
+    };
+
+    // scrollable reports whether there is anything above the viewport to scroll
+    // back to. The ALTERNATE buffer (full-screen TUI) has no scrollback at all,
+    // so a drag there is left to the application.
+    const scrollable = (term: import("@xterm/xterm").Terminal): boolean => {
+      const b = term.buffer.active;
+      return b.type === "normal" && b.baseY > 0;
+    };
+
+    // ── D17: the ALTERNATE-buffer scroll path (touch → wheel) ────────────────
+    //
+    // A full-screen TUI switches to the alternate buffer, which by definition
+    // has NO scrollback — so `scrollable()` is false for every drag and the
+    // gesture used to be handed to the application untouched. That was correct
+    // as far as it went and still left the user stuck, because of a mismatch
+    // measured against a live `claude` 2.1.220 PTY:
+    //
+    //   on entering its TUI it sets ?1049h (alternate buffer) together with
+    //   ?1000h ?1002h ?1003h ?1006h (click, drag, ANY-motion, SGR), and it
+    //   scrolls its own view on WHEEL events. Writing SGR wheel into its PTY
+    //   redraws; writing a button-0 press/motion/release makes it react
+    //   (3022 bytes) but never scrolls — it reads a drag as a drag.
+    //
+    // A desktop mouse has a wheel, so this works there and the defect is
+    // mobile-only. A finger has no wheel, and nothing was synthesizing one.
+    //
+    // So: convert vertical finger travel into wheel events. We dispatch a
+    // synthetic WheelEvent and let XTERM do the encoding rather than writing
+    // SGR ourselves — xterm already knows which mouse encoding is active
+    // (1006 / 1015 / default) and where the cell boundaries are, and it routes
+    // the bytes through the same onData path every other input takes, so the
+    // writer-lease gate applies without a second code path to keep in sync.
+    const alternateBuffer = (term: import("@xterm/xterm").Terminal): boolean =>
+      term.buffer.active.type === "alternate";
+
+    // xterm binds its wheel handling on the .xterm root; dispatching on the
+    // grid with bubbles:true reaches it from wherever the finger actually is.
+    const wheelTarget = (): HTMLElement | null =>
+      host.querySelector<HTMLElement>(".xterm-screen") ??
+      host.querySelector<HTMLElement>(".xterm");
+
+    let wheelResidual = 0; // sub-row pixels carried between moves
+
+    // wheelByPixels converts accumulated finger travel into whole-row wheel
+    // deltas. Finger DOWN (positive dy) means "show me earlier output", which
+    // is wheel UP, which is a NEGATIVE deltaY — the same sign convention a
+    // desktop wheel produces for the same intent.
+    const wheelByPixels = (
+      term: import("@xterm/xterm").Terminal,
+      dy: number,
+      x: number,
+      y: number,
+    ) => {
+      const el = wheelTarget();
+      if (!el) return;
+      wheelResidual += dy;
+      const px = rowPx(term);
+      const rows = Math.trunc(wheelResidual / px);
+      if (rows === 0) return;
+      wheelResidual -= rows * px;
+      // deltaMode 0 = pixels. Handing xterm a delta that is a whole number of
+      // row heights lets its own px→lines conversion decide the line count,
+      // so this tracks font-size and zoom without a second copy of that math.
+      el.dispatchEvent(
+        new WheelEvent("wheel", {
+          deltaY: -rows * px,
+          deltaMode: 0,
+          clientX: x,
+          clientY: y,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    };
+
+    // scrollByPixels converts accumulated finger travel into whole rows and
+    // moves the viewport. Finger down (positive dy) scrolls BACK, so the
+    // content follows the finger — the platform convention on every phone.
+    const scrollByPixels = (term: import("@xterm/xterm").Terminal, dy: number) => {
+      residual += dy;
+      const px = rowPx(term);
+      const rows = Math.trunc(residual / px);
+      if (rows === 0) return;
+      residual -= rows * px;
+      term.scrollLines(-rows);
+    };
+
+    const onTouchStart = (e: TouchEvent) => {
+      stopFling();
+      tracking = false;
+      verdict = null;
+      residual = 0;
+      wheelResidual = 0;
+      velocity = 0;
+      if (e.touches.length !== 1) return; // pinch/zoom is the browser's
+      const t = e.touches[0];
+      startX = t.clientX;
+      startY = t.clientY;
+      lastX = t.clientX;
+      lastY = t.clientY;
+      lastT = e.timeStamp;
+      tracking = true;
+    };
+
+    const onTouchMove = (e: TouchEvent) => {
+      const term = termRef.current;
+      if (!tracking || !term || e.touches.length !== 1) return;
+      const t = e.touches[0];
+      const totalX = t.clientX - startX;
+      const totalY = t.clientY - startY;
+
+      if (verdict === null) {
+        if (Math.abs(totalX) < DECIDE_PX && Math.abs(totalY) < DECIDE_PX) return;
+        if (Math.abs(totalY) > Math.abs(totalX)) {
+          // Vertical. Ours when there is scrollback to reach (normal buffer).
+          if (scrollable(term)) {
+            verdict = "scroll";
+          } else if (alternateBuffer(term) && canWriteRef.current) {
+            // A full-screen TUI owns its own scroll and expects WHEEL events
+            // (D17). Gated on canWrite so a read-only remote viewer still
+            // sends zero frames — its story is the presentation-only downscale
+            // (Change 2b), not synthesized input.
+            verdict = "wheel";
+          } else {
+            verdict = "pass";
+          }
+        } else {
+          // Horizontal (D14). Never ours to act on — but only "pass" when the
+          // host can genuinely scroll sideways, because otherwise the browser
+          // takes it as back-navigation and the dashboard unloads.
+          verdict = hostScrollsX() ? "pass" : "swallow";
+        }
+      }
+      if (verdict === "swallow") {
+        // Cancel the browser's default gesture (overscroll-to-navigate,
+        // rubber-band) without touching xterm: no stopPropagation, so a TUI in
+        // mouse-reporting mode still sees the move it asked for.
+        if (e.cancelable) e.preventDefault();
+        return;
+      }
+      if (verdict !== "scroll" && verdict !== "wheel") return;
+
+      // Ours: keep the page from rubber-banding and keep xterm's own (possibly
+      // ungated) handler from scrolling the same gesture a second time. For
+      // the wheel path stopPropagation matters for a second reason — it stops
+      // xterm reporting the same gesture to the TUI as a mouse DRAG, which is
+      // what a full-screen app would otherwise read as a selection.
+      e.preventDefault();
+      e.stopPropagation();
+
+      const dy = t.clientY - lastY;
+      const dt = e.timeStamp - lastT;
+      if (dt > 0) {
+        // Light exponential smoothing so one jittery sample can't fling.
+        velocity = 0.7 * (dy / dt) + 0.3 * velocity;
+      }
+      lastX = t.clientX;
+      lastY = t.clientY;
+      lastT = e.timeStamp;
+      if (verdict === "wheel") wheelByPixels(term, dy, t.clientX, t.clientY);
+      else scrollByPixels(term, dy);
+    };
+
+    const onTouchEnd = (e: TouchEvent) => {
+      const term = termRef.current;
+      const claimed = verdict === "scroll" || verdict === "wheel";
+      const wasWheel = verdict === "wheel";
+      const endX = lastX;
+      const endY = lastY;
+      tracking = false;
+      verdict = null;
+      if (!claimed || !term) return;
+      e.stopPropagation();
+      // Momentum. xterm's own handler quantises to whole rows with no inertia
+      // (a 150px drag moved 30px), which is why scrolling felt broken even when
+      // it worked at all. Decay the last measured velocity over rAF frames.
+      if (Math.abs(velocity) < FLING_MIN_V) return;
+      let v = velocity;
+      const step = () => {
+        v *= FLING_FRICTION;
+        if (Math.abs(v) < FLING_STOP_V) {
+          flingRaf = 0;
+          return;
+        }
+        // ~16ms worth of travel per frame.
+        if (wasWheel) wheelByPixels(term, v * 16, endX, endY);
+        else scrollByPixels(term, v * 16);
+        flingRaf = requestAnimationFrame(step);
+      };
+      flingRaf = requestAnimationFrame(step);
+    };
+
+    // Capture phase: xterm's listeners live on a DESCENDANT of the host, so
+    // capturing here lets us decide before it sees the event. passive:false is
+    // required — a passive listener may not preventDefault.
+    const opts: AddEventListenerOptions = { capture: true, passive: false };
+    host.addEventListener("touchstart", onTouchStart, opts);
+    host.addEventListener("touchmove", onTouchMove, opts);
+    host.addEventListener("touchend", onTouchEnd, opts);
+    host.addEventListener("touchcancel", onTouchEnd, opts);
+    return () => {
+      stopFling();
+      host.removeEventListener("touchstart", onTouchStart, opts);
+      host.removeEventListener("touchmove", onTouchMove, opts);
+      host.removeEventListener("touchend", onTouchEnd, opts);
+      host.removeEventListener("touchcancel", onTouchEnd, opts);
+    };
+  }, [isTouch]);
 
   // Keep the xterm read-only state in sync with control: enable stdin + focus
   // when this client holds the writer, disable it otherwise. Local sessions are
@@ -954,13 +1615,56 @@ export function LaunchTerminal({
   // Closing kills the child process tree (ws teardown → server reap), so
   // confirm when it's still live. Minimize is the non-destructive exit.
   function requestClose() {
+    // A reconnecting seat is still backed by a LIVE process (only the transport
+    // dropped), so it must get the same destructive confirmation as an open one.
     if (
-      status === "open" &&
+      (status === "open" || status === "reconnecting") &&
       !window.confirm(`Stop the running ${tool} session? This ends the process.`)
     ) {
       return;
     }
     onClose();
+  }
+
+  // ── D10: copy off a touch device ───────────────────────────────────────
+  // xterm.css sets `.xterm { user-select: none }` and xterm's own selection is
+  // mouse-drag based, so a long-press selects nothing and an error message
+  // cannot be copied off a phone at all. This reads the buffer directly rather
+  // than fighting xterm's selection layer (a `user-select` override would put
+  // the browser's native selection in contention with xterm's own).
+  //
+  // Honest scope, hence the label: it copies the CURRENT SELECTION when there
+  // is one, otherwise exactly the rows on screen — not the whole scrollback.
+  async function copyVisible() {
+    const term = termRef.current;
+    if (!term) return;
+    let text = term.getSelection();
+    if (!text) {
+      const buf = term.buffer.active;
+      const lines: string[] = [];
+      for (let i = 0; i < term.rows; i++) {
+        const line = buf.getLine(buf.viewportY + i);
+        // trimRight: the grid is space-padded to `cols`.
+        lines.push(line ? line.translateToString(true) : "");
+      }
+      while (lines.length && lines[lines.length - 1] === "") lines.pop();
+      text = lines.join("\n");
+    }
+    if (!text) {
+      pushToast("Nothing on screen to copy", "info");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      pushToast("Copied the visible terminal output", "success");
+    } catch {
+      // Clipboard writes need a secure context (HTTPS or localhost) and, on
+      // some browsers, a permission the user has denied. Name the dependency.
+      pushToast(
+        "Could not copy — the clipboard needs a secure (HTTPS) connection",
+        "warn",
+      );
+    }
   }
 
   // sendResizeNow tells the PTY to adopt explicit dims over the control channel
@@ -1081,22 +1785,126 @@ export function LaunchTerminal({
           : "flex h-[60vh] min-h-[360px] flex-col overflow-hidden rounded-2 border bg-[#0b0b0f]"
       }
     >
-      <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 border-b border-white/10 bg-[#14141a] px-3 py-1.5">
-        <span className="flex min-w-0 flex-wrap items-center gap-2 text-[11px] text-fg-2">
-          <span className="font-mono text-fg-1">{tool}</span>
+      {/* D9: the desktop header carries EIGHT always-on actions in one 33px
+          row. At 393px that wrapped to 2 rows and at 360px to 3 (~90px of a
+          640px screen) — a desktop action budget on a phone. Below the touch
+          breakpoint the six secondary actions collapse into one ⋯ menu, the
+          two lifecycle actions stay inline, and the row padding drops to zero
+          so the 44px tap targets don't cost more height than the old wrap did.
+          Desktop keeps the exact shipped class string. */}
+      <div
+        className={
+          "flex items-center justify-between gap-x-2 gap-y-1 border-b border-white/10 bg-[#14141a] " +
+          // Touch: NEVER wrap (D15). The header budget is what forced minimize
+          // down to a glyph; making the row structurally un-wrappable buys the
+          // space back the honest way — the identity span on the left is the
+          // one thing allowed to shrink, and it truncates. `touch-action: pan-y`
+          // additionally refuses a horizontal pan starting on the header, which
+          // is what Chrome's edge-swipe-back rides on (D14).
+          (isTouch
+            ? "flex-nowrap px-2 py-0 [touch-action:pan-y]"
+            : "flex-wrap px-3 py-1.5")
+        }
+        data-testid="terminal-header"
+      >
+        <span
+          className={
+            "flex min-w-0 items-center gap-2 text-[11px] text-white/60 " +
+            (isTouch ? "flex-nowrap overflow-hidden" : "flex-wrap")
+          }
+        >
+          {/* Literal palette, not theme tokens: this header is hardcoded
+              bg-[#14141a] (terminal chrome is always dark, independent of
+              sb_theme), so text-fg-1/text-fg-2 resolve LIGHT under the light
+              theme and render near-invisible on it. */}
+          <span
+            className={
+              "font-mono text-white/85" + (isTouch ? " min-w-0 truncate" : "")
+            }
+          >
+            {tool}
+          </span>
           <StatusPill status={status} exitCode={exitCode} />
           {errMsg && (
-            <span className="text-[10.5px] text-danger" title={errMsg}>
+            <span
+              className={
+                "text-[10.5px] text-danger" + (isTouch ? " min-w-0 truncate" : "")
+              }
+              title={errMsg}
+            >
               {errMsg}
             </span>
           )}
         </span>
-        <span className="flex flex-wrap items-center justify-end gap-1">
+        <span
+          className={
+            "flex items-center justify-end gap-1 " +
+            (isTouch ? "flex-nowrap shrink-0" : "flex-wrap")
+          }
+        >
+          {/* Touch: the six secondary actions, one ⋯ menu (D9) + "Copy
+              visible" (D10, which has no desktop counterpart because a mouse
+              can already drag-select). */}
+          {isTouch && (
+            <TerminalOverflowMenu
+              items={[
+                onOpenFiles && {
+                  label: "▤ Files",
+                  onSelect: onOpenFiles,
+                  disabled: !projectPanelEnabled || !isLiveStatus(status),
+                  disabledTitle: !isLiveStatus(status)
+                    ? "This session is no longer running — its project can no longer be browsed"
+                    : "This terminal was launched without a project root",
+                },
+                onOpenGit && {
+                  label: "⎇ Git",
+                  onSelect: onOpenGit,
+                  disabled: !projectPanelEnabled || !isLiveStatus(status),
+                  disabledTitle: !isLiveStatus(status)
+                    ? "This session is no longer running — its project can no longer be browsed"
+                    : "This terminal was launched without a project root",
+                },
+                onOpenSession && {
+                  label: "⊙ Session",
+                  onSelect: onOpenSession,
+                  disabled: !sessionPanelEnabled || !isLiveStatus(status),
+                  disabledTitle: !isLiveStatus(status)
+                    ? "This session is no longer running — its activity can no longer be shown"
+                    : "No AI tool running in this terminal",
+                },
+                { label: "⧉ Copy visible", onSelect: () => void copyVisible() },
+                // D13: the key-label override. It lives here rather than in the
+                // key bar because a control in the bar would have to clear the
+                // 44px tap floor and would cost a whole extra row of a phone's
+                // screen — and this is a set-once preference, not a key.
+                // Auto -> Mac -> PC -> Auto; auto names the vocabulary the
+                // DAEMON's OS produced, and the override stays the escape
+                // hatch for anything that fact cannot describe.
+                canWrite && {
+                  label: platformPrefLabel(keyPlatform.pref, keyPlatform.platform),
+                  onSelect: keyPlatform.cycle,
+                },
+                canWrite && {
+                  label: sizeMode === "original" ? "⤢ Fit" : "↺ Original size",
+                  onSelect: sizeMode === "original" ? enterFitSize : enterOriginalSize,
+                  disabled: sizeMode !== "original" && !initialDims,
+                  disabledTitle: "Original size unknown for this session",
+                },
+                {
+                  label: focusMode ? "⤢ Exit focus" : "⤢ Focus mode",
+                  onSelect: focusMode ? exitFocusMode : enterFocusMode,
+                  disabled: !focusModeSupported,
+                  disabledTitle: FOCUS_MODE_UNSUPPORTED,
+                },
+                onAddToGrid && { label: "⊞ Add to grid", onSelect: onAddToGrid },
+              ]}
+            />
+          )}
           {/* Project panel: read-only file tree + git view rooted at this
               terminal's project root. Disabled (honest title) when the run has
               no resolved root. Header buttons only — the panel is provider-owned
               and this never touches the ws bridge. */}
-          {onOpenFiles && (
+          {!isTouch && onOpenFiles && (
             <ProjectPanelButton
               label="▤ Files"
               enabled={!!projectPanelEnabled && isLiveStatus(status)}
@@ -1109,7 +1917,7 @@ export function LaunchTerminal({
               }
             />
           )}
-          {onOpenGit && (
+          {!isTouch && onOpenGit && (
             <ProjectPanelButton
               label="⎇ Git"
               enabled={!!projectPanelEnabled && isLiveStatus(status)}
@@ -1127,7 +1935,7 @@ export function LaunchTerminal({
               that can never correlate to an observer session (a plain shell
               run) or once the session is no longer live. Header button only —
               the panel is provider-owned and this never touches the ws bridge. */}
-          {onOpenSession && (
+          {!isTouch && onOpenSession && (
             <ProjectPanelButton
               label="⊙ Session"
               enabled={!!sessionPanelEnabled && isLiveStatus(status)}
@@ -1143,7 +1951,7 @@ export function LaunchTerminal({
           {/* Feature A: size-mode control. Resizing is a writer capability, so
               this hides for read-only remote viewers (mirrors the RemoteControlBar
               gating) and honest-disables when the original geometry is unknown. */}
-          {canWrite && (
+          {!isTouch && canWrite && (
             <SizeModeControl
               mode={sizeMode}
               hasOriginal={!!initialDims}
@@ -1151,31 +1959,50 @@ export function LaunchTerminal({
               onFit={enterFitSize}
             />
           )}
-          {/* Feature C4: focus mode (Chromium-only; hidden where unsupported). */}
-          {focusModeSupported && (
-            <Tooltip
-              maxWidth={320}
-              content={
-                focusMode
-                  ? "Exit focus mode — release keyboard capture and leave fullscreen"
-                  : "Focus mode — fullscreen + capture browser shortcuts (Ctrl-W/T/N) so they reach the TUI. Chromium only; exit with this button (Esc is captured)."
-              }
-            >
-              <button
-                type="button"
-                onClick={focusMode ? exitFocusMode : enterFocusMode}
-                className={
-                  "rounded-2 px-2 py-0.5 text-[11px] focus:outline-none " +
-                  (focusMode
-                    ? "bg-accent/20 text-accent hover:bg-accent/30"
-                    : "text-fg-3 hover:bg-white/10 hover:text-fg-1")
+          {/* Feature C4: focus mode. Fullscreen + Keyboard Lock; the lock API is
+              Chromium-only AND secure-context-only, so on Safari (any platform,
+              incl. every iPhone) or over a plain-http remote origin the
+              dependency is simply absent. It used to VANISH there, which reads
+              as "this build doesn't have focus mode". Per the honest-disabled
+              convention it now renders disabled, naming the missing dependency
+              — the button is a bonus (keyboard capture), not the only usable
+              view, so its absence must not look like a bug. */}
+          {!isTouch &&
+            (focusModeSupported ? (
+              <Tooltip
+                maxWidth={320}
+                content={
+                  focusMode
+                    ? "Exit focus mode — release keyboard capture and leave fullscreen"
+                    : "Focus mode — fullscreen + capture browser shortcuts (Ctrl-W/T/N) so they reach the TUI. Chromium only; exit with this button (Esc is captured)."
                 }
               >
-                {focusMode ? "⤢ Exit focus" : "⤢ Focus mode"}
-              </button>
-            </Tooltip>
-          )}
-          {onAddToGrid && (
+                <button
+                  type="button"
+                  onClick={focusMode ? exitFocusMode : enterFocusMode}
+                  className={
+                    "rounded-2 px-2 py-0.5 text-[11px] focus:outline-none " +
+                    (focusMode
+                      ? "bg-accent/20 text-accent hover:bg-accent/30"
+                      : "text-fg-3 hover:bg-white/10 hover:text-fg-1")
+                  }
+                >
+                  {focusMode ? "⤢ Exit focus" : "⤢ Focus mode"}
+                </button>
+              </Tooltip>
+            ) : (
+              <TooltipSpan content={FOCUS_MODE_UNSUPPORTED}>
+                <button
+                  type="button"
+                  disabled
+                  aria-label={FOCUS_MODE_UNSUPPORTED}
+                  className="cursor-not-allowed rounded-2 px-2 py-0.5 text-[11px] text-fg-4 opacity-60"
+                >
+                  ⤢ Focus mode
+                </button>
+              </TooltipSpan>
+            ))}
+          {!isTouch && onAddToGrid && (
             <Tooltip content="Add to grid — dock this terminal on the Terminals workspace. The session keeps running.">
               <button
                 type="button"
@@ -1190,14 +2017,39 @@ export function LaunchTerminal({
             <button
               type="button"
               onClick={onMinimize}
-              className="rounded-2 px-2 py-0.5 text-[11px] text-fg-3 hover:bg-white/10 hover:text-fg-1 focus:outline-none"
+              // D15 (operator-reported, 2026-07-27). This used to be a bare "▾"
+              // on touch — "icon-only to buy the header row back, so the
+              // accessible name has to carry the meaning the label used to".
+              // That reasoning was the bug: an accessible name is invisible to a
+              // sighted thumb, and "▾" beside "✕" reads as a dropdown chevron.
+              // The operator concluded there was NO minimize and that the only
+              // way out was the destructive ✕ — and minimize's other two doors
+              // are both shut on a phone (Escape needs a hardware key; the
+              // backdrop-click needs a backdrop, which a full-viewport panel
+              // does not have). So the word is back, and the header row is
+              // bought instead by refusing to wrap: the identity span on the
+              // left truncates and this action cluster never shrinks.
+              // Filled rather than ghosted, so the SAFE exit is the one that
+              // catches the eye first.
+              aria-label={
+                isTouch
+                  ? "Minimize — keeps the session running; restore it from the dock"
+                  : undefined
+              }
+              className={
+                "rounded-2 px-2 py-0.5 text-[11px] focus:outline-none " +
+                (isTouch
+                  ? TOUCH_TARGET +
+                    " shrink-0 whitespace-nowrap bg-white/10 text-white/90 hover:bg-white/20"
+                  : "text-fg-3 hover:bg-white/10 hover:text-fg-1")
+              }
             >
               ▾ Minimize
             </button>
           </Tooltip>
           <Tooltip
             content={
-              status === "open"
+              status === "open" || status === "reconnecting"
                 ? "Stop the running process and close"
                 : "Close"
             }
@@ -1205,15 +2057,36 @@ export function LaunchTerminal({
             <button
               type="button"
               onClick={requestClose}
-              className="rounded-2 px-2 py-0.5 text-[11px] text-fg-3 hover:bg-white/10 hover:text-fg-1 focus:outline-none"
+              aria-label={
+                isTouch
+                  ? status === "open" || status === "reconnecting"
+                    ? "Stop the running process and close"
+                    : "Close terminal"
+                  : undefined
+              }
+              // Touch: this is the DESTRUCTIVE action sitting next to Minimize
+              // at 19px in the measured layout. It gets the 44px floor, an
+              // extra gap from its neighbour, and a danger tint so a thumb
+              // aiming at Minimize has both distance and colour to go on.
+              className={
+                "rounded-2 px-2 py-0.5 text-[11px] focus:outline-none " +
+                (isTouch
+                  ? TOUCH_TARGET + " ml-2 text-danger hover:bg-danger/15"
+                  : "text-fg-3 hover:bg-white/10 hover:text-fg-1")
+              }
             >
-              {status === "open" ? "✕ Stop & close" : "✕ Close"}
+              {isTouch
+                ? "✕"
+                : status === "open" || status === "reconnecting"
+                  ? "✕ Stop & close"
+                  : "✕ Close"}
             </button>
           </Tooltip>
         </span>
       </div>
       {isRemote && (
         <RemoteControlBar
+          touch={isTouch}
           control={control}
           showAcquire={showAcquire}
           onToggleAcquire={() => {
@@ -1260,7 +2133,13 @@ export function LaunchTerminal({
       )}
       <div
         ref={hostRef}
-        className="min-h-0 flex-1 overflow-x-auto p-2"
+        // D11: `overscroll-behavior: contain` stops a drag that runs past the
+        // top/bottom of the scrollback from chaining into the page behind the
+        // panel (the phone rubber-band that made the whole dashboard lurch).
+        className={
+          "min-h-0 flex-1 overflow-x-auto p-2" +
+          (isTouch ? " overscroll-contain" : "")
+        }
         onMouseDown={() => {
           // Click-to-focus for the padding/letterbox area a docked grid tile's
           // xterm canvas doesn't cover (Feature C5); also the click half of the
@@ -1271,7 +2150,128 @@ export function LaunchTerminal({
           termRef.current?.focus();
         }}
       />
+      {/* D3: the on-screen modifier row. Rendered BELOW the terminal (the host
+          is flex-1, so this pins to the bottom edge) because that is where a
+          thumb rests and where the soft keyboard's own top row would sit —
+          putting it under the header would place it at the far end of the
+          reach arc. Only for a touch seat that can actually write: a read-only
+          viewer gets no key bar at all, which is the first of the three gates
+          on the write path (the other two — canWriteRef in onData and xterm's
+          own disableStdin — still hold). */}
+      {isTouch && canWrite && (
+        <TerminalKeyBar
+          mods={softMods}
+          onMods={setSoftModsBoth}
+          onSend={(seq) => {
+            // THE one write seam: term.input -> coreService.triggerDataEvent ->
+            // onData -> canWriteRef gate -> ws.send. No second path.
+            termRef.current?.input(seq, true);
+          }}
+          // DECCKM is flipped by PTY output with no React render in between, so
+          // it must be read at press time rather than passed as a prop.
+          appCursorKeys={() =>
+            !!termRef.current?.modes.applicationCursorKeysMode
+          }
+          // Labelling only (D13) — the encoders below it are byte-identical on
+          // both settings.
+          platform={keyPlatform.platform}
+        />
+      )}
     </div>
+  );
+}
+
+// FOCUS_MODE_UNSUPPORTED names the EXACT missing dependency (honest-disabled
+// convention). Focus mode needs document.fullscreenEnabled AND
+// navigator.keyboard.lock — the latter is Chromium-only and secure-context-only,
+// so it is absent in every Safari (including all iPhones) and over a plain-http
+// remote origin.
+const FOCUS_MODE_UNSUPPORTED =
+  "Focus mode needs keyboard capture — a Chromium browser over HTTPS (or localhost). This browser doesn't provide it.";
+
+// TOUCH_TARGET is the tap-target floor applied below the touch breakpoint.
+// Apple HIG asks 44pt and Android 48dp; 44px is the binding minimum. Measured
+// before this pass, the panel's controls were 19-21px tall.
+const TOUCH_TARGET = "min-h-[44px] min-w-[44px]";
+
+type OverflowItem = {
+  label: string;
+  onSelect: () => void;
+  disabled?: boolean;
+  /** Honest reason shown (and announced) when disabled. */
+  disabledTitle?: string;
+};
+
+/**
+ * TerminalOverflowMenu is the touch-only ⋯ menu that carries the header's
+ * secondary actions (D9). It exists so the header stays ONE row on a phone; on
+ * desktop the same actions render inline exactly as they always have, and this
+ * component is never mounted.
+ *
+ * Falsy entries are accepted and dropped so callers can build the list with the
+ * same `onOpenFiles && {…}` conditionals the inline buttons use.
+ */
+function TerminalOverflowMenu({
+  items,
+}: {
+  items: Array<OverflowItem | false | undefined | null>;
+}) {
+  const [open, setOpen] = useState(false);
+  const live = items.filter((i): i is OverflowItem => !!i);
+  return (
+    <span className="relative">
+      <button
+        type="button"
+        aria-label="More terminal actions"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        className={`${TOUCH_TARGET} rounded-2 px-2 text-[15px] leading-none text-white/70 hover:bg-white/10 hover:text-white focus:outline-none`}
+      >
+        ⋯
+      </button>
+      {open && (
+        <>
+          {/* Tap-away closes. Sits under the menu, over everything else. */}
+          <span
+            className="fixed inset-0 z-40"
+            onClick={() => setOpen(false)}
+            aria-hidden="true"
+          />
+          <span
+            data-testid="terminal-overflow-menu"
+            // Terminal chrome is always dark (the panel hardcodes #0b0b0f /
+            // #14141a rather than theme tokens). `bg-bg-1`/`text-fg-2` resolve
+            // to WHITE-on-dark-grey under the light theme, so this surface uses
+            // the same literal palette as the header it drops out of.
+            className="absolute right-0 top-full z-50 mt-1 flex w-56 flex-col overflow-hidden rounded-2 border border-white/15 bg-[#1b1b23] shadow-lg"
+          >
+            {live.map((item) => (
+              <button
+                key={item.label}
+                type="button"
+                disabled={item.disabled}
+                aria-label={
+                  item.disabled ? (item.disabledTitle ?? item.label) : undefined
+                }
+                title={item.disabled ? item.disabledTitle : undefined}
+                onClick={() => {
+                  setOpen(false);
+                  item.onSelect();
+                }}
+                className={
+                  `${TOUCH_TARGET} flex items-center px-3 text-left text-[13px] ` +
+                  (item.disabled
+                    ? "cursor-not-allowed text-white/35"
+                    : "text-white/85 hover:bg-white/10 hover:text-white")
+                }
+              >
+                {item.label}
+              </button>
+            ))}
+          </span>
+        </>
+      )}
+    </span>
   );
 }
 
@@ -1388,6 +2388,7 @@ function SizeModeControl({
 // the websocket. It reacts to control_granted / control_denied / control_revoked
 // surfaced through the `control` prop.
 function RemoteControlBar({
+  touch,
   control,
   showAcquire,
   onToggleAcquire,
@@ -1406,6 +2407,8 @@ function RemoteControlBar({
   onAcquireStanding,
   onForgetStanding,
 }: {
+  /** Apply the 44px tap-target floor (touch breakpoint). Desktop: unchanged. */
+  touch: boolean;
   control: Control;
   showAcquire: boolean;
   onToggleAcquire: () => void;
@@ -1464,7 +2467,10 @@ function RemoteControlBar({
           <button
             type="button"
             onClick={onToggleAcquire}
-            className="rounded-2 border border-accent/50 bg-accent/15 px-2 py-0.5 text-[11px] font-medium text-accent hover:bg-accent/25"
+            className={
+              "rounded-2 border border-accent/50 bg-accent/15 px-2 py-0.5 text-[11px] font-medium text-accent hover:bg-accent/25" +
+              (touch ? " " + TOUCH_TARGET : "")
+            }
           >
             {showAcquire ? "Cancel" : control === "revoked" ? "Re-acquire control" : "Acquire control"}
           </button>
@@ -1479,7 +2485,10 @@ function RemoteControlBar({
             <button
               type="button"
               onClick={onForgetStanding}
-              className="shrink-0 rounded-2 border border-danger/40 bg-danger/10 px-2 py-0.5 text-[10.5px] text-danger hover:bg-danger/20"
+              className={
+                "shrink-0 rounded-2 border border-danger/40 bg-danger/10 px-2 py-0.5 text-[10.5px] text-danger hover:bg-danger/20" +
+                (touch ? " " + TOUCH_TARGET : "")
+              }
             >
               Forget standing secret on this device
             </button>
@@ -1523,7 +2532,10 @@ function RemoteControlBar({
               type="button"
               onClick={onAcquire}
               disabled={requesting}
-              className="rounded-2 border border-accent/50 bg-accent/15 px-3 py-1 text-[11px] font-medium text-accent hover:bg-accent/25 disabled:opacity-50"
+              className={
+                "rounded-2 border border-accent/50 bg-accent/15 px-3 py-1 text-[11px] font-medium text-accent hover:bg-accent/25 disabled:opacity-50" +
+                (touch ? " " + TOUCH_TARGET : "")
+              }
             >
               {requesting ? "requesting…" : "Take control"}
             </button>
@@ -1566,7 +2578,10 @@ function RemoteControlBar({
             <button
               type="button"
               onClick={onAcquireStanding}
-              className="mt-1.5 rounded-2 border border-warn/50 bg-warn/10 px-3 py-1 text-[11px] font-medium text-warn hover:bg-warn/20"
+              className={
+                "mt-1.5 rounded-2 border border-warn/50 bg-warn/10 px-3 py-1 text-[11px] font-medium text-warn hover:bg-warn/20" +
+                (touch ? " " + TOUCH_TARGET : "")
+              }
             >
               Use standing secret
             </button>
@@ -1588,6 +2603,9 @@ function StatusPill({
   const map: Record<Status, { label: string; cls: string }> = {
     connecting: { label: "connecting…", cls: "bg-white/10 text-fg-3" },
     open: { label: "live", cls: "bg-ok/20 text-ok" },
+    // The session is still running server-side — only this browser's transport
+    // dropped. Warn-coloured (something is off) but never "exited".
+    reconnecting: { label: "reconnecting…", cls: "bg-warn/20 text-warn" },
     exited: {
       label: exitCode === null ? "exited" : `exited (${exitCode})`,
       cls: "bg-white/10 text-fg-3",
@@ -1597,7 +2615,10 @@ function StatusPill({
   const { label, cls } = map[status];
   return (
     <span
-      className={`rounded-full px-1.5 py-0.5 text-[9.5px] font-medium uppercase tracking-[0.05em] ${cls}`}
+      // shrink-0: in the touch header the identity row never wraps, so the
+      // pill must keep its full width and let the tool NAME be the thing that
+      // truncates — a half-clipped "reconnecting…" says nothing.
+      className={`shrink-0 whitespace-nowrap rounded-full px-1.5 py-0.5 text-[9.5px] font-medium uppercase tracking-[0.05em] ${cls}`}
     >
       {label}
     </span>

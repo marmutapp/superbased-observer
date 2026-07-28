@@ -61,6 +61,7 @@ func newCursorCmd() *cobra.Command {
 		fromTime     string
 		attach       *bool
 		noAttach     *bool
+		resume       *string
 	)
 	cmd := &cobra.Command{
 		Use:   "cursor [-- cursor-agent-args...]",
@@ -96,13 +97,26 @@ func newCursorCmd() *cobra.Command {
 				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
 					argsContainHeadlessFlag(args, "-p", "--print") ||
 					argsLeadWithSubcommand(args, cursorSubcommands),
-				passthrough: cursorAttachPassthrough(binPath),
+				passthrough: append(cursorAttachPassthrough(binPath), resumeAttachPassthrough(*resume)...),
 				toolArgs:    args,
 				stderr:      cmd.ErrOrStderr(),
 			})
 			if outcome.handled {
 				return aerr
 			}
+
+			// Native resume: `--resume <id>` → `cursor-agent --resume <id>`
+			// (bare path). The chatId is our SessionID verbatim — no transform.
+			resumedArgs, releaseResume, okResume, resumeErr := applyLauncherResume(launcherResumeSpec{
+				verb: "cursor", label: "cursor", configPath: configPath, id: *resume,
+				continueFrom: continueFrom, carry: carry, fromMessage: fromMessage, fromTime: fromTime,
+				args: args, stderr: cmd.ErrOrStderr(),
+			})
+			if !okResume {
+				return resumeErr
+			}
+			defer releaseResume()
+			args = resumedArgs
 
 			bin, err := resolveToolBin("cursor", binPath, "--cursor-agent-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
@@ -162,6 +176,7 @@ func newCursorCmd() *cobra.Command {
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "cursor")
+	resume = registerResumeFlag(cmd, "cursor")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
 }

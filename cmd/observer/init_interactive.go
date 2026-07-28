@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -522,6 +523,10 @@ func runInteractiveInit(out io.Writer, in io.Reader, opts interactiveInitOptions
 			fmt.Fprintln(out, "\nhermes detected — it lives on a separate install path; run `observer init --hermes` to wire it.")
 		}
 	}
+	// The elevated-ETW setup surface is informational (it writes nothing), so
+	// it is NOT a consent step — it just reports at the end of the checklist,
+	// exactly as it does on the batch path.
+	initProcessBridgeTaskStep(context.Background(), out, opts.ConfigPath)
 	printCommunityFooter(out)
 	return nil
 }

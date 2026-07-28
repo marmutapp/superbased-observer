@@ -40,7 +40,7 @@ func StarterTemplates() []StarterTemplate {
 			Rule: RuleInput{
 				Name:          "budget-band-cheaper",
 				When:          WhenInput{BudgetBandAtLeast: 0.8, BudgetBandSet: true},
-				RouteToModel:  "claude-3-5-haiku-20241022",
+				RouteToModel:  "claude-haiku-4-5",
 				OnUnavailable: OnUnavailableFailOpen,
 				ReasonCode:    string(ReasonBudgetBand),
 			},

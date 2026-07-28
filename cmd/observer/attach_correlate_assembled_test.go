@@ -132,7 +132,17 @@ func TestAttachCorrelationAssembledThroughHTTP(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if gotSID != wantSession {
-		t.Fatalf("SessionForRun(%q) = %q, want %q — the OOB session frame never reached Correlate", res.RunID, gotSID, wantSession)
+		// Do NOT read this as "the OOB frame was never delivered" (what this
+		// message used to claim — it misdirects at the transport layer). The
+		// frame is written synchronously by the spawner and drainOOB starts
+		// INSIDE ptyLauncher.Spawn, so it almost always DOES reach
+		// termsvc.Correlate. The failure is that no in-memory run→session link
+		// was established. Look at the ACCEPTANCE layer first:
+		// termsvc.Service.Correlate's liveness guard (byRun / launching) and the
+		// launch reservation in termsvc.launch — a correlation that lands before
+		// the PTY handle is registered used to be silently discarded there, and
+		// the OOB session frame is one-shot, so the link never came back.
+		t.Fatalf("SessionForRun(%q) = %q, want %q — no in-memory session link was established for the run; suspect termsvc.Correlate's liveness guard / the launch reservation, not the OOB transport", res.RunID, gotSID, wantSession)
 	}
 
 	// Adapter-level Snapshot must carry the correlated session id (the enrichment

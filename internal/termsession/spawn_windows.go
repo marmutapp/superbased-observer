@@ -184,10 +184,16 @@ func (windowsSpawner) Spawn(spec Spec) (PTY, error) {
 		hpc:     hpc,
 		job:     job,
 		process: pi.Process,
+		pid:     int(pi.ProcessId),
 		in:      os.NewFile(uintptr(inWrite), "conpty-in"),
 		out:     os.NewFile(uintptr(outRead), "conpty-out"),
 	}, nil
 }
+
+// The windows backend reports its child's pid, so the Manager can publish a
+// ProcessEvent for it (compile-time pin — the unix sibling has the same
+// assertion, so neither platform can silently lose the seam).
+var _ ProcessReporter = (*conPTY)(nil)
 
 // conPTY wraps a ConPTY (hpc) + its job object + the launcher process. The
 // pipe ends are wrapped as *os.File so Read/Write get the runtime's poller
@@ -199,6 +205,7 @@ type conPTY struct {
 	hpc     windows.Handle
 	job     windows.Handle
 	process windows.Handle
+	pid     int      // OS pid of the launcher child (ProcessInformation.ProcessId)
 	in      *os.File // child stdin (we write keystrokes here)
 	out     *os.File // child stdout (we read terminal output here)
 
@@ -206,6 +213,13 @@ type conPTY struct {
 	teardownOnce sync.Once
 	procOnce     sync.Once
 }
+
+// Pid implements [ProcessReporter]: the OS pid of the launcher child inside
+// the kill-on-close job object. It is the Windows counterpart of the unix
+// process-group leader pid — the whole `observer <tool>` → `<tool>` job hangs
+// off it — so an injected process-attribution sink can seed against it
+// identically on both platforms.
+func (p *conPTY) Pid() int { return p.pid }
 
 func (p *conPTY) Read(b []byte) (int, error)  { return p.out.Read(b) }
 func (p *conPTY) Write(b []byte) (int, error) { return p.in.Write(b) }

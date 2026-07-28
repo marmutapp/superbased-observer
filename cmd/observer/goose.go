@@ -38,6 +38,7 @@ func newGooseCmd() *cobra.Command {
 		fromTime     string
 		attach       *bool
 		noAttach     *bool
+		resume       *string
 	)
 	cmd := &cobra.Command{
 		Use:   "goose [-- goose-args...]",
@@ -69,13 +70,27 @@ func newGooseCmd() *cobra.Command {
 				flagNoAttach: *noAttach,
 				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
 					argsLeadWithSubcommand(args, gooseAttachHeadlessSubcommands),
-				passthrough: gooseAttachPassthrough(binPath),
+				passthrough: append(gooseAttachPassthrough(binPath), resumeAttachPassthrough(*resume)...),
 				toolArgs:    args,
 				stderr:      cmd.ErrOrStderr(),
 			})
 			if outcome.handled {
 				return aErr
 			}
+
+			// Native resume: `--resume <id>` → `goose session --resume
+			// --session-id <raw>` (the scoped observer id is stripped to goose's
+			// own id by the shared translation).
+			resumedArgs, releaseResume, okResume, resumeErr := applyLauncherResume(launcherResumeSpec{
+				verb: "goose", label: "goose", configPath: configPath, id: *resume,
+				continueFrom: continueFrom, carry: carry, fromMessage: fromMessage, fromTime: fromTime,
+				args: args, stderr: cmd.ErrOrStderr(),
+			})
+			if !okResume {
+				return resumeErr
+			}
+			defer releaseResume()
+			args = resumedArgs
 
 			bin, err := resolveToolBin("goose", binPath, "--goose-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
@@ -141,6 +156,7 @@ func newGooseCmd() *cobra.Command {
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "goose")
+	resume = registerResumeFlag(cmd, "goose")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
 }

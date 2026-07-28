@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -263,6 +264,33 @@ func TestAPIStatus(t *testing.T) {
 	}
 	if counts["sessions"] == nil || counts["actions"] == nil {
 		t.Errorf("missing session/action counts: %+v", counts)
+	}
+}
+
+// TestAPIStatusCarriesHostOS pins the DAEMON's OS on /api/status.
+//
+// The dashboard's on-screen terminal key bar labels its modifier keys from
+// this field (⌃/⌥ on darwin, Ctrl/Alt elsewhere): the vocabulary describes
+// the machine whose PTY is being typed into, and the browser is very often a
+// phone that is NOT that machine. The field must therefore always be present
+// and must be runtime.GOOS of the serving process — never a client guess.
+func TestAPIStatusCarriesHostOS(t *testing.T) {
+	s, _ := newTestServer(t)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+	if rr.Code != 200 {
+		t.Fatalf("status: %d", rr.Code)
+	}
+	var got map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	hostOS, ok := got["host_os"].(string)
+	if !ok {
+		t.Fatalf("host_os missing from /api/status: %+v", got)
+	}
+	if hostOS != runtime.GOOS {
+		t.Errorf("host_os = %q, want %q (runtime.GOOS of the daemon)", hostOS, runtime.GOOS)
 	}
 }
 

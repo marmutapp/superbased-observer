@@ -103,6 +103,39 @@ func (s *Store) Lookup(ctx context.Context, pid int) (Entry, bool, error) {
 	return e, true, nil
 }
 
+// Delete removes the bridge row for pid, returning whether a row was
+// actually deleted. It is the UNSEED half of the direct pid seed: a writer
+// that knows a bridged process has exited must retract its row, because the
+// OS is free to hand the same pid to an unrelated process and every reader
+// here (the proxy's ancestor walk, the process observer's SeedLookup) keys
+// purely on the numeric pid — a stale row is not a missing attribution, it
+// is a WRONG one.
+//
+// sessionID scopes the delete: when non-empty the row is removed only if it
+// still carries that session_id, so a writer can retract exactly what it
+// wrote and can never delete a row a later writer has already claimed for a
+// recycled pid. An empty sessionID deletes unconditionally by pid.
+//
+// A clean miss (no matching row) returns (false, nil); only I/O failures
+// return an error.
+func (s *Store) Delete(ctx context.Context, pid int, sessionID string) (bool, error) {
+	if pid <= 0 {
+		return false, nil
+	}
+	query := `DELETE FROM session_pid_bridge WHERE pid = ?`
+	args := []any{pid}
+	if sessionID != "" {
+		query += ` AND session_id = ?`
+		args = append(args, sessionID)
+	}
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return false, fmt.Errorf("pidbridge.Delete: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 // Prune deletes rows whose updated_at is older than now-olderThan. Returns
 // the count deleted. A non-positive olderThan is a no-op.
 func (s *Store) Prune(ctx context.Context, olderThan time.Duration) (int, error) {

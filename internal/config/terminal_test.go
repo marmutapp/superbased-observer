@@ -172,6 +172,61 @@ func TestTerminalAttachReclaimOnInputCompat(t *testing.T) {
 	}
 }
 
+// TestTerminalAttachForwardAuthEnvCompat pins the same partial-merge compat trap
+// for the forward_auth_env key: an EXISTING [terminal.attach] block written
+// BEFORE the key existed must still load with ForwardAuthEnv=true (seeded true in
+// Default(); BurntSushi leaves an absent key untouched — the same mechanism
+// DefaultOn / RouteProxy / ReclaimOnInput rely on). An explicit
+// forward_auth_env = false sticks.
+func TestTerminalAttachForwardAuthEnvCompat(t *testing.T) {
+	if !Default().Terminal.Attach.ForwardAuthEnv {
+		t.Fatal("Default() must seed Attach.ForwardAuthEnv=true")
+	}
+
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "legacy block without forward_auth_env keeps true",
+			body: "[terminal.attach]\nenabled = true\n",
+			want: true,
+		},
+		{
+			name: "legacy block with default_on but no forward_auth_env keeps true",
+			body: "[terminal.attach]\ndefault_on = false\n",
+			want: true,
+		},
+		{
+			name: "explicit forward_auth_env = false sticks",
+			body: "[terminal.attach]\nforward_auth_env = false\n",
+			want: false,
+		},
+		{
+			name: "explicit forward_auth_env = true sticks",
+			body: "[terminal.attach]\nforward_auth_env = true\n",
+			want: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.toml")
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := Load(LoadOptions{GlobalPath: path, Env: func(string) string { return "" }})
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := cfg.Terminal.Attach.ForwardAuthEnv; got != tc.want {
+				t.Errorf("Attach.ForwardAuthEnv = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestTerminalValidation(t *testing.T) {
 	tests := []struct {
 		name    string

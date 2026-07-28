@@ -6,6 +6,7 @@ import { HelpInd } from "@/components/HelpInd";
 import { BUILTIN_PROFILE_NAMES, SECTION_SPECS } from "./settings/sectionSpecs";
 import { StructuredConfigSection } from "./settings/StructuredConfigSection";
 import { AntigravityHelperCard } from "./settings/AntigravityHelperCard";
+import { ETWCapturerCard } from "./settings/ETWCapturerCard";
 import { ConnectedToolsSection } from "./settings/ConnectedToolsSection";
 import { EnrolmentSection } from "./settings/EnrolmentSection";
 import { HealthSection } from "./settings/HealthSection";
@@ -1884,6 +1885,8 @@ function SectionView({
         footer={
           section === "antigravity" ? (
             <AntigravityHelperCard />
+          ) : section === "process" ? (
+            <ETWCapturerCard />
           ) : section === "retention" ? (
             <PruneNowCard />
           ) : section === "profiles" ? (

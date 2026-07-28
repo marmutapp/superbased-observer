@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"reflect"
@@ -168,5 +169,64 @@ func TestEveryFrameStampsWireVersion(t *testing.T) {
 		if f.V != WireVersion {
 			t.Fatalf("frame %s has v=%d, want %d", f.Kind, f.V, WireVersion)
 		}
+	}
+}
+
+// TestCapturerStatsWireBackCompatBothDirections pins design constraint 5: the
+// classification counters are ADDITIVE, so neither half of a version-skewed
+// pair breaks.
+//
+// The conservative direction is the point. An older capturer omits the keys,
+// they decode as zero, and a zero ignored count fires NOTHING — the report
+// reads as "not proven", never as a fabricated pass and never as a false
+// alarm about a provider that is fine.
+func TestCapturerStatsWireBackCompatBothDirections(t *testing.T) {
+	t.Parallel()
+
+	// OLD CAPTURER → NEW DAEMON: the two new keys are simply absent.
+	const oldLine = `{"v":1,"kind":"stats","stats":{"network_decode_dropped":0,"network_decode_unsupported_version":0}}`
+	var f Frame
+	if err := json.Unmarshal([]byte(oldLine), &f); err != nil {
+		t.Fatalf("a pre-E6b stats line no longer decodes: %v", err)
+	}
+	if f.Stats == nil {
+		t.Fatal("stats frame decoded to nil")
+	}
+	if err := f.Stats.validate(); err != nil {
+		t.Fatalf("a pre-E6b report was refused: %v", err)
+	}
+	decode := f.Stats.DecodeStats()
+	if decode.NetworkIgnored != 0 || decode.NetworkDecoded != 0 {
+		t.Fatalf("absent keys did not decode as zero: %+v", decode)
+	}
+	if decode.Any() || decode.NothingClassified() {
+		t.Fatalf("an older capturer's report raised a signal it cannot support: %+v", decode)
+	}
+
+	// NEW CAPTURER → OLD DAEMON: the older daemon's struct has only the two
+	// original fields, so the new keys are unknown and must be ignored rather
+	// than failing the frame.
+	type legacyCapturerStats struct {
+		NetworkDecodeDropped            int64 `json:"network_decode_dropped"`
+		NetworkDecodeUnsupportedVersion int64 `json:"network_decode_unsupported_version"`
+	}
+	var buf bytes.Buffer
+	if err := NewEncoder(&buf).Stats(CapturerStats{
+		NetworkDecodeDropped: 3, NetworkDecodeUnsupportedVersion: 1,
+		NetworkDecodeDecoded: 900, NetworkDecodeIgnored: 48_211,
+	}); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var legacyFrame struct {
+		V     int                  `json:"v"`
+		Kind  FrameKind            `json:"kind"`
+		Stats *legacyCapturerStats `json:"stats"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &legacyFrame); err != nil {
+		t.Fatalf("a new stats line broke an older daemon's decode: %v", err)
+	}
+	if legacyFrame.Stats == nil || legacyFrame.Stats.NetworkDecodeDropped != 3 ||
+		legacyFrame.Stats.NetworkDecodeUnsupportedVersion != 1 {
+		t.Fatalf("the fields an older daemon DOES read did not survive: %+v", legacyFrame.Stats)
 	}
 }

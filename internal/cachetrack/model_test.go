@@ -247,8 +247,15 @@ func TestCacheableTokens(t *testing.T) {
 	}{
 		{"claude-opus-4-8", 1023, false},
 		{"claude-opus-4-8", 1024, true},
-		{"claude-opus-4-7", 4095, false},
-		{"claude-opus-4-7", 4096, true},
+		// Opus 4.7 is a 2,048 model per the vendor page (verified
+		// 2026-07-25). These two rows asserted a 4,095/4,096
+		// boundary until then — that assertion encoded the stale
+		// research-doc figure, i.e. it pinned the bug.
+		{"claude-opus-4-7", 2047, false},
+		{"claude-opus-4-7", 2048, true},
+		// 4,096 tier still covered here via Opus 4.6.
+		{"claude-opus-4-6", 4095, false},
+		{"claude-opus-4-6", 4096, true},
 		{"claude-haiku-3-5", 2047, false},
 		{"claude-haiku-3-5", 2048, true},
 	}

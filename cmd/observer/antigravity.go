@@ -32,6 +32,7 @@ func newAntigravityCmd() *cobra.Command {
 		fromTime     string
 		attach       *bool
 		noAttach     *bool
+		resume       *string
 	)
 	cmd := &cobra.Command{
 		Use:     "antigravity-cli [-- agy-args...]",
@@ -61,13 +62,25 @@ func newAntigravityCmd() *cobra.Command {
 				flagAttach:   *attach,
 				flagNoAttach: *noAttach,
 				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime),
-				passthrough:  antigravityAttachPassthrough(binPath),
+				passthrough:  append(antigravityAttachPassthrough(binPath), resumeAttachPassthrough(*resume)...),
 				toolArgs:     args,
 				stderr:       cmd.ErrOrStderr(),
 			})
 			if outcome.handled {
 				return aErr
 			}
+
+			// Native resume: `--resume <id>` → `agy --conversation <id>` (bare path).
+			resumedArgs, releaseResume, okResume, resumeErr := applyLauncherResume(launcherResumeSpec{
+				verb: "antigravity-cli", label: "antigravity-cli", configPath: configPath, id: *resume,
+				continueFrom: continueFrom, carry: carry, fromMessage: fromMessage, fromTime: fromTime,
+				args: args, stderr: cmd.ErrOrStderr(),
+			})
+			if !okResume {
+				return resumeErr
+			}
+			defer releaseResume()
+			args = resumedArgs
 
 			bin, err := resolveToolBin("antigravity-cli", binPath, "--agy-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
@@ -116,6 +129,7 @@ func newAntigravityCmd() *cobra.Command {
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "antigravity-cli")
+	resume = registerResumeFlag(cmd, "antigravity-cli")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
 }

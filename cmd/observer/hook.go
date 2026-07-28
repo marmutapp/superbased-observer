@@ -265,7 +265,7 @@ func handleClaudeCodeHook(ctx context.Context, event, configPath string) {
 		fmt.Fprintf(os.Stderr, "observer-hook: %s config: %v\n", label, err)
 		return
 	}
-	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "observer-hook: %s db: %v\n", label, err)
 		return
@@ -332,7 +332,7 @@ func pidbridgeWriterWithConfig(ctx context.Context, e pidbridge.Entry, configPat
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
-	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath})
 	if err != nil {
 		return fmt.Errorf("open db: %w", err)
 	}
@@ -760,7 +760,7 @@ func buildHookGuard(cfg config.Config, stderr io.Writer) *guard.Guard {
 	// DB open before its reply. Open failures report false:
 	// fail-safe toward enforcement.
 	g.SetApprovalLookup(func(ruleID, sessionID, rootHash string) bool {
-		database, err := db.Open(context.Background(), db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+		database, err := db.Open(context.Background(), db.Options{Path: cfg.Observer.DBPath})
 		if err != nil {
 			return false
 		}
@@ -774,7 +774,7 @@ func buildHookGuard(cfg config.Config, stderr io.Writer) *guard.Guard {
 
 // makeGuardPersist returns the lazy persist callback HandleGuarded
 // invokes AFTER the reply is on stdout: open the daemon DB
-// (SkipIntegrityCheck — the daemon already probes at startup), write
+// (no integrity probe — the daemon already probes at startup), write
 // one guard_events row through the one-owner store helper, close,
 // then fire the [guard.alerts] desktop notification if the verdict
 // meets the threshold (also post-reply, so a slow notification
@@ -782,7 +782,7 @@ func buildHookGuard(cfg config.Config, stderr io.Writer) *guard.Guard {
 // forensics JSONL already has the verdict if this fails.
 func makeGuardPersist(cfg config.Config, g *guard.Guard, label string, stderr io.Writer) func(guard.ActionVerdict) {
 	return func(v guard.ActionVerdict) {
-		database, err := db.Open(context.Background(), db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+		database, err := db.Open(context.Background(), db.Options{Path: cfg.Observer.DBPath})
 		if err != nil {
 			fmt.Fprintf(stderr, "observer-hook: %s guard persist db: %v\n", label, err)
 		} else {
@@ -847,7 +847,7 @@ func recordClaudecodeEffort(body []byte, eventName, label, configPath string, st
 	// registered as a wsl.exe bridge (see registerClaudeCodeWindows) so it
 	// executes INSIDE the daemon's context — this db.Open therefore resolves
 	// the daemon's own DB natively. No cross-OS SQLite open is attempted.
-	database, err := db.Open(context.Background(), db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+	database, err := db.Open(context.Background(), db.Options{Path: cfg.Observer.DBPath})
 	if err != nil {
 		fmt.Fprintf(stderr, "observer-hook: %s effort db: %v\n", label, err)
 		return
@@ -929,7 +929,7 @@ func handleCursorHook(ctx context.Context, event, configPath string) {
 		hook.HandleApprove("cursor:"+event, os.Stdin, os.Stdout, os.Stderr)
 		return
 	}
-	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "observer-hook: cursor db: %v\n", err)
 		hook.HandleApprove("cursor:"+event, os.Stdin, os.Stdout, os.Stderr)
@@ -1051,7 +1051,7 @@ func handleCodexHook(ctx context.Context, event, configPath string) {
 		_ = json.NewEncoder(os.Stdout).Encode(struct{}{})
 		return
 	}
-	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "observer-hook: codex db: %v\n", err)
 		_ = json.NewEncoder(os.Stdout).Encode(struct{}{})
@@ -1143,7 +1143,7 @@ func handleHermesHook(ctx context.Context, event, configPath string) {
 		fmt.Fprintf(os.Stderr, "observer-hook: %s config: %v\n", label, err)
 		return
 	}
-	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "observer-hook: %s db: %v\n", label, err)
 		return
@@ -1266,7 +1266,7 @@ func handleClaudeCodeActionEvent(ctx context.Context, label, configPath string, 
 		fmt.Fprintf(os.Stderr, "observer-hook: %s config: %v\n", label, err)
 		return
 	}
-	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "observer-hook: %s db: %v\n", label, err)
 		return
@@ -1965,7 +1965,7 @@ func handleClaudeCodeWorktreeCreate(ctx context.Context, label, configPath strin
 		fmt.Fprintf(stderr, "observer-hook: %s config: %v\n", label, err)
 		return
 	}
-	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath})
 	if err != nil {
 		fmt.Fprintf(stderr, "observer-hook: %s db: %v\n", label, err)
 		return

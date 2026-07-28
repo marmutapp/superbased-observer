@@ -95,8 +95,8 @@ type Options struct {
 	IdleTimeout time.Duration
 	// WriterLeaseIdle revokes a REMOTE writer lease with no Write/Resize for
 	// this long (default 5m), refreshed on each successful write (§4.α.2c).
-	// Local leases (the native wrapper, the loopback dashboard seat) are
-	// exempt — see reapOnce.
+	// Local leases (the native wrapper, the loopback dashboard seat) AND
+	// STANDING-provenance remote leases are exempt — see reapOnce.
 	WriterLeaseIdle time.Duration
 	// WriterLeaseMax is the hard cap on a REMOTE writer lease's lifetime
 	// (default 30m) after which the holder must re-acquire (fresh capability
@@ -125,6 +125,26 @@ type Options struct {
 	// no notion of notifications — this is a plain callback seam (like the
 	// dashboard's LaunchManager), so the outbound HTTP lives in cmd, not here.
 	OnExit func(SessionExit)
+	// OnProcess, when non-nil, receives the PTY CHILD PROCESS lifecycle signal
+	// — one ProcessSpawned when a session's child is running, one
+	// ProcessExited when it is gone. It is the process-attribution seam: the
+	// child's OS pid is otherwise known only to this package (it is used for
+	// the process-group reap and then discarded), so nothing downstream can
+	// attribute that process subtree to the terminal it belongs to.
+	//
+	// termsession stays free of any process-observation dependency — this is a
+	// plain injected callback (the same discipline as OnExit / OnOutput), so
+	// the pid bridge write lives in cmd, not here. Nil is a clean no-op, and an
+	// event is fired ONLY when the backend actually reports a pid (see
+	// ProcessReporter) — a fake PTY in a test therefore fires nothing.
+	//
+	// Both edges are delivered from the owning session's own goroutine and MUST
+	// NOT block: spawn fires inline in Create (so a Spawned edge always precedes
+	// its Exited edge), and exit fires inline on the waitExit goroutine —
+	// deliberately synchronous, because the delay between the child being reaped
+	// and its pid being retracted is exactly the window in which a recycled pid
+	// could be misattributed to a dead terminal.
+	OnProcess func(ProcessEvent)
 	// OnOutput, when non-nil, is called by the always-on pump with each chunk
 	// of PTY output (handle + the raw bytes). It is the UNTRUSTED byte tap for
 	// the OSC hint parser (internal/termscan, F3) — termsession itself never
@@ -154,6 +174,55 @@ type SessionExit struct {
 	Subcommand string
 	ExitCode   int
 	At         time.Time
+	// PID is the OS pid of the exited PTY child, or 0 when the backend did not
+	// report one. Additive (2026-07-26): a consumer that seeded process
+	// attribution against this pid needs the pid back to retract it. Prefer
+	// Options.OnProcess for that — it fires synchronously and therefore closes
+	// the pid-reuse window that OnExit's detached delivery leaves open.
+	PID int
+}
+
+// ProcessEventKind classifies a [ProcessEvent] edge.
+type ProcessEventKind string
+
+const (
+	// ProcessSpawned — the session's PTY child is running under PID.
+	ProcessSpawned ProcessEventKind = "spawned"
+	// ProcessExited — the session's PTY child has been reaped; PID is no
+	// longer a valid attribution target and must be retracted.
+	ProcessExited ProcessEventKind = "exited"
+)
+
+// ProcessEvent is the metadata-only PTY child-process lifecycle record handed
+// to Options.OnProcess. Content-free by construction: ids, a pid, the launcher
+// verb, and the (server-derived, already-validated) launch directory.
+type ProcessEvent struct {
+	// Kind is the lifecycle edge (ProcessSpawned / ProcessExited).
+	Kind ProcessEventKind
+	// Handle is the opaque terminal-session handle. It is the join key a
+	// consumer uses to reach the terminal RUN identity (and, once correlation
+	// establishes it, the agent session id) — the pid alone carries neither.
+	Handle string
+	// PID is the OS pid of the PTY's direct child (`observer <tool>`), which is
+	// also its process-group / job leader, so the whole tool subtree hangs off
+	// it. Always > 0 (an event is not fired otherwise).
+	PID int
+	// Subcommand is the observer launcher verb (e.g. "claude"). It is NOT the
+	// canonical tool name — a consumer that needs that resolves it from the run
+	// identity.
+	Subcommand string
+	// SourceSessionID is Spec.SessionID: the session a handoff launch continues
+	// FROM. It is explicitly NOT the session this process subtree belongs to
+	// (migration 064's identity invariant — the source and any correlated
+	// target session are distinct and must never be conflated), so it is named
+	// for what it is and must not be used as an attribution target.
+	SourceSessionID string
+	// Dir is the child's working directory as launched ("" = inherited).
+	Dir string
+	// ExitCode is the child's exit status; meaningful only for ProcessExited.
+	ExitCode int
+	// At is the event time.
+	At time.Time
 }
 
 // LeaseEventKind classifies a writer-lease transition for the audit tap.
@@ -165,11 +234,23 @@ const (
 	// LeaseReleased — the holder voluntarily released the lease.
 	LeaseReleased LeaseEventKind = "lease_released"
 	// LeaseRevoked — the lease was forcibly revoked (config-off, device revoke,
-	// emergency revoke, teardown, or idle/hard-cap expiry).
+	// emergency revoke, or teardown). A revoke of this kind means the DEVICE is
+	// no longer trusted.
 	LeaseRevoked LeaseEventKind = "lease_revoked"
 	// LeaseTakenOver — a granted acquire superseded an incumbent writer. The
 	// session and losing bridge remain valid; only the old writer lease is fenced.
 	LeaseTakenOver LeaseEventKind = "lease_taken_over"
+	// LeaseExpired — the lease reached its idle lifetime or hard cap and was
+	// swept by the reaper. Split out of LeaseRevoked (2026-07-25, mobile
+	// terminal-continuity arc) because the two mean OPPOSITE things to a
+	// consumer: a revoke says "this device lost trust — tear the socket down",
+	// whereas an expiry says "this credential aged out — re-authorize". Folding
+	// expiry into LeaseRevoked made a remote bridge CLOSE the websocket when a
+	// 30-minute lease simply aged out, which forced the user to re-issue
+	// credentials for a session that was never in doubt. The security bound is
+	// unchanged: the lease is still revoked and every write is still fenced —
+	// only the socket-teardown consequence differs (see RevokeIsExpiry).
+	LeaseExpired LeaseEventKind = "lease_expired"
 )
 
 // LeaseEvent is a metadata-only writer-lease transition record (never secrets,
@@ -211,6 +292,7 @@ type Manager struct {
 	now             func() time.Time
 	logger          *slog.Logger
 	onExit          func(SessionExit)
+	onProcess       func(ProcessEvent)
 	onOutput        func(handle string, p []byte)
 	onLeaseEvent    func(LeaseEvent)
 	// allowRemoteTakeover holds a replaceable LIVE policy source. Sessions call
@@ -256,6 +338,7 @@ func NewManager(opts Options) *Manager {
 		now:             opts.Now,
 		logger:          opts.Logger,
 		onExit:          opts.OnExit,
+		onProcess:       opts.OnProcess,
 		onOutput:        opts.OnOutput,
 		onLeaseEvent:    opts.OnLeaseEvent,
 		sessions:        make(map[string]*Session),
@@ -314,6 +397,11 @@ type Session struct {
 	out       *outBuf
 	createdAt time.Time
 	now       func() time.Time
+	// pid is the OS pid of the PTY child, snapshotted once at Create from the
+	// backend's ProcessReporter (0 when the backend reports none). It is
+	// immutable for the session's lifetime, so it needs no lock — the pid of a
+	// spawned child never changes, and liveness is read from doneAt.
+	pid int
 
 	lastAct  atomic.Int64 // unixnano of the last PTY I/O
 	doneAt   atomic.Int64 // unixnano the process exited (0 = still running)
@@ -361,6 +449,17 @@ type Session struct {
 	currentRows uint16
 	currentCols uint16
 	haveInitial bool
+	// geomOff is the ABSOLUTE output-ring offset captured at the most recent
+	// geometry CHANGE — the replay floor. The ring stores raw PTY bytes with no
+	// width tagging, so bytes emitted while the PTY was 152 cols wide render
+	// corrupted when replayed into a 47-col terminal (each line's first char
+	// lands at the end of the previous line). A reconnecting client does NOT
+	// self-heal, because its resize is usually a no-op: the PTY is already that
+	// size and the kernel skips SIGWINCH on an unchanged winsize. So a new
+	// subscriber starts at max(ring base, geomOff) and only ever replays bytes
+	// emitted at the CURRENT width. Written ONLY by recordResize (the one resize
+	// funnel, so geometry keeps a single owner); read lock-free by replayStart.
+	geomOff atomic.Int64
 }
 
 // Token is the opaque session identifier.
@@ -374,6 +473,12 @@ func (s *Session) SessionID() string { return s.spec.SessionID }
 
 // CreatedAt is when the session was spawned.
 func (s *Session) CreatedAt() time.Time { return s.createdAt }
+
+// PID is the OS pid of this session's PTY child (`observer <tool>`), or 0 when
+// the backend reports none. It stays populated after exit; use Exited (or
+// Manager.PIDForHandle) to learn whether it is still a valid attribution
+// target.
+func (s *Session) PID() int { return s.pid }
 
 // Done is closed when the underlying process exits.
 func (s *Session) Done() <-chan struct{} { return s.done }
@@ -414,14 +519,44 @@ func (s *Session) seedDims(rows, cols uint16) {
 // when no initial size was known (0×0 Spec), adopts this first real size as the
 // initial. Called only from resizeVia (the one resize funnel), so geometry has a
 // single owner.
+//
+// It is ALSO where the replay floor (geomOff) moves: a geometry change makes
+// every already-buffered byte unsafe to replay into the new width, so the ring's
+// current end becomes the new subscriber's replay start. Two cases deliberately
+// do NOT move the floor: a same-size resize (nothing about the width changed, so
+// truncating would silently discard good scrollback) and the first-size adoption
+// of a 0×0 Spec (there is no earlier-width content to discard).
+//
+// Lock order is dimsMu → outBuf.mu, and it can never invert: outBuf holds no
+// reference to a Session and so never takes dimsMu.
 func (s *Session) recordResize(rows, cols uint16) {
 	s.dimsMu.Lock()
 	defer s.dimsMu.Unlock()
+	firstAdoption := !s.haveInitial && rows != 0 && cols != 0
+	changed := rows != s.currentRows || cols != s.currentCols
 	s.currentRows, s.currentCols = rows, cols
-	if !s.haveInitial && rows != 0 && cols != 0 {
+	if firstAdoption {
 		s.initialRows, s.initialCols = rows, cols
 		s.haveInitial = true
+		return
 	}
+	if changed {
+		s.geomOff.Store(s.out.currentTotal())
+	}
+}
+
+// replayStart is the absolute ring offset a NEW subscriber must begin reading
+// from: the newer of the ring's oldest buffered byte and the last geometry
+// boundary. Both Subscribe paths route through it so the cursor rule has one
+// owner and cannot drift. The max() also clamps: once the ring has trimmed PAST
+// a geometry boundary the base wins, so the cursor never points at dropped bytes
+// and never moves backwards.
+func (s *Session) replayStart() int64 {
+	base := s.out.currentBase()
+	if geom := s.geomOff.Load(); geom > base {
+		return geom
+	}
+	return base
 }
 
 func (s *Session) touch() { s.lastAct.Store(s.now().UnixNano()) }
@@ -459,8 +594,12 @@ func (s *Session) emitLease(kind LeaseEventKind, holder, actor, reason string) {
 // --- Read side: subscriptions ---
 
 // Subscription is one read-only viewer's cursor over the session's output ring.
-// It replays recent scrollback from the ring's oldest buffered byte, then tails
-// live output. A slow subscriber that falls behind the ring is drop-oldest
+// It replays recent scrollback from the session's replayStart (the ring's oldest
+// buffered byte, or the last geometry boundary when that is newer — see
+// Session.geomOff), then tails live output. Starting at the geometry boundary is
+// what keeps a reconnect at a NEW terminal width from repainting bytes that were
+// laid out for the OLD width. A slow subscriber that falls behind the ring is
+// drop-oldest
 // degraded: its Read reports a growing Lost gap counter, and the always-on pump
 // NEVER back-pressures on it. Read from it like an io.Reader.
 type Subscription struct {
@@ -522,7 +661,7 @@ func (m *Manager) Subscribe(handle string) (*Subscription, error) {
 	}
 	sub := &Subscription{
 		s:      s,
-		off:    s.out.currentBase(), // replay from the ring's oldest byte, then tail
+		off:    s.replayStart(), // replay from the last geometry boundary, then tail
 		cancel: make(chan struct{}),
 	}
 	s.subs[sub] = struct{}{}
@@ -671,6 +810,25 @@ func (l *WriterLease) Gen() uint64 { return l.gen }
 // DEMOTES the client to a viewer; any other termination CLOSES the socket.
 // Meaningful only after Revoked() has closed.
 func (l *WriterLease) RevokeIsTakeover() bool { return l.revokeKind == LeaseTakenOver }
+
+// RevokeIsExpiry reports whether the lease terminated because it aged out — its
+// idle lifetime or hard cap was reached and the reaper swept it — as opposed to
+// an admin/device revoke (untrusted device) or a takeover. Meaningful only after
+// Revoked() has closed.
+//
+// The remote WS bridge treats an expiry like a takeover for TEARDOWN purposes:
+// it demotes the client to a read-only viewer instead of closing the socket. It
+// also PUBLISHES the distinction — the control_revoked frame carries
+// expiry:true — because that is what lets a device holding a standing secret
+// re-present it on the still-open socket with no owner round-trip, while a
+// single-use holder is told to ask for a fresh capability. (Without the wire
+// flag an expiry was indistinguishable from a takeover client-side, and the
+// "silently re-acquire" this justification rests on did not actually happen;
+// review B3, 2026-07-25.)
+//
+// The AUTHORITY consequence is unchanged — the lease is gone and every write is
+// fenced until a fresh §4.δ conjunction succeeds.
+func (l *WriterLease) RevokeIsExpiry() bool { return l.revokeKind == LeaseExpired }
 
 // Write feeds client keystrokes to the terminal. It serializes on the session
 // write fence and drops the write (ErrNotWriter) if this lease is no longer the
@@ -1168,6 +1326,7 @@ func (m *Manager) Create(spec Spec) (string, error) {
 	s := &Session{
 		spec:                 spec,
 		pty:                  p,
+		pid:                  ptyPID(p),
 		out:                  newOutBuf(m.ringBytes),
 		createdAt:            m.now(),
 		now:                  m.now,
@@ -1195,6 +1354,19 @@ func (m *Manager) Create(spec Spec) (string, error) {
 	reserved = false // reservation converted; the deferred release is now a no-op
 	m.mu.Unlock()
 
+	// Publish the process-attribution seam BEFORE the lifecycle goroutines
+	// start, so a ProcessSpawned edge can never be delivered after its own
+	// ProcessExited edge. Inline by contract (see Options.OnProcess).
+	m.fireProcess(ProcessEvent{
+		Kind:            ProcessSpawned,
+		Handle:          handle,
+		PID:             s.pid,
+		Subcommand:      spec.Subcommand,
+		SourceSessionID: spec.SessionID,
+		Dir:             spec.Dir,
+		At:              s.createdAt,
+	})
+
 	m.wg.Add(2)
 	go m.waitExit(s)
 	go m.pump(s)
@@ -1203,12 +1375,54 @@ func (m *Manager) Create(spec Spec) (string, error) {
 	return handle, nil
 }
 
+// fireProcess delivers one process-lifecycle edge to the injected sink. A nil
+// sink, or a backend that reports no pid, is a clean no-op — there is nothing
+// to attribute in either case.
+func (m *Manager) fireProcess(ev ProcessEvent) {
+	if m.onProcess == nil || ev.PID <= 0 {
+		return
+	}
+	m.onProcess(ev)
+}
+
+// PIDForHandle returns the OS pid of a LIVE session's PTY child. ok is false
+// when the handle is unknown, when the backend reported no pid, or when the
+// child has already exited — an exited pid is not a valid attribution target
+// because the OS may have handed it to an unrelated process, so this never
+// hands one out.
+func (m *Manager) PIDForHandle(handle string) (int, bool) {
+	m.mu.Lock()
+	s := m.sessions[handle]
+	m.mu.Unlock()
+	if s == nil || s.pid <= 0 {
+		return 0, false
+	}
+	if exited, _ := s.Exited(); exited {
+		return 0, false
+	}
+	return s.pid, true
+}
+
 // waitExit blocks on the process and records its exit. The session lingers
 // in the registry (ExitLinger) so an attached client sees the final bytes.
 func (m *Manager) waitExit(s *Session) {
 	defer m.wg.Done()
 	code, _ := s.pty.Wait()
 	s.markDone(code)
+	// Retract the process-attribution seed FIRST and INLINE. Wait has already
+	// reaped the child, so from here until the sink retracts the pid the OS may
+	// hand it to an unrelated process — a detached delivery would widen that
+	// window for no benefit (see Options.OnProcess).
+	m.fireProcess(ProcessEvent{
+		Kind:            ProcessExited,
+		Handle:          s.handle,
+		PID:             s.pid,
+		Subcommand:      s.spec.Subcommand,
+		SourceSessionID: s.spec.SessionID,
+		Dir:             s.spec.Dir,
+		ExitCode:        code,
+		At:              m.now(),
+	})
 	// Fire the Phase-0 session-exit signal (plan §7 Phase 0). Detached in its
 	// own goroutine so a blocking notification sink never stalls teardown.
 	if m.onExit != nil {
@@ -1218,6 +1432,7 @@ func (m *Manager) waitExit(s *Session) {
 			Subcommand: s.spec.Subcommand,
 			ExitCode:   code,
 			At:         m.now(),
+			PID:        s.pid,
 		}
 		go m.onExit(ev)
 	}
@@ -1453,9 +1668,26 @@ func (m *Manager) reapOnce(now time.Time) {
 		// owner at the keyboard — idle-expiring it silently killed input in
 		// long-lived attach sessions ("keys stop working after 5 idle
 		// minutes"), which is continuity breakage, not defence.
+		//
+		// STANDING-provenance remote leases are additionally exempt from the
+		// IDLE half (2026-07-25, mobile terminal-continuity arc), mirroring the
+		// local exemption above and for the same reason. A standing secret is by
+		// design a REUSABLE, non-expiring credential the operator minted once:
+		// its holder re-acquires automatically on every fresh socket with no
+		// owner round-trip, so idle-expiring the lease it backs bought no
+		// authority reduction at all — the next keystroke merely triggered a
+		// silent re-acquire — while the revoke ITSELF closed the remote socket
+		// and stranded the user ("reconnect to the terminal"). The idle bound
+		// remains fully in force for SINGLE-USE-capability remote leases, where
+		// it is a real bound: re-acquiring there costs a fresh owner approval.
+		// The HARD CAP still applies to standing leases: it forces a periodic
+		// re-run of the whole §4.δ conjunction (live device session + live
+		// allow_terminal + live standing generation + launch policy), which is a
+		// genuine re-authorization and is what an operator revoke relies on to
+		// take effect promptly.
 		s.writeMu.Lock()
 		if l := s.lease; l != nil && l.kind != termlease.HolderLocal {
-			idleOver := now.Sub(time.Unix(0, l.lastWrite.Load())) > s.writerIdle
+			idleOver := !l.standing && now.Sub(time.Unix(0, l.lastWrite.Load())) > s.writerIdle
 			hardOver := now.Sub(time.Unix(0, l.createdAt)) > s.writerMax
 			if idleOver || hardOver {
 				expire = append(expire, s)
@@ -1481,7 +1713,10 @@ func (m *Manager) reapOnce(now time.Time) {
 		l := s.lease
 		s.writeMu.Unlock()
 		if l != nil {
-			s.revokeLease(l, LeaseRevoked, "writer lease expired")
+			// LeaseExpired (not LeaseRevoked): an aged-out lease is a
+			// re-authorization prompt, not a trust withdrawal — the remote
+			// bridge demotes instead of closing the socket (RevokeIsExpiry).
+			s.revokeLease(l, LeaseExpired, "writer lease expired")
 		}
 	}
 	for _, h := range kill {

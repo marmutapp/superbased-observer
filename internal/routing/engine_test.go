@@ -13,6 +13,12 @@ import (
 // per-token multipliers so savings are easy to assert.
 func testSnapshot() *Snapshot {
 	prices := map[string]struct{ in, out, cacheWrite float64 }{
+		// claude-opus-5 and claude-opus-4-8 price IDENTICALLY on
+		// purpose ($5 in / $25 out per MTok, 5m cache write $6.25) —
+		// that rate parity is load-bearing for
+		// TestApplyPin_OpusFivePromotionEconomics, which asserts that a
+		// rewrite between the two SKUs has exactly zero gross saving.
+		"claude-opus-5":     {5, 25, 6.25},
 		"claude-opus-4-8":   {5, 25, 6.25},
 		"claude-sonnet-4-6": {3, 15, 3.75},
 		"claude-haiku-4-5":  {1, 5, 1.25},
@@ -446,5 +452,203 @@ func TestDecide_EscalatedKindHolds(t *testing.T) {
 	d = Decide(valuePolicy(t), testSnapshot(), in)
 	if !d.Changed {
 		t.Errorf("unrelated escalation held the turn: %+v", d)
+	}
+}
+
+// pinOpusClassPolicy compiles the minimal `pin_tier = opus-class` policy
+// used by TestApplyPin_OpusFivePromotionEconomics — the opusplan-style
+// quality pin, reduced to one rule so the assertions are about applyPin
+// and nothing else.
+func pinOpusClassPolicy(t *testing.T) Policy {
+	t.Helper()
+	p, issues := Compile(PolicySpec{
+		Policy: "custom",
+		Rules: []RuleSpec{{
+			Name:   "pin_reads_to_opus",
+			When:   WhenSpec{TurnKind: "read_only"},
+			Action: ActionSpec{PinTier: "opus-class", Reason: "phase_pin"},
+		}},
+	})
+	if LintHasErrors(issues) {
+		t.Fatalf("lint: %+v", issues)
+	}
+	return p
+}
+
+// TestApplyPin_OpusFivePromotionEconomics pins the DECISION-level half of
+// the 2026-07-25 operator-approved flagship promotion
+// (seedRepresentatives[ShapeAnthropic][TierOpusClass]: claude-opus-4-8 →
+// claude-opus-5). tiers_test.go pins the table cell; this pins what the
+// engine DOES with it, because that cell is live traffic under
+// `[routing] mode = "enforce"`.
+//
+// Do NOT "fix" a failure here by reverting the representative. The
+// promotion is deliberate: Claude Opus 5 is the current Anthropic
+// flagship, it is the same ProviderShape (so the §R11.4 same-shape
+// constraint is untouched), and it prices identically to Opus 4.8 at
+// $5/$25 per MTok — there is no per-token cost delta. Four claims, in the
+// order they matter:
+//
+//  1. Reachable pins now land on claude-opus-5. `pin_tier = opus-class`
+//     is an UPSHIFT intent (the opusplan case), so the reachable path is
+//     a LOWER-tier incumbent — and its target moved SKU.
+//  2. That upshift is priced honestly: a warm prefix is forfeited
+//     (CacheForfeitUSD > 0) and the net goes negative. Pins bypass
+//     stickiness and cache-hold by design (§R13, they are explicit
+//     quality intents), so the forfeit is recorded, never avoided.
+//  3. An incumbent ALREADY on either Opus SKU is NOT rewritten. applyPin's
+//     FIRST guard is `tier == r.Action.PinTier`, which short-circuits on
+//     TIER identity before the representative is ever resolved — so the
+//     promotion does not churn live claude-opus-4-8 sessions onto
+//     claude-opus-5 and does not invalidate their prompt caches. This is
+//     the anti-churn pin: if that early return is ever "optimized" away,
+//     opus-class sessions start paying a same-tier, cache-invalidating
+//     rewrite that buys nothing, and these rows fail loudly. Note the
+//     later `candidate == in.Shape.Model` guard is NOT what protects
+//     them — with a consistent tier table it is unreachable, since
+//     `tier != PinTier` already excludes the pinned tier's own
+//     representative. These rows also pin that the hold carries the
+//     RULE's reason (phase_pin), not no_candidate.
+//  4. When a cross-SKU rewrite IS forced — here by an operator tier
+//     override demoting claude-opus-4-8, the only supported way to reach
+//     it — the rate identity makes the gross saving exactly $0, so the net
+//     is precisely the negative of the cache forfeit: a rewrite that costs
+//     money and saves nothing. With no warm prefix there is nothing to
+//     forfeit and the net is $0 — which pins cache forfeit as the SOLE
+//     cause of the negative, not the SKU swap itself.
+func TestApplyPin_OpusFivePromotionEconomics(t *testing.T) {
+	t.Parallel()
+
+	// demotedSnapshot is claim 4's fixture: an operator tier override
+	// (§R7.1) places claude-opus-4-8 below opus-class, which is what makes
+	// applyPin resolve the opus-class representative for an Opus
+	// incumbent instead of short-circuiting on tier identity.
+	demotedSnapshot := func() *Snapshot {
+		snap := testSnapshot()
+		res := NewTierResolver()
+		res.Reload(map[string]Tier{"claude-opus-4-8": TierSonnetClass})
+		snap.Tiers = res.Table()
+		return snap
+	}
+
+	const (
+		negative = -1
+		zero     = 0
+	)
+
+	cases := []struct {
+		name  string
+		snap  *Snapshot
+		model string
+		// priorCacheRead is the warm prefix the switch would forfeit.
+		priorCacheRead int64
+		wantChanged    bool
+		wantModel      string
+		wantForfeitPos bool
+		wantSavingsSig int
+		// wantNetIsPureForfeit asserts EstSavingsUSD == -CacheForfeitUSD,
+		// i.e. the gross saving was exactly zero (rate-identical SKUs).
+		wantNetIsPureForfeit bool
+	}{
+		// Claims 1 + 2: the reachable upshift pin, retargeted to Opus 5.
+		{
+			name:           "upshift_pin_targets_opus5_and_forfeits_cache",
+			snap:           testSnapshot(),
+			model:          "claude-sonnet-4-6",
+			priorCacheRead: 1_000_000,
+			wantChanged:    true,
+			wantModel:      "claude-opus-5",
+			wantForfeitPos: true,
+			wantSavingsSig: negative,
+		},
+		// Claim 3: neither Opus SKU is churned by the promotion.
+		{
+			name:           "incumbent_opus48_not_rewritten_to_opus5",
+			snap:           testSnapshot(),
+			model:          "claude-opus-4-8",
+			priorCacheRead: 1_000_000,
+			wantChanged:    false,
+			wantModel:      "claude-opus-4-8",
+			wantSavingsSig: zero,
+		},
+		{
+			name:           "incumbent_opus5_not_rewritten",
+			snap:           testSnapshot(),
+			model:          "claude-opus-5",
+			priorCacheRead: 1_000_000,
+			wantChanged:    false,
+			wantModel:      "claude-opus-5",
+			wantSavingsSig: zero,
+		},
+		// Claim 4: a forced cross-SKU rewrite saves nothing and costs the
+		// forfeit — and is $0, not negative, without a warm prefix.
+		{
+			name:                 "forced_cross_sku_rewrite_costs_exactly_the_forfeit",
+			snap:                 demotedSnapshot(),
+			model:                "claude-opus-4-8",
+			priorCacheRead:       1_000_000,
+			wantChanged:          true,
+			wantModel:            "claude-opus-5",
+			wantForfeitPos:       true,
+			wantSavingsSig:       negative,
+			wantNetIsPureForfeit: true,
+		},
+		{
+			name:                 "forced_cross_sku_rewrite_cold_prefix_is_free",
+			snap:                 demotedSnapshot(),
+			model:                "claude-opus-4-8",
+			priorCacheRead:       0,
+			wantChanged:          true,
+			wantModel:            "claude-opus-5",
+			wantForfeitPos:       false,
+			wantSavingsSig:       zero,
+			wantNetIsPureForfeit: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			in := readOnlyInput()
+			in.Shape.Model = tc.model
+			in.Session.PriorCacheReadTokens = tc.priorCacheRead
+
+			d := Decide(pinOpusClassPolicy(t), tc.snap, in)
+
+			if d.Changed != tc.wantChanged || d.SelectedModel != tc.wantModel {
+				t.Fatalf("changed/model = %v/%q, want %v/%q (decision %+v)",
+					d.Changed, d.SelectedModel, tc.wantChanged, tc.wantModel, d)
+			}
+			if d.RuleName != "pin_reads_to_opus" {
+				t.Errorf("rule = %q, want pin_reads_to_opus", d.RuleName)
+			}
+			// The pin always attributes to its own reason — a held
+			// incumbent is an intentional tier-identity no-op, not a
+			// no_candidate failure.
+			if len(d.ReasonCodes) != 1 || d.ReasonCodes[0] != ReasonPhasePin {
+				t.Errorf("reasons = %v, want [phase_pin]", d.ReasonCodes)
+			}
+
+			if got := d.CacheForfeitUSD > 0; got != tc.wantForfeitPos {
+				t.Errorf("CacheForfeitUSD = %v, want positive=%v", d.CacheForfeitUSD, tc.wantForfeitPos)
+			}
+			if !tc.wantForfeitPos && d.CacheForfeitUSD != 0 {
+				t.Errorf("CacheForfeitUSD = %v, want exactly 0", d.CacheForfeitUSD)
+			}
+			switch tc.wantSavingsSig {
+			case negative:
+				if d.EstSavingsUSD >= 0 {
+					t.Errorf("EstSavingsUSD = %v, want strictly negative", d.EstSavingsUSD)
+				}
+			case zero:
+				if d.EstSavingsUSD != 0 {
+					t.Errorf("EstSavingsUSD = %v, want exactly 0", d.EstSavingsUSD)
+				}
+			}
+			if tc.wantNetIsPureForfeit && d.EstSavingsUSD != -d.CacheForfeitUSD {
+				t.Errorf("EstSavingsUSD = %v, want -CacheForfeitUSD (%v): rate-identical SKUs must have zero gross saving",
+					d.EstSavingsUSD, -d.CacheForfeitUSD)
+			}
+		})
 	}
 }

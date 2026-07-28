@@ -149,6 +149,49 @@ func TestTierTable_Representative(t *testing.T) {
 	}
 }
 
+// TestTierTable_OpusFivePlacement pins the 2026-07-25 Claude Opus 5
+// registration. Two distinct claims:
+//
+//  1. claude-opus-5 places Opus-class by an EXACT seed entry, not by the
+//     bare "claude-opus" family prefix. The prefix already covered it, so
+//     this asserts the explicit flagship pin exists as authored.
+//  2. The Anthropic Opus-class downshift representative is claude-opus-5.
+//     This is the live-behaviour cell (what enforce mode rewrites to);
+//     pricing parity with claude-opus-4-8 is what makes it cost-neutral.
+//
+// The remaining rows are the regression guard: registering a new flagship
+// must not disturb any neighbouring Anthropic placement.
+func TestTierTable_OpusFivePlacement(t *testing.T) {
+	t.Parallel()
+	tbl := NewTierResolver().Table()
+
+	if tier, src := tbl.Lookup("claude-opus-5"); tier != TierOpusClass || src != TierSourceExact {
+		t.Errorf("Lookup(claude-opus-5) = (%s,%s), want (opus-class, exact)", tier, src)
+	}
+	if got := ShapeForModel("claude-opus-5"); got != ShapeAnthropic {
+		t.Errorf("ShapeForModel(claude-opus-5) = %q, want %q", got, ShapeAnthropic)
+	}
+	if m, ok := tbl.Representative(ShapeAnthropic, TierOpusClass); !ok || m != "claude-opus-5" {
+		t.Errorf("Representative(anthropic, opus-class) = (%q,%v), want (claude-opus-5, true)", m, ok)
+	}
+
+	// Unchanged neighbours — the swap is additive, not invasive.
+	for _, tc := range []struct {
+		model string
+		want  Tier
+	}{
+		{"claude-opus-4-8", TierOpusClass},
+		{"claude-opus-4-1", TierOpusClass},
+		{"claude-fable-5", TierOpusClass},
+		{"claude-sonnet-4-6", TierSonnetClass},
+		{"claude-haiku-4-5", TierHaikuClass},
+	} {
+		if got, src := tbl.Lookup(tc.model); got != tc.want || src != TierSourceExact {
+			t.Errorf("Lookup(%q) = (%s,%s), want (%s, exact)", tc.model, got, src, tc.want)
+		}
+	}
+}
+
 // TestShapeForModel covers the prefix resolution table — one row per
 // table entry plus the conservative-unknown cases.
 func TestShapeForModel(t *testing.T) {

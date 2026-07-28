@@ -21,6 +21,18 @@
 // (the attached CAS); Read serves the attached client from the ring, not the
 // PTY directly.
 //
+// Process-attribution seam (Options.OnProcess): the PTY child's OS pid is
+// knowable only here — it is used for the process-group / job-object reap and
+// was otherwise discarded, which is why a dashboard-launched terminal's
+// process subtree never reached the §9.2.1 direct pid seed. The Manager now
+// publishes a content-free ProcessEvent on the spawn and exit edges through an
+// INJECTED callback, so the pid bridge write (and its retraction — a stale row
+// misattributes a recycled pid) lives in cmd, not here: this package still
+// imports nothing from the process-observation stack. Both real backends
+// report the pid via ProcessReporter (unix child pid / Windows
+// ProcessInformation.ProcessId); a fake PTY in a test implements neither and
+// therefore fires nothing.
+//
 // Module discipline (CLAUDE.md): the PTY + process are behind an injected
 // Spawner/PTY interface (rule 1) so the Manager's lifecycle logic is
 // unit-testable with an in-memory stub; the package imports only stdlib +

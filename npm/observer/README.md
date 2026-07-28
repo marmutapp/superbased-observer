@@ -41,6 +41,7 @@ the full two-plane explainer.
 - [Per-AI-client setup](#per-ai-client-setup)
 - [Architecture in detail](#architecture-in-detail)
 - [Dashboard tour](#dashboard-tour)
+- [Terminals — launch, join, and track your AI CLIs](#terminals--launch-join-and-track-your-ai-clis)
 - [MCP tools reference](#mcp-tools-reference)
 - [Compression mechanisms](#compression-mechanisms)
 - [Cost and token math](#cost-and-token-math)
@@ -716,6 +717,125 @@ the drawer at that entry.
 Each compression mechanism (json / code / logs / text / diff / html
 / drop) has a "Full methodology · see more" expandable section
 explaining the actual algorithm.
+
+
+## Terminals — launch, join, and track your AI CLIs
+
+The dashboard is also a terminal host. Instead of tracking your AI
+CLIs from the outside, you can launch them *inside* observer, watch
+their live telemetry alongside the session they produce, and — new in
+v1.25.0 — join a running one from a second browser tab. The terminal
+surfaces are read-only where they touch your files and single-writer
+where they touch your keyboard; nothing here mutates a repo or lets
+two people type at once.
+
+### Launch any supported AI CLI as a real terminal
+
+Nineteen CLI launchers — claude, codex, opencode, cursor, copilot-cli,
+kilo, cline-cli, hermes, gemini, openclaw, pi, antigravity, qwen,
+kiro, grok, kimi, devin, qoder, goose — start from the dashboard's
+**Launch here** control or from the command line as `observer <verb>`
+(`observer claude`, `observer codex`, and so on). Each opens a **real
+PTY** — a native pseudo-terminal on Linux and macOS, and a native
+ConPTY on Windows 10 1809+ and Windows 11 (no WSL required). If the
+tool's binary isn't on your `$PATH`, the launcher offers a guided
+one-click install rather than failing. Dashboard launching is gated by
+`[handoff].allow_dashboard_launch` (default `true`).
+
+(The count is nineteen *launchers*, not the adapter count — observer
+tracks 26 adapters in total, but only these nineteen ship a first-class
+terminal launcher.)
+
+### Attach-by-default
+
+As of v1.25.0, `observer <verb>` runs the child **daemon-owned** so the
+dashboard can join it, while the native terminal you launched from stays
+fully interactive as seat #1 — you lose nothing by getting the extra
+reach. Opt out per-run with `--no-attach`, or globally with
+`[terminal.attach].default_on = false`; scripted or piped runs never
+attach.
+
+A daemon-owned child forwards more than the routing above: it also
+carries over your shell's values for each tool's
+registry-documented credential env keys — `ANTHROPIC_API_KEY` for
+claude-code, `OPENAI_API_KEY` for codex and pi, `OPENROUTER_API_KEY`
+for hermes, `XAI_API_KEY` for grok, `GEMINI_API_KEY`/`GOOGLE_API_KEY`
+for gemini-cli, `COPILOT_PROVIDER_API_KEY` for copilot-cli, and others
+with registry-documented key envs — so a shell-exported API key works
+under attach exactly as it would bare. This is gated by
+`[terminal.attach].forward_auth_env` (default `true`); values transit
+the owner-only attach socket once per launch and are never logged or
+persisted. One honest caveat remains: tools without a registry-documented
+credential env (config-file, OAuth, or keychain auth) still see only
+the **daemon's** environment, and dashboard-launched terminals always
+do (there's no client shell to forward from) — for those, either
+export the credential where `observer start` runs, or use
+`--no-attach` to keep the child in your shell's environment.
+
+### Jump in — multi-seat terminals
+
+Every live daemon-owned run is joinable from any dashboard tab, whether
+that tab is local or a paired remote device, as an extra seat. A
+terminal holds up to **8 viewers** but exactly **one writer** at a time.
+The writer lease moves seamlessly across the native terminal, a local
+dashboard tab, and a remote dashboard tab — type into the native
+terminal to reclaim it; an authenticated remote can take over with a
+read-only fallback and a take-back for the seat it displaced. A freshly
+launched run correlates to its observer session in roughly 10–30
+seconds, after which its live telemetry lines up with the captured data.
+
+### Per-terminal Files & Git panels
+
+Each AI-tool terminal carries a read-only **Files** panel — a file tree
+plus a text viewer rooted at that terminal's project root — and a
+read-only **Git** panel showing branch, upstream, ahead/behind counts,
+working-tree status, and a 100-commit log. Right-click to copy a path or
+paste it into a live terminal. This is a read-only view in v1: no file
+mutations, no diff view.
+
+### Session Cockpit
+
+Toggle the **⊙ Session** control on any AI-tool terminal for a
+draggable, live panel of everything observer knows about that run:
+
+- **Last activity** and **tokens/sec**, tagged with a measured-vs-
+  estimated badge
+- **Live cost** with the AI-vs-tool split, plus the **next-message
+  cost band**
+- **Context fill** against the model's context budget, and — for
+  proxy-routed sessions — the **5h / 7d rate-limit gauge**
+- **Prompt-cache expiry chips** for the caches this session is keeping
+  warm
+- **CPU / memory / disk sparklines** and the spawned-process tree for
+  the terminal
+- The **last five turns**, each deep-linked into the full session
+  detail view
+
+### Workspace grid
+
+Run up to **9 concurrent tiles** (`[terminal].max_concurrent`),
+drag and resize them, and your layout persists across reloads. On a
+paired remote device the grid is read-only.
+
+### Restarts & continuity
+
+claude and codex **auto-resume the same transcript** after a daemon
+restart — a verified native resume, so the conversation continues where
+it left off. Every other tool's attached session ends when the daemon
+restarts; to pick the work back up, fork it with
+`observer <verb> --continue-from <session-id>`. That opens a new session
+id and seeds a distilled handover of the prior session as its first
+prompt — it works for all nineteen launchers.
+
+### Remote posture
+
+Remote terminal access is opt-in, **tailnet-only** (served over your
+private Tailscale network as private HTTPS), and off by default — there
+is no public-internet exposure. It splits into a view tier and an
+execute tier: `[remote].allow_terminal` (default `false`) governs remote
+*keyboard* control, while `[remote].allow_terminal_view` (default
+`true`) governs read-only viewing. Pairing is phone-first via QR code,
+and the dashboard is mobile-friendly for checking in from a phone.
 
 
 ## MCP tools reference

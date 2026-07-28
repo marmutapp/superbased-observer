@@ -7,7 +7,27 @@
     <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
     <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- viewport-fit=cover: opt into the full display on notched/rounded
+         phones so `env(safe-area-inset-*)` reports real values. Without it
+         those insets are always 0 and the full-viewport mobile terminal
+         (LaunchDock) would put its status line under the home indicator.
+
+         DO NOT ADD `interactive-widget=resizes-content` HERE. It was added on
+         2026-07-28 as a second, native way to solve the keyboard-occlusion
+         defect (D7) and was reverted the same day: it broke touch scrolling in
+         the mobile terminal on Chrome/Android, INCLUDING with the keyboard
+         dismissed (operator-reported). It is also redundant — under the
+         default `resizes-visual` Chrome still shrinks the VISUAL viewport and
+         fires `visualViewport.resize`, which is what src/lib/
+         useVisualViewport.ts consumes, so the keyboard fix works on Android
+         and iOS alike without touching the layout viewport at all.
+
+         Note for anyone re-testing this: the Playwright suites run desktop
+         Chromium with `hasTouch`, where a virtual keyboard does not exist and
+         `interactive-widget` is therefore INERT. Every mobile spec passed with
+         it set. This key cannot be validated by that harness — only on a real
+         device. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>SuperBased</title>
     <script>
       // Pre-paint: read theme preference (light / dark / system) and

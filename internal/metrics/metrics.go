@@ -12,10 +12,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/marmutapp/superbased-observer/internal/config"
 	"github.com/marmutapp/superbased-observer/internal/diag"
 	"github.com/marmutapp/superbased-observer/internal/intelligence/cost"
+	"github.com/marmutapp/superbased-observer/internal/processobs"
 )
 
 // Options configures a Renderer or Server.
@@ -178,11 +180,14 @@ func writeBridgeMetrics(ctx context.Context, out *buf, opts Options) error {
 
 // writeProcessMetrics emits the DB-derived process-observability gauges
 // (docs/process-observability.md §15). These reflect persisted state and so
-// work whether or not a backend is currently running; the live runtime
-// counters (backend_up, events/dropped totals, queue depth) come from the
-// daemon's in-memory processobs.Health and are added when the Observer is
-// wired into the daemon (P2). The table always exists (migration 044), so
-// a disabled feature simply reports zeros.
+// work whether or not a backend is currently running. The table always
+// exists (migration 044), so a disabled feature simply reports zeros.
+//
+// The LIVE runtime state (backend up, queue depth, network-accounting mode)
+// comes from the daemon's in-memory processobs.Health. This exporter is its
+// own process — `observer metrics`, not `observer start` — so it cannot read
+// that memory; the daemon publishes it as a diag.ProcessHealth record beside
+// the DB and writeProcessHealthMetrics below re-exports it.
 func writeProcessMetrics(ctx context.Context, out *buf, opts Options) error {
 	var total, attributed int
 	if err := opts.DB.QueryRowContext(ctx,
@@ -222,8 +227,240 @@ func writeProcessMetrics(ctx context.Context, out *buf, opts Options) error {
 		writeGaugeLabeled(out, "observer_process_runs_by_tool",
 			"Persisted, attributed process_runs rows per AI tool.", byTool)
 	}
+	writeProcessHealthMetrics(out, opts)
 	return nil
 }
+
+// writeProcessHealthMetrics re-exports the running daemon's
+// process-observability runtime health (diag.ProcessHealth) as gauges.
+//
+// Absence is meaningful and is expressed as absent metric families, not as
+// zeros: no live record means no daemon has reported, and a fabricated
+// `backend_up 0` would be indistinguishable from a daemon that is up with a
+// dead backend. observer_process_health_age_seconds lets a scraper decide
+// for itself whether the report is fresh — a wedged daemon keeps its record
+// on disk, so the age is the honest signal, not the presence of the file.
+//
+// Read failures are silent for the same reason: "no daemon reporting" is the
+// normal state for this optional, opt-in feature and must not fail the
+// scrape.
+func writeProcessHealthMetrics(out *buf, opts Options) {
+	h, ok := diag.LatestProcessHealth(diag.ProcessHealthDir(opts.DBPath))
+	if !ok {
+		return
+	}
+	backend := h.Backend
+	if backend == "" {
+		backend = "unknown"
+	}
+	up := 0.0
+	if h.BackendUp {
+		up = 1
+	}
+	writeGaugeLabeled(out, "observer_process_backend_up",
+		"1 if the process-observability capture backend reported itself up, 0 if down. Absent when no daemon has published health.",
+		[]labeled{{labels: [][2]string{{"backend", backend}}, value: up}})
+	writeGaugeLabeled(out, "observer_process_queue_depth",
+		"Depth of the process-observability event queue as last reported by the daemon.",
+		[]labeled{{labels: [][2]string{{"backend", backend}}, value: float64(h.QueueDepth)}})
+	writeGauge(out, "observer_process_health_timestamp_seconds",
+		"Unix timestamp at which the daemon last published its process-observability health.",
+		float64(h.WrittenAt.Unix()))
+	writeGauge(out, "observer_process_health_age_seconds",
+		"Age of the most recent process-observability health report, in seconds. Grows without bound if the daemon stops refreshing.",
+		h.Age(opts.Now()).Seconds())
+
+	// Enum-style state set: exactly one mode is 1. Emitting every mode
+	// (rather than only the active one) means an alert can be written as
+	// `observer_process_network_accounting{mode="unavailable"} == 1` without
+	// needing an absence check, and a mode flip cannot leave a stale series
+	// at 1.
+	mode := h.NetworkAccountingMode
+	if mode != "" && !processobs.KnownNetworkAccountingMode(mode) {
+		// An unrecognised mode is bucketed, never emitted as itself. It is
+		// reported (not folded into "off" — the point of this surface is to
+		// not invent certainty) but the LABEL VALUE stays inside this build's
+		// vocabulary: mode reaches the daemon partly from the cross-OS
+		// capturer's hello frame, and a label whose values a remote picks is
+		// a series Prometheus keeps forever, once per distinct string. The
+		// unrecognised value itself is on the doctor line, which holds one
+		// value at a time.
+		mode = processNetworkModeUnrecognised
+	}
+	modes := make([]labeled, 0, len(processNetworkModes)+1)
+	for _, m := range processNetworkModes {
+		v := 0.0
+		if m == mode {
+			v = 1
+		}
+		modes = append(modes, labeled{labels: [][2]string{{"mode", m}}, value: v})
+	}
+	if mode == processNetworkModeUnrecognised {
+		modes = append(modes, labeled{labels: [][2]string{{"mode", mode}}, value: 1})
+	}
+	writeGaugeLabeled(out, "observer_process_network_accounting",
+		"Per-process network byte accounting state, one series per mode: off (not requested), unavailable (requested but not attached — bytes are UNMEASURED, not zero), tcp (live, TCP payload bytes only — UDP/QUIC is never counted), unrecognised (the daemon reported a mode this exporter does not define — see `observer doctor` for the value).",
+		modes)
+
+	// The reason is the actionable half of "unavailable" ("missing CAP_BPF/
+	// CAP_PERFMON", "needs elevation", …) and is carried verbatim as a
+	// label. Info-style: value is always 1. The mode label is the bucketed
+	// one for the reason above; the reason itself is bounded in LENGTH at the
+	// bridge boundary (a capturer's hello reason is clamped there), and is
+	// accepted here as a documented trade: a post-authentication string whose
+	// operator value is precisely its verbatim wording.
+	writeGaugeLabeled(out, "observer_process_network_accounting_info",
+		"Always 1. Carries the current per-process network accounting mode and the daemon's verbatim reason for a non-live mode.",
+		[]labeled{{labels: [][2]string{
+			{"mode", mode},
+			{"reason", h.NetworkAccountingReason},
+		}, value: 1}})
+
+	writeProcessTransportMetrics(out, h)
+}
+
+// writeProcessTransportMetrics emits the cross-OS capturer link's connection
+// gauges — the only surface on which "the elevated capturer never connected"
+// and "the elevated capturer is being refused on a bad token" are visible.
+//
+// Absence is meaningful HERE TOO, and for a sharper reason than the health
+// families above: most installs have no dial-in capture transport at all, so
+// emitting `observer_process_transport_connections 0` for them would page on
+// a feed they never configured. The whole family set is therefore skipped
+// unless the daemon reported a configured transport — which also makes a
+// record written by an older daemon (no such key) silently correct rather
+// than a fabricated zero.
+//
+// The one thing that is NOT silence is a transport the operator asked for
+// that never came up: that gets its own info-style series, because otherwise
+// "requested and broken" scrapes identically to "never requested".
+func writeProcessTransportMetrics(out *buf, h diag.ProcessHealth) {
+	if h.TransportState == processobs.TransportStateUnavailable {
+		// Info-style (value always 1), same shape as
+		// observer_process_network_accounting_info: the free-form reason is a
+		// label on an always-1 series, never a value.
+		writeGaugeLabeled(out, "observer_process_transport_unavailable_info",
+			"Always 1 when a cross-OS capture transport was REQUESTED but could not be created (bind conflict, unwritable token file, block left disabled), carrying the daemon's verbatim reason. Absent when no transport was requested and when one is running — a requested-and-broken transport must not scrape identically to an unconfigured one.",
+			[]labeled{{labels: [][2]string{{"reason", h.TransportUnavailableReason}}, value: 1}})
+		return
+	}
+	if !h.TransportConfigured() {
+		return
+	}
+	addr := h.TransportAddr
+	if addr == "" {
+		addr = "unknown"
+	}
+	labels := [][2]string{{"addr", addr}}
+	connected := 0.0
+	if h.TransportConnected {
+		connected = 1
+	}
+	writeGaugeLabeled(out, "observer_process_transport_connected",
+		"1 if a cross-OS process capturer is connected to the daemon's accept listener right now, 0 if not. Absent when no such transport is configured.",
+		[]labeled{{labels: labels, value: connected}})
+	writeGaugeLabeled(out, "observer_process_transport_connections",
+		"Capturers that connected AND authenticated over the daemon's accept listener, for the daemon's lifetime. 0 with 0 auth failures means no capturer has ever started.",
+		[]labeled{{labels: labels, value: float64(h.TransportConnections)}})
+	writeGaugeLabeled(out, "observer_process_transport_auth_failures",
+		"Connections REFUSED at the daemon's capturer handshake, for ANY reason (wrong shared token, a protocol version this daemon does not speak, an unrelated local process probing the port). Non-zero with observer_process_transport_connections == 0 means something is dialling and nothing is getting through — the count names no cause; observer_process_transport_auth_failure_info carries the daemon's verbatim reason.",
+		[]labeled{{labels: labels, value: float64(h.TransportAuthFailures)}})
+	// The refusal's CLASS rides an info-style always-1 series as a label (the
+	// observer_process_network_accounting_info pattern), never a gauge value.
+	// Absent until a refusal is actually recorded: an empty series would read
+	// as "refused for no reason".
+	//
+	// The class, not the daemon's verbatim reason. The reason quotes a
+	// fragment supplied by whatever dialled the port — and this listener's
+	// bind is reachable from every process on the Windows host under WSL
+	// localhostForwarding — so a reason label lets any local process mint a
+	// fresh label value per connection attempt, and Prometheus retains every
+	// distinct series it has ever scraped. A length clamp does not help: it
+	// bounds each string's SIZE, not the NUMBER of distinct strings. The
+	// class comes from a closed vocabulary owned by this build and is
+	// re-normalised here, so the label's value set is bounded no matter what
+	// the health record on disk contains. The verbatim reason stays on
+	// `observer doctor`'s transport line, which holds exactly one value.
+	if h.TransportLastAuthError != "" {
+		writeGaugeLabeled(out, "observer_process_transport_auth_failure_info",
+			"Always 1. Classifies the most recent refused capturer handshake: token_mismatch (the shared secret did not match), protocol_version (the client speaks a wire version this daemon does not), malformed (not a capturer handshake at all — often an unrelated local process probing the port), transport (the socket died mid-handshake), unknown (a refusal recorded by a daemon predating this field). The daemon's VERBATIM reason is deliberately not a label — it quotes remote input, and one series per distinct string is unbounded cardinality; read `observer doctor` for it. Absent until a refusal is recorded.",
+			[]labeled{{labels: append(append([][2]string{}, labels...),
+				[2]string{"class", processobs.NormalizeTransportAuthClass(h.TransportLastAuthErrorClass)}), value: 1}})
+	}
+
+	// The capturer's OWN decoder health — the only evidence that the
+	// fixed-offset payload layout it decodes by actually holds on that host.
+	//
+	// Gated on the presence flag, and the gate is the point: a capturer with
+	// no running network decoder (every non-elevated run) reports nothing, and
+	// emitting `observer_process_capturer_decode_dropped 0` for it would say
+	// the layout assumptions were exercised and held when nothing was decoded
+	// at all. Absent means "never reported"; a reported 0 is a REAL
+	// measurement and is emitted as one, because "it stayed zero" is exactly
+	// what an operator validating this feed needs to be able to alert on.
+	if h.TransportCapturerDecodeReported {
+		writeGaugeLabeled(out, "observer_process_capturer_decode_dropped",
+			"Network data events the cross-OS capturer's decoder REFUSED as short or unexpectedly shaped, as of its most recent report. NON-ZERO IS THE LOUD ONE: the fixed-offset payload layout does not hold on that host, so the per-process byte totals are WRONG rather than merely missing. Absent when no capturer has ever reported its decode health (which is NOT the same as a reported zero).",
+			[]labeled{{labels: labels, value: float64(h.TransportCapturerDropped)}})
+		writeGaugeLabeled(out, "observer_process_capturer_decode_unsupported_version",
+			"Network data events the cross-OS capturer's decoder refused because the OS stamped an event version its layout table does not describe. Broken out from the dropped count because the cause and the fix differ: the OS shipped a new template and this build's field offsets may no longer apply. Absent when no capturer has ever reported its decode health.",
+			[]labeled{{labels: labels, value: float64(h.TransportCapturerUnsupportedVersion)}})
+		// The POSITIVE half of the same report. The two counters above can
+		// only say what was REFUSED, and the failure that matters most
+		// refuses nothing: if the OS renumbers the Kernel-Network event ids,
+		// every event lands in the ignored bucket and the capturer scrapes
+		// clean while measuring zero bytes.
+		//
+		// A LARGE IGNORED COUNT IS NORMAL — do not alert on it alone; it
+		// counts control-plane events, connect/disconnect/retransmit and UDP,
+		// which outnumber data events on every healthy host. The alertable
+		// fact is the conjunction, which is exported as its own 0/1 series
+		// below rather than left for each operator to re-derive.
+		writeGaugeLabeled(out, "observer_process_capturer_decode_decoded",
+			"Network data events the cross-OS capturer's decoder ACCEPTED and counted bytes from, as of its most recent report. This is the only series that says the decoder measured anything: every per-process byte total comes from an accepted event, so a zero here means the byte totals are necessarily zero however clean the refusal counters look. Absent when no capturer has ever reported its decode health.",
+			[]labeled{{labels: labels, value: float64(h.TransportCapturerDecoded)}})
+		writeGaugeLabeled(out, "observer_process_capturer_decode_ignored",
+			"Events the cross-OS capturer's decoder saw and classified as not-a-data-event (control-plane, TCP connect/disconnect/accept/retransmit, UDP). A LARGE VALUE IS NORMAL AND HEALTHY — this is not a fault counter and must not be alerted on by itself. It is exported because it is one half of the only conjunction that catches a renumbered provider; see observer_process_capturer_decode_nothing_classified. Absent when no capturer has ever reported its decode health.",
+			[]labeled{{labels: labels, value: float64(h.TransportCapturerIgnored)}})
+		nothingClassified := 0.0
+		if h.CapturerDecodeNothingClassified() {
+			nothingClassified = 1
+		}
+		writeGaugeLabeled(out, "observer_process_capturer_decode_nothing_classified",
+			"1 when the capturer's decoder saw events, classified NONE of them as data, and refused none either — the renumbered-provider signature, in which every refusal-shaped check passes while the decoder measures nothing. It is exported as a derived series, not left to a PromQL conjunction, because the raw counters are individually unalarming and an operator cannot be expected to re-derive the one shape that matters. 1 is a SUSPICION, not a diagnosis: on a host moving TCP traffic it means the provider's event ids no longer match this build's layout table; on a genuinely idle host it means the feed has not yet proven it decodes anything. Absent when no capturer has ever reported its decode health.",
+			[]labeled{{labels: labels, value: nothingClassified}})
+		if !h.TransportCapturerDecodeAt.IsZero() {
+			writeGaugeLabeled(out, "observer_process_capturer_decode_report_timestamp_seconds",
+				"Unix timestamp at which the daemon RECEIVED the capturer's most recent decode-health report (stamped locally, never taken from the wire). Absent until one arrives; it is what makes the two counters above readable as current rather than as history.",
+				[]labeled{{labels: labels, value: float64(h.TransportCapturerDecodeAt.Unix())}})
+		}
+	}
+
+	// Never-happened is expressed as an absent series, not as epoch 0: a
+	// capturer that has never connected must not read as "connected in 1970".
+	if !h.TransportLastConnectAt.IsZero() {
+		writeGaugeLabeled(out, "observer_process_transport_last_connect_timestamp_seconds",
+			"Unix timestamp of the most recent successful capturer connection. Absent until one happens.",
+			[]labeled{{labels: labels, value: float64(h.TransportLastConnectAt.Unix())}})
+	}
+	if !h.TransportLastDisconnectAt.IsZero() {
+		writeGaugeLabeled(out, "observer_process_transport_last_disconnect_timestamp_seconds",
+			"Unix timestamp of the most recent capturer disconnection. Absent until one happens; paired with the connect timestamp it makes a flapping capturer visible.",
+			[]labeled{{labels: labels, value: float64(h.TransportLastDisconnectAt.Unix())}})
+	}
+}
+
+// processNetworkModes is the set of accounting modes always emitted as a
+// state set. It is READ FROM the processobs vocabulary rather than restated
+// here, so this exporter cannot drift out of sync with the one owner of that
+// list (CLAUDE.md rule 4).
+var processNetworkModes = processobs.NetworkAccountingModes()
+
+// processNetworkModeUnrecognised is the bucket every mode this build does not
+// define lands in. It is not a processobs mode — it is this exporter's way of
+// saying "the daemon named something I do not know" with ONE label value
+// instead of one per distinct string.
+const processNetworkModeUnrecognised = "unrecognised"
 
 // writeCostMetrics emits cost / token / compression gauges rolled up over
 // the last windowMinutes.
@@ -398,21 +635,46 @@ func formatLabels(labels [][2]string) string {
 	return b.String()
 }
 
-// escapeLabel escapes `\`, `"`, and newlines per Prometheus text format.
+// escapeLabel makes s safe as a Prometheus label value.
+//
+// The text format defines exactly three escapes — `\\`, `\"`, `\n` — and
+// nothing else. That is a smaller alphabet than "control characters", so the
+// other control bytes need a decision rather than a pass-through:
+//
+//   - a raw CR inside a quoted label value is not escapable (there is no
+//     `\r` escape; emitting one would be an UNDEFINED escape sequence that a
+//     conforming parser rejects), and a raw CR/LF pair would end the sample
+//     line early, splicing the tail of one label into what a scraper reads as
+//     the next metric;
+//   - invalid UTF-8 is not a legal label value at all.
+//
+// So the three defined escapes are applied, every OTHER C0 control and DEL is
+// DROPPED, and invalid UTF-8 is replaced (ranging a string yields U+FFFD for
+// each bad byte). Dropping loses a byte nobody can render anyway; it cannot
+// forge exposition structure.
+//
+// This is BELT, not the braces. Today's callers are not known to be able to
+// reach here with a control byte — the strings that quote remote input are
+// built with %q at the error-construction site, which escapes them first, and
+// the clamp on those strings bounds length, not bytes. That makes %q the
+// ACTUAL protection and this function the backstop for the next caller that
+// forgets one. Neither is a substitute for the other.
 func escapeLabel(s string) string {
-	if !strings.ContainsAny(s, "\\\"\n") {
+	if !needsLabelEscape(s) {
 		return s
 	}
 	var b strings.Builder
 	b.Grow(len(s) + 4)
 	for _, r := range s {
-		switch r {
-		case '\\':
+		switch {
+		case r == '\\':
 			b.WriteString(`\\`)
-		case '"':
+		case r == '"':
 			b.WriteString(`\"`)
-		case '\n':
+		case r == '\n':
 			b.WriteString(`\n`)
+		case r < 0x20 || r == 0x7f:
+			// No defined escape, and raw would corrupt the exposition.
 		default:
 			b.WriteRune(r)
 		}
@@ -420,8 +682,31 @@ func escapeLabel(s string) string {
 	return b.String()
 }
 
+// needsLabelEscape reports whether s must go through the escaping path. It is
+// the fast path's gate, so it has to cover EVERY transform escapeLabel makes
+// — including the ones that are not escapes (dropped control bytes, replaced
+// invalid UTF-8). A gate narrower than the transform is how raw bytes slip
+// past an escaper that would have handled them.
+func needsLabelEscape(s string) bool {
+	if !utf8.ValidString(s) {
+		return true
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\\' || c == '"' || c < 0x20 || c == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
 // escapeHelp escapes `\` and newlines in HELP text (no `"` escape needed —
 // HELP is terminated by end-of-line, not a quote).
+//
+// It deliberately does NOT carry escapeLabel's control-byte handling: every
+// HELP string in this package is a compile-time literal written here, so
+// there is no input path to defend. If a HELP string ever becomes dynamic,
+// that changes and this must gain the same treatment.
 func escapeHelp(s string) string {
 	if !strings.ContainsAny(s, "\\\n") {
 		return s

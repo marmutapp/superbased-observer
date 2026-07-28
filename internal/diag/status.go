@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -35,6 +36,22 @@ type StatusSnapshot struct {
 	// that the operator has restarted the daemon since the save.
 	StartedAt     time.Time `json:"started_at,omitempty"`
 	UptimeSeconds int64     `json:"uptime_seconds,omitempty"`
+
+	// HostOS is runtime.GOOS of the process that produced this
+	// snapshot ("darwin" / "linux" / "windows") — i.e. the machine
+	// whose PTYs the dashboard's terminals are attached to. Stamped
+	// by Snapshot itself (unlike Version/StartedAt) because it is a
+	// build-time constant of the running binary, so the CLI's JSON
+	// status carries it too.
+	//
+	// The dashboard's on-screen terminal key bar reads it to choose
+	// the modifier VOCABULARY it prints (⌃/⌥ on darwin, Ctrl/Alt
+	// elsewhere). That decision belongs to the HOST, not the browser:
+	// the browser is very often a phone that is not the machine being
+	// typed into. Labels only — the bytes a key emits are identical
+	// on every OS. Not omitempty: an absent field is the wire signal
+	// for "daemon too old to know", which the client handles.
+	HostOS string `json:"host_os"`
 }
 
 // SnapshotCounts holds the row counts for each table the user cares about.
@@ -90,7 +107,7 @@ func Snapshot(ctx context.Context, database *sql.DB, dbPath string) (StatusSnaps
 	if database == nil {
 		return StatusSnapshot{}, errors.New("diag.Snapshot: nil DB")
 	}
-	snap := StatusSnapshot{DBPath: dbPath}
+	snap := StatusSnapshot{DBPath: dbPath, HostOS: runtime.GOOS}
 	if fi, err := os.Stat(expandTilde(dbPath)); err == nil {
 		snap.DBSizeBytes = fi.Size()
 	}

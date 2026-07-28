@@ -40,6 +40,7 @@ func newCopilotCLICmd() *cobra.Command {
 		fromTime     string
 		attach       *bool
 		noAttach     *bool
+		resume       *string
 	)
 	cmd := &cobra.Command{
 		Use:   "copilot-cli [-- copilot-args...]",
@@ -75,13 +76,24 @@ func newCopilotCLICmd() *cobra.Command {
 				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
 					argsContainHeadlessFlag(args, "-p", "--prompt") ||
 					argsLeadWithSubcommand(args, copilotSubcommands),
-				passthrough: copilotAttachPassthrough(binPath, model),
+				passthrough: append(copilotAttachPassthrough(binPath, model), resumeAttachPassthrough(*resume)...),
 				toolArgs:    args,
 				stderr:      cmd.ErrOrStderr(),
 			})
 			if outcome.handled {
 				return err
 			}
+			// Native resume: `--resume <id>` → `copilot --session-id <id>` (bare path).
+			resumedArgs, releaseResume, okResume, resumeErr := applyLauncherResume(launcherResumeSpec{
+				verb: "copilot-cli", label: "copilot-cli", configPath: configPath, id: *resume,
+				continueFrom: continueFrom, carry: carry, fromMessage: fromMessage, fromTime: fromTime,
+				args: args, stderr: cmd.ErrOrStderr(),
+			})
+			if !okResume {
+				return resumeErr
+			}
+			defer releaseResume()
+			args = resumedArgs
 			cfg, err := config.Load(config.LoadOptions{GlobalPath: configPath})
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
@@ -157,6 +169,7 @@ func newCopilotCLICmd() *cobra.Command {
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "copilot-cli")
+	resume = registerResumeFlag(cmd, "copilot-cli")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
 }

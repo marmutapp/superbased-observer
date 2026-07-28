@@ -145,3 +145,67 @@ func TestPlainCapabilityNotTerminalConsumable(t *testing.T) {
 		t.Fatal("plain capability consumed via terminal path with a guessed confirm")
 	}
 }
+
+// TestZeroLifetimesResolveToDefaultsNotForever pins the "0 = the package
+// default" convention BEHAVIOURALLY for all three widened bounds — the
+// convention internal/config's validateRemote documents and now enforces
+// (review B2, 2026-07-25). A 0 that meant "never expires" would turn an omitted
+// config key into an unbounded credential, which is the failure mode the
+// validator's error message promises cannot happen.
+func TestZeroLifetimesResolveToDefaultsNotForever(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0).UTC()
+
+	t.Run("capability ttl 0 is 10m, not forever", func(t *testing.T) {
+		now := base
+		cs := NewCapabilityStore(0, func() time.Time { return now })
+
+		live, liveConfirm, err := cs.MintTerminalControl("dev-A", "h1")
+		if err != nil {
+			t.Fatalf("MintTerminalControl: %v", err)
+		}
+		now = base.Add(DefaultCapabilityTTL - time.Minute)
+		if !cs.ConsumeTerminalControl(live, liveConfirm, "dev-A", "h1") {
+			t.Fatal("a capability expired BEFORE the 10m default")
+		}
+
+		dead, deadConfirm, err := cs.MintTerminalControl("dev-A", "h1")
+		if err != nil {
+			t.Fatalf("MintTerminalControl: %v", err)
+		}
+		now = now.Add(DefaultCapabilityTTL + time.Minute)
+		if cs.ConsumeTerminalControl(dead, deadConfirm, "dev-A", "h1") {
+			t.Fatal("a ttl=0 capability store never expires — 0 must mean the default, not forever")
+		}
+	})
+
+	t.Run("session ttl/idle 0 are the 48h/24h defaults, not forever", func(t *testing.T) {
+		now := base
+		s := NewSessionStore(SessionParams{Now: func() time.Time { return now }})
+		raw, err := s.Create()
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		now = base.Add(DefaultSessionIdle + time.Minute)
+		if err := s.Validate(raw); err == nil {
+			t.Fatal("a session survived past the idle default — 0 must mean the default, not forever")
+		}
+
+		// And the ABSOLUTE cap binds even a continuously-touched session.
+		now = base
+		s2 := NewSessionStore(SessionParams{Now: func() time.Time { return now }})
+		raw2, err := s2.Create()
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		for elapsed := time.Duration(0); elapsed < DefaultSessionTTL; elapsed += time.Hour {
+			now = base.Add(elapsed)
+			if err := s2.Validate(raw2); err != nil {
+				t.Fatalf("session died at %v, inside the absolute cap: %v", elapsed, err)
+			}
+		}
+		now = base.Add(DefaultSessionTTL + time.Minute)
+		if err := s2.Validate(raw2); err == nil {
+			t.Fatal("a continuously-touched session outlived the absolute TTL")
+		}
+	})
+}

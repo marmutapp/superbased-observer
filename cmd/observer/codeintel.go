@@ -379,7 +379,7 @@ func newCodeIntelExplainCmd() *cobra.Command {
 // and swallowed (ADR-0002 — index time only, off the proxy hot path).
 // New projects over auto_index_limit are consent-gated (force=false).
 func runCodeIntelOnStart(ctx context.Context, configPath string) {
-	cfg, database, cleanup, err := loadConfigAndDBFast(ctx, configPath)
+	cfg, database, cleanup, err := loadConfigAndDB(ctx, configPath)
 	if err != nil {
 		return
 	}

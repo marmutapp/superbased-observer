@@ -159,7 +159,7 @@ func matchRemoteCodePipe(ctx *MatchContext) (bool, string) {
 // hasPSCommandFlag reports a PowerShell-style -Command/-EncodedCommand
 // parameter on the unit (case-insensitive — PS parameters are).
 func hasPSCommandFlag(c *Command) bool {
-	for _, t := range c.Argv[1:] {
+	for _, t := range c.Args() {
 		lt := strings.ToLower(t)
 		if lt == "-command" || lt == "-encodedcommand" || lt == "-c" {
 			return true
@@ -237,7 +237,7 @@ func safeUploadLocalhostOnly(_ *MatchContext, cmd *Command) bool {
 		return false
 	}
 	urls := 0
-	for _, t := range cmd.Argv[1:] {
+	for _, t := range cmd.Args() {
 		lt := strings.ToLower(t)
 		if !strings.HasPrefix(lt, "http://") && !strings.HasPrefix(lt, "https://") {
 			continue
@@ -273,7 +273,7 @@ func matchSecretsInNetworkArgs(ctx *MatchContext, cmd *Command) (bool, string) {
 	if ctx.Cfg.SecretDetect == nil || !networkCommandBases[cmd.Base] {
 		return false, ""
 	}
-	for _, a := range cmd.Argv[1:] {
+	for _, a := range cmd.Args() {
 		if types := ctx.Cfg.SecretDetect(a); len(types) > 0 {
 			return true, "secret-shaped value (" + strings.Join(types, ", ") + ") in " + cmd.Base + " arguments"
 		}

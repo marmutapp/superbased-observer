@@ -44,6 +44,7 @@ func newPiCmd() *cobra.Command {
 		fromTime     string
 		attach       *bool
 		noAttach     *bool
+		resume       *string
 	)
 	cmd := &cobra.Command{
 		Use:   "pi [-- pi-args...]",
@@ -81,13 +82,25 @@ func newPiCmd() *cobra.Command {
 				flagNoAttach:  *noAttach,
 				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
 					argsContainHeadlessFlag(args, "-p", "--print"),
-				passthrough: piAttachPassthrough(binPath),
+				passthrough: append(piAttachPassthrough(binPath), resumeAttachPassthrough(*resume)...),
 				toolArgs:    args,
 				stderr:      cmd.ErrOrStderr(),
 			})
 			if outcome.handled {
 				return err
 			}
+			// Native resume: `--resume <id>` → `pi --session <id>` (LEADS the user
+			// args; the `--provider observer` select is prepended below).
+			resumedArgs, releaseResume, okResume, resumeErr := applyLauncherResume(launcherResumeSpec{
+				verb: "pi", label: "pi", configPath: configPath, id: *resume,
+				continueFrom: continueFrom, carry: carry, fromMessage: fromMessage, fromTime: fromTime,
+				args: args, stderr: cmd.ErrOrStderr(),
+			})
+			if !okResume {
+				return resumeErr
+			}
+			defer releaseResume()
+			args = resumedArgs
 			cfg, err := config.Load(config.LoadOptions{GlobalPath: configPath})
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
@@ -148,6 +161,7 @@ func newPiCmd() *cobra.Command {
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "pi")
+	resume = registerResumeFlag(cmd, "pi")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
 }

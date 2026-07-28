@@ -31,9 +31,9 @@ func buildOTelExporter(ctx context.Context, configPath string) (e *otelexp.Expor
 	if err := os.MkdirAll(filepath.Dir(cfg.Observer.DBPath), 0o755); err != nil {
 		return nil, func() {}, false, fmt.Errorf("ensure db dir: %w", err)
 	}
-	// SkipIntegrityCheck: this is a long-running daemon open reached
+	// No integrity probe here: this is a long-running daemon open reached
 	// synchronously from `observer start` BEFORE the dashboard listener
-	// binds (only when [exporter.otel] is enabled). Without this flag the
+	// binds (only when [exporter.otel] is enabled). Were it verified here the
 	// multi-GB `PRAGMA quick_check` runs here on the readiness path and
 	// blocks `start` for the full duration of the scan (~24s warm on a
 	// 9.5GB DB, minutes cold) — the exact gap the 2026-07-16 integrity-off
@@ -41,7 +41,7 @@ func buildOTelExporter(ctx context.Context, configPath string) (e *otelexp.Expor
 	// minimal config never wires the exporter. The one authoritative
 	// quick_check still runs once, off the readiness path, via
 	// db.RunStartupMaintenance (see runStartupDBMaintenance in start.go).
-	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath})
 	if err != nil {
 		return nil, func() {}, false, fmt.Errorf("open db %s: %w", cfg.Observer.DBPath, err)
 	}

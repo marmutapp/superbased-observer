@@ -3,10 +3,52 @@
 package termsession
 
 import (
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
+
+// TestRealSpawnerReportsLivePID pins the process-attribution seam against the
+// REAL spawner: the pid the Manager publishes must be a genuinely live OS
+// process (and, on Linux, its own process-group leader — Setsid — so the whole
+// `observer <tool>` → `<tool>` subtree hangs off it). This is what makes the
+// pid a sound direct-attribution seed rather than a number.
+func TestRealSpawnerReportsLivePID(t *testing.T) {
+	sp := NewOSSpawner()
+	p, err := sp.Spawn(Spec{BinPath: "/bin/sleep", Subcommand: "30"})
+	if err != nil {
+		t.Fatalf("real spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Kill() })
+
+	rep, ok := p.(ProcessReporter)
+	if !ok {
+		t.Fatal("the unix PTY does not implement ProcessReporter — the process-attribution seam is unwired")
+	}
+	pid := rep.Pid()
+	if pid <= 0 {
+		t.Fatalf("Pid() = %d, want a live pid", pid)
+	}
+	// Signal 0 probes liveness without disturbing the process.
+	if serr := syscall.Kill(pid, 0); serr != nil {
+		t.Fatalf("pid %d is not live: %v", pid, serr)
+	}
+	// Setsid makes the child its own process-group leader, so the whole
+	// subtree is reachable from this one pid.
+	if pgid, gerr := syscall.Getpgid(pid); gerr != nil || pgid != pid {
+		t.Fatalf("Getpgid(%d) = (%d,%v), want the pid itself (process-group leader)", pid, pgid, gerr)
+	}
+	if runtime.GOOS == "linux" {
+		if _, serr := os.Stat(filepath.Join("/proc", strconv.Itoa(pid))); serr != nil {
+			t.Fatalf("/proc/%d missing — the reported pid is not a real process: %v", pid, serr)
+		}
+	}
+}
 
 // TestPTYSupportedUnix pins that the unix build reports the embedded
 // terminal as available — cmd relies on this to WIRE the launch seam (and

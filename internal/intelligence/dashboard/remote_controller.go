@@ -3,12 +3,14 @@ package dashboard
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/marmutapp/superbased-observer/internal/remoteauth"
+	"github.com/marmutapp/superbased-observer/internal/termlease"
 )
 
 // Cookie + header names for the remote auth flow (plan §4.3/§4.5).
@@ -58,6 +60,29 @@ type RemoteOptions struct {
 	// the master gate the standing verification leg checks BEFORE the hash
 	// compare. Default false. Hot-swapped alongside the hash.
 	StandingTerminalEnabled bool
+	// StandingSecretAtRest answers, at verify time, whether a standing
+	// terminal-control secret still EXISTS at rest on this node. It is the ONE
+	// piece of evidence that separates a genuine REVOKE from a temporary
+	// DISABLE, which are otherwise byte-identical on the live controller: both
+	// arrive as ReloadStandingTerminalSecret("", false).
+	//
+	//	revoke  → remotecfg.StandingTerminalDisable DELETES the hash file
+	//	          ⇒ probe false ⇒ no secret any device holds can ever be
+	//	          accepted again (a re-mint issues a DIFFERENT one), so the
+	//	          denial is PERMANENT and the device may discard its copy
+	//	disable → allow_terminal→false / remote-disable / a config toggle only
+	//	          flip the gate and LEAVE the hash file ⇒ probe true ⇒ the
+	//	          refusal is TRANSIENT and the device must keep its secret
+	//
+	// It is deliberately a live probe rather than a reload-time snapshot: the
+	// disk is the durable truth, and no hot-reload plumbing can then drift out
+	// of sync with it. It MUST fail safe — return true whenever the answer is
+	// unknown (stat error, no probe wired) — because a wrong "false" destroys a
+	// user's saved secret irreversibly, while a wrong "true" costs one more
+	// denied attempt. Nil ⇒ every such denial stays transient (the pre-A2
+	// behaviour). Wired by cmd/observer from
+	// remotecfg.StandingTerminalSecretPath.
+	StandingSecretAtRest func() bool
 	// Session tunes the device-session lifecycle.
 	Session remoteauth.SessionParams
 	// CapabilityTTL is the execute-capability lifetime (0 ⇒ default).
@@ -95,6 +120,10 @@ type remoteController struct {
 	standingMu      sync.RWMutex
 	standingHash    string
 	standingEnabled bool
+	// standingAtRest is the RemoteOptions.StandingSecretAtRest probe (nil ⇒
+	// "unknown", i.e. fail-safe transient). Set once at construction and only
+	// read, so it needs no lock.
+	standingAtRest func() bool
 	// standingGen is the standing-access GENERATION, bumped on EVERY
 	// ReloadStandingTerminalSecret (mint / rotate / revoke / disable). The cmd
 	// acquire adapter captures it BEFORE the §4.δ verify and re-checks it AFTER
@@ -165,6 +194,7 @@ func NewRemoteController(o RemoteOptions) RemoteController {
 		csrf:                        map[string]string{},
 		standingHash:                o.StandingTerminalSecretHash,
 		standingEnabled:             o.StandingTerminalEnabled,
+		standingAtRest:              o.StandingSecretAtRest,
 		// A dedicated limiter for standing-secret acquire attempts so a brute
 		// force against the reusable standing secret is throttled independently
 		// of the pairing limiter. rate_limit_per_min=0 means "unlimited" for the
@@ -490,6 +520,18 @@ func (c *remoteController) SessionLifetime(raw string) (<-chan struct{}, time.Du
 	return c.sessions.SessionLifetime(raw)
 }
 
+// TouchDeviceSession refreshes a LIVE device session's idle clock on behalf of a
+// currently-attached terminal websocket (the deviceSessionToucher seam), and
+// reports whether the session was live. It is the deliberate, explicitly-named
+// counterpart to the read-only SessionLifetime above — that method must keep its
+// "bind to, never extend" contract for its own callers, so extending is a
+// separate call rather than a change of its semantics. Extends only: it cannot
+// resurrect a revoked/expired session, cross a generation bump, or push past the
+// absolute TTL.
+func (c *remoteController) TouchDeviceSession(raw string) bool {
+	return c.sessions.TouchAttachedViewer(raw)
+}
+
 // ConsumeTerminalControl consumes a single-use terminal-control capability + its
 // bound confirm for (raw device session, handle) — the termlease.CapabilityConsumer
 // leg. The raw session id is hashed here (matching MintTerminalControl's stored
@@ -545,6 +587,32 @@ func (c *remoteController) StandingTerminalGeneration() uint64 {
 // fingerprint + handle (never the secret). The secret is NOT consumed (reusable
 // until the operator revokes it).
 func (c *remoteController) VerifyStandingTerminalControl(secret, deviceSessionID, handle string) bool {
+	ok, _ := c.VerifyStandingTerminalControlReason(secret, deviceSessionID, handle)
+	return ok
+}
+
+// VerifyStandingTerminalControlReason is the termlease.ReasoningStandingVerifier
+// form of the leg above: identical verification, plus a classification of the
+// denial that decides whether the DEVICE should destroy its saved secret.
+//
+//	malformed / bad_secret  → BadSecret   the value itself was judged and failed
+//	standing_revoked        → Revoked     no secret exists at rest at all
+//	standing_disabled       → Unavailable the gate is off, the secret survives
+//	rate_limited            → Unavailable never reached the compare
+//
+// The revoked/disabled split (operator decision A2, 2026-07-25) is the reason
+// this is not a plain boolean. A genuine revoke DELETES the hash at rest, while
+// a temporary disable leaves it — but both reach the live controller as the
+// same ("", false) reload, so the state in memory cannot tell them apart. The
+// StandingSecretAtRest probe supplies the missing evidence, and it fails SAFE:
+// with no probe wired, or any answer other than a definite "no secret exists",
+// the denial stays transient. Getting this wrong in the permanent direction
+// silently wipes a valid secret off the device and costs the operator a manual
+// re-mint; getting it wrong in the transient direction costs one more denied
+// attempt.
+//
+// The authorization outcome is unchanged in every case — this only classifies.
+func (c *remoteController) VerifyStandingTerminalControlReason(secret, deviceSessionID, handle string) (ok bool, denial termlease.StandingDenial) {
 	c.standingMu.RLock()
 	enabled := c.standingEnabled
 	hash := c.standingHash
@@ -552,8 +620,14 @@ func (c *remoteController) VerifyStandingTerminalControl(secret, deviceSessionID
 
 	fp := deviceFingerprint(deviceSessionID)
 	if !enabled || hash == "" {
+		// Nothing to compare against. WHICH refusal this is depends on whether a
+		// standing secret still exists at rest (see StandingSecretAtRest).
+		if c.standingSecretRevoked() {
+			c.auditStanding(fp, handle, "deny", "standing_revoked")
+			return false, termlease.StandingDenialRevoked
+		}
 		c.auditStanding(fp, handle, "deny", "standing_disabled")
-		return false
+		return false, termlease.StandingDenialUnavailable // never compared the secret
 	}
 	// Rate-limit standing attempts on ONE GLOBAL bucket, deliberately NOT the
 	// device-session identity: a session id is freely rotatable (logout +
@@ -565,19 +639,33 @@ func (c *remoteController) VerifyStandingTerminalControl(secret, deviceSessionID
 	// device fingerprint — identity churn shows up as fingerprint churn there.
 	if c.standingLimiter != nil && !c.standingLimiter.Allow("standing") {
 		c.auditStanding(fp, handle, "deny", "rate_limited")
-		return false
+		return false, termlease.StandingDenialUnavailable // never compared the secret
 	}
 	raw, err := remoteauth.DecodeStandingSecret(secret)
 	if err != nil {
 		c.auditStanding(fp, handle, "deny", "malformed")
-		return false
+		return false, termlease.StandingDenialBadSecret // the presented value itself is unusable
 	}
 	if !remoteauth.VerifySecret(hash, raw) {
 		c.auditStanding(fp, handle, "deny", "bad_secret")
-		return false
+		return false, termlease.StandingDenialBadSecret // judged and rejected
 	}
 	c.auditStanding(fp, handle, "ok", "standing")
-	return true
+	return true, termlease.StandingDenialNone
+}
+
+// standingSecretRevoked reports whether this node can PROVE that no standing
+// terminal-control secret exists at rest — the evidence that turns "standing
+// access denied" into a PERMANENT verdict on the presented secret.
+//
+// Fail-safe by construction: with no probe wired it returns false ("unknown"),
+// so the denial stays transient and the device keeps its secret. The probe
+// itself owes the same discipline (any stat error ⇒ report present).
+func (c *remoteController) standingSecretRevoked() bool {
+	if c.standingAtRest == nil {
+		return false
+	}
+	return !c.standingAtRest()
 }
 
 // auditStanding records one standing terminal-control acquire attempt through
@@ -604,6 +692,47 @@ type pairRequest struct {
 type pairResponse struct {
 	OK   bool   `json:"ok"`
 	CSRF string `json:"csrf,omitempty"`
+}
+
+// pairErrorResponse is the MACHINE-READABLE pairing failure. Only the failures
+// a device can act on get one (today: the device cap); every other failure
+// stays a bare status so no new signal is handed to an unauthenticated caller.
+type pairErrorResponse struct {
+	OK    bool   `json:"ok"`
+	Code  string `json:"code"`
+	Error string `json:"error"`
+}
+
+// pairCodeTooManyDevices is returned (with 409 Conflict) when the device-session
+// cap is full. It is deliberately distinguishable from the generic 503: the cap
+// is fail-CLOSED by design — pairing must never silently evict a live device —
+// so the only remedy is for the operator to revoke a device, and the UI can only
+// say that if the failure is nameable.
+const pairCodeTooManyDevices = "too_many_devices"
+
+// sessionCookieMaxAge is the device cookie's Max-Age, in seconds, derived from
+// the session store's OWN absolute TTL.
+//
+// Why it must exist at all: a Set-Cookie with neither Max-Age nor Expires is a
+// BROWSER-SESSION cookie. Mobile Safari/Chrome drop those when the browsing
+// session ends or a backgrounded tab is evicted — which they do within an hour
+// or two — so a device with a perfectly live, durable, 48h server session
+// stopped sending its bearer and every request 401'd behind a rendered shell.
+// The server session was never the problem; the cookie carrying it was.
+//
+// Why the absolute TTL and not the idle window: the cookie is minted at the
+// same instant as the session, and the session's absolute deadline is
+// createdAt+TTL, so a Max-Age of TTL expires the cookie at exactly the moment
+// the session it carries dies. Using the (shorter) idle window would recreate
+// the bug in miniature — the cookie would expire while the session was still
+// being refreshed. Clamped to >= 1 because a 0 Max-Age would omit the attribute
+// and silently restore the session-cookie behaviour this fixes.
+func (c *remoteController) sessionCookieMaxAge() int {
+	secs := int(c.sessions.TTL().Seconds())
+	if secs < 1 {
+		secs = 1
+	}
+	return secs
 }
 
 // handlePair verifies the pairing secret (from the JSON BODY only — never a
@@ -636,6 +765,22 @@ func (c *remoteController) handlePair(w http.ResponseWriter, r *http.Request) {
 	}
 	rawSession, err := c.sessions.Create()
 	if err != nil {
+		if errors.Is(err, remoteauth.ErrTooManySessions) {
+			// Fail-closed by design: evicting a live session to make room would
+			// sign out somebody else's device on nothing but possession of the
+			// pairing secret. Say so instead, so the operator knows the exact
+			// remedy (revoke a device) rather than reading "cannot create
+			// session" off a 503.
+			c.auditPair(r, "fail", "session_limit")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(pairErrorResponse{
+				OK:    false,
+				Code:  pairCodeTooManyDevices,
+				Error: "the maximum number of devices are already paired — revoke one on the host dashboard (Remote → Paired devices), then pair again",
+			})
+			return
+		}
 		c.auditPair(r, "fail", "session_create")
 		http.Error(w, "cannot create session", http.StatusServiceUnavailable)
 		return
@@ -651,10 +796,25 @@ func (c *remoteController) handlePair(w http.ResponseWriter, r *http.Request) {
 	}
 	c.setCSRF(h, csrf)
 	c.limiter.Reset(key)
+	// MaxAge makes this a PERSISTENT cookie that survives a browser restart /
+	// tab eviction; every other attribute is unchanged (HttpOnly + Secure +
+	// SameSite=Strict + Path=/ are load-bearing security properties — see
+	// sessionCookieMaxAge for why the lifetime is the session's own TTL).
+	//
+	// It is NOT re-issued on activity, deliberately. The server refreshes the
+	// IDLE clock (SessionStore.Validate) but never the ABSOLUTE deadline, which
+	// stays createdAt+TTL for the session's whole life. A cookie re-stamped on
+	// activity would therefore drift PAST the deadline of the session it
+	// carries and start presenting a bearer for a session the store has already
+	// dropped — the mirror image of the bug being fixed, and pure noise. Minted
+	// once, expiring exactly with its session, is the coherent choice; the
+	// residual case (a cookie outliving an IDLE-expired session) surfaces as the
+	// client's "pair this device again" prompt, not a broken dashboard.
 	http.SetCookie(w, &http.Cookie{
 		Name:     remoteSessionCookie,
 		Value:    rawSession,
 		Path:     "/",
+		MaxAge:   c.sessionCookieMaxAge(),
 		HttpOnly: true,
 		Secure:   true,
 		SameSite: http.SameSiteStrictMode,

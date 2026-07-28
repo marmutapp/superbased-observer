@@ -337,7 +337,7 @@ func matchGitDiscard(_ *MatchContext, cmd *Command) (bool, string) {
 			return true, "git reset --hard discards uncommitted changes"
 		}
 	case "checkout":
-		for _, a := range cmd.Argv[1:] {
+		for _, a := range cmd.Args() {
 			if a == "--" {
 				return true, "git checkout -- discards working-tree changes"
 			}
@@ -659,7 +659,7 @@ func matchDiskDevice(_ *MatchContext, cmd *Command) (bool, string) {
 	case cmd.Base == "format-volume" || cmd.Base == "clear-disk":
 		return true, cmd.Base + " volume operation"
 	case cmd.Base == "dd":
-		for _, a := range cmd.Argv[1:] {
+		for _, a := range cmd.Args() {
 			la := strings.ToLower(a)
 			if strings.HasPrefix(la, "of=/dev/") || strings.HasPrefix(la, `of=\\.\`) {
 				return true, "dd writing to device " + a

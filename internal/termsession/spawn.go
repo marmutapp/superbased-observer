@@ -186,6 +186,29 @@ type Spawner interface {
 	Spawn(spec Spec) (PTY, error)
 }
 
+// ProcessReporter is the OPTIONAL extension of [PTY] that reports the OS pid
+// of the spawned child. Both real backends implement it (the unix creack/pty
+// child and the native-Windows ConPTY child), which is what lets the Manager
+// publish a [ProcessEvent] so an injected sink can attribute that process
+// subtree. It is deliberately a SEPARATE interface rather than a method on
+// PTY: a fake PTY in an existing test keeps compiling untouched, and a
+// backend that genuinely cannot report a pid simply doesn't implement it
+// (the Manager then reports pid 0 and fires no process event).
+type ProcessReporter interface {
+	// Pid is the OS process id of the PTY's direct child, or 0 when unknown
+	// (e.g. the process failed to start or has been released).
+	Pid() int
+}
+
+// ptyPID returns the OS pid of a PTY's child when the backend implements
+// [ProcessReporter], else 0. Nil-safe.
+func ptyPID(p PTY) int {
+	if r, ok := p.(ProcessReporter); ok {
+		return r.Pid()
+	}
+	return 0
+}
+
 // ErrPlatformUnsupported is returned by the OS spawner on a platform where
 // an in-process PTY cannot be created (a native-Windows observer daemon).
 // The dashboard surfaces it as an honest terminal message, not a hang.

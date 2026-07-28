@@ -9,7 +9,8 @@ import (
 
 // The Ticket-A regression tests (docs/plans/claude-code-hook-stall-ticket-
 // and-db-prune-plan-2026-07-12.md): backfillPathHashes must not run on the
-// hook fast-path (SkipIntegrityCheck=true), and the daemon path must pay
+// default fast open (IntegrityCheck=false — the hook path, every CLI
+// command, and the daemon's own opens), and the maintenance path must pay
 // the table scan at most once per DB thanks to the schema_meta
 // done-marker. All assertions are structural (a scan-was-called probe),
 // never wall-clock.
@@ -62,8 +63,9 @@ func TestBackfillPathHashes_OpenPathGating(t *testing.T) {
 	tests := []struct {
 		name string
 		// opens is the sequence of Open calls the scenario performs after
-		// legacy rows are seeded; each entry is that call's
-		// SkipIntegrityCheck value.
+		// legacy rows are seeded; each entry is that call's IntegrityCheck
+		// value (opt-IN since 2026-07-28 — false is the default fast open
+		// every hook and CLI command takes, true is the maintenance open).
 		opens []bool
 		// wantScans is the expected cumulative probe count after all opens.
 		wantScans int32
@@ -72,32 +74,32 @@ func TestBackfillPathHashes_OpenPathGating(t *testing.T) {
 		wantHashFilled bool
 	}{
 		{
-			name:           "hook open skips the scan entirely",
-			opens:          []bool{true},
-			wantScans:      0,
-			wantHashFilled: false,
-		},
-		{
-			name:           "repeated hook opens never scan",
-			opens:          []bool{true, true, true},
-			wantScans:      0,
-			wantHashFilled: false,
-		},
-		{
-			name:           "daemon open scans once and repairs hashes",
+			name:           "default open skips the scan entirely",
 			opens:          []bool{false},
+			wantScans:      0,
+			wantHashFilled: false,
+		},
+		{
+			name:           "repeated default opens never scan",
+			opens:          []bool{false, false, false},
+			wantScans:      0,
+			wantHashFilled: false,
+		},
+		{
+			name:           "maintenance open scans once and repairs hashes",
+			opens:          []bool{true},
 			wantScans:      1,
 			wantHashFilled: true,
 		},
 		{
-			name:           "second daemon open short-circuits on the marker",
-			opens:          []bool{false, false},
+			name:           "second maintenance open short-circuits on the marker",
+			opens:          []bool{true, true},
 			wantScans:      1,
 			wantHashFilled: true,
 		},
 		{
-			name:           "hook then daemon then hook scans exactly once",
-			opens:          []bool{true, false, true, false},
+			name:           "default then maintenance then default scans exactly once",
+			opens:          []bool{false, true, false, true},
 			wantScans:      1,
 			wantHashFilled: true,
 		},
@@ -120,10 +122,10 @@ func TestBackfillPathHashes_OpenPathGating(t *testing.T) {
 			}
 
 			probe := installBackfillProbe(t)
-			for i, skip := range tc.opens {
-				database, err := Open(ctx, Options{Path: path, SkipIntegrityCheck: skip})
+			for i, check := range tc.opens {
+				database, err := Open(ctx, Options{Path: path, IntegrityCheck: check})
 				if err != nil {
-					t.Fatalf("Open #%d (skip=%v): %v", i, skip, err)
+					t.Fatalf("Open #%d (check=%v): %v", i, check, err)
 				}
 				if err := database.Close(); err != nil {
 					t.Fatalf("Close #%d: %v", i, err)
@@ -134,7 +136,7 @@ func TestBackfillPathHashes_OpenPathGating(t *testing.T) {
 				t.Errorf("scan count = %d, want %d", got, tc.wantScans)
 			}
 
-			verify, err := Open(ctx, Options{Path: path, SkipIntegrityCheck: true})
+			verify, err := Open(ctx, Options{Path: path})
 			if err != nil {
 				t.Fatalf("verify Open: %v", err)
 			}
@@ -164,10 +166,16 @@ func TestBackfillPathHashes_OpenPathGating(t *testing.T) {
 	}
 }
 
-// TestBackfillPathHashes_FreshOpenSetsMarker pins that the very first open
-// of a fresh DB (no legacy rows) records the done-marker, so a daemon
-// restart never re-pays even the empty scan.
-func TestBackfillPathHashes_FreshOpenSetsMarker(t *testing.T) {
+// TestBackfillPathHashes_FreshMaintenanceSetsMarker pins that the first
+// maintenance pass over a fresh DB (no legacy rows) records the done-marker,
+// so a daemon restart never re-pays even the empty scan.
+//
+// Since the 2026-07-28 polarity inversion the marker is written by
+// RunStartupMaintenance — the daemon's once-per-process background pass —
+// rather than by whichever Open happened to come first. That is the correct
+// single owner: plain Opens (hooks, CLI commands, the daemon's own dozen
+// feature goroutines) now neither scan nor mark.
+func TestBackfillPathHashes_FreshMaintenanceSetsMarker(t *testing.T) {
 	ctx := context.Background()
 	path := t.TempDir() + "/fresh.db"
 
@@ -175,15 +183,21 @@ func TestBackfillPathHashes_FreshOpenSetsMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	if pathHashBackfillDone(ctx, first) {
+		t.Fatal("done-marker set by a plain Open — the scan must be opt-in")
+	}
+	if err := RunStartupMaintenance(ctx, first); err != nil {
+		t.Fatalf("RunStartupMaintenance: %v", err)
+	}
 	if !pathHashBackfillDone(ctx, first) {
-		t.Fatal("done-marker not set on first open of a fresh DB")
+		t.Fatal("done-marker not set after the first maintenance pass")
 	}
 	if err := first.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
 	probe := installBackfillProbe(t)
-	second, err := Open(ctx, Options{Path: path})
+	second, err := Open(ctx, Options{Path: path, IntegrityCheck: true})
 	if err != nil {
 		t.Fatalf("re-Open: %v", err)
 	}

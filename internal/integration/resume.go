@@ -17,9 +17,18 @@ import (
 // (CLAUDE.md #3). Adding a new mechanism here is the one edit a future
 // launcher-translation needs.
 var knownResumeMechanisms = map[string]bool{
-	"flag:--resume":     true, // tool takes `--resume <id>` (claude-code)
+	"flag:--resume":     true, // tool takes `--resume <id>` (claude-code, gemini-cli, qwen-code, grok, devin, hermes, qoder)
 	"subcommand:resume": true, // tool takes `resume <id>` (codex)
 	"positional":        true, // tool takes a bare `<id>` positional
+	// The 2026-07-24 live-verified native-resume wave (15 launchers). Each key
+	// is one tool's native id-carrying resume flag; the observer launcher owns
+	// the translation from the uniform `--resume <id>` tail to it (see
+	// cmd/observer/resume_launcher.go's resumeTranslations table).
+	"flag:--session":      true, // `--session <id>` (opencode, kilo-code-cli, pi, kimi-code)
+	"flag:--session-id":   true, // `--session-id <id>` (copilot-cli; goose under its `session` subcommand)
+	"flag:--id":           true, // `--id <id>` (cline-cli)
+	"flag:--conversation": true, // `--conversation <id>` (antigravity-cli)
+	"flag:--resume-id":    true, // `--resume-id <id>` (kiro-cli, under its `chat` subcommand)
 }
 
 // ResumeArgs composes the argv TAIL appended after `observer <spec.Subcommand>`

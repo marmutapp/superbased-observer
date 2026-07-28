@@ -173,6 +173,13 @@ func buildTerminalStack(cfg config.Config, database *sql.DB, logger *slog.Logger
 		opts.WriterLeaseMax = time.Duration(cfg.Remote.WriterLeaseMaxMinutes) * time.Minute
 	}
 	opts.OnOutput = scanHub.Observe
+	// Direct process attribution for daemon-launched terminals
+	// (terminal_pidseed.go). termsession publishes the PTY child's pid through
+	// this content-free callback; the seeder holds it until correlation names
+	// the run's agent session, then writes the §9.2.1 pidbridge seed — and
+	// retracts it the moment the child is reaped. Nil (no DB) is a clean no-op.
+	pidSeeder := newTerminalPidSeeder(database, logger)
+	opts.OnProcess = pidSeeder.Observe
 	// Metadata-only writer-lease audit tap (Phase-4 execute-tier audit
 	// lifecycle, plan §8.1). termsession stays store-free — this cmd-side FUNC
 	// SEAM maps each content-free LeaseEvent to a typed remote_audit row.
@@ -231,7 +238,15 @@ func buildTerminalStack(cfg config.Config, database *sql.DB, logger *slog.Logger
 	// attach run's Snapshot carries a session id and "Jump in" can match it.
 	// Assigned after svc exists (launcher is svc's Launcher, so the two are
 	// mutually referential — the same shape as the OnExit/scanHub closures).
-	launcher.correlate = svc.Correlate
+	// correlate is svc.Correlate plus the direct-pid-seed after-effect: whenever
+	// a run acquires an ESTABLISHED session link, the terminal's PTY child pid
+	// is written into session_pid_bridge so its whole process subtree is
+	// attributed directly instead of riding the confidence-scored lazy cwd
+	// correlation. Wrapping HERE — at the single point both correlation
+	// producers (the OOB drain below and the discovery sweep) are wired from —
+	// keeps termsvc the one owner of the link itself.
+	correlate := seedingCorrelator(svc.Correlate, pidSeeder, svc)
+	launcher.correlate = correlate
 
 	// Generic terminal-run discovery sweep (Session Cockpit part C). A
 	// daemon-resident, tool-AGNOSTIC pass that periodically links a LIVE
@@ -254,7 +269,7 @@ func buildTerminalStack(cfg config.Config, database *sql.DB, logger *slog.Logger
 			svc.HandleForRun,
 			svc.SessionLinkForRun,
 			svc.ProjectRoot,
-			svc.Correlate,
+			correlate,
 			func(dir string) string {
 				info, gerr := git.Resolve(dir)
 				if gerr != nil {
@@ -407,6 +422,12 @@ func buildTerminalStack(cfg config.Config, database *sql.DB, logger *slog.Logger
 			}
 			stopStatus()
 			hub.stop()
+			// Retract every direct pid seed while the DB is still open and
+			// BEFORE mgr.Shutdown() kills the PTYs — a row left behind would
+			// attribute whatever process the OS next hands that pid to a
+			// terminal that no longer exists. mgr.Shutdown's own exit edges are
+			// then a no-op (the seeder has already dropped the handles).
+			pidSeeder.releaseAll()
 			mgr.Shutdown()
 		},
 	}, nil
@@ -570,6 +591,15 @@ type terminalSurfaces struct {
 // gating truth — shared by `observer start` and its tests.
 func buildTerminalSurfaces(cfg config.Config, database *sql.DB, logger *slog.Logger) (terminalSurfaces, error) {
 	surf := terminalSurfaces{close: func() {}}
+	// Terminal websocket liveness bounds ([terminal].ws_ping_*). Applied before
+	// any bridge can start; non-positive values leave the built-in defaults, and
+	// the failure budget is what lets a FROZEN backgrounded mobile tab survive a
+	// trip to another app instead of having its bridge reaped inside ~40s.
+	dashboard.SetTerminalPingPolicy(
+		time.Duration(cfg.Terminal.WSPingIntervalSeconds)*time.Second,
+		time.Duration(cfg.Terminal.WSPingTimeoutSeconds)*time.Second,
+		cfg.Terminal.WSPingFailuresAllowed,
+	)
 	// Nothing requested → build no stack (and no PTY reaper goroutine).
 	if !cfg.Handoff.AllowDashboardLaunch && !cfg.Terminal.Attach.Enabled {
 		return surf, nil

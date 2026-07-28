@@ -16,6 +16,7 @@
   },
   "db_path": "/inv/observer.db",
   "db_size_bytes": 0,
+  "host_os": "\u003cGOOS\u003e",
   "last_action_at": "\u003cTS\u003e",
   "last_action_tool": "codex",
   "per_tool_last_seen": [

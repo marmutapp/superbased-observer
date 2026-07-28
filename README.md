@@ -22,6 +22,7 @@
 - [Install](#install)
 - [First-run walkthrough](#first-run-walkthrough)
 - [Dashboard tour](#dashboard-tour)
+- [Terminals — launch, join, and track your AI CLIs](#terminals--launch-join-and-track-your-ai-clis)
 - [MCP server — 25 cross-tool intelligence calls](#mcp-server--25-cross-tool-intelligence-calls)
 - [API proxy — accurate token capture + compression](#api-proxy--accurate-token-capture--compression)
 - [Architecture](#architecture)
@@ -66,7 +67,10 @@ can't give you, in order of how much they matter:
    (Five of the 26 are `*-web` adapters for ChatGPT/Claude.ai/Gemini/
    Copilot/Perplexity in the browser — those need the browser-capture
    extension, which today only installs unpacked; every tool listed
-   above works out of the box.)
+   above works out of the box.) Nineteen of those are also full CLI
+   launchers you can run as real terminals — from the dashboard or
+   your own shell, captured through the same pipeline — see
+   [Terminals](#terminals--launch-join-and-track-your-ai-clis) below.
 
 Raw token counting across tools is table stakes here — it's the
 substrate the accurate-cost layer above is built on, not the pitch.
@@ -291,10 +295,11 @@ launches (suppress with `--no-open`; default URL
 Analyze / Optimize / Configure), each designed around one question —
 the tour below covers the core surfaces; Live (recent sessions with a
 real-time action feed), Search (full-text over captured tool outputs),
-Privacy (capture map + scrub tester), and the opt-in Terminals / Remote
-pages (covered under [Remote & mobile access](#remote--mobile-access)
-below) are self-explanatory once
-you're in, and the Suggestions tab's advisor
+Privacy (capture map + scrub tester), and the opt-in Terminals page
+(covered in [Terminals](#terminals--launch-join-and-track-your-ai-clis)
+below) and Remote page (covered under
+[Remote & mobile access](#remote--mobile-access) below) are
+self-explanatory once you're in, and the Suggestions tab's advisor
 nudges and the Patterns tab's derived habits are covered in their own
 docs. Evaluating without data? Start **demo mode** from the empty
 Overview — synthetic dataset in a temp DB, real `observer.db`
@@ -560,13 +565,76 @@ feed from anywhere on your tailnet. Bind the dashboard to a tailnet
 interface with `[dashboard].addr` (or the `OBSERVER_DASHBOARD_ADDR`
 env override) instead of the default loopback.
 
-Optionally, the **Terminals** tab + launch dock let you launch AI
-tools and run terminal commands from the dashboard — but remote
-**execute** is gated behind an explicit standing grant
-(`[remote].allow_standing_terminal_control`, **default off**), with
-per-session terminal leases and a full audit trail. Viewing is always
-read-only until you turn execute on. Full setup:
-[`docs/remote-access.md`](docs/remote-access.md).
+The same tailnet pairing is also what lets a remote device join a live
+terminal, not just view charts — the launch dock, joinable sessions,
+Session Cockpit, and the execute-is-gated posture (**default off**,
+`[remote].allow_terminal`) are covered in
+[Terminals](#terminals--launch-join-and-track-your-ai-clis) below.
+Full remote setup: [`docs/remote-access.md`](docs/remote-access.md).
+
+---
+
+## Terminals — launch, join, and track your AI CLIs
+
+The dashboard doesn't just watch your AI tools after the fact — it
+can launch them, and any paired device can join a session that's
+already running.
+
+- **Launch from the dashboard or any shell.** All 19 CLI launchers
+  (claude, codex, opencode, cursor, copilot-cli, kilo, cline-cli,
+  hermes, gemini, openclaw, pi, antigravity, qwen, kiro, grok, kimi,
+  devin, qoder, goose) launch as real PTY terminals from the
+  dashboard ("Launch here") or via `observer <verb>`; Linux/macOS +
+  native Windows (ConPTY, Win10 1809+). Guided one-click install when
+  the tool binary isn't found.
+- **Attach-by-default (v1.25.0).** `observer <verb>` runs
+  daemon-owned so the dashboard can join; the native terminal stays
+  fully interactive as seat #1. `--no-attach` for a bare run;
+  scripted/piped invocations never attach. The attach client also
+  forwards your shell's values for each tool's registry-documented
+  credential env keys (claude-code, codex, hermes, pi, copilot-cli,
+  gemini-cli, grok, and others with registry-documented key envs) via
+  `[terminal.attach].forward_auth_env` (default `true`), so a
+  shell-exported API key works exactly as it would bare. Honest
+  caveat: tools without a registry-documented credential env, and
+  dashboard-launched terminals, still see only the daemon's env
+  (config-file/OAuth auth is unaffected; export where `observer start`
+  runs, or use `--no-attach`).
+- **Jump in from anywhere.** Every live daemon-owned terminal is
+  joinable from any dashboard tab — local or paired remote — as an
+  extra seat. Many read-only viewers (cap 8), exactly one writer;
+  control moves seamlessly native → local dashboard → remote
+  dashboard by taking the writer lease (type in the native terminal
+  to reclaim it; remote takeover is available only to
+  fully-authenticated paired tailnet devices, and the seat that loses
+  the lease stays read-only with take-back available). Fresh runs
+  link to their observer session in roughly 10–30 seconds.
+- **Per-terminal Files & Git panels.** Read-only file tree + viewer
+  rooted at the terminal's project root; a Git panel with
+  branch/upstream/ahead-behind/status plus a 100-commit log; copy
+  path / paste into the terminal. Read-only v1 — no edits and no git
+  mutations from the panel.
+- **Session Cockpit.** A draggable live panel on any AI-tool
+  terminal: tokens/sec (measured vs estimated badge), cost with
+  AI/tool split, the next-message cost band, context fill vs the
+  model's budget, the 5h/7d rate-limit gauge (proxy-routed sessions),
+  prompt-cache expiry countdowns, CPU/mem/disk plus the spawned
+  process tree, and the last five turns deep-linked to session
+  detail.
+- **Workspace grid.** Up to 9 live terminal tiles at once, drag to
+  resize, layouts persist server-side; read-only when viewed from a
+  remote device.
+- **Restarts & continuity.** On a daemon restart, claude and codex
+  auto-resume the same transcript (native resume); every other tool's
+  attached session ends. Fork any tool's session forward with
+  `observer <verb> --continue-from <id>` — a new session id seeded
+  with a distilled handover as the first prompt.
+- **Remote posture.** Remote access is opt-in, tailnet-only
+  (Tailscale serve), off by default; viewing and execute are separate
+  tiers, and execute is default-off. See
+  [Remote & mobile access](#remote--mobile-access) above, plus
+  [`docs/remote-access.md`](docs/remote-access.md) and
+  [`docs/session-handoff.md`](docs/session-handoff.md).
 
 ---
 

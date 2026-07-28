@@ -28,6 +28,8 @@ import (
 	"errors"
 	"log/slog"
 	"time"
+
+	"github.com/marmutapp/superbased-observer/internal/processobs"
 )
 
 // ErrUnsupported is returned by Start on a non-Linux build, or when the kernel
@@ -46,6 +48,18 @@ type Options struct {
 	Now func() time.Time
 	// Logger receives non-fatal backend diagnostics. Default: slog.Default().
 	Logger *slog.Logger
+	// NetworkAccounting requests per-process TCP byte counters (the fentry/
+	// fexit probes in netprogram_linux.go). Default false — it is an extra
+	// privileged attach, so it follows the same opt-in posture as the rest of
+	// [observer.process]. When the probes cannot attach the backend degrades
+	// to lifecycle-only capture exactly as before; Start never fails because
+	// of it.
+	NetworkAccounting bool
+	// NetworkStatus is the shared handle the backend WRITES the accounting
+	// status to (off / unavailable+reason / tcp), so health, doctor and the
+	// dashboard can tell "measured zero bytes" from "not measured". Optional:
+	// nil means nobody is listening.
+	NetworkStatus *processobs.NetworkAccounting
 	// enrich resolves a pid to its /proc snapshot; nil = the real /proc reader
 	// (Linux). Unexported: tests drive the pure translator directly rather than
 	// the Backend, so they never need to inject here.

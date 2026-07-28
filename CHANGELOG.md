@@ -2,6 +2,697 @@
 
 All notable changes to SuperBased Observer are documented here.
 
+## [1.26.0] — 2026-07-28
+
+### Added
+
+- **feat(processobs/etw): Windows per-process network accounting over ETW
+  (W1–W4).** Closes the cross-OS gap where only Linux (eBPF) could measure
+  per-process network bytes. W1 is a pure-Go, CGO-free, dependency-free
+  decode-only consumer of `Microsoft-Windows-Kernel-Network` — the manifest
+  provider chosen over the legacy NT Kernel Logger for no singleton-session
+  contention, fixed-width payloads (`connid` is `win:UInt32`, where the
+  legacy MOF declares it Pointer-qualified so the width tracks pointer size)
+  and keyword filtering. Bytes are attributed to the PAYLOAD pid, never
+  `EVENT_HEADER.ProcessId`, which for kernel network events is routinely 4
+  (System) or 0 (Idle) because completion runs in a DPC or worker thread.
+  TCP only, enforced structurally: TCP and UDP decode into unrelated types
+  with no shared parent, so a UDP count cannot reach a TCP total by
+  accident. The ABI is pinned by 26 two-sided compile-time assertions rather
+  than tests — CI has no Windows runner and `GOOS=windows go build` does not
+  compile `_test.go` files, so a size test would never execute anywhere.
+  W2 adds the per-pid cumulative accumulator that reconciles ETW's
+  PER-EVENT byte reports with the cumulative contract every consumer
+  differentiates (16384 live entries with LRU eviction, mirroring the Linux
+  `netMapMaxEntries`, plus a 1024-entry retired cache so an exit event still
+  carries final totals), and settles the W1 open question: Linux's
+  `tcp_cleanup_rbuf(copied)` maps to ETW event 11 alone, not 11+18 — summing
+  both would double-count already-pended data.
+- **feat(processobs,cmd,config): the elevated Windows capturer dials the
+  daemon (ETW W3/W4).** The transport direction from the 2026-06-17 spike
+  was inverted by measurement: on a NAT-mode host, WSL→Windows 127.0.0.1 is
+  REFUSED (it is WSL's own loopback) and WSL→gateway times out (Defender
+  drops inbound on the WSL vNIC), while Windows→WSL loopback works via
+  `localhostForwarding`. So the capturer dials a loopback listener the WSL
+  daemon owns — no firewall rule, no host-IP discovery, no
+  NAT-vs-mirrored probe. Auth is mandatory with no bypass: 256 bits of
+  `crypto/rand` persisted 0600 beside the DB, constant-time compared, never
+  logged, read from `--token-file` or `OBSERVER_PROCESS_BRIDGE_TOKEN` —
+  there is deliberately NO `--token` flag, because argv is world-readable
+  and this tool captures argv. New `[observer.process.etw]` config block.
+  Backend selection is additive: `etw` selects the same baseline `auto`
+  would and ADDS the listener, so an elevated feed that never arrives can
+  never trade away working zero-privilege capture. Two real bugs were found
+  building it — an infinite hot loop (a read error and `bufio.ErrTooLong`
+  are permanent and `bufio.Scanner` returns them forever, latent on a pipe
+  where EOF ends a stream, immediately fatal on a socket where a reset does)
+  and a 30s reconnect stall, now ~1s via a hangup watcher. W4 adds
+  capturer-link health (a `TransportStatsSource` + `TransportUnavailableSource`
+  capability PAIR resolved into `none`/`unavailable`/`configured`, with the
+  `(TransportStats, bool)` signature load-bearing so a Composite carrying no
+  transport child cannot be forced to claim "a transport exists, with zero
+  connections"), a detect-and-emit setup surface (`observer init` DETECTS an
+  existing task via `/Query`, which works unprivileged, and emits a
+  fully-resolved command for the operator's own elevated run — it never
+  prints "registered", because from WSL's medium-integrity interop token
+  `/Create` is refused for `/RL HIGHEST` and for `/SC ONLOGON` while a plain
+  `/SC ONCE` succeeds, so it is elevation that is blocked, not task
+  creation), and `--token-file` re-read per reconnect attempt so a
+  logon-triggered task firing before WSL is up no longer dies permanently.
+  `AuthFailures` counts every handshake refusal and so can never name a
+  cause — proven live, a wire-version mismatch and port-scanner garbage both
+  rendered as "shared-token mismatch" — so the daemon's verbatim reason now
+  travels separately, clamped to 240 bytes, with the metric label carrying a
+  bounded CLASS rather than the remote string.
+- **feat(processobs,dashboard): dashboard-driven ETW capturer setup (E1–E7).**
+  The W4 arc had concluded `observer init` can only DETECT and emit a
+  command; the measurement behind that still stands (`schtasks /Create` IS
+  Access-denied from WSL's medium-integrity token) but the inference —
+  "elevation cannot be self-granted" — was too strong. Elevation cannot be
+  taken silently; it can be brokered through UAC consent. Measured on this
+  host: `Start-Process -Verb RunAs` from WSL reaches High Mandatory Level,
+  `/Create /SC ONLOGON /RL HIGHEST` succeeds, and the single-quoted `/TR`
+  form stores correctly — the first end-to-end confirmation of the quoting
+  rule W4 derived (the backslash-escaped form parses in cmd.exe but FAILS in
+  PowerShell; the unquoted form stores unquoted and would launch
+  `C:\Program`). New `GET /api/process/etw/status` (capability V, first-class
+  states rather than errors), `POST /api/process/etw/register` (capability L
+  + confirm token, with the argv built ENTIRELY server-side — there is no
+  request struct at all), and an ETW capturer card under Settings → Process
+  capture. Independent review of E1–E6 raised eight findings, each reproduced
+  with a failing test before any fix; two were real and sharp — an apostrophe
+  in a Windows path (`C:\Users\O'Brien\…`) closed the `/TR` quote early so
+  schtasks stored a program that was a PREFIX of the real path, and
+  `normalize()` floored a negative counter to zero, turning "this report is
+  nonsense" into "the decoder ran and refused nothing".
+- **feat(processobs,diag,metrics): decode-classification counters, so
+  "nothing captured" can no longer read as "healthy".** `Classify()` routes
+  every unknown event id to `ClassIgnored`, so a renumbered provider would
+  report `dropped:0 / unsupported:0` and zero bytes — passing validation
+  while measuring nothing. New `NetworkIgnored` + `NetworkDecoded` counters
+  and `NothingClassified()`; `Ignored` is deliberately NOT in `Any()`,
+  because a healthy busy capture has a huge Ignored and folding it in would
+  fire a fault on every working host. Separately, `Health.NetworkAccountingMode`
+  / `Reason` were computed and read by nothing, so an operator whose probes
+  failed to attach got silence and could not tell "measured, no traffic"
+  from "never measured". The daemon now publishes a small node-local JSON
+  record beside the DB (per-PID + liveness-filtered, the pattern
+  `diag.LockInfo` already uses; a record whose writer pid is gone is dropped
+  rather than called stale), refreshed every 30s because the backend only
+  decides the accounting outcome inside `Start`. Both `observer doctor` and
+  the `/metrics` exporter read it and report it AS A REPORT ("pid N said X,
+  T ago"), never as live truth; with no daemon reporting, the
+  `observer_process_*` families are ABSENT rather than zeroed, since a
+  fabricated `backend_up 0` is indistinguishable from a genuinely down
+  backend, and the network mode is an enum series per mode so a mode flip
+  cannot leave a stale series at 1.
+  - Honesty caveat, restated on every surface: nothing under
+    `internal/processobs/etw/` has ever executed. There is no Windows CI
+    runner and WSL cannot elevate, so the Windows runtime path is compiled,
+    vetted and lint-clean under both GOOS — not run. The six-step elevated
+    validation is now enumerated (it had been cited in three documents and
+    written down in none) in `docs/process-observability.md` §5.5 and is
+    still owed. An idle host also produces the same counter shape as a
+    renumbered provider; no threshold was invented in either direction, so
+    the signal is worded as a suspicion.
+- **feat(processobs): eBPF per-process network bytes + a high-frequency
+  metric ring.** The Linux backend attached only
+  `sched_process_exec`/`exit` and hard-coded `NetworkBytesIn/Out` to zero;
+  it now attaches `fexit/tcp_sendmsg` (return value = bytes actually
+  queued, so partial sends are honest) and `fentry/tcp_cleanup_rbuf`.
+  `tcp_recvmsg` was rejected deliberately — its arity changed between 5.x
+  and 6.x and an fexit program must know the argument count to locate the
+  return slot. Same pure-Go `cilium/ebpf` loader and hand-written asm as the
+  existing lifecycle programs: no clang, no bpf2go, no CO-RE, no CGO.
+  Alongside it, sampling and persistence are split into separate cadences —
+  `sample_interval_ms` (2000) into memory, `persist_interval_ms` (15000)
+  with a ring capped at `persist_max_samples` (60) — which is 7.5× finer
+  sampling AND 7.5× fewer row rewrites, with the stored column the same size
+  as before and independent of the sample rate. `MetricSample` gains
+  `net_rx`/`net_tx`/`net_measured` as additive JSON on the existing ring, so
+  no migration; old rings decode with the fields absent, which reads as
+  unmeasured. TCP payload bytes only — no UDP, so QUIC/HTTP-3 is invisible —
+  stated in the field docs, the config and the operator docs. NOT VERIFIED:
+  the eBPF happy path; the authoring host runs
+  `kernel.unprivileged_bpf_disabled=2`, so the programs have never been
+  through the kernel verifier. The degradation path is verified.
+- **feat(dashboard): live CPU/RSS/disk charts on the Session Cockpit.** The
+  cockpit's System section rendered three 48×14px sparklines with no axes,
+  units, tooltip or time base, and three defects underneath: only ONE
+  process was charted (measured on a real session — 458 processes, 455 with
+  samples, 33 with the ≥2 samples a rate needs, exactly one drawn);
+  `cpu_ms`, `rb` and `wb` are cumulative monotonic counters plotted RAW, and
+  no differentiation code existed anywhere in the repo. New
+  `GET /api/session/<id>/metrics?bucket=` aggregates the process subtree onto
+  an epoch-anchored common grid, differentiates each consecutive pair with
+  overlap weighting, and sums per-process rates (RSS is instantaneous and is
+  summed, never differentiated). Each trap is pinned by a test: mid-window
+  entry is a baseline not a delta against an implicit zero, mid-window exit
+  contributes nothing after its last sample, a counter reset drops that pair
+  for that metric only, a pair spanning >8 buckets is a sampling gap rather
+  than a fake plateau, and a counter reading zero in every sample of every
+  process is reported UNMEASURED. Every rate is nullable — null is a real
+  gap, 0 is covered-and-idle — and `cpu_scale` is `per_core_sum` with
+  `cpu_cores`, unclamped (real data hit 963%). The bucket is the observed
+  median sample interval; nothing hardcodes a cadence. Rendered pixels are
+  NOT verified: reaching the cockpit needs a live agent terminal.
+- **feat(attach): native auto-resume on 18 of 19 launchers.** v1.25.0 held
+  auto-resume-on-daemon-restart to claude and codex. Two live PTY
+  verification waves (bare binaries, bounded, no input typed, read-only
+  store inspection) confirmed 15 more tools reopen the SAME transcript by
+  the observer-captured id — opencode, kilo, cline-cli, goose, gemini,
+  copilot-cli, pi, qwen, grok, kimi, devin, hermes, kiro, qoder,
+  antigravity — and a follow-up authenticated run added cursor, whose
+  `chatId` is our `SessionID` verbatim (Cursor names its on-disk chat
+  directories with the same uuid the adapter already stores). Cursor's id is
+  passed JOINED as `--resume=<id>` because the flag declares an OPTIONAL
+  value; `resumeTranslation` grew a `joined` field for it. Implemented as 15
+  `Resume: ResumeSpec` registry rows + 5 new id mechanisms
+  (`flag:--session` / `--session-id` / `--id` / `--conversation` /
+  `--resume-id`) driving one shared table-driven
+  `cmd/observer/resume_launcher.go`; claude/codex stay bespoke for their
+  session-id/fork interplay. Grounded nuances captured in the table: gemini
+  resumes by full UUID, goose strips the `@hash8` scope suffix while
+  announcing the stored scoped id for correlation, kimi wants the
+  `session_`-prefixed id, kiro's flag rides the `chat` subcommand. openclaw
+  is now the sole `ResumeNone` launcher (picker-only, runtime-blocked from
+  probing). Recorded honestly: cursor's resume is flaky over some networks
+  ("RetriableError: WritableIterable is closed"), affecting non-resume calls
+  alike, so it is transport rather than a broken mechanism.
+- **feat(attach,integration): the launching shell's credentials now reach an
+  attached child.** Retires the v1.25.0 accepted caveat that an attached
+  child inherits the DAEMON's environment, so a shell-exported-only API key
+  that worked bare vanished under attach-by-default. New
+  `Capability.AuthEnv []string` carries the env-var NAMES (never values) a
+  tool reads credentials from, with seven grounded rows — claude-code,
+  codex, hermes, pi, copilot-cli (BYOK key plus the documented GitHub-token
+  precedence chain), gemini-cli (upstream-verified 6-var set across
+  AI-Studio and Vertex auth modes) and grok; every other row stays
+  zero-valued with candidate/exclusion comments, and kiro-cli's AWS
+  credential chain is a deliberate exclusion. `forwardAuthEnv` is
+  presence-aware (an explicit empty `KEY=` forwards verbatim and overrides
+  the daemon value at the child, last-wins) and wired ONCE in
+  `launcherAttach` by capability dispatch — no per-launcher edits, bare
+  launch untouched. New `[terminal.attach].forward_auth_env`, default TRUE.
+  Values transit the owner-only attach socket once per launch, are never
+  logged (count-only audit, test-pinned) and are never persisted.
+- **feat(predict): billed tokens beside the next-message cost band.** The
+  predictor showed a dollar band and a fan-out pill with no token figure.
+  Every dimension was already on the wire, so this is a pure read-side
+  change — no API, no Go model, no migration. The figure is
+  `turns × (prefix + fresh_input + output)`, the term-for-term counterpart
+  of the priced `P·cache_read + S·input + O·output`, so the tokens and the
+  dollars count the same things; showing only "new" tokens was the tempting
+  alternative and is wrong by roughly three orders of magnitude against the
+  price. It is called BILLED, never "total tokens" or "context" — cache-read
+  tokens genuinely are billed, and the cockpit already uses the same
+  `prefix_tokens` field as a context-fill gauge. The composition is shown
+  rather than hidden ("420.7K tok billed · 702 new"); a percentage was tried
+  and rejected because 420,702 against 420,000 rounds to "100% cached".
+  Arithmetic verified end-to-end through the real CLI against the pinned
+  fixture: `2.0 × (210,000 + 1 + 350) = 420,702`, new `2 × 351 = 702`. Same
+  figure added to the CLI band table; the docs disclose that cache-WRITE is
+  neither read nor priced, so both the dollars and the tokens are a lower
+  bound on a message that seeds new cache.
+- **feat(dashboard): sortable columns on the session messages table.** The
+  table was chronologically ascending with server-side pagination, so new
+  messages landed on the LAST page while page 1 stayed pinned to the oldest
+  rows — following a live session meant paging manually to the end. Every
+  header now toggles asc/desc with the `DataTable` arrow convention, and the
+  sort is SERVER-side (a client-only sort would have reordered just the 25
+  rows of the current page). New allow-listed `sort_by` + `sort_dir` mirror
+  `parseSessionsSortParams`; an absent OR unrecognised key reproduces
+  today's exact chronological order rather than erroring. Three details
+  carry the correctness: `elapsed_ms` and `tps_ms`/`tps_basis` are derived
+  from neighbouring rows over the whole timeline, so the reorder runs
+  strictly after those derivations and immediately before the offset/limit
+  slice; the `#` column is now a server-assigned whole-timeline ordinal
+  (`seq`) instead of a page-relative array index; and every comparator falls
+  through to `seq` ascending, without which equal-valued rows would visibly
+  reshuffle between 4s polls. `tail=N` still selects the last N
+  chronologically and then sorts those for display, and `locate` computes
+  its page in the post-sort order. Suggested-by: @smoochy.
+- **feat(website): IA + aesthetics rework — generated marketing pages,
+  `/features` and `/faq`.** The homepage was 22.4 mobile screens and the
+  product screenshots were hand-crops cut mid-column; the root cause the
+  operator named is that the site had two mandatory pre-ship gates and both
+  are CORRECTNESS gates — neither asks whether the page is any good. So
+  `docs/website-design-guide.md` gains a third mandatory gate (editorial &
+  aesthetic review, 13 items each tracing to a real observed defect) plus a
+  quarterly cadence. The top-level marketing pages are now GENERATED from
+  `website/pages-src/*.html` through one shared shell
+  (`docs-tools/pagegen`) via `make website-build`, gated by
+  `make verify-website-build` — which kills a materialised drift class,
+  since the chrome had already forked into 4 `#topnav` and 3 footer variants
+  with mismatched analytics attributes and stale build markers. The gate
+  runs in `website-deploy.yml` BEFORE the strip step, not only in `ci.yml`,
+  because `ci.yml` is a separate workflow and cannot block a deploy. The
+  homepage goes 19054px / 22.4 screens / 1787 words → 11294px / 13.3 / 897
+  with ZERO points deleted: the removed prose moved to new `/features` and
+  `/faq` pages, with the FAQPage JSON-LD moved WITH it (parity is checked by
+  same-file verbatim presence). 20 pixel icons redrawn at 16×16; the nav and
+  footer drop the "S" glyph for a wordmark — six chrome sources needed
+  updating, not the three expected, because `/docs`, `/arcade` and
+  `legal/eula` each carried their own lockup. Density and a11y: the privacy
+  prose-run 4418→437px, enterprise 14 tiny fonts / 11 sub-44px targets →
+  0/0, all five support pages at 0/0. The public site and READMEs also gained
+  a terminal-capability content wave (dashboard launch, Jump-in,
+  native→local→remote lease movement, Session Cockpit, per-terminal
+  Files/Git), a new `website/docs-src/guides/terminals.md`, and matching
+  README sections regenerated through `docs/distribution/README-body.md`.
+  `security.html` / `privacy.html` corrected: raw content ships under
+  `full_content` OR `admin_managed`, not `full_content` alone.
+
+### Fixed
+
+- **fix(web,dashboard): the mobile terminal is usable.** Reported from a
+  phone: tapping a running-terminal pill rendered the panel clipped on BOTH
+  sides, scrolling did nothing in either presentation, and the soft keyboard
+  offers no Ctrl/Alt/Esc/Tab/arrows. Panel geometry —
+  `min-w-[480px]` beats `max-w-[96vw]` (CSS 10.4: min wins over max), so the
+  box resolved to 480px on a 393px viewport and the `justify-center`
+  backdrop split the overflow evenly, making the LEFT half unreachable
+  (before: panel 480×511 @ left −43, 3 text overflows; after: 393×852 @
+  left 0, 0 overflows). The breakpoint is a CAPABILITY query —
+  `(pointer: coarse) and (max-width: 1023px)` — so a desktop user who merely
+  narrows their window keeps a fine pointer and is untouched; desktop
+  geometry is bit-identical. Touch scroll was never a CSS problem: xterm
+  gates its ONLY touch-scroll path behind
+  `!coreMouseService.areMouseEventsActive`, so scrolling dies the moment a
+  TUI enables mouse reporting — an identical 150px drag moved −30px with
+  mouse mode off and 0px with it on. Own handlers now drive
+  `term.scrollLines()` for vertical-dominant gestures on a scrollable normal
+  buffer, so a tap still reaches the TUI as an SGR mouse report. On the
+  ALTERNATE buffer (captured live from `claude` 2.1.220, which sets `?1049h`
+  with `?1000h ?1002h ?1003h ?1006h`) there is no scrollback at all and the
+  app scrolls on WHEEL events — which a finger does not have, and which is
+  exactly why this never reproduced on desktop; a vertical drag there now
+  dispatches a `WheelEvent` and lets XTERM encode it, so the writer-lease
+  gate applies with no second input path. The on-screen key bar writes
+  through `term.input(seq, true)`, inheriting both the `disableStdin` and
+  `canWrite` gates, with exact bytes asserted per button including SS3 under
+  DECCKM. Keys are now labelled by ACTION (Interrupt / End input) with caret
+  notation demoted to a sub-label — the operator read `^C`/`^D` as
+  "Alt+C / Alt+D" — and Mac labelling (⌃ Control, ⌥ Option) is driven by the
+  DAEMON's OS via a new `host_os` on `/api/status`, not the browser's
+  user-agent, since the browser is usually a phone that is not the machine
+  being typed into. There is deliberately no ⌘ button: a PTY receives bytes,
+  Ctrl+C is 0x03 on every OS, and ⌘ never reaches a terminal at all. Also:
+  a visible "▾ Minimize" with a filled background so the SAFE exit catches
+  the eye (all three of minimize's previous doors are shut on a phone — no
+  hardware Escape, no backdrop under a full-viewport panel, and an icon-only
+  ▾ carrying its meaning only in an aria-label, which left the operator
+  believing the destructive ✕ was the only exit); horizontal swipes are now
+  swallowed rather than declined, so the OS edge-swipe no longer unloads the
+  whole dashboard; tap targets 19px → 44px; a Copy action, because xterm's
+  mouse-drag selection leaves no way to get an error off a phone; and focus
+  mode renders honestly disabled naming its missing dependency instead of
+  vanishing.
+- **fix(web): the on-screen keyboard costs the terminal zero rows.** The
+  first fix here rested on a wrong premise — per the CSSWG a virtual
+  keyboard does not affect ANY CSS viewport unit, `dvh` included — and the
+  second (`interactive-widget=resizes-content`) broke Chrome/Android touch
+  scrolling with the keyboard DISMISSED and could not be tested at all, since
+  the Playwright suites run desktop Chromium where the key is inert. Both are
+  gone. Shrinking the panel turned out to be the defect itself: measured live
+  from the operator's own session, the keyboard took the PTY from rows=29 to
+  rows=8, and a live `claude` 2.1.220 driven in a PTY at fixed sizes caps its
+  composer at 2 lines and shows only the tail at 8 rows — so a third typed
+  line looked like it overwrote the second. Nothing was wrong with the
+  emulation; the app was being handed an 8-row terminal. The panel now keeps
+  its UNOCCLUDED height and TRANSLATES up instead, putting the composer and
+  key bar at the bottom of the visible area while the row count never
+  changes, with the header sliding off the top as the deliberate trade. The
+  unoccluded height is the running maximum of `visualViewport.height` at the
+  current width — a keyboard only ever reduces that height and never changes
+  the width, so the maximum IS the no-keyboard height, obtained without
+  asking any engine-specific "is a keyboard present" question. Width changes
+  reset it, which is rotation. The two keyboard specs are inverted to pin the
+  new contract, and the test fake's viewport snapshot (taken in an init
+  script that runs BEFORE Playwright applies the emulated viewport, so every
+  consumer inherited a baseline no test asked for) is now live getters.
+- **fix(terminal): a reattached terminal renders at its own width, and
+  repaints.** Operator-reported from a phone after a page reload: every line
+  missing its first character, that character appearing at the end of the
+  line above — the signature of content wrapped at one width being rendered
+  at another. `Manager.Subscribe` started every new subscriber at the replay
+  ring's OLDEST byte, and the ring stores raw PTY bytes with no geometry
+  tagging, so a session that lived at 152 columns on a desktop and later at
+  47 on a phone replayed both eras into whichever width the reconnecting
+  client happened to be. The ring's absolute offset is now recorded at each
+  real geometry change (planted in `recordResize` and nowhere else, so
+  geometry keeps its single owner) and every subscriber starts at
+  `max(currentBase(), that offset)`. The stated trade: a genuine resize
+  shortens the replay available to the NEXT attach — those bytes were
+  unrenderable at the new width anyway, and already-attached subscribers are
+  untouched. It never self-healed because the client's post-replay resize is
+  a no-op: Linux `tty_do_resize()` skips SIGWINCH when the winsize is
+  unchanged, measured directly as three `TIOCSWINSZ` calls and only two
+  SIGWINCH delivered — and a full-screen TUI on the alternate buffer owns
+  every cell and only rewrites what it believes changed, so a stale frame
+  persists indefinitely. A one-shot repaint nudge (resize by one row and
+  immediately back, `rows-1` so the PTY never exceeds the client's real
+  viewport) now fires once per reattach on the writer path only, skipped when
+  geometry is unknown or when the client's resize already differs from the
+  live size.
+- **fix(terminal): mobile backgrounding no longer kills terminals or forces a
+  fresh capability code.** Leaving the browser to copy a code out of email
+  tore down the view of every running terminal. The PTYs never died —
+  unsubscribe detaches a viewer without killing the process and idle reaping
+  is off by default — but `ws.onclose` latched status "exited", a terminal
+  state, and the socket-setup effect depended only on `[token, isRemote]`, so
+  nothing ever reopened it; only a full page reload recovered. There is now a
+  distinct "reconnecting" status that counts as live, retry with exponential
+  backoff and jitter, and a `visibilitychange`/`pageshow` handler that
+  reconnects immediately on return, with the standing-secret auto-present in
+  `onopen` so control is regained with no user action. Server side, three
+  expiries each forced a new code and each moved with a config key whose
+  default is the new value: capability TTL 2m → 10m (two minutes is shorter
+  than the round trip to a mail app; still single-use, still bound to
+  session+action+handle), device-session idle 1h → 24h with the absolute cap
+  12h → 48h (an absolute cap below the idle target makes the target
+  unreachable), and standing-provenance writer leases exempted from the 5m
+  idle reap while the 30m hard cap stays. WS liveness now needs 5 consecutive
+  missed pongs (~3.3min) rather than one, so a briefly-frozen tab is not
+  mistaken for a dead peer; an aged-out lease DEMOTES rather than closing the
+  socket, while a trust-withdrawing revoke still closes it outright. A
+  revoked standing secret is classified `auth_revoked` (permanent, so the
+  device clears it) while temporarily-disabled and rate-limited stay
+  transient — previously any auth-ish denial deleted the saved secret with no
+  retry. Negative `session_ttl_minutes` values previously validated clean and
+  silently yielded the maximum; they are now rejected at load.
+- **fix(remote): a paired phone no longer loses authorization within the
+  hour.** Returning to the dashboard from a phone gave
+  `401 unauthorized: authentication required` on every API call while the UI
+  itself still served — a working shell with no data. `handlePair` set the
+  cookie with HttpOnly, Secure, SameSite=Strict, Path `/` — and NO Max-Age
+  and NO Expires, making it a BROWSER-SESSION cookie that mobile
+  Safari/Chrome discard when they end a browsing session or evict a
+  backgrounded tab, while the server session stayed live and simply
+  unreachable. Root-caused by elimination against the live install, with the
+  session table as the fingerprint: 17 rows from 24 pairings since Jul 14,
+  ELEVEN with zero seconds between `created_at` and `last_seen`. MaxAge now
+  derives from the store's own post-defaults lifetime via a new
+  `SessionStore.TTL()` accessor, tracking `[remote].session_ttl_minutes` with
+  no second constant, clamped to ≥1 (a 0 omits the attribute and silently
+  restores the bug); nothing was loosened and no TTL was extended. This is
+  also the true root cause of the symptom the 2026-07-25 TTL widening treated
+  — no server-side lifetime can rescue a credential the browser has already
+  thrown away, which is why the defect survived that work by two days. Two
+  adjacent defects fixed with it: `restore()` loaded every non-expired row
+  with no Max check while `Create` hard-fails `ErrTooManySessions`, so the
+  store could start above `max_sessions` and pairing then failed with a bare
+  503 (restore now keeps the Max most-recently-seen and durably prunes the
+  surplus; the refusal is a 409 naming the revoke path); and `api.ts` gated
+  401 recovery on `unsafeMethod()`, which is FALSE for GET, so EVERY read had
+  no recovery and no UX — recovery is now gated on `isRemoteView()` with a
+  single-flight whoami probe and a one-shot latch, rendering a full-screen
+  re-pair prompt on a confirmed loss and latching nothing on a probe failure.
+- **fix(remote): the pairing audit was never wired, so mobile auth was
+  unfalsifiable.** `buildRemoteController` built `dashboard.RemoteOptions` and
+  never set `Audit`, and `remoteController.auditSession` returns early on a
+  nil func — so every session-lifecycle event was silently discarded:
+  `session_paired`, `session_revoked`,
+  `terminal_control_standing_acquire`, and the six reasons `handlePair`
+  distinguishes. Only the DIFFERENT `Options.RemoteAudit` seam was ever set,
+  which is why `http_request` rows existed in abundance and hid the gap.
+  Measured on this install: the audit window 2026-07-13..2026-07-27 covers
+  all 17 rows in `remote_sessions` and contains zero `session_paired` rows to
+  explain any of them, so the "maybe it's the max_sessions limit" hypothesis
+  had been untestable the whole time. Second half: a deny row could not tell
+  a missing credential from a rejected one — `Principal` collapses no cookie,
+  unknown session, expired session and failed CSRF into `CapabilityPublic`,
+  and those have opposite fixes. The deny row now carries `no_cookie` or
+  `cookie_rejected`, appended to the row that is already written so it adds
+  no audit volume on a hot auth path. Both changes are metadata-only and
+  neither alters an authorization decision.
+- **fix(dashboard): `/api/health/doctor` withholds local paths and user names
+  from remote callers.** The route is capability V, so a paired REMOTE device
+  could read the checks' free text verbatim — and that text carries absolute
+  paths and user names pervasively, because most checks are built as
+  `"read X: " + err.Error()` and a Go path error stringifies the whole path.
+  Measured on a live host before designing anything, and the finding that
+  mattered is that the disclosure is in the HEALTHY report, not just on
+  errors: the `windows proxy routes` check emits the Windows USER NAME on a
+  passing run. The sibling ETW route already withheld exactly this class, so
+  the two were inconsistent in the ordinary case. One choke point now mirrors
+  the ETW route: for a remote-exposed caller a `pathRedactor` performs
+  EXACT-SUBSTRING substitution of roots the server already holds —
+  deliberately NOT a "looks like a path" regex, on the precedent that
+  heuristic predicates in this tree have shipped critical bypasses four times
+  — longest-root-first with dedupe, both cleaned and as-given spellings
+  registered, roots under 4 chars discarded, and cross-OS homes from
+  `crossmount.AllHomes()` given INDEXED placeholders because several homes can
+  carry the config. `local_detail_withheld` is set UNCONDITIONALLY so the
+  client knows which projection it is rendering, and the UI notice says the
+  redaction is partial rather than implying it is complete. Named residuals:
+  a path under no known root, OS-convention system paths left readable on
+  purpose, and non-path identity — the org enrolment check reports the
+  enrolled user's EMAIL, which substitution structurally cannot touch.
+- **fix(cost,cachetrack,routing): Claude Opus 5 was unregistered and priced
+  live traffic at $0.00.** `LookupWithSource` MISSed `claude-opus-5` because
+  the family ladder had no bare `claude-opus` key and `"claude-opus-4"` is
+  not a prefix of `"claude-opus-5"`. Measured on a live node: 78 Opus-5 turns
+  over ~3 days (16.76M cache-read + 1.26M cache-write) reported $0.00 and
+  re-cost to $18.04 — an under-count that grew with every turn. Three
+  registries were wrong, not one: `cost/pricing.go` gains an exact row at
+  $5/$25 per MTok (cache read 0.50, 5m write 6.25, 1h write 10, web search
+  0.01) with `FastMultiplier` 2, plus a bare `claude-opus` family net so a
+  future SKU inherits current rates instead of MISSing to $0;
+  `cachetrack/tier.go` gains the 512-token min-cacheable tier (Opus 5 halved
+  Opus 4.8's 1024, and Fable 5 and Mythos 5 shared the same bug, so
+  512–1023-token prefixes were labelled `below_min_cacheable` though they
+  cached); `routing/tiers.go` gains an explicit `TierOpusClass` pin plus the
+  `seedRepresentatives` opus-class swap. Adversarial review caught four
+  pre-existing errors in the same tables, each re-verified against the vendor
+  card: `opus-4-7` was 4096 where 2048 is published (it survived because a
+  test asserted the 4095/4096 boundary — a passing test defending the bug);
+  `claude-mythos-preview` had no row and fell through to 1024 instead of
+  2048, erring in the dangerous direction where the engine predicts a cache
+  write that never happens and then grades a mispredict; there were no bare
+  `claude-sonnet` / `claude-haiku` rows, the identical MISS-to-$0 hole, added
+  at the STANDARD $3/$15 rather than Sonnet 5's introductory rate which
+  expires 2026-08-31; and legacy alias `claude-opus-4-0` resolved through the
+  current-gen family row at $5/$25 instead of $15/$75, a 3× under-bill.
+  Non-shadowing was proven empirically by resolving a 277-id corpus against
+  both the old and new tables — 259 rows byte-identical, every delta
+  intended.
+- **fix(policy,guard): R-155 launcher-wrapper bypass.** R-155 (persistence
+  installs) is SeverityCritical/DecisionDeny, but `matchPersistenceCommand`
+  switched on `Command.Base`, so any launcher wrapper put the real program in
+  a positional slot and the rule never saw it — measured ALLOW in
+  `ModeEnforce`, in all three dialects, for `Start-Process` (positional,
+  `-FilePath`, `saps`/`start` aliases, `-Verb RunAs`), `wsl.exe -d <d> --`
+  and cmd's `start`, and for the crontab / `systemctl enable` / Run-key arms
+  too. Fixed at the PARSE layer rather than inside R-155:
+  `internal/policy/launcher.go` resolves a launcher into the launched argv so
+  EVERY rule inherits the coverage (verified through R-101 `rm -rf /`, R-110
+  force-push and R-153 secret-read). Three further rounds each found the same
+  class again, each after clean mutation proofs: a `bound` flag computed over
+  the whole argv SUPPRESSED the cmd-`START` reading (the tell was that ADDING
+  an argument made a denied command allowed) and is deleted, with ambiguity
+  now emitted as a full cross-product; four fail-OPEN exits became
+  fail-CLOSED via `Command.Unanalyzed`, a new rule R-157 and a
+  `maxParseUnits` budget; `pwsh -CommandWithArgs`/`-cwa` was absent from the
+  host vocabulary, substitutions were never stripped under the cmd dialect at
+  any depth, and `parseDepth` stopped stripping at the cap without marking —
+  all fixed vocabulary-wide with a ~30-row `psHostParams` table. Found
+  unprompted while fixing: a PANIC (seven matchers sliced `Argv[1:]`
+  unguarded, so a line lexing to no words crashed the whole evaluation on
+  attacker-influenced input), and that .NET ignores whitespace in base64
+  while Go rejects it, so `powershell -e "<b64 with spaces>"` was silently
+  undecodable. Because mutation proofs verify the change you made and never
+  the class, the defence is now GENERATED:
+  `TestLauncher_WrappingNeverRelaxes` walks 2,385 command lines / 7,155
+  verdicts asserting that wrapping never turns a deny into an allow, and it
+  found four further holes in the fix's own drafts. Recorded rather than
+  papered over: `ssh`, `docker run`, `psexec`, `conhost`, `wt.exe` and
+  `Invoke-Command`/`Start-Job -ScriptBlock` are still unresolved and still
+  allow. The ETW setup carve-out was deliberately not widened — it now fails
+  closed on any launcher-wrapped unit, and its predicate is a tokenizer plus
+  closed allow-lists (subcommand must be the FIRST argument, `/TN` must
+  match, the schtasks flag set is closed, the program extension must be
+  `.exe` or absent, `--connect` must name a loopback address) after two
+  adversarial passes each found a critical bypass in permissive parsing.
+- **fix(processobs,termsession,store): process attribution reaches
+  non-claude-code tools.** Resource charts and process trees were blank for
+  almost every AI tool — measured against a real DB, 101 direct-attribution
+  rows out of ~2.67M, with `session_pid_bridge` holding only claude-code and
+  hermes. Three independent causes. (1) The terminal knew the pid and threw
+  it away: `termsession` spawns the PTY child and held `proc.Pid` only to set
+  the process group, so a terminal launched from the dashboard — exactly
+  where the operator clicks "Session" — was never directly attributed. It is
+  now published through an injected `OnProcess` seam (nil = clean no-op) on
+  both unix and Windows ConPTY, each pinned by a compile-time assertion, and
+  seeded ON CORRELATION rather than on run identity, because putting a
+  run_id in the session_id column would fabricate a session that the PROXY
+  then stamps onto `api_turns`, corrupting cost attribution. (2) Attribution
+  resolved once at exec and never again, so a correlation-time seed was a
+  race against the poll: measured over 103 real runs, out-of-band correlation
+  lands in 0.2–1.9s and usually wins, while `discovered` correlation takes
+  30–266s and ALWAYS lost — i.e. precisely the non-claude tools. A deferred
+  pass now re-resolves a tracked-but-unattributed run when a seed appears and
+  re-inherits down its subtree, upgrade-only
+  (`none<low<medium<high`), bounded to the live in-memory tree with a 15-min
+  age cut and 512 lookups/pass; steady state is zero lookups. (3) The store
+  was erasing attribution it had already resolved:
+  `upsertProcessRunSQL` wrote `session_id` / `attribution_source` /
+  `attribution_confidence` unconditionally from `excluded`, so the exit
+  persist wiped whatever `CorrelateCrossOS` had since set — and
+  `cross_os_correlation` is the ONLY attribution path for every non-claude
+  tool. Now a SQL MAX-upgrade guard mirroring the `token_usage` ON CONFLICT
+  discipline, five columns gated on one shared predicate so they move as a
+  unit. The guard stops future erasure but does not repair already-blanked
+  rows.
+- **fix(dashboard,web): the per-process network series reaches the chart.**
+  The network chart was invisible on Linux with the eBPF probes live and
+  measuring, and the cause was on both sides of the wire:
+  `sampleNetworkRx`/`Tx` were hardcoded `return 0, false` stubs whose comment
+  ("MetricSample carries no network counters today") had been stale since the
+  fields landed, forcing `MetricSeriesAvailability.Network` false forever;
+  and `ResourceCharts.tsx` had no network chart at all — `ChartSpec.dataKey`
+  was typed `"cpu" | "rss" | "disk"` — so the server would have emitted the
+  fields and the browser discarded them. Both sides now land, gated on
+  `series.network` exactly the way the other charts gate on their
+  availability flags, so an unmeasured host gets no chart rather than a flat
+  zero line that would read as "no traffic" when the truth is "not measured".
+  `ok` is gated on `NetMeasured` alone and never inferred from the byte
+  value; mixed rings produce an honest gap. Also fixes `anySeries`, which
+  ORed only cpu/rss/disk, so a host measuring network but none of those
+  rendered "No resource samples in the retained window." over a non-empty
+  points array. The series is TCP-only and the chart says so.
+- **fix(dashboard): the `etw` process backend is runnable, and the whole
+  vocabulary is pinned.** `processBackendRunnable` mirrors
+  `selectProcessBackend`'s construction vocabulary and had silently drifted:
+  `"etw"` was correctly false while the selector returned "not yet
+  implemented" and STAYED false after the selector began constructing a real
+  Backend. Nothing went red, because the only coverage was a handler test
+  asserting the OLD answer — the test defended the staleness rather than
+  catching it. The consequence was not cosmetic: the enable verb switches a
+  non-runnable backend to `auto`, so an operator who had configured
+  `backend = "etw"` and granted elevation would have had it quietly
+  rewritten, discarding the ETW feed they set up, with the response reporting
+  success. A table-driven test now covers the ENTIRE vocabulary, each row
+  stating the selector behaviour it claims.
+- **fix(termsvc): a correlate-before-registration race dropped the
+  out-of-band session link.** `drainOOB` starts INSIDE `Spawn` but
+  `s.byRun[runID]` is only assigned after `Spawn` returns, so a trusted OOB
+  session frame could reach `Correlate` before the run was registered.
+  `Correlate`'s liveness guard exists to stop an ENDED run being resurrected,
+  but `byRun` is equally empty for a NOT-YET-REGISTERED one, so a legitimate
+  early correlation was silently discarded — and the frame is one-shot, so
+  the link was lost for the life of the run and "Jump in" stayed blank. Not
+  theoretical: the full `-race` suite failed on
+  `TestAttachCorrelationAssembledThroughHTTP`. Fixed with a `launching`
+  reservation taken under `s.mu` BEFORE `Spawn` and released in the SAME
+  critical section that installs `byHandle`/`byRun`; `releaseLaunching` drops
+  the reservation AND any `bySession` entry on the Spawn-error path plus a
+  deferred catch-all, because an entry written while the run was only
+  reserved would otherwise be unreachable by `EndRunByHandle` (keyed by
+  handle) — i.e. fixing the bug naively would have reintroduced the
+  resurrection leak the guard exists to prevent.
+- **fix(hermes): `observer hermes` supplies a model whenever it injects
+  `--provider`.** The launcher prepended `--provider observer` and nothing
+  else; hermes rejects that combination outright
+  (`--provider requires --model (or HERMES_INFERENCE_MODEL)`) and exits
+  before issuing a single API call, so every wrapped run died at argument
+  validation while the same agent was healthy run natively. The bug survived
+  live verification because the documented invocation always carried an
+  explicit `--model` — the one form anybody tested was the one form that
+  worked. The launcher now resolves a model the way hermes would, via an
+  ordered rule table: a foreign `--provider X` leaves argv untouched with a
+  not-proxy-routed warning; an already-supplied model injects the provider
+  only; otherwise hermes' own `model.default` is injected alongside; and
+  failing that, nothing is injected and the run launches unrouted with a loud
+  notice (deliberately fail-open — injecting `--provider` without a model is
+  guaranteed to fail, and refusing to launch would break a command that works
+  natively). Also fixed while hardening the arg scanner: `hermesConfigPath`
+  ignored `HERMES_HOME` and `--profile`, so with a profile active the
+  provider entry was written to the wrong file AND the injected model came
+  from the wrong home; the `chat` subcommand re-declares
+  `--model`/`--provider`, so top-level flags were silently discarded and are
+  now placed after `chat`; `--oneshot` and `chat -q` did not trip the
+  attach-incompatible gate, so scripted headless runs were handed to a
+  daemon-owned PTY; argparse abbreviations (`--prov openrouter`) bypassed the
+  foreign-provider guard; and an option-looking token is no longer accepted
+  as a flag value. `stripUpstreamPrefix` now warns once per unknown upstream
+  id — it fails open by design but did so silently, returning an opaque 404
+  with nothing to debug from. Reported-by: @Pranjal-Godhat.
+- **fix(obs): the `budget-band-cheaper` egress starter template routed to a
+  retired model.** It suggested `claude-3-5-haiku-20241022`, retired
+  2026-02-19, so an operator applying the template as-is would route
+  budget-pressured end-users to a model that now 404s upstream. Swapped to
+  `claude-haiku-4-5`, the documented drop-in replacement. Test fixtures and
+  the historical pricing-registry row keep the old id by design — they price
+  observed data, not suggestions.
+- **fix(website): mobile visual density and three tap/overflow defects.** The
+  complaint was "the mobile site is very text-heavy"; measurement said the
+  intuition was right but the cause was not text volume — word count is
+  IDENTICAL desktop vs mobile and words/screen is actually LOWER on a phone.
+  What collapses is the visual supply: text:visual 0.59 at 1280px vs 1.69 at
+  393px, with 6 of 13 sections carrying zero visual coverage — 6.2 phone
+  screens without an image, diagram, chart or code block. Two mechanisms: a
+  16:9 embed loses height exactly as fast as prose gains it (648px at 1280
+  becomes 201px at 393, −69%, while the same copy grows 751 → 1963px), and
+  the 860px collapse stacks visuals BELOW copy instead of beside it. So the
+  fix adds visual supply rather than cutting text — nothing deleted, hidden,
+  collapsed or reordered, which keeps the deliberately text-first indexable
+  homepage intact: text:visual @393 1.69 → 0.879, longest visual-free run
+  2936 → 1023px, longest prose run 1916 → 318px, sections at 0% visual
+  6 → 0. The cheapest step was surfacing what already shipped — `pixel-icons.js`
+  defines 20 pixel-art glyphs, loads on every page except index and arcade,
+  and its 13 domain icons rendered nowhere. The two dashboard screenshots
+  were 1920×1080 rendered into 355 CSS px, a 5.4× reduction putting the UI's
+  own 13px labels at ~2.4px, and are now 3:2 detail crops whose numbers are
+  readable. Defects: the arcade rotate-banner dismiss button was 100%
+  unreachable at every phone width and tapping it navigated the visitor OFF
+  the arcade (the real cause was a full-screen z-index:200 scrim on first
+  paint, not the top bar that appeared to steal the tap); all six support
+  pages scrolled horizontally below 344px (+21px at 320 — iPhone SE, Galaxy
+  Fold cover), and the earlier 7px-font hack attempting this is deleted; two
+  homepage images had no intrinsic size, reserving 0px before load for ~400px
+  of cumulative shift; the install command — the page's primary CTA — was
+  visually truncated and now wraps; footer legal links were 17px tall. Site
+  download and stars figures refreshed from authoritative sources (the npm
+  registry range API, pepy.tech for the all-time PyPI figure since pypistats
+  only exposes a 180-day window, and the Marketplace extensionquery).
+
+### Changed
+
+- **perf(db): the `quick_check` integrity probe is opt-IN, not opt-out.**
+  `observer remote status` took 3m59.971s on a 14.7GB install — not because
+  the data was too large to read, but because `db.Open` ran
+  `PRAGMA quick_check`, which reads and checksums every page, so a read-only
+  status command paid a full-database verification to print a table. Measured
+  after: 0.189s, same output. The polarity was the defect: under the opt-out
+  spelling (`SkipIntegrityCheck`) the same class had already been patched
+  three times at individual call sites — the MCP server, the daemon, and
+  `observer run` (re-measured 0.16s vs >120s) — and each patch left the trap
+  armed for the next caller. The real blast radius was never 11 files:
+  `cmd/observer`'s `loadConfigAndDB` reached 85 call sites across 40 files,
+  every read-only reporting command among them. An opt-out flag must be
+  remembered at each new site and is silent when forgotten; an opt-in flag
+  fails safe. `Options.SkipIntegrityCheck` becomes `Options.IntegrityCheck`,
+  and the `loadConfigAndDB` / `loadConfigAndDBFast` twins collapse into one
+  function — two names for identical behaviour is how callers picked wrong in
+  the first place. Nothing loses the probe: it runs once per daemon via
+  `RunStartupMaintenance` (off the readiness path) and as `observer doctor`'s
+  `db.integrity` check, which ran its OWN `quick_check` all along, so doctor
+  had been paying for it twice. The one caller that opts in is
+  `observer db import`, which validates an untrusted foreign database before
+  merging it. The schema-034 path-hash backfill also moves to a single owner
+  (`RunStartupMaintenance`) rather than whichever `Open` happened to come
+  first.
+- **ci: the Windows cross-compile is gated.** `go test ./...` never compiles
+  a `//go:build windows` file and the build step's only Windows target was
+  `cmd/antigravity-bridge`, so a Windows-only break in `internal/processobs`
+  shipped undetected — a gap that widens with the almost entirely
+  windows-tagged ETW backend. Compile-only; the tree was verified clean
+  before adding, so this pins a property that already held. `make test-race`
+  also gains a `-timeout` (`cmd/observer` measures 593–698s against Go's 600s
+  default, so the release checklist's full race suite could have failed RED
+  for no reason).
+
 ## [1.25.0] — 2026-07-24
 
 ### Added

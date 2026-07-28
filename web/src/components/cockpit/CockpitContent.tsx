@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
-import { IdLink, Pill, Sparkline, ToolBadge } from "@/components/primitives";
+import { IdLink, Pill, ToolBadge } from "@/components/primitives";
+import { ResourceCharts, type SessionMetricsResponse } from "./ResourceCharts";
 import { useApi } from "@/lib/useApi";
 import { isRemoteView } from "@/lib/remote";
 import { markRestartPending } from "@/lib/restartPending";
@@ -110,6 +111,18 @@ export function CockpitContent({ link, linkError, linkLoading, mountMs }: Cockpi
     [sessionId],
     { refreshMs: 5000 },
   );
+  // Subtree-aggregated, server-differentiated resource series for the System
+  // charts. Deliberately a SEPARATE poll from /processes: the tree endpoint
+  // also drives debounced correlation WRITE passes, while this one is a pure
+  // read. Same 5s cadence as the tree so the two stay visually in step; the
+  // bucket is left to the server, which derives it from the observed sampling
+  // cadence rather than any hardcoded interval.
+  const metrics = useApi<SessionMetricsResponse>(
+    sessionId ? `/api/session/${sessionId}/metrics` : null,
+    undefined,
+    [sessionId],
+    { refreshMs: 5000 },
+  );
   const network = useApi<SessionNetworkSummary>(
     sessionId ? `/api/session/${sessionId}/network` : null,
     { summary: 1 },
@@ -211,6 +224,9 @@ export function CockpitContent({ link, linkError, linkLoading, mountMs }: Cockpi
       <SystemSection
         procs={procs.data}
         flat={flat}
+        metrics={metrics.data}
+        metricsLoading={metrics.loading}
+        metricsErr={metrics.error}
         network={network.data}
         networkErr={network.error}
         err={procs.error}
@@ -601,24 +617,21 @@ function CacheCountdown({
 
 // --- 7: System -------------------------------------------------------------
 
-function pickSampleNode(nodes: ProcessNode[]): ProcessNode | null {
-  let best: ProcessNode | null = null;
-  for (const n of nodes) {
-    const len = n.metric_samples?.length ?? 0;
-    if (len >= 2 && (!best || len > (best.metric_samples?.length ?? 0))) best = n;
-  }
-  return best;
-}
-
 function SystemSection({
   procs,
   flat,
+  metrics,
+  metricsLoading,
+  metricsErr,
   network,
   networkErr,
   err,
 }: {
   procs?: SessionProcessResponse | null;
   flat: ProcessNode[];
+  metrics?: SessionMetricsResponse | null;
+  metricsLoading: boolean;
+  metricsErr: Error | null;
   network?: SessionNetworkSummary | null;
   networkErr: Error | null;
   err: Error | null;
@@ -637,11 +650,6 @@ function SystemSection({
   }
   if (!procs) return null;
 
-  const sampleNode = pickSampleNode(flat);
-  const cpu = sampleNode?.metric_samples?.map((s) => s.cpu_ms) ?? [];
-  const rss = sampleNode?.metric_samples?.map((s) => s.ws) ?? [];
-  const disk = sampleNode?.metric_samples?.map((s) => s.rb + s.wb) ?? [];
-
   const recent = [...flat]
     .sort((a, b) => {
       const ta = a.started_at ? Date.parse(a.started_at) : 0;
@@ -653,15 +661,9 @@ function SystemSection({
   return (
     <div>
       <SectionLabel>System</SectionLabel>
-      {sampleNode ? (
-        <div className="mb-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] text-fg-3">
-          <SparkStat label="CPU" data={cpu} />
-          <SparkStat label="RSS" data={rss} />
-          <SparkStat label="Disk" data={disk} />
-        </div>
-      ) : (
-        <div className="mb-2 text-[10.5px] text-fg-4">no resource samples yet</div>
-      )}
+      <div className="mb-2">
+        <ResourceCharts metrics={metrics ?? null} loading={metricsLoading} error={metricsErr} />
+      </div>
 
       {recent.length > 0 && (
         <div className="space-y-0.5">
@@ -769,19 +771,6 @@ function NetworkTraffic({
         </div>
       )}
     </div>
-  );
-}
-
-function SparkStat({ label, data }: { label: string; data: number[] }) {
-  return (
-    <span className="inline-flex items-center gap-1">
-      <span className="text-fg-4">{label}</span>
-      {data.length >= 2 ? (
-        <Sparkline data={data} width={48} height={14} fill={false} />
-      ) : (
-        <span className="text-fg-4">—</span>
-      )}
-    </span>
   );
 }
 

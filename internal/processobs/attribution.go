@@ -71,6 +71,11 @@ type Attributor struct {
 
 	runs    map[string]*ProcessRun // processKey -> tracked run
 	livePID map[int]string         // pid -> current processKey occupying it
+
+	// metricRing governs the live-chart ring buffer (sample cadence, retained
+	// window, persist cadence). Zero value = DefaultMetricPolicy; installed by
+	// the daemon via SetMetricPolicy.
+	metricRing MetricPolicy
 }
 
 // NewAttributor builds an Attributor. seed may be nil (everything is then
@@ -169,17 +174,15 @@ func (a *Attributor) Observe(ev RawEvent, env map[string]string) (*ProcessRun, C
 	}
 }
 
-// metricSampleInterval throttles sparkline ring-buffer appends; maxMetricSamples
-// caps the buffer (oldest dropped). ~15s × 60 = ~15 min of trend at a glance.
-const (
-	metricSampleInterval = 15 * time.Second
-	maxMetricSamples     = 60
-)
-
 // metrics folds an EventMetrics refresh into an already-tracked run: it updates
-// the resource counters and appends a sparkline sample WITHOUT re-resolving
+// the resource counters and appends a live-chart sample WITHOUT re-resolving
 // attribution (the run keeps its session/source). A no-op (ChangeNone) when the
 // process isn't tracked — e.g. evicted, or one we never saw exec for.
+//
+// The return value is the PERSIST decision, and it is deliberately decoupled
+// from the sample decision: the in-memory ring is updated on every refresh, but
+// ChangeUpdated (→ a DB row rewrite) is only reported once per
+// MetricPolicy.PersistInterval. See MetricPolicy for the reasoning.
 func (a *Attributor) metrics(ev RawEvent) (*ProcessRun, Change) {
 	if !ev.HasStartTime {
 		return nil, ChangeNone
@@ -192,9 +195,82 @@ func (a *Attributor) metrics(ev RawEvent) (*ProcessRun, Change) {
 		return nil, ChangeNone
 	}
 	applyMetrics(run, &ev)
-	appendMetricSample(run, &ev)
+	a.appendMetricSample(run, &ev)
 	run.LastSeenAt = ev.Timestamp
+	if !a.shouldPersistMetrics(run, ev.Timestamp) {
+		return nil, ChangeNone
+	}
+	run.lastMetricPersistAt = ev.Timestamp
 	return run, ChangeUpdated
+}
+
+// shouldPersistMetrics applies the persist throttle. A zero/negative
+// PersistInterval persists every refresh (the pre-decoupling behaviour); a
+// zero timestamp (a backend that does not stamp events) also persists, so the
+// throttle can never silently swallow every write.
+func (a *Attributor) shouldPersistMetrics(run *ProcessRun, ts time.Time) bool {
+	p := a.metricPolicy()
+	if p.PersistInterval <= 0 || ts.IsZero() {
+		return true
+	}
+	if run.lastMetricPersistAt.IsZero() {
+		// Anchor on the run's creation so a freshly-exec'd process (already
+		// persisted at exec) does not immediately rewrite its row.
+		anchor := run.StartedAt
+		if anchor.IsZero() {
+			return true
+		}
+		return ts.Sub(anchor) >= p.PersistInterval
+	}
+	return ts.Sub(run.lastMetricPersistAt) >= p.PersistInterval
+}
+
+// SetMetricPolicy installs the live-chart ring policy (sample cadence,
+// retained window, persist cadence). Additive: the zero value / never calling
+// it leaves DefaultMetricPolicy in force, so existing callers are unaffected
+// (CLAUDE.md rule 6). Not safe to call concurrently with Observe — the daemon
+// sets it once at construction.
+func (a *Attributor) SetMetricPolicy(p MetricPolicy) { a.metricRing = p.withDefaults() }
+
+// metricPolicy returns the effective policy, defaulting when never set.
+func (a *Attributor) metricPolicy() MetricPolicy {
+	if a.metricRing.SampleInterval <= 0 {
+		return DefaultMetricPolicy()
+	}
+	return a.metricRing
+}
+
+// SnapshotForPersist returns the copy of run that goes to the Sink. It is the
+// ONE place the persisted view diverges from the in-memory one: the
+// full-resolution ring is downsampled to MetricPolicy.PersistMaxSamples into a
+// FRESH slice, so (a) the stored JSON stays small however fast we sample and
+// (b) the batched copy can never alias — and be mutated by — the live ring.
+func (a *Attributor) SnapshotForPersist(run *ProcessRun) ProcessRun {
+	out := *run
+	out.MetricSamples = downsampleMetricSamples(run.MetricSamples, a.metricPolicy().PersistMaxSamples)
+	return out
+}
+
+// downsampleMetricSamples reduces a ring to at most max points, evenly spaced,
+// ALWAYS keeping the first and — load-bearing for a live chart — the last point
+// exactly. Returns a fresh slice (never aliasing the input) or nil when empty.
+// max ≤ 0 copies the whole ring.
+func downsampleMetricSamples(in []MetricSample, max int) []MetricSample {
+	if len(in) == 0 {
+		return nil
+	}
+	if max <= 0 || len(in) <= max {
+		return append([]MetricSample(nil), in...)
+	}
+	if max == 1 {
+		return []MetricSample{in[len(in)-1]}
+	}
+	out := make([]MetricSample, 0, max)
+	last := len(in) - 1
+	for i := range max - 1 {
+		out = append(out, in[i*last/(max-1)])
+	}
+	return append(out, in[last])
 }
 
 // applyMetrics copies resource counters from a (metrics-bearing) event onto a
@@ -216,11 +292,15 @@ func applyMetrics(run *ProcessRun, ev *RawEvent) {
 	run.HandleCount = ev.HandleCount
 }
 
-// appendMetricSample appends a throttled sparkline point to the run's ring
-// buffer: a fresh point only when ≥ metricSampleInterval since the last (always
+// appendMetricSample appends a throttled point to the run's live-chart ring:
+// a fresh point only when ≥ MetricPolicy.SampleInterval since the last (always
 // for the first), else it refreshes the last point in place so "current" stays
-// live without growing the buffer. Capped at maxMetricSamples (oldest dropped).
-func appendMetricSample(run *ProcessRun, ev *RawEvent) {
+// live without growing the buffer. On append, points outside
+// MetricPolicy.Window are evicted and the ring is clamped to the derived cap,
+// so a high sample rate bounds memory by TIME, not by however long the process
+// lives.
+func (a *Attributor) appendMetricSample(run *ProcessRun, ev *RawEvent) {
+	p := a.metricPolicy()
 	s := MetricSample{
 		T:          ev.Timestamp,
 		CPUMs:      ev.CPUUserMs + ev.CPUSystemMs,
@@ -228,9 +308,17 @@ func appendMetricSample(run *ProcessRun, ev *RawEvent) {
 		ReadBytes:  ev.ReadBytes,
 		WriteBytes: ev.WriteBytes,
 	}
+	// Network bytes are carried ONLY when the backend actually measured them;
+	// otherwise NetMeasured stays false and the consumer renders the series as
+	// absent rather than as a zero line (types.go: MetricSample.NetMeasured).
+	if ev.HasNetworkMetrics {
+		s.NetRxBytes = ev.NetworkBytesIn
+		s.NetTxBytes = ev.NetworkBytesOut
+		s.NetMeasured = true
+	}
 	if n := len(run.MetricSamples); n > 0 {
 		last := run.MetricSamples[n-1].T
-		if !ev.Timestamp.IsZero() && !last.IsZero() && ev.Timestamp.Sub(last) < metricSampleInterval {
+		if !ev.Timestamp.IsZero() && !last.IsZero() && ev.Timestamp.Sub(last) < p.SampleInterval {
 			// Refresh the current bucket's values in place but KEEP its start
 			// timestamp, so the throttle measures from the last APPENDED point —
 			// otherwise advancing T each poll resets the interval and a second
@@ -241,9 +329,29 @@ func appendMetricSample(run *ProcessRun, ev *RawEvent) {
 		}
 	}
 	run.MetricSamples = append(run.MetricSamples, s)
-	if len(run.MetricSamples) > maxMetricSamples {
-		run.MetricSamples = run.MetricSamples[len(run.MetricSamples)-maxMetricSamples:]
+	run.MetricSamples = evictMetricSamples(run.MetricSamples, s.T, p)
+}
+
+// evictMetricSamples trims a ring to the retained window (points older than
+// newest-Window are dropped) and then to the derived point cap. Both bounds
+// drop from the OLDEST end, so the newest point always survives. A zero newest
+// timestamp (a backend that does not stamp events) skips the time bound and
+// relies on the count cap alone.
+func evictMetricSamples(s []MetricSample, newest time.Time, p MetricPolicy) []MetricSample {
+	if !newest.IsZero() && p.Window > 0 {
+		cutoff := newest.Add(-p.Window)
+		drop := 0
+		for drop < len(s) && !s[drop].T.IsZero() && s[drop].T.Before(cutoff) {
+			drop++
+		}
+		if drop > 0 {
+			s = s[drop:]
+		}
 	}
+	if capN := p.ringCap(); len(s) > capN {
+		s = s[len(s)-capN:]
+	}
+	return s
 }
 
 // fork records a child process. We do NOT persist at fork (spec §8: the
@@ -331,7 +439,7 @@ func (a *Attributor) exec(ev RawEvent, env map[string]string) (*ProcessRun, Chan
 
 	if ev.HasMetrics {
 		applyMetrics(run, &ev)
-		appendMetricSample(run, &ev)
+		a.appendMetricSample(run, &ev)
 	}
 
 	a.resolveAttribution(run, ev.SessionToken)
@@ -418,7 +526,7 @@ func (a *Attributor) exit(ev RawEvent) (*ProcessRun, Change) {
 	}
 	if ev.HasMetrics {
 		applyMetrics(run, &ev)
-		appendMetricSample(run, &ev)
+		a.appendMetricSample(run, &ev)
 	}
 
 	// Detach: free the pid and stop tracking. The returned pointer stays

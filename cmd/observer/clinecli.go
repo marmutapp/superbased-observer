@@ -42,6 +42,7 @@ func newClineCLICmd() *cobra.Command {
 		fromTime     string
 		attach       *bool
 		noAttach     *bool
+		resume       *string
 	)
 	cmd := &cobra.Command{
 		Use:   "cline-cli [-- cline-args...]",
@@ -81,13 +82,25 @@ func newClineCLICmd() *cobra.Command {
 				flagNoAttach:  *noAttach,
 				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
 					argsLeadWithSubcommand(args, clineSubcommands),
-				passthrough: clineAttachPassthrough(binPath),
+				passthrough: append(clineAttachPassthrough(binPath), resumeAttachPassthrough(*resume)...),
 				toolArgs:    args,
 				stderr:      cmd.ErrOrStderr(),
 			})
 			if outcome.handled {
 				return err
 			}
+			// Native resume: `--resume <id>` → `cline --id <id>` (LEADS the user
+			// args; the `-P openai-compatible` provider select is prepended below).
+			resumedArgs, releaseResume, okResume, resumeErr := applyLauncherResume(launcherResumeSpec{
+				verb: "cline-cli", label: "cline-cli", configPath: configPath, id: *resume,
+				continueFrom: continueFrom, carry: carry, fromMessage: fromMessage, fromTime: fromTime,
+				args: args, stderr: cmd.ErrOrStderr(),
+			})
+			if !okResume {
+				return resumeErr
+			}
+			defer releaseResume()
+			args = resumedArgs
 			cfg, err := config.Load(config.LoadOptions{GlobalPath: configPath})
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
@@ -157,6 +170,7 @@ func newClineCLICmd() *cobra.Command {
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "cline-cli")
+	resume = registerResumeFlag(cmd, "cline-cli")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
 }

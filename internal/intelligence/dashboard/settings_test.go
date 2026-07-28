@@ -1438,3 +1438,94 @@ func TestConfigWrite_RemoteManageRaceSectionSave(t *testing.T) {
 		}
 	}
 }
+
+// TestHandleConfigSection_SaveProcessETW pins the [observer.process.etw] half
+// of the process section — the keys the ETW capturer card edits, none of which
+// were reachable from the dashboard before.
+//
+// Three properties, in order of how badly each would bite:
+//  1. The card's one-field PUT ({"ETW":{"Enabled":true}}) preserves every other
+//     ETW key. Zeroing listen_addr here would silently move the daemon's accept
+//     listener on the next restart, and the elevated capturer — whose --connect
+//     address is baked into a Scheduled Task — would dial a dead port forever.
+//  2. The shared token is NEVER written from the wire. It gates a loopback port
+//     that WSL2 exposes to the whole Windows host, so a body carrying one is
+//     ignored and the operator's own value stands.
+//  3. A malformed listen_addr is refused at the seam. config.Load does not
+//     reject it; the failure would otherwise surface as a listener that never
+//     binds after a restart the operator performed on our advice.
+func TestHandleConfigSection_SaveProcessETW(t *testing.T) {
+	tdir := t.TempDir()
+	cfgPath := filepath.Join(tdir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte(`[observer.process]
+enabled = true
+backend = "auto"
+
+[observer.process.etw]
+enabled = false
+listen_addr = "127.0.0.1:9999"
+token = "operator-set-secret"
+token_path = "/home/u/.observer/tok"
+handshake_timeout_ms = 7000
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	server, err := New(Options{DB: database, ConfigPath: cfgPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// (1) + (2): the card's enable toggle, with a token in the body for good
+	// measure — the sort of thing a full-draft PUT from the structured form
+	// would carry.
+	rr := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPut, "/api/config/section/process",
+		strings.NewReader(`{"ETW":{"Enabled":true,"Token":"stolen"}}`)))
+	if rr.Code != 200 {
+		t.Fatalf("etw enable save: %d body=%s", rr.Code, rr.Body.String())
+	}
+	reloaded, err := config.Load(config.LoadOptions{GlobalPath: cfgPath})
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	etw := reloaded.Observer.Process.ETW
+	if !etw.Enabled {
+		t.Errorf("ETW.Enabled not applied: %+v", etw)
+	}
+	if etw.ListenAddr != "127.0.0.1:9999" || etw.TokenPath != "/home/u/.observer/tok" || etw.HandshakeTimeoutMS != 7000 {
+		t.Errorf("partial ETW body zeroed preserved keys: %+v", etw)
+	}
+	if etw.Token != "operator-set-secret" {
+		t.Errorf("the shared token must never be writable from the wire, got %q", etw.Token)
+	}
+	// And the sibling process scalars are untouched.
+	if !reloaded.Observer.Process.Enabled || reloaded.Observer.Process.Backend != "auto" {
+		t.Errorf("an ETW-only body clobbered the process scalars: %+v", reloaded.Observer.Process)
+	}
+
+	// (3) a listen_addr that is not host:port is refused, and nothing is written.
+	rr = httptest.NewRecorder()
+	server.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPut, "/api/config/section/process",
+		strings.NewReader(`{"ETW":{"ListenAddr":"not-an-address"}}`)))
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("malformed listen_addr: got %d, want 400 (body=%s)", rr.Code, rr.Body.String())
+	}
+	rr = httptest.NewRecorder()
+	server.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPut, "/api/config/section/process",
+		strings.NewReader(`{"ETW":{"HandshakeTimeoutMS":-1}}`)))
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("negative handshake timeout: got %d, want 400", rr.Code)
+	}
+	reloaded, err = config.Load(config.LoadOptions{GlobalPath: cfgPath})
+	if err != nil {
+		t.Fatalf("reload after refusals: %v", err)
+	}
+	if reloaded.Observer.Process.ETW.ListenAddr != "127.0.0.1:9999" {
+		t.Errorf("a refused save still wrote: %+v", reloaded.Observer.Process.ETW)
+	}
+}

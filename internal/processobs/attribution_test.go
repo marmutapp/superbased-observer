@@ -292,6 +292,10 @@ func TestAttributionMetricsRefresh(t *testing.T) {
 	t.Parallel()
 	clk := &evClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	a := NewAttributor(bridgeSeed(100, "s", "claude-code", 1), nil, nil)
+	// PersistInterval 0 = report every refresh, so this test isolates the
+	// sampling/attribution behaviour from the persist throttle (which has its
+	// own test below).
+	a.SetMetricPolicy(MetricPolicy{SampleInterval: time.Second, Window: time.Hour})
 
 	run, ch := a.Observe(execEv("b", 100, 1, 1000, "/usr/bin/claude", []string{"claude"}, clk.next()), nil)
 	if ch != ChangeCreated {
@@ -327,14 +331,17 @@ func TestAttributionMetricsRefresh(t *testing.T) {
 	}
 }
 
-// TestAttributionMetricsSparklineThrottle pins the ring-buffer throttle: refreshes
-// within metricSampleInterval update the current point in place (values change,
-// count stays), and only a refresh PAST the interval appends a new point — so a
-// sparkline accrues one point per interval, not one per poll.
+// TestAttributionMetricsSparklineThrottle pins the ring-buffer throttle:
+// refreshes within MetricPolicy.SampleInterval update the current point in
+// place (values change, count stays), and only a refresh PAST the interval
+// appends a new point — so the ring accrues one point per interval, not one per
+// poll. PersistInterval is 0 here so every refresh still reports ChangeUpdated
+// and the test observes the ring directly.
 func TestAttributionMetricsSparklineThrottle(t *testing.T) {
 	t.Parallel()
 	base := time.Unix(1_700_000_000, 0).UTC()
 	a := NewAttributor(bridgeSeed(100, "s", "claude-code", 1), nil, nil)
+	a.SetMetricPolicy(MetricPolicy{SampleInterval: 15 * time.Second, Window: time.Hour})
 
 	mev := func(ts time.Time, ws int64) RawEvent {
 		return RawEvent{

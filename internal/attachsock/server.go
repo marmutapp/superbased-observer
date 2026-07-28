@@ -47,7 +47,12 @@ type SpawnRequest struct {
 	// Rows / Cols are the initial PTY size.
 	Rows uint16
 	Cols uint16
-	// Env is the extra child environment ("KEY=VALUE") the launcher forwards.
+	// Env is the extra child environment ("KEY=VALUE") the launcher forwards:
+	// the tool's proxy-routing / profile vars AND — when
+	// [terminal.attach].forward_auth_env is on — the caller's provider-
+	// credential values (forwardAuthEnv). CREDENTIAL-BEARING: entries may carry
+	// secret values; they transit this owner-only (0600 AF_UNIX) socket once per
+	// launch and must NEVER be logged or persisted.
 	Env []string
 	// ExtraArgs are the allow-listed argv tokens appended to the inner
 	// `observer <Subcommand>` launcher (routing escape hatch + `--` tool

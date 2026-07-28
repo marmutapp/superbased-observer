@@ -19,7 +19,7 @@ func advisorSessionDigest(ctx context.Context) string {
 	if err != nil || !cfg.Advisor.Enabled || !cfg.Advisor.SessionDigest {
 		return ""
 	}
-	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath})
 	if err != nil {
 		return ""
 	}

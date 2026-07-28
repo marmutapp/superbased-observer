@@ -1,4 +1,5 @@
 import clsx from "clsx";
+import { Info } from "lucide-react";
 import { Link } from "react-router-dom";
 import {
   ChartShell,
@@ -92,6 +93,10 @@ function DoctorCard() {
         empty={!report.loading && (d?.checks ?? []).length === 0}
         emptyHint="No checks returned."
       >
+        {/* `=== true` on purpose: the field is absent on the local
+            projection (Go `omitempty`) and on any daemon older than the
+            feature, and `undefined` must render exactly like `false`. */}
+        {d?.local_detail_withheld === true && <RedactionNotice />}
         <div className="space-y-1.5">
           {(d?.checks ?? []).map((c) => (
             <div
@@ -149,6 +154,42 @@ function DoctorCard() {
         </div>
       </ChartState>
     </ChartShell>
+  );
+}
+
+// RedactionNotice — shown only when GET /api/health/doctor came back as the
+// REMOTE-FACING PROJECTION (local_detail_withheld). This is a privacy filter
+// working as designed, not a problem with the install, so it wears the same
+// neutral chrome as the check rows above it (line-1 / bg-2 / fg-3) with an Info
+// glyph — never the warn/danger colours or the ⚠ / ✗ status glyphs the list
+// uses, which would read as one more failed check in a list of checks.
+//
+// The copy deliberately does NOT say the report is fully sanitised. The
+// server's own residue note (pathRedactor, health_doctor_redact.go) lists what
+// survives: a path under no root this daemon holds, OS-convention paths like
+// /etc/codex/*.toml left readable on purpose, and the org enrolment check's
+// user email, which substitution cannot touch at all. "some machine detail can
+// still come through" is the honest form of that; the reassuring form would be
+// false.
+function RedactionNotice() {
+  const ph = "font-mono text-fg-2";
+  return (
+    <div
+      data-testid="doctor-redaction-notice"
+      className="mb-2 flex items-start gap-2 rounded-2 border border-line-1 bg-bg-2 px-3 py-2 text-[11.5px] leading-relaxed text-fg-3"
+    >
+      <Info className="mt-[2px] h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+      <p>
+        This device is connected remotely, so machine-specific paths and user
+        names appear as placeholders — <code className={ph}>~</code>,{" "}
+        <code className={ph}>&lt;config&gt;</code>,{" "}
+        <code className={ph}>&lt;other-home&gt;</code> — standing in for real
+        locations on the host, and some machine detail can still come through.
+        The checks and their results are unchanged; for the unredacted report,
+        open this dashboard locally on the host or run{" "}
+        <code className={ph}>observer doctor</code> in a terminal there.
+      </p>
+    </div>
   );
 }
 

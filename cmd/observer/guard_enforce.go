@@ -205,7 +205,7 @@ func newGuardApproveCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
 			}
-			database, err := db.Open(cmd.Context(), db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+			database, err := db.Open(cmd.Context(), db.Options{Path: cfg.Observer.DBPath})
 			if err != nil {
 				return fmt.Errorf("open db: %w", err)
 			}
@@ -250,7 +250,7 @@ func newGuardApprovalsCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
 			}
-			database, err := db.Open(cmd.Context(), db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+			database, err := db.Open(cmd.Context(), db.Options{Path: cfg.Observer.DBPath})
 			if err != nil {
 				return fmt.Errorf("open db: %w", err)
 			}
@@ -298,7 +298,7 @@ func newGuardRevokeCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
 			}
-			database, err := db.Open(cmd.Context(), db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+			database, err := db.Open(cmd.Context(), db.Options{Path: cfg.Observer.DBPath})
 			if err != nil {
 				return fmt.Errorf("open db: %w", err)
 			}
@@ -403,7 +403,7 @@ func newGuardSimulateCmd() *cobra.Command {
 			if enforce {
 				cfg.Guard.Mode = "enforce"
 			}
-			database, err := db.Open(cmd.Context(), db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+			database, err := db.Open(cmd.Context(), db.Options{Path: cfg.Observer.DBPath})
 			if err != nil {
 				return fmt.Errorf("open db: %w", err)
 			}
@@ -441,7 +441,7 @@ func newGuardRescanCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
 			}
-			database, err := db.Open(cmd.Context(), db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+			database, err := db.Open(cmd.Context(), db.Options{Path: cfg.Observer.DBPath})
 			if err != nil {
 				return fmt.Errorf("open db: %w", err)
 			}

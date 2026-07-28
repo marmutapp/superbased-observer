@@ -125,6 +125,10 @@ func openCodeRows() []Translation {
 			},
 		},
 		{RuleID: "R-156", Fidelity: FidelityNone, Note: noFileRules},
+		{
+			RuleID: "R-157", Fidelity: FidelityNone,
+			Note: "R-157 is a PARSER-STATE rule (a wrapper whose inner command could not be analysed), not a command or path shape: there is nothing for a native prefix/glob to match, and the fail-closed decision depends on how far OUR parser got. Stays hook-enforced.",
+		},
 		{RuleID: "R-160", Fidelity: FidelityNone, Note: noFileRules},
 		{
 			RuleID: "R-161", Fidelity: FidelityNone,

@@ -45,14 +45,14 @@ func newServeCmd() *cobra.Command {
 			if err := os.MkdirAll(filepath.Dir(cfg.Observer.DBPath), 0o755); err != nil {
 				return fmt.Errorf("ensure db dir: %w", err)
 			}
-			// SkipIntegrityCheck: the MCP server is a short-lived subprocess
+			// No integrity probe here: the MCP server is a short-lived subprocess
 			// the AI tool spawns per session against the daemon-owned DB — the
 			// daemon already ran quick_check at its own startup. Re-running it
 			// here just contends with the daemon's WAL holder AND, on a large
 			// DB, can push the first `initialize` response past the MCP
 			// client's startup timeout ("Couldn't start Observer MCP server").
 			// Same rationale as the hook path (feedback_hook_db_open_no_timeout).
-			database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+			database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath})
 			if err != nil {
 				return fmt.Errorf("open db %s: %w", cfg.Observer.DBPath, err)
 			}

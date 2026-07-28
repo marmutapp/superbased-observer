@@ -84,6 +84,24 @@ type Config struct {
 	Experiments []ExperimentConfig `toml:"experiments"`
 }
 
+// Device-session lifetime defaults for the [remote] block, in MINUTES. They are
+// the config-side spelling of remoteauth.DefaultSessionTTL / DefaultSessionIdle
+// — kept here (rather than imported) so this low-level package stays free of a
+// dependency on the auth layer; internal/config/continuity_defaults_test.go
+// pins the two spellings in lock-step.
+//
+// 2880 (48h) is the operator's 2026-07-25 decision for the absolute cap: it
+// clears one full 24h idle window with a day of headroom, so the idle rule
+// decides the common case, without the week-long exposure a 7-day cap carries.
+const (
+	// DefaultRemoteSessionTTLMinutes is the absolute device-session lifetime
+	// (48 hours).
+	DefaultRemoteSessionTTLMinutes = 2880
+	// DefaultRemoteSessionIdleMinutes is the device-session idle timeout
+	// (24 hours).
+	DefaultRemoteSessionIdleMinutes = 1440
+)
+
 // RemoteConfig is the [remote] surface — the remote-dashboard-access security
 // substrate + notification rail (remote-dashboard-access plan §5). LOCAL-ONLY:
 // never distributed via [org_client.share], never a server-forced toggle. The
@@ -179,10 +197,32 @@ type RemoteConfig struct {
 	// terminal-control verifier clamps <=0 back to 6/min (each standing attempt
 	// costs a 19 MiB argon2 compute, so it is never unlimited).
 	RateLimitPerMin int `toml:"rate_limit_per_min"`
-	// SessionTTLMinutes is the device-session lifetime (plan §4.3). Default 720
-	// (12h); a session older than this is rejected.
+	// CapabilityTTLMinutes is the lifetime of a single-use terminal-control
+	// execute capability + its bound confirm nonce (plan §4.2). Default 10.
+	// Raised from a hard-coded 2 minutes on 2026-07-25: the codes are conveyed
+	// out-of-band (email / chat / password manager) and the human round-trip
+	// routinely outlasted a 2-minute window, so a code expired in transit and
+	// had to be re-issued. This widens EXPOSURE TIME only — the capability stays
+	// single-use, session+action+handle-bound, confirm-paired, and owner-loopback
+	// minted. 0 uses the package default; set 2 to restore the old window.
+	CapabilityTTLMinutes int `toml:"capability_ttl_minutes"`
+	// SessionTTLMinutes is the absolute device-session lifetime (plan §4.3).
+	// Default 2880 (48 hours); a session older than this is rejected. Raised
+	// from 720 (12h) on 2026-07-25 so the 24h idle target below is actually
+	// reachable — an absolute cap under the idle bound makes the idle bound
+	// unreachable. 48h (not the 7 days first implemented) is the operator's
+	// chosen bound: one full idle window plus a day of headroom, at a fraction
+	// of the exposure. 0 uses the package default (remoteauth.DefaultSessionTTL);
+	// negatives are rejected at load.
 	SessionTTLMinutes int `toml:"session_ttl_minutes"`
-	// SessionIdleMinutes is the device-session idle timeout. Default 60.
+	// SessionIdleMinutes is the device-session idle timeout. Default 1440 (24h),
+	// raised from 60 on 2026-07-25 at the operator's request: a paired phone put
+	// down overnight must still be paired in the morning. A live attached
+	// terminal viewer now also refreshes the clock, so this measures genuine
+	// inactivity rather than time since the last page load. 0 uses the package
+	// default (remoteauth.DefaultSessionIdle); negatives are rejected at load,
+	// as is an idle window LONGER than SessionTTLMinutes (the absolute cap would
+	// silently make it unreachable).
 	SessionIdleMinutes int `toml:"session_idle_minutes"`
 	// MaxSessions caps concurrent device sessions (plan §4.3). Default 5.
 	MaxSessions int `toml:"max_sessions"`
@@ -1065,6 +1105,22 @@ type TerminalConfig struct {
 	// MaxSubscribers caps concurrent read-only viewers PER session (Phase 4
 	// output fan-out, §4.α.1). Default 8. 0 uses the termsession default.
 	MaxSubscribers int `toml:"max_subscribers"`
+	// WSPingIntervalSeconds is how often the terminal websocket bridge pings its
+	// peer to detect a dead / half-open transport. Default 30. 0 keeps the
+	// built-in default.
+	WSPingIntervalSeconds int `toml:"ws_ping_interval_seconds"`
+	// WSPingTimeoutSeconds bounds the wait for one pong. Default 10. 0 keeps the
+	// built-in default.
+	WSPingTimeoutSeconds int `toml:"ws_ping_timeout_seconds"`
+	// WSPingFailuresAllowed is how many CONSECUTIVE missed pongs the bridge
+	// tolerates before declaring the peer dead. Default 5 — with the 30s/10s
+	// defaults that is roughly 3.3 minutes of grace. It exists because a mobile
+	// browser FREEZES a backgrounded tab: the user switching to their mail app
+	// to copy a pairing code stops the tab answering pings, and a one-strike
+	// liveness check tore the bridge down within ~40s, which is what surfaced as
+	// "reconnect to the terminal" on return. 1 restores the old one-strike
+	// behaviour. A genuinely dead peer is still reaped — just later.
+	WSPingFailuresAllowed int `toml:"ws_ping_failures_allowed"`
 	// Launch is the fresh-agent launch opt-in block (F1). ALL default-off.
 	Launch TerminalLaunchConfig `toml:"launch"`
 	// Status is the agent-status detection block (F4). Default-on.
@@ -1112,6 +1168,23 @@ type TerminalAttachConfig struct {
 	// (seeded true in Default(); BurntSushi leaves an absent key untouched, same
 	// mechanism as RouteProxy / DefaultOn above).
 	ReclaimOnInput bool `toml:"reclaim_on_input"`
+	// ForwardAuthEnv makes an attach launch forward the caller's own provider-
+	// credential env vars (the tool's grounded integration.Capability.AuthEnv
+	// NAMES — e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY) across the attach socket
+	// to the daemon-spawned child. Default TRUE: it RESTORES bare-launch
+	// behavior — a bare launch inherits the caller's os.Environ() directly, so a
+	// shell-exported-only key reaches the tool; a daemon-spawned attach child
+	// inherits the DAEMON's env instead, so without this a key exported only in
+	// the caller's shell would be invisible and the attach launch would fail to
+	// authenticate where a bare launch succeeds. The forwarded values transit
+	// the owner-only (0600 AF_UNIX) attach socket ONCE per launch and are never
+	// logged or persisted. Set false to withhold them (the child then falls back
+	// to the daemon's own env / the tool's config-file or OAuth auth). The
+	// partial-merge default keeps this TRUE for an existing [terminal.attach]
+	// block that predates the key (seeded true in Default(); BurntSushi leaves an
+	// absent key untouched — the same mechanism as RouteProxy / DefaultOn /
+	// ReclaimOnInput above). An explicit forward_auth_env = false sticks.
+	ForwardAuthEnv bool `toml:"forward_auth_env"`
 }
 
 // TerminalLaunchConfig is the [terminal.launch] block — the fresh-agent
@@ -1880,6 +1953,118 @@ type ProcessConfig struct {
 	Env        ProcessEnvConfig        `toml:"env"`
 	Network    ProcessNetworkConfig    `toml:"network"`
 	Filesystem ProcessFilesystemConfig `toml:"filesystem"`
+	Metrics    ProcessMetricsConfig    `toml:"metrics"`
+	ETW        ProcessETWConfig        `toml:"etw"`
+}
+
+// ProcessETWConfig is the [observer.process.etw] surface: the daemon-side
+// ACCEPT listener for the elevated Windows ETW capturer
+// (docs/process-observability.md §5.5,
+// docs/plans/process-obs-etw-windows-parity-plan-2026-07-26.md §W3).
+//
+// It is its OWN sub-block on purpose. [observer.process.network] is already
+// taken by capture of the TARGET process's own connections (§7.2), and
+// overloading that name would make two unrelated features share a namespace.
+//
+// WHY THE DAEMON LISTENS AND THE CAPTURER DIALS (measured 2026-07-26, not a
+// preference): WSL cannot reach a Windows-bound listener — 127.0.0.1 is WSL's
+// own loopback and the default gateway is dropped by Defender on the WSL vNIC
+// — while Windows→WSL loopback works via localhostForwarding. So the elevated
+// capturer dials out to this listener; the daemon never dials Windows. That
+// needs no firewall rule and no host-IP discovery.
+//
+// SECURITY: localhostForwarding also means a WSL-side loopback listener is
+// reachable from ANY process on the Windows host, including other users'. The
+// shared token is therefore load-bearing, not decorative, and the listener has
+// NO unauthenticated mode.
+//
+// This is an ADDITIVE feed, never a replacement: with it enabled the
+// zero-privilege poll/bridge baseline runs exactly as before, and an install
+// where no elevated capturer ever connects behaves identically to one without
+// the block. LOCAL-ONLY, never distributed.
+type ProcessETWConfig struct {
+	// Enabled starts the daemon-side accept listener. Default FALSE: it opens
+	// a port and the feed behind it needs an elevated Windows Scheduled Task,
+	// so it follows the opt-in posture of the rest of [observer.process].
+	Enabled bool `toml:"enabled"`
+	// ListenAddr is the loopback bind. Default "127.0.0.1:8823" — its own
+	// port, like every other loopback rail (proxy :8820, browser ingest
+	// :8821). Kept in lock-step with processobs/bridge.DefaultListenAddr.
+	ListenAddr string `toml:"listen_addr"`
+	// AllowNonLoopback permits a non-loopback bind. Default false; the
+	// listener refuses one otherwise (ErrNonLoopback). An explicit operator
+	// decision, never a fallback.
+	AllowNonLoopback bool `toml:"allow_non_loopback"`
+	// Token is the shared secret the capturer must present as its first act.
+	// Empty (the default) means the daemon GENERATES one and persists it 0600
+	// at TokenPath, so the capturer can read it with --token-file. A token set
+	// here is never written to disk — the operator who set it owns its
+	// distribution.
+	Token string `toml:"token"`
+	// TokenPath overrides where a generated token is persisted. Empty =
+	// "process-bridge-token" next to the observer DB.
+	TokenPath string `toml:"token_path"`
+	// HandshakeTimeoutMS bounds the authentication exchange only; an
+	// authenticated stream is legitimately idle for long stretches and is not
+	// deadlined. Default 10000 (10s). 0 inherits the default.
+	HandshakeTimeoutMS int `toml:"handshake_timeout_ms"`
+}
+
+// ProcessMetricsConfig is the [observer.process.metrics] surface: the live
+// CPU / memory / disk / network chart's ring buffer.
+//
+// THE WRITE-AMPLIFICATION TRAP this section exists to solve. The ring is
+// persisted inside ONE column (process_runs.metric_samples_json), so every
+// persist rewrites the whole row. Before this section the two cadences were
+// welded together: the poll backend emitted a metrics event every
+// poll_interval_ms (2s) and EVERY one of them rewrote the row, while the ring
+// itself only accepted a new point every 15s — the worst of both worlds
+// (30 row-rewrites/minute/process for a 4-point/minute chart). Sampling
+// faster without splitting them would have multiplied those writes on a DB
+// already in the multi-GB range.
+//
+// So SampleIntervalMS (how fresh the chart is) and PersistIntervalMS (how
+// often we touch the DB) are independent, and PersistMaxSamples downsamples
+// the stored copy so the column size does not grow with the sample rate. At
+// the defaults: samples every 2s (7.5× finer than before), rows rewritten
+// every 15s (7.5× fewer writes than before), ≤60 points stored (the same
+// column size as before).
+//
+// LOCAL-ONLY, never distributed. Restart-bound (read once at daemon start).
+type ProcessMetricsConfig struct {
+	// SampleIntervalMS is the in-memory ring append cadence. Default 2000,
+	// matching PollIntervalMS.
+	//
+	// CEILING: a sample can never be fresher than the poll that produced it.
+	// Setting this BELOW [observer.process].poll_interval_ms does not make the
+	// chart finer — it just makes every poll append a point instead of
+	// refreshing one in place. To genuinely get 1s resolution you must ALSO
+	// set poll_interval_ms = 1000, which doubles the /proc scan cost. The
+	// daemon logs a WARN at start when this is below the poll interval rather
+	// than silently promising resolution it cannot deliver.
+	SampleIntervalMS int `toml:"sample_interval_ms"`
+	// WindowSeconds is the retained live window: points older than
+	// newest-window are evicted on append, so memory is bounded by TIME
+	// regardless of how long a process lives. Default 300 (5 min).
+	WindowSeconds int `toml:"window_seconds"`
+	// MaxSamples hard-caps the in-memory ring whatever window/interval imply.
+	// Default 300 (≈24 KB per tracked process, worst case).
+	MaxSamples int `toml:"max_samples"`
+	// PersistIntervalMS throttles DB row rewrites for metrics-only refreshes.
+	// Lifecycle events (exec/exit) always persist, so a finished process
+	// always lands with its final ring; at most this much of the tail is lost
+	// if the daemon is killed. Default 15000. <= 0 persists every refresh (the
+	// pre-decoupling behaviour — NOT recommended).
+	PersistIntervalMS int `toml:"persist_interval_ms"`
+	// PersistMaxSamples downsamples the persisted ring (evenly, always keeping
+	// the oldest AND newest points). Default 60. <= 0 stores the whole ring.
+	//
+	// The stored ring still spans the whole window, but at
+	// window_seconds/persist_max_samples resolution (5s at the defaults). To
+	// store the full in-memory resolution set this to
+	// window_seconds / (sample_interval_ms/1000) — 150 at the defaults — which
+	// grows the bytes per rewrite but NOT the number of rewrites.
+	PersistMaxSamples int `toml:"persist_max_samples"`
 }
 
 // ProcessArgvConfig controls argv capture (§8 Command group, §12.1).
@@ -1949,6 +2134,24 @@ type ProcessNetworkConfig struct {
 	// excerpts after best-effort UTF-8 conversion. Default false: binary bodies
 	// get hashes/byte counts only.
 	StoreBinary bool `toml:"store_binary"`
+	// ProcessBytes turns on per-process CUMULATIVE socket byte counters, which
+	// feed the live network series of the process metric samples. Default
+	// FALSE: it attaches extra privileged eBPF programs (fentry/fexit on
+	// tcp_sendmsg / tcp_cleanup_rbuf), so it follows the same opt-in posture as
+	// the rest of [observer.process].
+	//
+	// LINUX ONLY, TCP ONLY. It needs CAP_BPF+CAP_PERFMON (or root), a
+	// BTF-carrying kernel with BPF trampolines (≥5.5, x86-64/arm64), and it
+	// counts TCP payload bytes only — no UDP/QUIC, no unix sockets, no
+	// headers. Windows-side processes (the WSL cross-OS bridge) are NEVER
+	// counted; that needs ETW and is not implemented. When the probes cannot
+	// attach, capture degrades to lifecycle-only and samples are marked
+	// UNMEASURED (never a fabricated zero).
+	//
+	// It yields BYTE COUNTS on sockets — never plaintext. TLS payloads stay
+	// invisible to this path; body capture remains the proxy's job
+	// (CaptureBodies).
+	ProcessBytes bool `toml:"process_bytes"`
 }
 
 // ProcessFilesystemConfig controls file_write/file_open_sensitive capture
@@ -2538,10 +2741,31 @@ func Default() Config {
 					CaptureHeaders:    true,
 					ScrubBodies:       true,
 					StoreBinary:       false,
+					ProcessBytes:      false, // privileged eBPF attach — opt-in
+				},
+				// Live-chart ring. Sample at the poll cadence, retain 5 min,
+				// persist every 15s with at most 60 stored points — see
+				// ProcessMetricsConfig for the write-amplification arithmetic.
+				Metrics: ProcessMetricsConfig{
+					SampleIntervalMS:  2000,
+					WindowSeconds:     300,
+					MaxSamples:        300,
+					PersistIntervalMS: 15000,
+					PersistMaxSamples: 60,
 				},
 				Filesystem: ProcessFilesystemConfig{
 					Enabled: false,
 					Mode:    "sensitive",
+				},
+				// Daemon-side accept listener for the elevated Windows ETW
+				// capturer. OFF by default; the values below are seeded so a
+				// bare `[observer.process.etw] enabled = true` inherits sane
+				// ones rather than zeros (the partial-merge rule).
+				ETW: ProcessETWConfig{
+					Enabled:            false,
+					ListenAddr:         "127.0.0.1:8823", // == processobs/bridge.DefaultListenAddr
+					AllowNonLoopback:   false,
+					HandshakeTimeoutMS: 10000,
 				},
 			},
 		},
@@ -2647,9 +2871,20 @@ func Default() Config {
 			WriterLeaseIdleMinutes:       5,
 			WriterLeaseMaxMinutes:        30,
 			RateLimitPerMin:              6,
-			SessionTTLMinutes:            720,
-			SessionIdleMinutes:           60,
-			MaxSessions:                  5,
+			CapabilityTTLMinutes:         10,
+			// Device sessions: 24h idle inside a 48-hour absolute cap
+			// (2026-07-25 mobile terminal-continuity arc; 48h is the
+			// operator's decision over the 7d first implemented). An EXISTING
+			// config.toml that already spells session_ttl_minutes = 720 /
+			// session_idle_minutes = 60 keeps those values — BurntSushi's
+			// field-level decode leaves only ABSENT keys at the seed — so an
+			// upgrading operator who wants the new window must clear or edit
+			// those two keys. Kept in lock-step with
+			// remoteauth.DefaultSessionTTL / DefaultSessionIdle (pinned by
+			// internal/config/continuity_defaults_test.go).
+			SessionTTLMinutes:  DefaultRemoteSessionTTLMinutes,
+			SessionIdleMinutes: DefaultRemoteSessionIdleMinutes,
+			MaxSessions:        5,
 			Notify: RemoteNotifyConfig{
 				Enabled: false,
 				Kind:    "webhook",
@@ -2702,11 +2937,17 @@ func Default() Config {
 			IdleTimeout:    "0", // never idle-reap live sessions (continuity default)
 			RingBytes:      262144,
 			MaxSubscribers: 8,
-			Status:         TerminalStatusConfig{Enabled: true},
+			// WS liveness: ping every 30s, 10s per pong, tolerate 5 consecutive
+			// misses (~3.3 min) so a frozen backgrounded mobile tab survives a
+			// trip to the mail app. A dead peer is still reaped.
+			WSPingIntervalSeconds: 30,
+			WSPingTimeoutSeconds:  10,
+			WSPingFailuresAllowed: 5,
+			Status:                TerminalStatusConfig{Enabled: true},
 			// Attach is default-ON (owner-only AF_UNIX 0600 socket), children
 			// proxy-routed by default; DefaultOn makes the launchers attach by
 			// default (opt-out per-launch with --no-attach).
-			Attach: TerminalAttachConfig{Enabled: true, RouteProxy: true, DefaultOn: true, ReclaimOnInput: true},
+			Attach: TerminalAttachConfig{Enabled: true, RouteProxy: true, DefaultOn: true, ReclaimOnInput: true, ForwardAuthEnv: true},
 			// Launch: fresh-launch fields stay zero-valued (opt-in), but the
 			// guided-install kill-switch defaults ON — the consent is the
 			// dashboard click, so this only lets an operator turn it OFF.
@@ -3331,6 +3572,15 @@ func validateTerminal(c TerminalConfig) error {
 	if c.RingBytes < 0 {
 		return errors.New("config: terminal.ring_bytes must be >= 0")
 	}
+	if c.WSPingIntervalSeconds < 0 {
+		return errors.New("config: terminal.ws_ping_interval_seconds must be >= 0")
+	}
+	if c.WSPingTimeoutSeconds < 0 {
+		return errors.New("config: terminal.ws_ping_timeout_seconds must be >= 0")
+	}
+	if c.WSPingFailuresAllowed < 0 {
+		return errors.New("config: terminal.ws_ping_failures_allowed must be >= 0")
+	}
 	if strings.TrimSpace(c.IdleTimeout) != "" {
 		d, err := time.ParseDuration(c.IdleTimeout)
 		if err != nil {
@@ -3411,6 +3661,40 @@ func validateRemote(c RemoteConfig) error {
 		}
 		if c.MaxSessions < 0 {
 			return fmt.Errorf("config: remote.max_sessions %d must be >= 0", c.MaxSessions)
+		}
+		if c.CapabilityTTLMinutes < 0 {
+			return fmt.Errorf("config: remote.capability_ttl_minutes %d must be >= 0", c.CapabilityTTLMinutes)
+		}
+		// The two device-session bounds. Both follow capability_ttl_minutes'
+		// convention: 0 means "use the package default" (remoteauth's
+		// NewSessionStore clamps <= 0 to DefaultSessionTTL / DefaultSessionIdle),
+		// and a NEGATIVE value is a config error rather than a silent
+		// promotion to the maximum. Unvalidated, `session_ttl_minutes = -720`
+		// loaded cleanly and yielded the LONGEST window the build offers —
+		// the exact inverse of the operator's intent, and a blast radius that
+		// grew when these bounds were widened (2026-07-25 review B2).
+		if c.SessionTTLMinutes < 0 {
+			return fmt.Errorf("config: remote.session_ttl_minutes %d must be >= 0 (0 = default %d)", c.SessionTTLMinutes, DefaultRemoteSessionTTLMinutes)
+		}
+		if c.SessionIdleMinutes < 0 {
+			return fmt.Errorf("config: remote.session_idle_minutes %d must be >= 0 (0 = default %d)", c.SessionIdleMinutes, DefaultRemoteSessionIdleMinutes)
+		}
+		// Coherence: the idle window must fit INSIDE the absolute cap. The
+		// tighter of the two already wins at runtime, so an idle > absolute
+		// config is safe — but it is also silently inoperative (the idle rule
+		// can never fire), and that exact interaction is why the absolute cap
+		// was widened at all. Refusing it makes the mistake loud instead of
+		// invisible. Compared on EFFECTIVE values so a 0 (= default) on either
+		// key is checked against the default it will actually resolve to.
+		ttl, idle := c.SessionTTLMinutes, c.SessionIdleMinutes
+		if ttl == 0 {
+			ttl = DefaultRemoteSessionTTLMinutes
+		}
+		if idle == 0 {
+			idle = DefaultRemoteSessionIdleMinutes
+		}
+		if idle > ttl {
+			return fmt.Errorf("config: remote.session_idle_minutes %d exceeds remote.session_ttl_minutes %d — the absolute cap would expire the session first, making the idle window unreachable", idle, ttl)
 		}
 		if c.Enabled && len(c.TrustedHosts) == 0 && strings.EqualFold(strings.TrimSpace(c.Mode), "tailscale") {
 			return errors.New("config: remote.trusted_hosts must name the tailnet host (the Host the browser sends) when remote.mode = \"tailscale\" — `observer remote enable --tailscale` populates it")
@@ -3559,6 +3843,22 @@ func validateProcessObs(p ProcessConfig) error {
 	}
 	if p.Network.MaxResponseBytes < 0 {
 		return fmt.Errorf("config: observer.process.network.max_response_bytes must be >= 0, got %d", p.Network.MaxResponseBytes)
+	}
+	// [observer.process.etw] is validated whenever process observability is
+	// enabled, NOT only when the ETW block itself is — the same choice the
+	// Network/Filesystem enums above make. Rationale: a bad listen_addr or a
+	// negative timeout in a block the operator is about to flip on should
+	// fail NOW, at the edit, rather than at flip time when they have already
+	// moved on. The parent `p.Enabled` gate (the early return at the top of
+	// this function) still applies, so an install with process capture off
+	// never fails the daemon over a stale ETW section.
+	if p.ETW.HandshakeTimeoutMS < 0 {
+		return fmt.Errorf("config: observer.process.etw.handshake_timeout_ms must be >= 0 (0 inherits the default), got %d", p.ETW.HandshakeTimeoutMS)
+	}
+	if p.ETW.ListenAddr != "" {
+		if _, _, err := net.SplitHostPort(p.ETW.ListenAddr); err != nil {
+			return fmt.Errorf("config: observer.process.etw.listen_addr %q must be host:port: %w", p.ETW.ListenAddr, err)
+		}
 	}
 	if p.QueueSize <= 0 {
 		return fmt.Errorf("config: observer.process.queue_size %d must be > 0 when enabled", p.QueueSize)

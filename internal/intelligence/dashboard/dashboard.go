@@ -28,6 +28,7 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/intelligence/learn"
 	"github.com/marmutapp/superbased-observer/internal/intelligence/suggest"
 	"github.com/marmutapp/superbased-observer/internal/orgclient"
+	"github.com/marmutapp/superbased-observer/internal/processbridge/setup"
 	"github.com/marmutapp/superbased-observer/internal/scrub"
 	"github.com/marmutapp/superbased-observer/internal/stash"
 	"github.com/marmutapp/superbased-observer/internal/store"
@@ -335,6 +336,30 @@ type Server struct {
 	// the real platform (repo injected-IO discipline). Defaults to
 	// realProcessCapability in New.
 	processCapabilityFn func(config.ProcessConfig) processCapability
+
+	// etwSetupEnvFn supplies the I/O seam GET /api/process/etw/status and
+	// POST /api/process/etw/register both plan
+	// through (PATH lookup for schtasks.exe, the read-only `schtasks /Query`
+	// probe, the Windows-binary/username resolution). Injected as a field so
+	// handler tests exercise every planner outcome WITHOUT touching the real
+	// Task Scheduler — the same injected-IO discipline processCapabilityFn
+	// follows, and the same reason browserhost's tests inject fake registry
+	// hives. nil means the production probes.
+	etwSetupEnvFn func() setup.Env
+
+	// etwProbes rate-bounds the STATUS endpoint's probes (see etwProbeTTL).
+	// GET /api/process/etw/status is capability View, so a paired remote device
+	// can poll it, and each applicable poll execs schtasks.exe (plus cmd.exe
+	// for the Windows user name). The elevation broker does not share it.
+	etwProbes etwProbeCache
+
+	// etwRegisterOps remembers what the last elevated-ETW registration PTY was
+	// actually started with, keyed by its handle. The launch manager's labelled
+	// setup ops are idempotent — a second POST while one is live gets the SAME
+	// handle back — so without this the response would describe the plan THIS
+	// request computed rather than the command the reused PTY is running.
+	etwRegisterMu  sync.Mutex
+	etwRegisterOps etwRegisterRecord
 
 	// resumeMu + resumeGates single-flight handleSessionResume PER session id
 	// (R2-3): the duplicate-resume liveness check (sessionHasLiveSensitiveRun)
@@ -648,6 +673,20 @@ func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[st
 	// enable-capture WRITES config.toml (turns on [observer.process] + fixes a
 	// non-runnable backend) → whole-route Local, like /api/config/section/.
 	reg("/api/process/enable-capture", L, s.handleProcessEnableCapture)
+	// Elevated-ETW-capturer setup DETECTION (ETW dashboard plan §E2). VIEW: it
+	// reads config, runs the same read-only `schtasks /Query` probe
+	// `observer init` runs, and reads the daemon's own published health record.
+	// It registers nothing and spawns nothing — the elevation broker that does
+	// is a separate Local + confirm-token route.
+	reg("/api/process/etw/status", V, s.handleProcessETWStatus)
+	// The elevation BROKER (ETW dashboard plan §E3): spawns a fixed,
+	// server-derived `powershell.exe … Start-Process schtasks.exe -Verb RunAs`
+	// in a local-only setup PTY so Windows shows the operator a UAC prompt.
+	// LOCAL + confirm-token-gated, exactly like the Tailscale setup POSTs and
+	// /api/terminal/install — a machine-reaching mutation a remote principal
+	// must never drive, and a consent dialog that can only be approved on the
+	// machine itself.
+	reg("/api/process/etw/register", L, s.handleProcessETWRegister)
 	reg("/api/actions", V, s.handleActions)
 	reg("/api/live", V, s.handleLive)
 	reg("/api/search", V, s.handleSearch)
@@ -2620,6 +2659,17 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 		s.handleSessionProcesses(w, r, id)
 		return
 	}
+	// Sub-route: /api/session/<id>/metrics?bucket=<duration> → the plottable
+	// sibling of /processes: the same per-process metric_samples_json rings,
+	// but bucketed onto a common time grid, DIFFERENTIATED (the cpu/disk
+	// counters are cumulative) and aggregated across the whole attributed
+	// subtree. Drives the Session Cockpit's live CPU / RSS / Disk charts.
+	// Read-only — the correlation write passes stay on /processes.
+	if strings.HasSuffix(id, "/metrics") {
+		id = strings.TrimSuffix(id, "/metrics")
+		s.handleSessionMetrics(w, r, id)
+		return
+	}
 	// Sub-route: /api/session/<id>/network → lightweight network egress event
 	// list for the session. Body excerpts are fetched explicitly through
 	// /api/process/network/<event_id>.
@@ -3384,6 +3434,13 @@ func (s *Server) handleSessionMessages(w http.ResponseWriter, r *http.Request, s
 		ResponseTokensEst int64  `json:"response_tokens_est,omitempty"`
 	}
 	type messageRow struct {
+		// Seq is the row's 1..N ordinal in CHRONOLOGICAL order, assigned
+		// once right after the authoritative merge sort and therefore
+		// stable across pagination, ?tail and any ?sort_by reordering.
+		// The dashboard's "#" column renders it (a page-relative index
+		// would renumber under a non-default sort), and sort_by=seq is
+		// the "restore chronological order" key.
+		Seq               int    `json:"seq"`
 		MessageID         string `json:"message_id"`
 		Timestamp         string `json:"timestamp"`
 		Role              string `json:"role"`
@@ -3928,6 +3985,14 @@ func (s *Server) handleSessionMessages(w http.ResponseWriter, r *http.Request, s
 		return out[i].Role == "user" && out[j].Role != "user"
 	})
 
+	// Stable chronological ordinal, assigned ONCE here — before the
+	// ?sort_by reorder and before pagination — so the "#" column means the
+	// same thing on every page and under every sort, and so every sort has
+	// a deterministic final tie-break (see messageSortOrder).
+	for i := range out {
+		out[i].Seq = i + 1
+	}
+
 	// Per-message wall-clock duration: gap from this message's
 	// timestamp to the NEXT message's. Computed across the full sorted
 	// timeline (not the paginated slice) so a row near a page boundary
@@ -3981,6 +4046,61 @@ func (s *Server) handleSessionMessages(w http.ResponseWriter, r *http.Request, s
 		}
 	}
 
+	// ?sort_by / ?sort_dir — display ordering, applied LAST: after the
+	// authoritative chronological merge, after the Seq assignment, and after
+	// the ElapsedMs / TpsMs derivations (which are defined over the
+	// chronological timeline and would be corrupted by a reorder), but BEFORE
+	// the offset/limit slice so a sort addresses the WHOLE timeline rather
+	// than the current page. Absent / unrecognised params resolve to the
+	// chronological default, whose permutation is the identity — the response
+	// is then byte-identical to the pre-sort handler.
+	sortBy, sortDesc := parseMessagesSortParams(r)
+	applySort := func(rows []*messageRow) []*messageRow {
+		if messageSortIsDefault(sortBy, sortDesc) || len(rows) < 2 {
+			return rows
+		}
+		fields := make([]messageSortField, len(rows))
+		for i, mr := range rows {
+			f := messageSortField{
+				Seq:         mr.Seq,
+				Timestamp:   mr.Timestamp,
+				MessageID:   mr.MessageID,
+				Role:        mr.Role,
+				Model:       mr.Model,
+				EffortLevel: mr.EffortLevel,
+				Input:       mr.Input,
+				CacheRead:   mr.CacheRead,
+				CacheWrite:  mr.CacheCreation,
+				Output:      mr.Output,
+				ElapsedMs:   mr.ElapsedMs,
+				ToolCalls:   mr.ToolCallCount,
+				AICostUSD:   mr.AICostUSD,
+				ToolCostUSD: mr.ToolCostUSD,
+				CostUSD:     mr.CostUSD,
+			}
+			// Tok/s: same arithmetic as the client's tokensPerSec() helper
+			// (output ÷ tps_ms/1000, absent when either is missing) so the
+			// server sorts on exactly the number the operator sees.
+			if mr.Output > 0 && mr.TpsMs != nil && *mr.TpsMs > 0 {
+				tps := float64(mr.Output) / (float64(*mr.TpsMs) / 1000)
+				f.TokensPerSec = &tps
+			}
+			// Content: mirrors the Content cell, which is derived from the
+			// first tool call. No tool calls → the cell renders "—" and the
+			// key is the empty string.
+			if len(mr.ToolCalls) > 0 {
+				tc := mr.ToolCalls[0]
+				f.Content = messageContentSortKey(tc.ActionType, tc.Target)
+			}
+			fields[i] = f
+		}
+		sorted := make([]*messageRow, len(rows))
+		for i, p := range messageSortOrder(fields, sortBy, sortDesc) {
+			sorted[i] = rows[p]
+		}
+		return sorted
+	}
+
 	// ?tail=N (FROZEN contract, v1.24): return the last N rows of the FULL
 	// ordered timeline — NOT a re-slice of a paginated page. Because it
 	// addresses the whole timeline, tail is mutually exclusive with the
@@ -4008,9 +4128,13 @@ func (s *Server) handleSessionMessages(w http.ResponseWriter, r *http.Request, s
 			if total > n {
 				offset = total - n
 			}
+			// tail keeps its frozen meaning — the last N rows
+			// CHRONOLOGICALLY — and the sort then reorders just those N
+			// for display. tail+sort is therefore NOT an error (unlike
+			// tail+pagination, which would fight over the window).
 			writeJSON(w, map[string]any{
 				"session_id": sessionID,
-				"messages":   out[offset:],
+				"messages":   applySort(out[offset:]),
 				"total":      total,
 				"limit":      n,
 				"offset":     offset,
@@ -4035,10 +4159,14 @@ func (s *Server) handleSessionMessages(w http.ResponseWriter, r *http.Request, s
 			offset = n
 		}
 	}
+	// Reorder for display BEFORE locate/offset/limit so the page window is cut
+	// out of the EFFECTIVE order the caller asked for.
+	out = applySort(out)
 	// ?locate=<message_id>: snap offset to the page containing that message so
 	// the caller (the Processes panel "jump to the message that spawned this
 	// process" link) lands on the right page. Reuses this handler's own
-	// chronological ordering — no fragile external ordinal. No-op if not found.
+	// effective ordering — no fragile external ordinal — so it stays correct
+	// under a non-default sort_by. No-op if not found.
 	if mid := r.URL.Query().Get("locate"); mid != "" && limit > 0 {
 		for i := range out {
 			if out[i].MessageID == mid {

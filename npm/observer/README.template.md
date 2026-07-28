@@ -41,6 +41,7 @@ the full two-plane explainer.
 - [Per-AI-client setup](#per-ai-client-setup)
 - [Architecture in detail](#architecture-in-detail)
 - [Dashboard tour](#dashboard-tour)
+- [Terminals — launch, join, and track your AI CLIs](#terminals--launch-join-and-track-your-ai-clis)
 - [MCP tools reference](#mcp-tools-reference)
 - [Compression mechanisms](#compression-mechanisms)
 - [Cost and token math](#cost-and-token-math)

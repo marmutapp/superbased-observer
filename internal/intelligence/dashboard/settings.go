@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -384,6 +385,26 @@ func applySectionUpdate(cfg *config.Config, name string, body []byte, configPath
 				ScrubBodies       *bool   `json:"ScrubBodies"`
 				StoreBinary       *bool   `json:"StoreBinary"`
 			} `json:"Network"`
+			// [observer.process.etw] — the daemon-side accept listener for the
+			// elevated Windows ETW capturer. Same pointer idiom, so the ETW
+			// card's one-field PUT ({"ETW":{"Enabled":true}}) preserves every
+			// other key instead of zeroing the listener address and timeout.
+			//
+			// TOKEN IS DELIBERATELY ABSENT. It is a shared secret whose whole
+			// job is to gate a loopback port that WSL2's localhostForwarding
+			// exposes to every process on the Windows host. It has no editor
+			// here, and — because this decoder has no field for it — a body
+			// that carries one is IGNORED rather than round-tripped, so the
+			// value in config.toml is what the operator put there. An operator
+			// who wants to set one edits config.toml; empty (the default) means
+			// the daemon generates and persists one at TokenPath.
+			ETW *struct {
+				Enabled            *bool   `json:"Enabled"`
+				ListenAddr         *string `json:"ListenAddr"`
+				AllowNonLoopback   *bool   `json:"AllowNonLoopback"`
+				TokenPath          *string `json:"TokenPath"`
+				HandshakeTimeoutMS *int    `json:"HandshakeTimeoutMS"`
+			} `json:"ETW"`
 		}
 		if err := json.Unmarshal(body, &sec); err != nil {
 			return fmt.Errorf("decode process: %w", err)
@@ -416,6 +437,22 @@ func applySectionUpdate(cfg *config.Config, name string, body []byte, configPath
 			}
 			if sec.Network.MaxResponseBytes != nil && *sec.Network.MaxResponseBytes < 0 {
 				return fmt.Errorf("process.network.max_response_bytes must be >= 0, got %d", *sec.Network.MaxResponseBytes)
+			}
+		}
+		if sec.ETW != nil {
+			// A malformed listen_addr does NOT fail config.Load — it fails
+			// later, when the daemon tries to bind, by which time the operator
+			// has restarted into a listener that never comes up. Catch it here
+			// so the save is refused with the value that caused it.
+			if sec.ETW.ListenAddr != nil && strings.TrimSpace(*sec.ETW.ListenAddr) != "" {
+				if _, _, err := net.SplitHostPort(strings.TrimSpace(*sec.ETW.ListenAddr)); err != nil {
+					return fmt.Errorf("process.etw.listen_addr %q is not a host:port address (%v) — "+
+						"leave it empty to inherit the 127.0.0.1:8823 default", *sec.ETW.ListenAddr, err)
+				}
+			}
+			if sec.ETW.HandshakeTimeoutMS != nil && *sec.ETW.HandshakeTimeoutMS < 0 {
+				return fmt.Errorf("process.etw.handshake_timeout_ms must be >= 0 (0 inherits the 10000 ms default), got %d",
+					*sec.ETW.HandshakeTimeoutMS)
 			}
 		}
 		if sec.Enabled != nil {
@@ -461,6 +498,24 @@ func applySectionUpdate(cfg *config.Config, name string, body []byte, configPath
 			if sec.Network.StoreBinary != nil {
 				cfg.Observer.Process.Network.StoreBinary = *sec.Network.StoreBinary
 			}
+		}
+		if sec.ETW != nil {
+			if sec.ETW.Enabled != nil {
+				cfg.Observer.Process.ETW.Enabled = *sec.ETW.Enabled
+			}
+			if sec.ETW.ListenAddr != nil {
+				cfg.Observer.Process.ETW.ListenAddr = strings.TrimSpace(*sec.ETW.ListenAddr)
+			}
+			if sec.ETW.AllowNonLoopback != nil {
+				cfg.Observer.Process.ETW.AllowNonLoopback = *sec.ETW.AllowNonLoopback
+			}
+			if sec.ETW.TokenPath != nil {
+				cfg.Observer.Process.ETW.TokenPath = strings.TrimSpace(*sec.ETW.TokenPath)
+			}
+			if sec.ETW.HandshakeTimeoutMS != nil {
+				cfg.Observer.Process.ETW.HandshakeTimeoutMS = *sec.ETW.HandshakeTimeoutMS
+			}
+			// Token is intentionally not assigned — see the decoder above.
 		}
 	case "terminal":
 		// Editable subset of [terminal.attach] (session-attach design Phase 4,

@@ -25,6 +25,8 @@ import {
   useRemoteTerminalGate,
 } from "@/lib/remoteTerminal";
 import { usePointerDrag } from "@/lib/useDrag";
+import { useMobileTerminal } from "@/lib/useMediaQuery";
+import { useVisualViewport } from "@/lib/useVisualViewport";
 import type { ProjectPanelTab } from "@/components/ProjectPanel";
 import { CompanionProvider } from "@/components/primitives/companion";
 import { Tooltip, TooltipSpan } from "@/components/primitives";
@@ -96,7 +98,14 @@ function lowestFreeCascade(panels: PanelEntry[]): number {
 // without being destroyed. The core discipline: a launched `LaunchTerminal`
 // is mounted ONCE at a stable position in this provider's tree and NEVER
 // conditionally re-rendered into a different parent — because unmounting it
-// tears down the websocket, and the server reaps the child on ws-disconnect.
+// tears down the websocket AND the xterm instance, losing the scrollback and
+// forcing a fresh subscribe. It does NOT kill the child: since detach-replay
+// the server keeps the PTY running across a viewer disconnect (termsession
+// Unsubscribe removes the viewer without terminating the process, and idle
+// reaping is off by default), which is why closeSession below must issue an
+// explicit DELETE to reap and why LaunchTerminal reconnects instead of
+// tombstoning when its socket drops. (The older "the server reaps the child on
+// ws-disconnect" note here was simply wrong, and contradicted by both.)
 // "Minimize" therefore only toggles CSS (the panel goes off-screen, the ws +
 // process stay alive); "Stop & close" is the sole destructive path.
 //
@@ -472,7 +481,9 @@ export function LaunchDockProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const anyLive = sessions.some((s) => {
       const st = statuses[s.token];
-      return st === "open" || st === "connecting";
+      // "reconnecting" counts as live: the child is still running server-side,
+      // so closing the tab still abandons a real session.
+      return st === "open" || st === "connecting" || st === "reconnecting";
     });
     if (!anyLive) return;
     const onBeforeUnload = (e: BeforeUnloadEvent) => {
@@ -664,12 +675,23 @@ function TerminalHost({
     el.className = "flex w-full flex-1 min-h-0 flex-col";
     return el;
   });
+  // Touch-phone presentation: the floating window becomes the whole viewport.
+  // Capability-gated (coarse pointer AND small viewport) in lib/useMediaQuery —
+  // a desktop user who merely narrows their window is untouched, so every
+  // `mobile === false` path below is byte-for-byte what shipped.
+  const mobile = useMobileTerminal();
   // Floating-window size: user-resizable (native CSS resize grip) and
   // persisted, so the modal workflow is first-class alongside the grid — a
   // resize refits the PTY via LaunchTerminal's ResizeObserver. The parked
   // wrapper uses the same size so PTY dimensions survive minimize/restore.
   const [floatSize, setFloatSize] = useState(loadFloatSize);
   useEffect(() => {
+    // MOBILE MUST NOT PERSIST (defect D6). The phone panel is viewport-sized,
+    // so measuring it and writing the result into FLOAT_SIZE_KEY feeds
+    // phone-derived geometry into the DESKTOP default — one phone visit used
+    // to shrink the user's desktop terminal window (measured: a 393px phone
+    // wrote {w:480}) permanently, on every device sharing that storage.
+    if (mobile) return;
     if (!expanded || docked) return;
     const el = boxRef.current;
     if (!el) return;
@@ -703,7 +725,7 @@ function TerminalHost({
       }
       ro.disconnect();
     };
-  }, [expanded, docked]);
+  }, [expanded, docked, mobile]);
 
   // Reparent the stable host: grid cell wins; otherwise the floating box.
   // Idempotent — appendChild moves the node (never clones), and the xterm
@@ -739,6 +761,31 @@ function TerminalHost({
   }, [expanded, docked, isLive, onMinimize]);
 
   const showModal = !docked && expanded;
+  // The visible viewport box for the phone panel — keyboard, browser chrome
+  // and all. Non-null whenever the phone panel is up and the page is not
+  // pinch-zoomed; a parked or desktop panel keeps its shipped sizing exactly.
+  // With no keyboard up it equals what 100dvh would have given, so this is not
+  // "keyboard mode", just an accurate height. See the `style` prop below.
+  const visibleBox = useVisualViewport(mobile && showModal);
+
+  // D14: while the full-viewport terminal is up on a phone, the DOCUMENT
+  // ELEMENT must refuse horizontal overscroll too. `overscroll-behavior` only
+  // does anything on a scroll container, and the panel's own containment
+  // therefore cannot speak for the root — which is precisely where Chrome
+  // reads the property when deciding whether an edge swipe becomes
+  // back-navigation. A swipe-left used to unload the whole dashboard, live PTY
+  // and all (operator-reported). Restored on teardown so nothing leaks into
+  // normal page scrolling; desktop is untouched.
+  useEffect(() => {
+    if (!mobile || !showModal) return;
+    const el = document.documentElement;
+    const prevX = el.style.overscrollBehaviorX;
+    el.style.overscrollBehaviorX = "contain";
+    return () => {
+      el.style.overscrollBehaviorX = prevX;
+    };
+  }, [mobile, showModal]);
+
   // Backdrop-minimize must fire only when the PRESS started on the backdrop
   // itself: a resize-grip drag (or a text-selection drag) that releases over
   // the backdrop synthesizes a click on the wrapper — the common ancestor of
@@ -751,7 +798,16 @@ function TerminalHost({
         docked
           ? "hidden"
           : showModal
-            ? "fixed inset-0 z-[80] flex items-center justify-center bg-black/50 p-6"
+            ? mobile
+              ? // Phone: the backdrop IS the frame. `p-6` used to eat 48px of a
+                // 393px screen, and centring is what made the overflow
+                // unreachable — a centred flex item that is wider than its
+                // container hangs off BOTH edges and no scroll can reach the
+                // left one. `overscroll-contain` stops a drag past the top of
+                // the terminal from triggering Android Chrome's
+                // pull-to-refresh, which would tear the live PTY down (D11).
+                "fixed inset-0 z-[80] flex items-stretch justify-stretch overscroll-contain bg-black/50 p-0"
+              : "fixed inset-0 z-[80] flex items-center justify-center bg-black/50 p-6"
             : "pointer-events-none fixed left-[-100000px] top-0"
       }
       onMouseDown={
@@ -778,15 +834,93 @@ function TerminalHost({
       {/* Deliberate: the resize hint stays a NATIVE title attribute here. A
           custom floating Tooltip would persist while the pointer rests over the
           live terminal (worse than the auto-dismissing native hint), so this one
-          site keeps the browser's own tooltip. */}
+          site keeps the browser's own tooltip. Suppressed on touch, where there
+          is no resize grip to drag and no hover to dismiss the hint. */}
       <div
         ref={boxRef}
-        title={showModal ? "Drag the corner to resize — the terminal refits" : undefined}
-        style={{ width: floatSize.w, height: floatSize.h }}
+        data-testid="terminal-float-panel"
+        title={
+          showModal && !mobile ? "Drag the corner to resize — the terminal refits" : undefined
+        }
+        // THE INLINE STYLE IS WHY A TAILWIND BREAKPOINT ALONE CANNOT FIX THIS
+        // (defect D1). An inline `width` beats any class, so the mobile branch
+        // has to DROP the style, not merely restyle around it. On desktop the
+        // persisted float size is unchanged.
+        //
+        // The mobile branch takes a style back, but only `height`/`transform`
+        // — never `width`, which is what D1 was about. `h-[100dvh]` cannot do
+        // this job: no CSS viewport unit shrinks for a keyboard (see
+        // lib/useVisualViewport.ts), so without this the panel stays full
+        // height and the line being typed sits underneath the keyboard.
+        // Shrinking the panel is enough on its own — the terminal's existing
+        // ResizeObserver sees it and refits the PTY to fewer rows, which lifts
+        // the prompt into view.
+        style={
+          mobile
+            ? visibleBox
+              ? {
+                  // PAN, DO NOT SHRINK. The height is the UNOCCLUDED height,
+                  // so opening the keyboard does not change the panel's box —
+                  // which means no ResizeObserver tick, no fit(), and no PTY
+                  // resize. That is the whole point: a full-screen TUI lays
+                  // itself out for the rows it is given, and squeezing them
+                  // squeezes the app. Measured against a live claude 2.1.220
+                  // on 2026-07-28: its composer is 5 lines at 20+ rows, 3 at
+                  // 14, and exactly 2 at 8 — where it also shows only the TAIL
+                  // of what you type, so a third line appears to overwrite the
+                  // second. Shrinking the terminal to clear the keyboard is
+                  // what put the operator's phone in that state.
+                  height: visibleBox.fullHeight,
+                  // Slide the panel up so its BOTTOM edge — the composer and
+                  // the on-screen key bar — lands at the bottom of the visible
+                  // area. The header scrolls off the top while the keyboard is
+                  // up, which is the deliberate trade: what you need while
+                  // typing is the line you are typing, and dismissing the
+                  // keyboard brings the header straight back.
+                  //
+                  // offsetTop is folded in because a `position: fixed` panel is
+                  // anchored to the LAYOUT viewport, so when iOS scrolls the
+                  // visual viewport to reveal the focused field the panel would
+                  // otherwise slide out of view.
+                  //
+                  // Emitted ONLY when it actually moves. A transform — even
+                  // `translateY(0px)` — promotes the panel to its own
+                  // compositing layer and makes it a containing block, which on
+                  // iOS is a well-known way to break touch scrolling and
+                  // momentum inside a descendant. With no keyboard up the shift
+                  // is exactly 0, so the common case pays nothing.
+                  ...(() => {
+                    const shift =
+                      visibleBox.offsetTop + visibleBox.height - visibleBox.fullHeight;
+                    return shift !== 0 ? { transform: `translateY(${shift}px)` } : null;
+                  })(),
+                }
+              : undefined
+            : { width: floatSize.w, height: floatSize.h }
+        }
         className={
           showModal
-            ? "pointer-events-auto flex max-h-[92vh] min-h-[280px] w-auto min-w-[480px] max-w-[96vw] resize flex-col overflow-hidden"
-            : "flex flex-col"
+            ? mobile
+              ? // Phone: fill the viewport exactly.
+                //   min-w-0     — `min-w-[480px]` was the bug. Per CSS §10.4
+                //                 min-width WINS over max-width, so
+                //                 `max-w-[96vw]` was INERT and the box resolved
+                //                 to 480px on a 393px screen (left edge at −43,
+                //                 unreachable). Anything but 0 here re-breaks it.
+                //   100dvh      — not `vh`: `vh` is the LARGE viewport and does
+                //                 not shrink when the soft keyboard opens, which
+                //                 hid the input + status lines behind it (D7).
+                //   pb-safe     — the home-indicator inset, paired with
+                //                 viewport-fit=cover in index.html (D12).
+                //   resize-none — no grip to drag with a finger.
+                "pointer-events-auto flex h-[100dvh] max-h-[100dvh] min-h-0 w-full min-w-0 max-w-full resize-none flex-col overflow-hidden overscroll-contain pb-[env(safe-area-inset-bottom)]"
+              : "pointer-events-auto flex max-h-[92vh] min-h-[280px] w-auto min-w-[480px] max-w-[96vw] resize flex-col overflow-hidden"
+            : mobile
+              ? // Parked off-screen on a phone: keep it viewport-sized so the
+                // PTY dimensions survive minimize/restore (the desktop branch
+                // gets that from the inline style, which mobile has none of).
+                "flex h-[100dvh] w-screen flex-col"
+              : "flex flex-col"
         }
         onClick={(e) => e.stopPropagation()}
       />
@@ -1026,12 +1160,15 @@ function DockPill({
   const dot: Record<Status, string> = {
     connecting: "bg-fg-3 animate-pulse",
     open: "bg-ok",
+    // Live server-side; only this browser's transport dropped.
+    reconnecting: "bg-warn animate-pulse",
     exited: "bg-fg-3",
     error: "bg-danger",
   };
   const label: Record<Status, string> = {
     connecting: "connecting…",
     open: "live",
+    reconnecting: "reconnecting…",
     exited: "exited",
     error: "error",
   };

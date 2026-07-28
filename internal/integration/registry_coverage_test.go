@@ -265,6 +265,62 @@ func TestBinarySpecHonesty(t *testing.T) {
 	}
 }
 
+// authEnvClosureOwnedKeys are the launcher-closure-owned routing/profile env
+// keys that AuthEnv must never carry — they are forwarded by the tool-specific
+// attach closures (claudeAttachEnv / codexAttachEnv) or the proxy-route seam,
+// not the credential-forwarding path. Mixing them into AuthEnv would double-
+// forward (and, for the base URL, risk overriding the daemon's route).
+var authEnvClosureOwnedKeys = map[string]bool{
+	"ANTHROPIC_BASE_URL":   true,
+	"CLAUDE_CONFIG_DIR":    true,
+	"ANTHROPIC_CONFIG_DIR": true,
+	"CODEX_HOME":           true,
+}
+
+// TestAuthEnvWellFormed pins the honesty + hygiene rules on every AuthEnv row:
+// each entry is a bare env-var NAME (never a value) — non-empty, no `=`, no
+// whitespace, not OBSERVER_-prefixed, not one of the launcher-closure-owned
+// routing/profile keys — and a row carries no intra-row duplicate. This is the
+// guardrail behind the "NAMES only, never values" contract on Capability.AuthEnv.
+func TestAuthEnvWellFormed(t *testing.T) {
+	for _, c := range integration.Capabilities() {
+		seen := map[string]bool{}
+		for i, k := range c.AuthEnv {
+			switch {
+			case k == "":
+				t.Errorf("adapter %q: AuthEnv[%d] is empty", c.Tool, i)
+			case strings.ContainsAny(k, "="):
+				t.Errorf("adapter %q: AuthEnv[%d] = %q contains '=' (a NAME, never a KEY=VALUE)", c.Tool, i, k)
+			case strings.ContainsAny(k, " \t\n\r"):
+				t.Errorf("adapter %q: AuthEnv[%d] = %q contains whitespace", c.Tool, i, k)
+			case strings.HasPrefix(k, "OBSERVER_"):
+				t.Errorf("adapter %q: AuthEnv[%d] = %q is OBSERVER_-prefixed (internal, never a credential env)", c.Tool, i, k)
+			case authEnvClosureOwnedKeys[k]:
+				t.Errorf("adapter %q: AuthEnv[%d] = %q is a launcher-closure-owned routing/profile key (forwarded elsewhere)", c.Tool, i, k)
+			}
+			if seen[k] {
+				t.Errorf("adapter %q: AuthEnv has a duplicate %q", c.Tool, k)
+			}
+			seen[k] = true
+		}
+	}
+}
+
+// TestAuthEnvImpliesAttachable pins that credential-env is declared ONLY on an
+// attachable row: forwarding is a property of the attach socket (the daemon-
+// spawned child does not inherit the caller's os.Environ()), so a bare-only tool
+// has nothing to forward across and must carry no AuthEnv.
+func TestAuthEnvImpliesAttachable(t *testing.T) {
+	for _, c := range integration.Capabilities() {
+		if len(c.AuthEnv) == 0 {
+			continue
+		}
+		if c.Attach == nil {
+			t.Errorf("adapter %q: AuthEnv set (%v) but the row is not attachable (Attach == nil)", c.Tool, c.AuthEnv)
+		}
+	}
+}
+
 // TestCrossOSRouteOnlyForPersistedKinds pins that ProxyRoute.CrossOSBridge
 // is set only on the PERSISTED route kinds — RouteEnvSettings (claude-code
 // → ~/.claude/settings.json) and RouteConfigFile (codex →

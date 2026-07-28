@@ -885,6 +885,90 @@ func TestProcessObservabilityDefaults(t *testing.T) {
 	}
 }
 
+// TestProcessETWDefaults pins the [observer.process.etw] sub-block: the
+// daemon-side ACCEPT listener the elevated Windows ETW capturer dials into
+// (docs/plans/process-obs-etw-windows-parity-plan-2026-07-26.md §W3).
+//
+// Three properties matter here. (1) It is its OWN block — NOT an extension of
+// [observer.process.network], whose name is already taken by capture of the
+// target process's own connections (§7.2). (2) It partial-merges like every
+// other sub-section, so a bare `[observer.process.etw] enabled = true`
+// inherits a loopback addr and a sane timeout. (3) Its validation is gated on
+// the PARENT `[observer.process].enabled` (the early return in
+// validateProcessObs) but NOT on its own `enabled` — the same choice the
+// Network/Filesystem enums make, so a bad value fails at the edit rather than
+// at flip time.
+func TestProcessETWDefaults(t *testing.T) {
+	t.Parallel()
+
+	e := Default().Observer.Process.ETW
+	if e.Enabled {
+		t.Error("observer.process.etw.enabled must default false (it opens a port; opt-in like the rest of [observer.process])")
+	}
+	if e.ListenAddr != "127.0.0.1:8823" {
+		t.Errorf("listen_addr = %q, want the loopback default 127.0.0.1:8823", e.ListenAddr)
+	}
+	if e.AllowNonLoopback {
+		t.Error("allow_non_loopback must default false")
+	}
+	if e.Token != "" || e.TokenPath != "" {
+		t.Errorf("token/token_path must default empty (the daemon generates + persists one): %+v", e)
+	}
+	if e.HandshakeTimeoutMS != 10000 {
+		t.Errorf("handshake_timeout_ms = %d, want 10000", e.HandshakeTimeoutMS)
+	}
+
+	// Partial-merge: enabling ONLY the sub-block keeps every seeded default.
+	cfgPath := filepath.Join(t.TempDir(), "config.toml")
+	body := "[observer.process]\nenabled = true\n\n[observer.process.etw]\nenabled = true\n"
+	if err := os.WriteFile(cfgPath, []byte(body), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := Load(LoadOptions{GlobalPath: cfgPath, Env: func(string) string { return "" }})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := cfg.Observer.Process.ETW
+	if !got.Enabled || got.ListenAddr != "127.0.0.1:8823" || got.HandshakeTimeoutMS != 10000 {
+		t.Errorf("partial [observer.process.etw] section lost defaults: %+v", got)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Errorf("partial-merged etw config failed Validate: %v", err)
+	}
+
+	// Bad values are rejected when process observability is enabled, whether
+	// or not the ETW block itself is.
+	for _, tt := range []struct {
+		name string
+		mut  func(*Config)
+	}{
+		{"negative timeout", func(c *Config) { c.Observer.Process.ETW.HandshakeTimeoutMS = -1 }},
+		{"addr without a port", func(c *Config) { c.Observer.Process.ETW.ListenAddr = "127.0.0.1" }},
+		{"garbage addr", func(c *Config) { c.Observer.Process.ETW.ListenAddr = "not an address" }},
+		{"bad value in a DISABLED sub-block still fails", func(c *Config) {
+			c.Observer.Process.ETW.Enabled = false
+			c.Observer.Process.ETW.HandshakeTimeoutMS = -5
+		}},
+	} {
+		bad := Default()
+		bad.Observer.Process.Enabled = true
+		bad.Observer.Process.ETW.Enabled = true
+		tt.mut(&bad)
+		if err := Validate(bad); err == nil {
+			t.Errorf("Validate accepted %s", tt.name)
+		}
+	}
+
+	// ...but a stale ETW section on a DISABLED [observer.process] never fails
+	// the daemon (the parent opt-in gate).
+	off := Default()
+	off.Observer.Process.ETW.Enabled = true
+	off.Observer.Process.ETW.HandshakeTimeoutMS = -1
+	if err := Validate(off); err != nil {
+		t.Errorf("Validate rejected a stale etw section under disabled process capture: %v", err)
+	}
+}
+
 // TestBrowserIngestTimeoutDefaults pins the [browser].ingest_timeout_ms
 // partial-merge invariant: the browser-capture DB ingest deadline is
 // decoupled from the ~500ms blocking-hook timeout and defaults to a generous

@@ -60,7 +60,7 @@ func buildOrgBundle(ctx context.Context, configPath string) (orgBundle, error) {
 	if err := os.MkdirAll(filepath.Dir(cfg.Observer.DBPath), 0o755); err != nil {
 		return orgBundle{}, fmt.Errorf("ensure db dir: %w", err)
 	}
-	// SkipIntegrityCheck: `observer start` calls this synchronously (via
+	// No integrity probe here: `observer start` calls this synchronously (via
 	// buildOrgClient) BEFORE the dashboard listener binds when [org_client]
 	// is enabled — the same readiness-path position as buildOTelExporter,
 	// so an un-skipped multi-GB `PRAGMA quick_check` here would block the
@@ -68,7 +68,7 @@ func buildOrgBundle(ctx context.Context, configPath string) (orgBundle, error) {
 	// CLI subcommands that also use this bundle are short-lived and never
 	// need the probe either; the one authoritative quick_check runs off the
 	// readiness path via db.RunStartupMaintenance.
-	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath})
 	if err != nil {
 		return orgBundle{}, fmt.Errorf("open db %s: %w", cfg.Observer.DBPath, err)
 	}

@@ -51,6 +51,10 @@ type launcherAttachSpec struct {
 	attachEnv func(proxyURL string, noProxyRoute bool) []string
 	// env forwarded across the socket; nil = none.
 	// claude: base URL (unless npr) + profile env (always)
+	authEnvExtra []string // DYNAMIC credential-env NAMES to forward IN ADDITION
+	// to the tool's registry AuthEnv row (hermes' non-default
+	// --key-env NAME); merged registry-first + deduped by
+	// mergeAuthKeys, gated by [terminal.attach].forward_auth_env.
 	passthrough []string // wrapper flags forwarded to the inner launcher
 	// (--<tool>-path, --resume, --model, --upstream…)
 	toolArgs []string // the operator's `--` remainder
@@ -134,6 +138,13 @@ func launcherAttach(ctx context.Context, spec launcherAttachSpec) (launcherAttac
 	if spec.attachEnv != nil {
 		env = spec.attachEnv(proxyURL, npr)
 	}
+	// Credential-env forwarding (default-on): layer the caller's own provider
+	// keys — the tool's grounded registry AuthEnv row plus any launcher-supplied
+	// DYNAMIC key (hermes' --key-env) — AFTER the base attachEnv, so a
+	// shell-exported-only key reaches the daemon-spawned child as it would a bare
+	// launch. capab is the registry row already resolved at the top of this func
+	// — dispatch on capability DATA, never a tool-name branch (CLAUDE.md #3).
+	env = composeAttachEnv(env, cfg.Terminal.Attach.ForwardAuthEnv, capab.AuthEnv, spec.authEnvExtra, os.Environ())
 
 	extra := attachExtraArgs(npr, spec.proxyOverride, spec.proxyFlag, spec.configPath, spec.passthrough, spec.toolArgs)
 

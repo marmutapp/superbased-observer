@@ -91,13 +91,13 @@ type runStats struct {
 }
 
 func runRun(ctx context.Context, argv []string, opts runOptions) error {
-	// Open with SkipIntegrityCheck (loadConfigAndDBFast): `observer run` wraps
+	// Open without the integrity probe (the db.Open default): `observer run` wraps
 	// individual shell commands on the hook path — a short-lived open per
 	// command, exactly like the claude-code hooks (cmd/observer/hook.go). The
-	// multi-GB `PRAGMA quick_check` on the integrity-ON open would run on every
+	// multi-GB `PRAGMA quick_check` would otherwise run on every
 	// wrapped command and add tens of seconds of latency (Ticket A, 2026-07-12);
 	// the daemon runs the probe once at startup via db.RunStartupMaintenance.
-	cfg, database, cleanup, err := loadConfigAndDBFast(ctx, opts.configPath)
+	cfg, database, cleanup, err := loadConfigAndDB(ctx, opts.configPath)
 	if err != nil {
 		return err
 	}

@@ -47,18 +47,19 @@ func TestOpenInMemoryAppliesSchema(t *testing.T) {
 	}
 }
 
-// TestOpenSkipsIntegrityCheckWhenRequested verifies that
-// Options.SkipIntegrityCheck disables the `PRAGMA quick_check` probe.
-// Hook subprocesses pass true so they don't contend with the daemon's
-// WAL holder; the schema must still be migrated to the current version.
-func TestOpenSkipsIntegrityCheckWhenRequested(t *testing.T) {
+// TestOpenSkipsIntegrityCheckByDefault pins the polarity inverted on
+// 2026-07-28: a plain Open runs NO `PRAGMA quick_check`, because that probe
+// checksums every page and so costs time proportional to the file rather
+// than to the caller's work. Migrations must still be applied — skipping
+// verification must not skip schema setup.
+func TestOpenSkipsIntegrityCheckByDefault(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "skip-check.db")
 
-	database, err := Open(ctx, Options{Path: path, SkipIntegrityCheck: true})
+	database, err := Open(ctx, Options{Path: path})
 	if err != nil {
-		t.Fatalf("Open with SkipIntegrityCheck: %v", err)
+		t.Fatalf("Open: %v", err)
 	}
 	defer database.Close()
 
@@ -74,7 +75,28 @@ func TestOpenSkipsIntegrityCheckWhenRequested(t *testing.T) {
 	// verify the migration path still ran.
 	var name string
 	if err := database.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE name = 'actions'`).Scan(&name); err != nil {
-		t.Fatalf("migrations didn't apply when SkipIntegrityCheck=true: %v", err)
+		t.Fatalf("migrations didn't apply on a default (unverified) Open: %v", err)
+	}
+}
+
+// TestOpenRunsIntegrityCheckWhenRequested is the other half of the polarity
+// pin: opting in must actually run the probe and still yield a usable DB.
+// `observer db import` is the one caller that does this, to validate an
+// untrusted foreign file before merging it.
+func TestOpenRunsIntegrityCheckWhenRequested(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "checked.db")
+
+	database, err := Open(ctx, Options{Path: path, IntegrityCheck: true})
+	if err != nil {
+		t.Fatalf("Open with IntegrityCheck: %v", err)
+	}
+	defer database.Close()
+
+	var name string
+	if err := database.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE name = 'actions'`).Scan(&name); err != nil {
+		t.Fatalf("migrations didn't apply on a verified Open: %v", err)
 	}
 }
 

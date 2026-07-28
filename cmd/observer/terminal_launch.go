@@ -197,6 +197,11 @@ func (l *ptyLauncher) Spawn(req termsvc.LaunchRequest) (string, error) {
 // residual exposure is the user's own env — which the agent needs anyway. We
 // therefore strip only the internal OOB channel variables and emit a per-launch
 // env audit line. A tighter policy is a documented follow-up.
+//
+// CREDENTIAL-BEARING: req.ExtraEnv may include the caller's forwarded provider-
+// credential values (forwardAuthEnv, gated by [terminal.attach].forward_auth_env)
+// layered last-wins over the inherited env. Never log or persist these values —
+// the env audit line (l.auditEnv) records key NAMES + counts only, never values.
 func launchChildEnv(req termsvc.LaunchRequest, authToken string) []string {
 	parent := os.Environ()
 	out := make([]string, 0, len(parent)+len(req.ExtraEnv)+6)

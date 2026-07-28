@@ -24,6 +24,7 @@ OAPI         := $(GO) tool oapi-codegen
 .PHONY: all build test test-race test-invariant lint fmt vet tidy clean run cover \
         gen-openapi verify-openapi build-orgserver \
         web-install web-dev web-build web-clean docs-build \
+        website-build verify-website-build \
         sync-distribution-readmes verify-distribution-readmes
 
 all: fmt vet lint test build
@@ -58,8 +59,14 @@ run: build
 test:
 	$(GO) test $(GOFLAGS) ./...
 
+# -timeout 40m matches ci.yml's test step. Without it the local run
+# inherits go test's 10m per-binary default, and cmd/observer already
+# measures 593s under -race on a developer box (2026-07-26) — ~7s of
+# headroom, so a busy machine fails RED with `panic: test timed out`
+# and nothing actually broken. The release checklist calls for a full
+# race suite, which is exactly when that false failure would land.
 test-race:
-	$(GO) test $(GOFLAGS) -race ./...
+	$(GO) test $(GOFLAGS) -race -timeout 40m ./...
 
 # Single-user-local invariant net: seeds a fixed corpus, drives the
 # dashboard's headline endpoints, and diffs the canonicalised JSON
@@ -184,6 +191,30 @@ web-org-clean:
 docs-build:
 	cd website/docs-tools && go run ./changeloggen -changelog ../../CHANGELOG.md -src ../docs-src -sitemap ../sitemap.xml -feed ../feed.xml
 	cd website/docs-tools && go run ./gen -src ../docs-src -out ../docs -assets ../assets
+
+# ---------------------------------------------------------------
+# Marketing site (/, /about, /enterprise, /newsletter, /privacy,
+# /security, /terms). Renders website/pages-src/*.html — TOML front
+# matter + an HTML body — through ONE shared shell that owns the
+# <head>, the nav and the footer, the same way docs-build renders
+# /docs. Output is committed; Cloudflare Pages ships the rendered
+# files and the deploy workflow strips website/pages-src/.
+#
+# Run after editing anything under website/pages-src/. NEVER edit
+# website/*.html directly — verify-website-build will fail CI.
+# ---------------------------------------------------------------
+website-build:
+	cd website/docs-tools && go run ./pagegen -src ../pages-src -out ..
+
+# Drift gate for the marketing pages: renders into a temp dir and
+# diffs against the committed HTML. Fails if any page drifted — i.e.
+# somebody hand-edited a rendered page instead of its source, which
+# is exactly how the site accumulated four #topnav variants and three
+# footer variants before the shell existed. Never mutates the working
+# tree, so a stale local render is still surfaced. Mirrors the
+# verify-distribution-readmes pattern.
+verify-website-build:
+	@scripts/verify-website-build.sh
 
 # Generates the on-brand, dark-theme 1200x630 OG/social cards used by the
 # generated docs pages (per-section, not per-page — see ogImageFor in

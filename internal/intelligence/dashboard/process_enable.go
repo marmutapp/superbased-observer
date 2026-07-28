@@ -32,19 +32,24 @@ import (
 //   - "poll" / "bridge" / "both" / "auto" / "linux_ebpf" → a Backend IS
 //     constructed. Runnable-as-vocabulary.
 //   - "off"              → returns an error ("backend set to off"). Not runnable.
-//   - "etw"              → returns an error UNCONDITIONALLY on every platform
-//     ("etw backend not yet implemented"). Not runnable.
+//   - "etw"              → a Backend IS constructed (re-verified 2026-07-26).
+//     It selects the same baseline "auto" would and ADDS the ETW accept
+//     listener, because the elevated feed is additive and must never trade
+//     working zero-privilege capture for one that may never connect. This
+//     stopped being an unconditional error when W3 landed; the doc comment
+//     said otherwise and would have made the enable verb refuse a working
+//     configuration.
 //   - "endpointsecurity" → returns an error UNCONDITIONALLY on every platform
 //     ("endpointsecurity backend not yet implemented (P6)"). Not runnable.
 //   - "" / any unknown   → the selector's default returns "unknown process
 //     backend %q". Not runnable.
 func processBackendRunnable(backend string) bool {
 	switch backend {
-	case "poll", "bridge", "both", "auto", "linux_ebpf":
+	case "poll", "bridge", "both", "auto", "linux_ebpf", "etw":
 		return true
 	default:
-		// off, "", etw, endpointsecurity, and any unknown value construct
-		// nothing in the selector.
+		// off, "", endpointsecurity, and any unknown value construct nothing
+		// in the selector.
 		return false
 	}
 }

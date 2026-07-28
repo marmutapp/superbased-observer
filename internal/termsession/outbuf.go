@@ -102,9 +102,11 @@ func (o *outBuf) read(off *int64, p []byte) (n int, wait <-chan struct{}, closed
 }
 
 // currentBase returns the absolute offset of the oldest buffered byte under the
-// ring lock. A new subscriber captures it as its replay start so replay-then-
-// tail is one monotonic cursor over the SINGLE authoritative ring (§4.α.1) —
-// there is no second buffer and thus no replay/live handoff seam to get wrong.
+// ring lock. It is the FLOOR of a new subscriber's replay start (see
+// Session.replayStart, which may start later — at the last geometry boundary),
+// so replay-then-tail is one monotonic cursor over the SINGLE authoritative ring
+// (§4.α.1) — there is no second buffer and thus no replay/live handoff seam to
+// get wrong.
 func (o *outBuf) currentBase() int64 {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -113,8 +115,10 @@ func (o *outBuf) currentBase() int64 {
 
 // currentTotal returns the absolute offset one past the last buffered byte
 // under the ring lock, i.e. how many bytes the pump has drained into the ring
-// so far. Tests use it to wait for the pump to have fully drained a known
-// amount of produced output before asserting on ring state.
+// so far. Session.recordResize captures it as the geometry boundary (everything
+// before it was laid out at the OLD width); tests use it to wait for the pump to
+// have fully drained a known amount of produced output before asserting on ring
+// state.
 func (o *outBuf) currentTotal() int64 {
 	o.mu.Lock()
 	defer o.mu.Unlock()

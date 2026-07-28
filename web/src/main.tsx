@@ -38,11 +38,16 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <ThemeProvider>
       <BrowserRouter>
-        <LaunchDockProvider>
-          <RemotePairingGate>
+        {/* The pairing gate wraps the dock, not the other way round: when a
+            remote device is pairing — or has lost its session and needs to
+            pair again — its full-screen prompt must replace the WHOLE app,
+            including the launch dock, rather than leaving live-looking chrome
+            floating over an unauthenticated screen. */}
+        <RemotePairingGate>
+          <LaunchDockProvider>
             <App />
-          </RemotePairingGate>
-        </LaunchDockProvider>
+          </LaunchDockProvider>
+        </RemotePairingGate>
       </BrowserRouter>
     </ThemeProvider>
   </React.StrictMode>,

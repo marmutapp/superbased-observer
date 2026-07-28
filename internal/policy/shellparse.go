@@ -7,9 +7,93 @@ import (
 
 // maxUnwrapDepth bounds recursive unwrapping of nested shell payloads
 // (`bash -c "bash -c ..."`), command substitutions and dialect
-// switches (spec §4.3: ≤5 levels). Payloads at the limit stay opaque
-// on Command.Payload instead of being parsed further.
+// switches (spec §4.3: ≤5 levels). A payload at the limit is NOT
+// analysed, and that fact is recorded on Command.Unanalyzed so R-157
+// fails CLOSED on it — see the Unanalyzed field comment for why the
+// old "recorded on Payload rather than dropped" wording was a
+// fail-OPEN dressed up as preservation.
 const maxUnwrapDepth = 5
+
+// maxExpansionUnits bounds how many times one top-level parse may
+// EXPAND a wrapper — a `-c` payload unwrapped, a launcher candidate
+// re-parsed. It is NOT a cap on the total number of Commands a parse
+// can produce, and the name and comment say so because the previous
+// pair claimed exactly that and an independent review measured the
+// claim false (docs/security.md H5 round 4): `sh -c "true; true"`
+// yields two units for one charge, and top-level units and command
+// substitutions are not charged at all.
+//
+// WHAT IT ACTUALLY BOUNDS, AND WHY THAT IS THE PART THAT MATTERS.
+// Unwrapping is MULTIPLICATIVE, not linear: a launcher unit resolves
+// to several candidate readings (launcher.go deliberately emits every
+// reading rather than guessing), and each of those may itself be a
+// launcher. Depth alone bounds the tree's HEIGHT, so the leaf count is
+// fan-out^depth — a crafted line can turn a few kilobytes into
+// millions of units, and the guard hook's watchdog fails OPEN on
+// timeout. Charging per expansion SITE bounds that product, and
+// exhausting the budget is recorded on Unanalyzed (fail CLOSED), never
+// silently dropped.
+//
+// The uncharged paths are uncharged because they are already bounded
+// by the INPUT LENGTH rather than multiplied by it: a line of N bytes
+// holds at most N separator-split units, at most N substitutions, and
+// a payload of M bytes at most M units. None of them compounds with
+// depth, and a substitution has no wrapper unit to record an
+// Unanalyzed reason on.
+const maxExpansionUnits = 4096
+
+// maxLauncherCandidates bounds how many candidate readings ONE
+// launcher unit may expand into. The shipped resolvers emit at most
+// eighteen: the cross-product of the FOUR Start-Process binding
+// ambiguities (2^4, and only over the ones a given argv actually
+// contains) plus the two cmd-START operand positions — see
+// launcher.go's psBindModes. Truncating drops a reading, which is
+// exactly the defect docs/security.md H5 round 2 records, so a
+// truncated unit is marked Unanalyzed and R-157 denies rather than
+// analysing part of a line and calling it clean.
+const maxLauncherCandidates = 18
+
+// Unanalyzed reasons. Each names the specific fail-CLOSED path so the
+// R-157 verdict tells the operator which limit was hit.
+const (
+	unanalyzedNestingLimit    = "nesting exceeded the analysis limit"
+	unanalyzedLauncherTarget  = "launcher target not statically recoverable"
+	unanalyzedLauncherFanOut  = "launcher readings exceeded the fan-out bound"
+	unanalyzedExpansionBudget = "nested expansion exceeded the unit budget"
+)
+
+// parseState carries the per-parse recursion state: the unwrap depth
+// and the expansion budget SHARED by the whole tree.
+type parseState struct {
+	depth  int
+	budget *int
+}
+
+// newParseState starts a fresh top-level parse.
+func newParseState() parseState {
+	b := maxExpansionUnits
+	return parseState{budget: &b}
+}
+
+// deeper returns the state one unwrap level down, sharing the budget.
+func (s parseState) deeper() parseState {
+	return parseState{depth: s.depth + 1, budget: s.budget}
+}
+
+// afford charges n nested units against the shared budget, reporting
+// whether they fit. A false result is a fail-CLOSED signal: the
+// caller records unanalyzedExpansionBudget rather than expanding
+// fewer units and reporting nothing.
+func (s parseState) afford(n int) bool {
+	if s.budget == nil {
+		return true // a zero-value state (tests) is unbounded
+	}
+	if *s.budget < n {
+		return false
+	}
+	*s.budget -= n
+	return true
+}
 
 // Command is one parsed command unit — the shape every rule matcher
 // consumes, identical across dialects so rules express facts
@@ -28,6 +112,16 @@ type Command struct {
 	Base string
 	// Argv is the unit's argument vector after wrapper stripping;
 	// Argv[0] is the original (pre-canonicalization) command word.
+	//
+	// INVARIANT: non-empty for every unit this package emits.
+	// processUnit gets this for free (it returns early on no words);
+	// every other construction site must too, which is why
+	// markSubstitutionLimit's synthetic unit carries a placeholder
+	// word. Pinned by TestParsedCommandsAlwaysHaveArgv, and read
+	// through Args() so that a future construction site breaking the
+	// invariant costs a missed match rather than a panicking guard —
+	// seven matchers used to slice Argv[1:] raw, and the synthetic
+	// unit reached them.
 	Argv []string
 	// Raw is the unit's text, reconstructed by joining its words —
 	// original quoting is not preserved (lexer strips it).
@@ -60,12 +154,49 @@ type Command struct {
 	Heredoc string
 	// Payload is a nested code payload that was NOT unwrapped into
 	// further Commands: interpreter one-liners (`python -c '...'`,
-	// always opaque) and shell payloads at maxUnwrapDepth. Rules
-	// scan it with regexes — best-effort by design (gap F1).
+	// always opaque) and shell payloads at maxUnwrapDepth.
+	//
+	// HONEST STATUS (corrected 2026-07-27, docs/security.md H5 round
+	// 2). NO built-in rule, matcher or compiled user rule reads this
+	// field today — gap F1's "rules scan it with regexes" is not
+	// implemented, and the previous comment claiming it was made the
+	// depth limit look like preservation when it was a silent
+	// fail-OPEN (`wsl -- ` ×6 ALLOWED while ×5 denied). The field is
+	// kept because it carries the un-analysed text into the verdict
+	// record; ENFORCEMENT is Unanalyzed's job, not Payload's.
 	Payload string
 	// PayloadKind labels Payload: "python" | "node" | "perl" |
 	// "ruby" | "shell" | "powershell" | "cmd".
 	PayloadKind string
+	// Unanalyzed names the reason a nested command this unit WRAPS
+	// was not analysed — "" when everything nested was. It is the
+	// fail-CLOSED signal R-157 enforces, and it exists because every
+	// limit in this parser used to fail OPEN: exceeding
+	// maxUnwrapDepth, a launcher that named a target no reading
+	// could recover, a truncated candidate set and an exhausted
+	// expansion budget all ended with "return nil" and nothing
+	// recorded, so the wrapper analysed as an ordinary command that
+	// matched no rule.
+	//
+	// It is deliberately NOT a bool: the reason is carried into the
+	// verdict so an operator can tell a depth limit from an
+	// unparsable wrapper.
+	Unanalyzed string
+}
+
+// Args returns the unit's argument tokens — everything after the
+// command word — and nil for a unit that has none.
+//
+// It exists so no matcher writes `cmd.Argv[1:]`, which panics on a
+// zero-length Argv. Command.Argv's invariant says that cannot happen
+// and a test pins it, but an invariant plus seven unguarded slice
+// expressions is one construction-site mistake away from a panicking
+// guard, and a panicking guard is a worse failure than any verdict.
+func (c *Command) Args() []string {
+	if len(c.Argv) <= 1 {
+		return nil
+	}
+	return c.Argv[1:]
 }
 
 // HasLongFlag reports whether any argv token equals one of the given
@@ -220,7 +351,7 @@ func ParseCommand(raw string, dialect Dialect) []Command {
 	if strings.TrimSpace(raw) == "" {
 		return nil
 	}
-	return parseDepth(raw, dialect, 0)
+	return parseDepth(raw, dialect, newParseState())
 }
 
 // ParseArgv parses a pre-split argument vector (boundaries that
@@ -235,19 +366,22 @@ func ParseArgv(argv []string, dialect Dialect) []Command {
 	var subs []string
 	words := make([]string, 0, len(argv))
 	for _, w := range argv {
-		if dialect != DialectCmd {
-			cw, s := stripSubstitutions(w)
-			subs = append(subs, s...)
-			w = cw
-		}
+		// Every dialect, for the reason parseDepth documents: a
+		// cmd-tagged line routinely carries a command for another
+		// shell, and skipping the strip there lost the substitution
+		// entirely.
+		cw, s := stripSubstitutions(w)
+		subs = append(subs, s...)
+		w = cw
 		if strings.TrimSpace(w) != "" || len(words) > 0 {
 			words = append(words, w)
 		}
 	}
 	var out []Command
-	processUnit(unit{words: words}, dialect, 0, &out)
+	st := newParseState()
+	processUnit(unit{words: words}, dialect, st, &out)
 	for _, sub := range subs {
-		out = append(out, parseDepth(sub, dialect, 1)...)
+		out = append(out, parseDepth(sub, dialect, st.deeper())...)
 	}
 	return out
 }
@@ -270,10 +404,50 @@ type unit struct {
 // value is unknowable statically, so a target like `rm -rf $(pwd)`
 // analyzes as a target-less rm plus a separate pwd unit (documented
 // approximation).
-func parseDepth(raw string, dialect Dialect, depth int) []Command {
-	var subs []string
-	if dialect != DialectCmd && depth < maxUnwrapDepth {
-		raw, subs = stripSubstitutions(raw)
+//
+// SUBSTITUTIONS ARE STRIPPED IN EVERY DIALECT, AND THE DEPTH LIMIT
+// FAILS CLOSED ON THEM. Both halves of that sentence are round-4 fixes
+// (docs/security.md H5 round 4) to the same fail-OPEN family, found
+// from one measured line:
+//
+//	cmd /c cmd /c cmd /c cmd /c sh -c echo$(crontab)
+//
+// which ALLOWED under the CMD dialect while denying under posix and
+// powershell. Understanding the dialect split is what found the rest:
+//
+//   - posix and powershell strip at depth 0, so the nested `crontab`
+//     is lifted out of the WHOLE line before any unwrapping.
+//   - cmd.exe has no `$( )` of its own, so the old code never stripped
+//     under that dialect AT ALL. But a cmd-tagged line routinely
+//     carries a command for another shell — that is why cmdWrappers
+//     and the dialect-agnostic launcher rows exist — and the payload
+//     re-join (`strings.Join(argv[i+1:], " ")`) does not preserve
+//     quoting, so a substitution containing a SPACE was torn into
+//     `$(crontab` + `-e` and lost at ANY depth: `cmd /c sh -c
+//     "$(crontab -e)"` ALLOWED under cmd while denying under the other
+//     two (measured 2026-07-27 while fixing the line above).
+//     Stripping in every dialect closes that whole class. The cost is
+//     over-analysis of a LITERAL `$(…)` in a genuine cmd line, which
+//     is the direction this package errs in everywhere else
+//     (unconditional lowercasing, launchers matched under every
+//     dialect).
+//   - AT maxUnwrapDepth the substitution's contents are not parsed —
+//     but they are still stripped, and the line they came out of is
+//     marked Unanalyzed so R-157 denies. Suppressing the strip instead
+//     (the old `st.depth < maxUnwrapDepth` guard) left `echo$(crontab)`
+//     as one literal word with Base `echo$(crontab)`, matching nothing.
+//     This is unwrapPayload's fail-OPEN one layer out, closed the same
+//     way.
+//
+// The dialects can still differ in WHICH rule fires (R-155 where the
+// substitution is seen below the cap, R-157 where it is only reached at
+// it); the DECISION no longer does.
+func parseDepth(raw string, dialect Dialect, st parseState) []Command {
+	orig := raw
+	raw, subs := stripSubstitutions(raw)
+	atLimit := st.depth >= maxUnwrapDepth && len(subs) > 0
+	if atLimit {
+		subs = nil
 	}
 	var units []unit
 	switch dialect {
@@ -287,17 +461,59 @@ func parseDepth(raw string, dialect Dialect, depth int) []Command {
 	}
 	var out []Command
 	for _, u := range units {
-		processUnit(u, dialect, depth, &out)
+		processUnit(u, dialect, st, &out)
+	}
+	if atLimit {
+		markSubstitutionLimit(orig, dialect, st, &out)
 	}
 	for _, sub := range subs {
-		out = append(out, parseDepth(sub, dialect, depth+1)...)
+		out = append(out, parseDepth(sub, dialect, st.deeper())...)
 	}
 	return out
 }
 
+// markSubstitutionLimit records that a command substitution on this
+// line was stripped but never analysed, so R-157 denies.
+//
+// The reason goes on the units the line produced — they are the
+// commands the substitution's value would have flowed into. A line
+// that is NOTHING but a substitution (`$(crontab -e)`) produces no
+// unit at all, so a synthetic one carries the reason instead; without
+// it the fail-closed signal would have nowhere to live and the drop
+// would be silent again.
+//
+// The synthetic unit gets a ONE-WORD Argv, never an empty one:
+// Command.Argv is non-empty for every unit this parser emits, and the
+// first version of this path broke that invariant — seven matchers
+// sliced Argv[1:] raw and the whole evaluation PANICKED (measured
+// while adding this path; the raw slices are Args() now). Base stays
+// empty on purpose: the text is not a command word and must not
+// canonicalize into one.
+func markSubstitutionLimit(raw string, dialect Dialect, st parseState, out *[]Command) {
+	if len(*out) == 0 {
+		text := strings.TrimSpace(raw)
+		if text == "" {
+			text = "$()"
+		}
+		*out = append(*out, Command{
+			Argv:       []string{text},
+			Raw:        text,
+			Dialect:    dialect,
+			Depth:      st.depth,
+			Unanalyzed: unanalyzedNestingLimit,
+		})
+		return
+	}
+	for i := range *out {
+		if (*out)[i].Depth == st.depth && (*out)[i].Unanalyzed == "" {
+			(*out)[i].Unanalyzed = unanalyzedNestingLimit
+		}
+	}
+}
+
 // processUnit turns one lexed unit into a Command (plus any nested
 // Commands its payloads unwrap into) and appends them to out.
-func processUnit(u unit, dialect Dialect, depth int, out *[]Command) {
+func processUnit(u unit, dialect Dialect, st parseState, out *[]Command) {
 	words := stripAssignments(u.words)
 	if len(words) == 0 {
 		return
@@ -314,14 +530,14 @@ func processUnit(u unit, dialect Dialect, depth int, out *[]Command) {
 		Argv:            stripped,
 		Raw:             raw,
 		Dialect:         dialect,
-		Depth:           depth,
+		Depth:           st.depth,
 		Sudo:            sudo,
 		Wrappers:        wrappers,
 		Pipeline:        u.pipeline,
 		RedirectTargets: u.redirects,
 		Heredoc:         u.heredoc,
 	}
-	nested := analyzeNested(&cmd, depth)
+	nested := analyzeNested(&cmd, st)
 	*out = append(*out, cmd)
 	*out = append(*out, nested...)
 }
@@ -371,8 +587,15 @@ type wrapperSpec struct {
 // handled separately: exec strips like a wrapper; eval re-parses its
 // arguments as a command line (see analyzeNested).
 var posixWrappers = map[string]wrapperSpec{
-	"sudo":    {argFlags: setOf("-u", "-g", "-p", "-C", "-D", "-R", "-T", "-h", "--user", "--group")},
-	"doas":    {argFlags: setOf("-u")},
+	"sudo": {argFlags: setOf("-u", "-g", "-p", "-C", "-D", "-R", "-T", "-h", "--user", "--group")},
+	"doas": {argFlags: setOf("-u")},
+	// gsudo is the widely-installed third-party sudo for Windows and
+	// wraps its command exactly like sudo does. It is listed in BOTH
+	// dialect tables for the reason cmdWrappers documents: a Windows
+	// command line can arrive tagged with any dialect, and a wrapper
+	// that strips under one dialect and not another is the asymmetry
+	// H5 was.
+	"gsudo":   {argFlags: setOf("-u", "--user", "-i", "--integrity")},
 	"env":     {assignments: true, argFlags: setOf("-u", "-S", "-C", "-P", "--unset", "--split-string", "--chdir")},
 	"timeout": {leadingOperand: true, argFlags: setOf("-k", "-s", "--kill-after", "--signal")},
 	"nice":    {argFlags: setOf("-n", "--adjustment")},
@@ -386,22 +609,46 @@ var posixWrappers = map[string]wrapperSpec{
 		"--max-args", "--max-procs", "--delimiter", "--arg-file", "--max-chars", "--max-lines", "--replace")},
 }
 
+// cmdWrappers is the cmd-dialect wrapper table. cmd.exe has no
+// wrapper convention of its own, but Windows 11 (24H2) ships
+// `sudo.exe`, and a Windows client can deliver `sudo systemctl enable
+// …` (or a WSL-bound line) tagged with the cmd dialect. Before this
+// table existed, that command's base was `sudo` and R-155's
+// systemctl arm never saw it — it denied under posix and PowerShell
+// and ALLOWED under cmd, a dialect asymmetry with no defensible
+// reading (measured 2026-07-27; docs/security.md H5).
+//
+// ONLY the privilege wrappers are listed. posixWrappers must NOT be
+// reused wholesale here: cmd's `timeout` is a SLEEP, not a wrapper,
+// and `start` is a launcher with its own syntax (launcher.go).
+var cmdWrappers = map[string]wrapperSpec{
+	"sudo":  {argFlags: setOf("-u", "--user")},
+	"doas":  {argFlags: setOf("-u")},
+	"gsudo": {argFlags: setOf("-u", "--user", "-i", "--integrity")},
+}
+
+// privilegeWrappers are the wrappers that set Command.Sudo — the
+// privilege-escalation fact that survives wrapper stripping. Derived
+// from one place so the two dialect tables cannot disagree about
+// which of their rows escalate.
+var privilegeWrappers = map[string]bool{"sudo": true, "doas": true, "gsudo": true}
+
 // stripWrappers iteratively removes leading wrapper commands,
 // returning the remaining argv, the stripped wrapper names in order,
 // and whether a privilege-escalation wrapper (sudo/doas) was present.
-// The cmd dialect has no wrapper convention this models.
 func stripWrappers(words []string, dialect Dialect) (rest, wrappers []string, sudo bool) {
+	table := posixWrappers
 	if dialect == DialectCmd {
-		return words, nil, false
+		table = cmdWrappers
 	}
 	for len(words) > 0 {
 		base := canonicalBase(words[0], dialect)
-		spec, ok := posixWrappers[base]
+		spec, ok := table[base]
 		if !ok {
 			break
 		}
 		wrappers = append(wrappers, base)
-		if base == "sudo" || base == "doas" {
+		if privilegeWrappers[base] {
 			sudo = true
 		}
 		words = consumeWrapperArgs(words[1:], spec)
@@ -485,36 +732,54 @@ var interpreters = map[string]interpreterSpec{
 }
 
 // analyzeNested inspects a freshly-built Command for nested code:
-// shell `-c` payloads (recursively parsed up to maxUnwrapDepth),
-// PowerShell -Command/-EncodedCommand and `cmd /c` payloads (parsed
-// under their own dialect), eval re-parsing, and interpreter
-// one-liners (kept opaque on Payload). It may set Payload/PayloadKind
-// on cmd and returns the unwrapped nested Commands.
-func analyzeNested(cmd *Command, depth int) []Command {
+// LAUNCHER wrappers (Start-Process / wsl / cmd's START — see
+// launcher.go), shell `-c` payloads (recursively parsed up to
+// maxUnwrapDepth), PowerShell -Command/-EncodedCommand and `cmd /c`
+// payloads (parsed under their own dialect), eval re-parsing, and
+// interpreter one-liners (kept opaque on Payload). It may set
+// Payload/PayloadKind on cmd and returns the unwrapped nested
+// Commands.
+func analyzeNested(cmd *Command, st parseState) []Command {
+	// Launchers are checked first; no launcher base collides with a
+	// shell, interpreter or `-c`-carrying base below.
+	if spec, ok := launcherFor(cmd); ok {
+		return unwrapLauncher(cmd, spec, st)
+	}
 	switch {
 	case posixShellBases[cmd.Base]:
 		payload, ok := dashCPayload(cmd.Argv)
 		if !ok {
 			return nil
 		}
-		return unwrapPayload(cmd, payload, DialectPosix, "shell", depth)
+		return unwrapPayload(cmd, payload, DialectPosix, "shell", st)
 	case cmd.Base == "eval":
 		if len(cmd.Argv) < 2 {
 			return nil
 		}
-		return unwrapPayload(cmd, strings.Join(cmd.Argv[1:], " "), cmd.Dialect, "shell", depth)
+		return unwrapPayload(cmd, strings.Join(cmd.Argv[1:], " "), cmd.Dialect, "shell", st)
+	case cmd.Base == "invoke-expression" || cmd.Base == "iex":
+		// PowerShell's eval. `iex` canonicalizes to
+		// `invoke-expression` only in the PowerShell dialect, so the
+		// raw alias is matched too — the same dialect-agnostic
+		// reasoning launcher.go applies to `start` (a Windows command
+		// line can arrive tagged with any dialect).
+		payload, ok := psExpressionPayload(cmd.Argv)
+		if !ok {
+			return nil
+		}
+		return unwrapPayload(cmd, payload, DialectPowerShell, "powershell", st)
 	case cmd.Base == "powershell" || cmd.Base == "pwsh":
 		payload, ok := psCommandPayload(cmd.Argv)
 		if !ok {
 			return nil
 		}
-		return unwrapPayload(cmd, payload, DialectPowerShell, "powershell", depth)
+		return unwrapPayload(cmd, payload, DialectPowerShell, "powershell", st)
 	case cmd.Base == "cmd":
 		payload, ok := cmdSlashCPayload(cmd.Argv)
 		if !ok {
 			return nil
 		}
-		return unwrapPayload(cmd, payload, DialectCmd, "cmd", depth)
+		return unwrapPayload(cmd, payload, DialectCmd, "cmd", st)
 	default:
 		if spec, ok := interpreters[cmd.Base]; ok {
 			if p, found := cmd.FlagValue(spec.flags...); found {
@@ -528,12 +793,23 @@ func analyzeNested(cmd *Command, depth int) []Command {
 // unwrapPayload either recursively parses a nested payload under the
 // given dialect or — at the depth limit — records it opaquely on the
 // wrapper Command.
-func unwrapPayload(cmd *Command, payload string, dialect Dialect, kind string, depth int) []Command {
-	if depth >= maxUnwrapDepth {
+func unwrapPayload(cmd *Command, payload string, dialect Dialect, kind string, st parseState) []Command {
+	if st.depth >= maxUnwrapDepth {
+		// FAIL CLOSED. Recording the text on Payload is a RECORD, not
+		// a defence — no rule reads Payload (see its field comment),
+		// so before Unanalyzed existed a wrapper chain one level past
+		// the limit simply ALLOWED. Both are set: the text for the
+		// operator, the reason for R-157.
+		cmd.Payload, cmd.PayloadKind = payload, kind
+		cmd.Unanalyzed = unanalyzedNestingLimit
+		return nil
+	}
+	if !st.afford(1) {
+		cmd.Unanalyzed = unanalyzedExpansionBudget
 		cmd.Payload, cmd.PayloadKind = payload, kind
 		return nil
 	}
-	return parseDepth(payload, dialect, depth+1)
+	return parseDepth(payload, dialect, st.deeper())
 }
 
 // dashCPayload finds a POSIX shell's -c payload, accepting combined

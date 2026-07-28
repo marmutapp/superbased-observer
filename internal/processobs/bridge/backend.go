@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os/exec"
 	"strconv"
@@ -39,6 +38,17 @@ type Options struct {
 	// Logger receives degraded-state warnings (decode errors, respawns,
 	// give-up). Optional; nil silences them.
 	Logger *slog.Logger
+	// NetworkAccounting optionally receives the per-process network-byte
+	// accounting status the capturer reports in its hello frame, so a Windows
+	// deployment's health reflects what the WINDOWS capturer measured rather
+	// than the daemon host's own (always pessimistic) guess.
+	//
+	// nil is the no-op default and means "this backend does not own the
+	// handle". Hand it over only where the bridge is the sole source that
+	// could measure bytes: it is single-owner state (CLAUDE.md rule 4), and a
+	// bridge reporting "off" alongside a live local eBPF backend would
+	// otherwise clobber a true "tcp".
+	NetworkAccounting *processobs.NetworkAccounting
 }
 
 // Backend is the WSL half of the cross-OS bridge (spec §5.5): a
@@ -52,6 +62,7 @@ type Backend struct {
 	explicitPath   string
 	pollIntervalMS int
 	logger         *slog.Logger
+	netStatus      *processobs.NetworkAccounting
 
 	resolvedPath string
 
@@ -69,6 +80,11 @@ type Backend struct {
 	decodeErrs int64
 	respawns   int64
 	lastErr    string
+	// claim tracks whether the LAST hello frame made a positive claim that
+	// bytes are being counted, so it can be withdrawn when the capturer dies
+	// — see invalidateNetworkStatus. Shared with the accept-mode Listener so
+	// the rule has one implementation (stream.go).
+	claim netClaim
 }
 
 // New builds a bridge Backend from Options (path resolution is deferred to
@@ -78,6 +94,7 @@ func New(opts Options) *Backend {
 		explicitPath:   opts.WindowsBinaryPath,
 		pollIntervalMS: opts.PollIntervalMS,
 		logger:         opts.Logger,
+		netStatus:      opts.NetworkAccounting,
 		minBackoff:     defaultMinBackoff,
 		maxBackoff:     defaultMaxBackoff,
 		stop:           make(chan struct{}),
@@ -120,6 +137,10 @@ func (b *Backend) Close() error {
 // until ctx/stop or the failure cap. It owns closing b.out.
 func (b *Backend) loop(ctx context.Context) {
 	defer close(b.out)
+	// Whatever ends this loop — ctx cancel, Close, or the failure cap — no
+	// capturer is running afterwards, so a positive network-accounting claim
+	// must not outlive it.
+	defer b.invalidateNetworkStatus("cross-OS process capturer stopped — per-process network bytes are no longer being measured")
 
 	backoff := b.minBackoff
 	failures := 0
@@ -131,6 +152,9 @@ func (b *Backend) loop(ctx context.Context) {
 		if b.done(ctx) {
 			return
 		}
+		// The capturer is gone. Anything it claimed about live byte counting
+		// is now stale, and stale is a lie — withdraw it before the respawn.
+		b.invalidateNetworkStatus("cross-OS process capturer exited — per-process network bytes are not being measured until it respawns")
 
 		if produced > 0 {
 			failures, backoff = 0, b.minBackoff
@@ -141,6 +165,10 @@ func (b *Backend) loop(ctx context.Context) {
 
 		if failures >= maxConsecutiveFailures {
 			b.setLastErr(fmt.Sprintf("capturer exited %d times without producing events: %v", failures, err))
+			// Terminal for this backend: say so explicitly rather than leaving
+			// the daemon's generic default, which cannot name the cause.
+			b.netStatus.Set(processobs.NetworkAccountingUnavailable,
+				fmt.Sprintf("cross-OS process capturer exited %d times without producing events — capture disabled", failures))
 			b.warn("process bridge: capturer failing repeatedly — capture disabled (daemon continues)",
 				"failures", failures, "err", err)
 			return
@@ -176,36 +204,14 @@ func (b *Backend) runCapturer(ctx context.Context) (events int64, err error) {
 		return 0, fmt.Errorf("spawn %s: %w", b.resolvedPath, serr)
 	}
 
-	dec := NewDecoder(stdout)
-readLoop:
-	for {
-		frame, derr := dec.Next()
-		if errors.Is(derr, io.EOF) {
-			break readLoop
-		}
-		if derr != nil {
-			b.incDecodeErr()
-			b.warn("process bridge: decode error (line skipped)", "err", derr)
-			continue
-		}
-		switch frame.Kind {
-		case KindHello:
-			if frame.V != WireVersion {
-				b.warn("process bridge: capturer wire-version mismatch", "got", frame.V, "want", WireVersion)
-			}
-		case KindEvent:
-			if frame.Event == nil {
-				continue
-			}
-			events++
-			b.incEvents()
-			if !b.send(ctx, *frame.Event) {
-				_ = cmd.Process.Kill() // consumer gone; stop the capturer
-				break readLoop
-			}
-		case KindError:
-			b.warn("process bridge: capturer reported error", "err", frame.Error)
-		}
+	// The stream itself is transport-agnostic (stream.go); only the spawn,
+	// the kill, and the stderr tail below are specific to this transport. A
+	// terminal read error on the pipe is discarded here on purpose: the
+	// child's exit status plus its stderr tail, spliced in below, is the
+	// strictly better diagnostic for THIS transport.
+	events, consumerGone, _ := consumeFrames(ctx, stdout, b)
+	if consumerGone {
+		_ = cmd.Process.Kill() // consumer gone; stop the capturer
 	}
 
 	werr := cmd.Wait()
@@ -217,6 +223,79 @@ readLoop:
 		}
 	}
 	return events, werr
+}
+
+// --- frameSink (stream.go): the spawn transport's half of the shared decode
+// loop. Each method is deliberately trivial; the RULES live in consumeFrames
+// and netClaim so the accept transport cannot drift from them.
+
+func (b *Backend) onHello(h Hello) { b.applyHelloNetworkStatus(h) }
+
+func (b *Backend) onDecodeErr(err error) {
+	b.incDecodeErr()
+	b.warn("process bridge: decode error (line skipped)", "err", err)
+}
+
+func (b *Backend) onWireMismatch(got, want int) {
+	b.warn("process bridge: capturer wire-version mismatch", "got", got, "want", want)
+}
+
+func (b *Backend) onErrorFrame(msg string) {
+	b.warn("process bridge: capturer reported error", "err", msg)
+}
+
+func (b *Backend) onEvent(ctx context.Context, ev processobs.RawEvent) bool {
+	b.incEvents()
+	return b.send(ctx, ev)
+}
+
+// onCapturerStats logs the capturer's decoder report and carries it NO FURTHER
+// — deliberately, and this is the whole of the reasoning.
+//
+// The spawn transport is not a dial-in transport: it implements no
+// processobs.TransportStatsSource, so it has nowhere to publish the fact that
+// would not be a value invented for it. And the fact is nearly always absent
+// here anyway: a spawn-mode capturer is exec'd from WSL's MEDIUM-integrity
+// interop token, ETW session control always requires elevation, so its network
+// decoder never starts and it sends no stats frame at all. The elevated
+// capturer — the one whose drop count is the validation signal — reaches the
+// daemon over the ACCEPT transport, which does carry it.
+//
+// Dropping it silently would still be wrong, so it is logged. If this ever
+// needs to be a reported state, the fix is to give this backend the transport
+// capability, not to fabricate a TransportStats it does not have.
+func (b *Backend) onCapturerStats(s CapturerStats) {
+	decode := s.DecodeStats()
+	switch {
+	case decode.Any():
+		b.warn("process bridge: the capturer's network-telemetry decoder is REFUSING events — "+
+			"per-process byte totals from this host may be wrong, not merely missing",
+			"dropped", decode.NetworkDropped,
+			"unsupported_version", decode.NetworkUnsupportedVersion)
+	case decode.NothingClassified():
+		b.warn("process bridge: the capturer's network-telemetry decoder has classified NO data events — "+
+			"it refused nothing, but it accepted nothing either, so it is measuring no bytes at all; "+
+			"if this host was moving TCP traffic, the provider's event ids no longer match this build's layout table",
+			"ignored", decode.NetworkIgnored,
+			"decoded", decode.NetworkDecoded)
+	}
+}
+
+// applyHelloNetworkStatus carries the capturer's per-process network-byte
+// accounting status from its hello frame onto the shared status handle, so
+// `observer doctor` / the dashboard report what the WINDOWS side measured.
+// The rule it applies (silence is UNKNOWN, never a confident "off") lives in
+// netClaim.apply.
+func (b *Backend) applyHelloNetworkStatus(h Hello) {
+	b.claim.apply(b.netStatus, h)
+}
+
+// invalidateNetworkStatus withdraws a POSITIVE network-accounting claim once
+// the capturer that made it is gone, replacing it with "unavailable" plus the
+// given reason. See netClaim.invalidate for why only a positive claim is
+// withdrawn.
+func (b *Backend) invalidateNetworkStatus(reason string) {
+	b.claim.invalidate(b.netStatus, reason)
 }
 
 // send delivers an event unless ctx/stop fires first; false means stop.

@@ -105,7 +105,10 @@ func nativeResumeHint(capab integration.Capability) string {
 	case "positional":
 		return fmt.Sprintf("resume it natively with `%s <id>`", capab.Resume.Subcommand)
 	default:
-		return fmt.Sprintf("resume it natively with `%s`", capab.Resume.Subcommand)
+		// The observer launcher tail is uniformly `--resume <id>` for every
+		// ResumeNative tool regardless of the tool's own flag spelling, so
+		// the fallback hint can always name the actionable observer form.
+		return fmt.Sprintf("resume it natively with `observer %s --resume <id>`", capab.Resume.Subcommand)
 	}
 }
 

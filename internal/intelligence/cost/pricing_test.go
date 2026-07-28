@@ -473,6 +473,228 @@ func TestTable_Opus48ExplicitSourceExact(t *testing.T) {
 	}
 }
 
+// TestTable_Opus5PricingAndFamilyFallback pins the 2026-07-25 Claude Opus 5
+// rows. Before them `claude-opus-5` resolved to PricingSourceMiss and costed
+// at $0.00 (measured live: 78 turns over ~3 days re-costed $0.00 → $18.04):
+// there was no bare `claude-opus` key, and "claude-opus-4" is not a prefix of
+// "claude-opus-5", so the family ladder could not save it. Same defect CLASS
+// as the 2026-07-12 claude-fable-5 wrong-anchor incident — a flagship SKU
+// silently mispriced.
+//
+// Rates are IDENTICAL to claude-opus-4-8 ($5/$25, cache 0.50/6.25/10, web
+// search $0.01/call) including FastMultiplier=2 (Opus 5 fast mode is $10/$50
+// = exactly 2× every per-token dimension). Verified against
+// platform.claude.com/docs/en/about-claude/pricing 2026-07-25. Do NOT "fix"
+// these to a higher tier — $10/$50 is Fable 5 / Mythos 5, not Opus 5.
+//
+// The four cases below cover the exact row, the family safety net, the
+// long-context tag, and a shadowing regression guard.
+func TestTable_Opus5PricingAndFamilyFallback(t *testing.T) {
+	tb := NewTable()
+	for _, tc := range []struct {
+		name, model                       string
+		wantSource                        PricingSource
+		in, out, cacheR, cacheW, cacheW1h float64
+		webSearch, fastMult               float64
+	}{
+		// (a) The explicit pinned SKU — exact match, full rate card, and the
+		// FastMultiplier premium tier lives here (never on a family prefix).
+		{"opus-5 explicit", "claude-opus-5", PricingSourceExact, 5, 25, 0.50, 6.25, 10, 0.01, 2},
+		// (b) The bare `claude-opus` safety net: a hypothetical future SKU
+		// inherits the CURRENT tier via family fallback rather than MISSing
+		// to $0. FastMultiplier stays 0 — a fast tier is a per-SKU
+		// capability future models must opt into explicitly.
+		{"future opus-6 inherits current tier, not MISS", "claude-opus-6", PricingSourceFamily, 5, 25, 0.50, 6.25, 10, 0.01, 0},
+		// (c) The `[1m]` long-context tag. The bracket tail defeats the
+		// date-strip ladder, but `claude-opus-5` is itself date-suffix-free
+		// so it doubles as a family prefix and — being longer than
+		// "claude-opus" — wins familyKeys' longest-first sort. It therefore
+		// carries the SAME rates AND FastMultiplier as the exact row: it is
+		// the same SKU under a context tag, not a different model.
+		{"opus-5 [1m] long-context tag", "claude-opus-5[1m]", PricingSourceFamily, 5, 25, 0.50, 6.25, 10, 0.01, 2},
+		// (d) REGRESSION GUARD for the new bare `claude-opus` key: the
+		// legacy Opus 4.1 row must stay EXACT at $15/$75. "claude-opus-4-1"
+		// is longer than "claude-opus" so it wins the sort; a bug that let
+		// the family key shadow it would silently 3× under-bill legacy
+		// traffic. (`claude-3-opus` is safe by construction — it does not
+		// start with "claude-opus" at all.)
+		{"legacy opus-4-1 unshadowed", "claude-opus-4-1", PricingSourceExact, 15, 75, 1.5, 18.75, 30, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, src, ok := tb.LookupWithSource(tc.model)
+			if !ok {
+				t.Fatalf("LookupWithSource(%q): ok=false (MISS → $0.00 — the bug this pins)", tc.model)
+			}
+			if src != tc.wantSource {
+				t.Errorf("source: got %q want %q", src, tc.wantSource)
+			}
+			if p.Input != tc.in {
+				t.Errorf("input: got %v want %v", p.Input, tc.in)
+			}
+			if p.Output != tc.out {
+				t.Errorf("output: got %v want %v", p.Output, tc.out)
+			}
+			if p.CacheRead != tc.cacheR {
+				t.Errorf("cache_read: got %v want %v", p.CacheRead, tc.cacheR)
+			}
+			if p.CacheCreation != tc.cacheW {
+				t.Errorf("cache_creation: got %v want %v", p.CacheCreation, tc.cacheW)
+			}
+			if p.CacheCreation1h != tc.cacheW1h {
+				t.Errorf("cache_creation_1h: got %v want %v", p.CacheCreation1h, tc.cacheW1h)
+			}
+			if p.WebSearchPerRequest != tc.webSearch {
+				t.Errorf("web_search_per_request: got %v want %v", p.WebSearchPerRequest, tc.webSearch)
+			}
+			if p.FastMultiplier != tc.fastMult {
+				t.Errorf("fast_multiplier: got %v want %v", p.FastMultiplier, tc.fastMult)
+			}
+		})
+	}
+}
+
+// TestTable_BareAnthropicFamilyRowsAndLegacyAlias pins the 2026-07-25
+// completion of the bare-family-row set plus the one legacy alias that the
+// current-gen family row was silently under-billing.
+//
+// Two defects, one root cause — the family ladder is a plain longest-PREFIX
+// match, so a generation bump breaks it ("claude-sonnet-5" is not a prefix of
+// "claude-sonnet-6") while a legacy alias that still shares the current-gen
+// prefix silently inherits the WRONG (cheaper) tier:
+//
+//   - `claude-sonnet` / `claude-haiku` bare rows: without them the next
+//     generation MISSes to $0.00 — the identical hole `claude-opus-5` fell
+//     through before its pin. internal/routing/tiers.go already carried both
+//     bare tiers, so the two registries disagreed until this change.
+//   - `claude-opus-4-0`: Anthropic's documented undated alias for LEGACY
+//     Claude Opus 4 at $15/$75. It had no row, so it resolved through the
+//     `claude-opus-4` family row — which is deliberately pinned to
+//     CURRENT-gen $5/$25 for future SKUs — and billed at 1/3 the real rate.
+//
+// Deliberate rate choices pinned here (do NOT "simplify" them to match a
+// sibling row):
+//
+//   - bare `claude-sonnet` is the STANDARD $3/$15 card, NOT Sonnet 5's
+//     $2/$10 INTRODUCTORY rate. The intro window closes 2026-08-31; a family
+//     fallback carrying it would under-bill every unpinned Sonnet SKU from
+//     2026-09-01. The explicit `claude-sonnet-5` row (longer → wins the
+//     longest-first sort) keeps billing the intro rate for the one SKU that
+//     actually has it, and its guard case below must stay $2/$10.
+//   - neither bare row gets a FastMultiplier (fast mode is Opus-tier only)
+//     or a LongContextThreshold (the LC tier is per-SKU: Sonnet 4 / 4.5 have
+//     it, 4.6 and 5 do not) — a family fallback must not invent either.
+//
+// Everything after the three new cases is a REGRESSION GUARD asserting the
+// new bare prefixes shadow nothing. The legacy `claude-3-5-*` / `claude-3-*`
+// ids are safe by construction (they do not START with "claude-sonnet" /
+// "claude-haiku"), and every existing `claude-sonnet-*` / `claude-haiku-*`
+// key is strictly longer than its bare prefix so it wins familyKeys' sort.
+func TestTable_BareAnthropicFamilyRowsAndLegacyAlias(t *testing.T) {
+	tb := NewTable()
+	for _, tc := range []struct {
+		name, model                       string
+		wantSource                        PricingSource
+		in, out, cacheR, cacheW, cacheW1h float64
+		fastMult                          float64
+		wantLCThreshold                   int64
+	}{
+		// ---- the three rows this change adds ----
+		//
+		// (a) Next-gen Sonnet via the new bare family row — standard
+		// $3/$15, not the expiring $2/$10 intro rate, and no LC tier.
+		{"future sonnet-6 → bare claude-sonnet at STANDARD rates", "claude-sonnet-6", PricingSourceFamily, 3, 15, 0.30, 3.75, 6, 0, 0},
+		// (b) Next-gen Haiku via the new bare family row — current-gen
+		// (4.5) rates, never the cheaper legacy 3.5 / 3 Haiku tiers.
+		{"future haiku-5 → bare claude-haiku at current-gen rates", "claude-haiku-5", PricingSourceFamily, 1, 5, 0.10, 1.25, 2, 0, 0},
+		// (c) The legacy alias trap: EXACT now, at the real legacy
+		// $15/$75. Resolving this via family (→ $5/$25) is a 3× under-bill.
+		{"opus-4-0 legacy alias EXACT at legacy rates", "claude-opus-4-0", PricingSourceExact, 15, 75, 1.5, 18.75, 30, 0, 0},
+
+		// ---- regression guards: these MUST be unchanged ----
+		//
+		// Sonnet 5 keeps the introductory $2/$10 through 2026-08-31.
+		{"guard: sonnet-5 keeps INTRO 2/10", "claude-sonnet-5", PricingSourceExact, 2, 10, 0.20, 2.50, 4, 0, 0},
+		{"guard: sonnet-4-6 exact", "claude-sonnet-4-6", PricingSourceExact, 3, 15, 0.30, 3.75, 6, 0, 0},
+		// Sonnet 4.5 keeps its per-SKU 200K long-context tier — the bare
+		// family row carries none and must not have displaced it.
+		{"guard: sonnet-4-5 keeps its LC tier", "claude-sonnet-4-5", PricingSourceExact, 3, 15, 0.30, 3.75, 6, 0, 200_000},
+		{"guard: sonnet-3-7 deprecated exact", "claude-sonnet-3-7", PricingSourceExact, 3, 15, 0.30, 3.75, 6, 0, 0},
+		{"guard: haiku-4-5 exact", "claude-haiku-4-5", PricingSourceExact, 1, 5, 0.10, 1.25, 2, 0, 0},
+		{"guard: haiku-4.5 dot variant exact", "claude-haiku-4.5", PricingSourceExact, 1, 5, 0.10, 1.25, 2, 0, 0},
+		// Legacy 3.5 rows — do NOT start with "claude-sonnet"/"claude-haiku",
+		// so the new bare prefixes cannot reach them.
+		{"guard: 3-5-sonnet legacy rates", "claude-3-5-sonnet", PricingSourceExact, 3, 15, 0.30, 3.75, 6, 0, 0},
+		{"guard: 3-5-haiku legacy rates", "claude-3-5-haiku", PricingSourceExact, 0.80, 4, 0.08, 1.00, 1.6, 0, 0},
+		{"guard: 3-sonnet dated legacy rates", "claude-3-sonnet-20240229", PricingSourceExact, 3, 15, 0.30, 3.75, 6, 0, 0},
+		{"guard: 3-haiku dated legacy rates", "claude-3-haiku-20240307", PricingSourceExact, 0.25, 1.25, 0.03, 0.30, 0.50, 0, 0},
+		// Opus guards: the sibling legacy alias and the current flagship.
+		{"guard: opus-4-1 legacy exact", "claude-opus-4-1", PricingSourceExact, 15, 75, 1.5, 18.75, 30, 0, 0},
+		{"guard: opus-5 flagship exact w/ fast tier", "claude-opus-5", PricingSourceExact, 5, 25, 0.50, 6.25, 10, 2, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, src, ok := tb.LookupWithSource(tc.model)
+			if !ok {
+				t.Fatalf("LookupWithSource(%q): ok=false (MISS → $0.00)", tc.model)
+			}
+			if src != tc.wantSource {
+				t.Errorf("source: got %q want %q", src, tc.wantSource)
+			}
+			if p.Input != tc.in {
+				t.Errorf("input: got %v want %v", p.Input, tc.in)
+			}
+			if p.Output != tc.out {
+				t.Errorf("output: got %v want %v", p.Output, tc.out)
+			}
+			if p.CacheRead != tc.cacheR {
+				t.Errorf("cache_read: got %v want %v", p.CacheRead, tc.cacheR)
+			}
+			if p.CacheCreation != tc.cacheW {
+				t.Errorf("cache_creation: got %v want %v", p.CacheCreation, tc.cacheW)
+			}
+			if p.CacheCreation1h != tc.cacheW1h {
+				t.Errorf("cache_creation_1h: got %v want %v", p.CacheCreation1h, tc.cacheW1h)
+			}
+			if p.FastMultiplier != tc.fastMult {
+				t.Errorf("fast_multiplier: got %v want %v", p.FastMultiplier, tc.fastMult)
+			}
+			if p.LongContextThreshold != tc.wantLCThreshold {
+				t.Errorf("long_context_threshold: got %v want %v", p.LongContextThreshold, tc.wantLCThreshold)
+			}
+		})
+	}
+}
+
+// TestTable_DottedVendorPrefixStillMisses pins a KNOWN, DELIBERATELY UNFIXED
+// limitation so it cannot change silently.
+//
+// normalizeUnpricedModel — the last-resort reducer — strips only `capi:` /
+// `sweagent-capi:` router prefixes and leading path segments. It never strips
+// a DOTTED vendor prefix, so Bedrock/Vertex-style ids
+// (`us.anthropic.claude-opus-5:v1`, `anthropic.claude-opus-5`) do not start
+// with any family key and resolve to PricingSourceMiss → $0.00 even though
+// the bare `claude-opus` family row now exists.
+//
+// This gap is PRE-EXISTING and CLASS-WIDE (Opus 4.8 has it too, as the third
+// case shows) — it is out of scope for the family-row work and is recorded
+// here only so nobody assumes the family "safety net" catches it. If a future
+// change teaches normalizeUnpricedModel about dotted vendor prefixes, this
+// test SHOULD fail: update it deliberately rather than assuming a regression.
+func TestTable_DottedVendorPrefixStillMisses(t *testing.T) {
+	tb := NewTable()
+	for _, model := range []string{
+		"us.anthropic.claude-opus-5:v1",
+		"anthropic.claude-opus-5",
+		"us.anthropic.claude-opus-4-8:v1", // same class, pre-dates the opus-5 rows
+	} {
+		t.Run(model, func(t *testing.T) {
+			p, src, ok := tb.LookupWithSource(model)
+			if ok || src != PricingSourceMiss {
+				t.Fatalf("LookupWithSource(%q) = (%+v, %q, %v); want MISS — the dotted-vendor-prefix gap is documented as unfixed in pricing.go's claude-opus row", model, p, src, ok)
+			}
+		})
+	}
+}
+
 // TestTable_LastResortNormalization pins the §11.A central last-resort
 // reducer in LookupWithSource: router-prefixed (capi:/sweagent-capi:) and
 // provider-path-qualified (openrouter/anthropic/…) model strings that the

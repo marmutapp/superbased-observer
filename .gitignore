@@ -105,6 +105,14 @@ tmp/
 .env.local
 .aider*
 
+# Local tool state — never committed. These are listed because they are NOT
+# build output anyone expects: `.vite/` is vite's on-disk cache and
+# `.antigravitycli/` is the Antigravity CLI's local state. Both appear as
+# untracked at the repo root, and before this entry two consecutive session
+# handovers had to carry a standing warning never to `git add -A` here.
+.vite/
+.antigravitycli/
+
 # Internal docs — kept locally on the private repo for development
 # context, untracked from the public repo. The dashboard's runtime
 # walkthrough asset under internal/intelligence/dashboard/static/ is

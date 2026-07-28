@@ -5,8 +5,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"strings"
@@ -61,7 +63,8 @@ func buildRemoteController(cfg config.Config, database *sql.DB) dashboard.Remote
 	// rest so the running controller can verify it. A read failure / absent file
 	// leaves it empty (the standing path then denies) — never fatal.
 	standingHash := ""
-	if b, rerr := os.ReadFile(remotecfg.StandingTerminalSecretPath(cfg)); rerr == nil {
+	standingPath := remotecfg.StandingTerminalSecretPath(cfg)
+	if b, rerr := os.ReadFile(standingPath); rerr == nil {
 		standingHash = strings.TrimSpace(string(b))
 	}
 	return dashboard.NewRemoteController(dashboard.RemoteOptions{
@@ -74,6 +77,42 @@ func buildRemoteController(cfg config.Config, database *sql.DB) dashboard.Remote
 
 		StandingTerminalSecretHash: standingHash,
 		StandingTerminalEnabled:    cfg.Remote.AllowStandingTerminalControl,
+		// The revoke-vs-disable discriminator (operator decision A2). The live
+		// controller sees both as the same ("", false) reload, so it asks the
+		// DISK: a genuine revoke unlinks this file, while allow_terminal→false,
+		// remote-disable and a plain config toggle all leave it in place. Only
+		// a definite "no such file" is reported as absent — any other stat
+		// outcome answers "present", so an unreadable directory or a transient
+		// I/O error can never make a device throw away a valid secret.
+		StandingSecretAtRest: func() bool {
+			_, serr := os.Stat(standingPath)
+			return !errors.Is(serr, fs.ErrNotExist)
+		},
+		// Single-use execute-capability lifetime. 0 ⇒ remoteauth's default
+		// (10m), sized for a human round-trip to a mail/chat app to fetch the
+		// capability + confirm codes. Single-use semantics are unaffected.
+		CapabilityTTL: time.Duration(cfg.Remote.CapabilityTTLMinutes) * time.Minute,
+		// Audit is the SESSION-LIFECYCLE sink: session_paired, session_revoked,
+		// and the six auth_failed reasons handlePair distinguishes
+		// (rate_limited / bad_request / bad_secret / session_limit /
+		// session_create). It is a DIFFERENT seam from Options.RemoteAudit,
+		// which carries the per-request http_request rows from remote.go's
+		// authorize path — and because only the latter was ever wired, the
+		// former silently no-op'd (remoteController.auditSession returns early
+		// on a nil audit func).
+		//
+		// The cost was not a missing log line, it was an unfalsifiable bug: a
+		// paired phone losing authorization has SIX candidate causes and the
+		// audit that discriminates them recorded nothing, so every
+		// investigation had to reason backwards from `http_request … deny`
+		// rows plus disk state. Measured on this install 2026-07-28: 17 rows
+		// in remote_sessions covered by the audit window, and zero
+		// session_paired rows to explain any of them.
+		//
+		// nil-safe: remoteAuditSink returns nil when database is nil (the
+		// pure-in-memory path), which is exactly the no-op the controller
+		// already tolerates.
+		Audit: remoteAuditSink(database),
 		Session: remoteauth.SessionParams{
 			TTL:  time.Duration(cfg.Remote.SessionTTLMinutes) * time.Minute,
 			Idle: time.Duration(cfg.Remote.SessionIdleMinutes) * time.Minute,

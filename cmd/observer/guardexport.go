@@ -82,7 +82,7 @@ func newGuardExportCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
 			}
-			database, err := db.Open(cmd.Context(), db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+			database, err := db.Open(cmd.Context(), db.Options{Path: cfg.Observer.DBPath})
 			if err != nil {
 				return fmt.Errorf("open db: %w", err)
 			}
@@ -230,7 +230,7 @@ func newGuardReportCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
 			}
-			database, err := db.Open(cmd.Context(), db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+			database, err := db.Open(cmd.Context(), db.Options{Path: cfg.Observer.DBPath})
 			if err != nil {
 				return fmt.Errorf("open db: %w", err)
 			}

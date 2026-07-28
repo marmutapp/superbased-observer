@@ -299,7 +299,14 @@ export function WorkspaceGrid({
                   <TombstoneTile
                     key={token}
                     token={token}
-                    pending={!dock.sessionsHydrated}
+                    // Pending (not dead) while the dock is still rehydrating
+                    // OR while this token is reconnecting: a dropped transport
+                    // is not an ended session, and reading "Session ended" for
+                    // one is the exact mis-report this arc fixes.
+                    pending={
+                      !dock.sessionsHydrated ||
+                      dock.statuses[token] === "reconnecting"
+                    }
                     readOnly={readOnly}
                     onRemove={() => removeFromGrid(token)}
                   />
@@ -345,6 +352,8 @@ function StatusDot({ status }: { status: Status | undefined }) {
   const cls: Record<Status, string> = {
     connecting: "bg-fg-3 animate-pulse",
     open: "bg-ok",
+    // Still live server-side — only this browser's transport dropped.
+    reconnecting: "bg-warn animate-pulse",
     exited: "bg-fg-3",
     error: "bg-danger",
   };
@@ -382,6 +391,7 @@ function TerminalTile({
   const label: Record<Status, string> = {
     connecting: "connecting…",
     open: "live",
+    reconnecting: "reconnecting…",
     exited: "exited",
     error: "error",
   };
@@ -475,7 +485,8 @@ function TerminalTile({
 
 // TombstoneTile: a saved cell whose session is gone (daemon restart / exit) —
 // honest dead-state with a remove affordance. While the provider is still
-// rehydrating (no sessions known yet) it reads as pending instead of dead.
+// rehydrating (no sessions known yet), or the token is reconnecting, it reads
+// as pending instead of dead.
 function TombstoneTile({
   token,
   pending,

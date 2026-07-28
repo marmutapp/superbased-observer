@@ -37,34 +37,44 @@ type Options struct {
 	// watcher.
 	BusyTimeout time.Duration
 
-	// SkipIntegrityCheck disables the `PRAGMA quick_check` probe (and the
-	// one-time schema-034 path-hash backfill) that normally run at the end
-	// of Open. Set this from short-lived subprocesses that connect to the
-	// daemon-owned DB — the hook path and the MCP server (`observer serve`):
-	// the daemon already runs the probe at startup, so re-running it on
-	// every spawn just contends with the daemon's WAL holder for no
-	// diagnostic benefit, and on a large DB the quick_check can run for tens
-	// of seconds — long enough to push the MCP server's first `initialize`
-	// response past the AI client's startup timeout. Memory note
-	// `feedback_hook_db_open_no_timeout` captured the contention.
+	// IntegrityCheck opts IN to the `PRAGMA quick_check` probe (and the
+	// one-time schema-034 path-hash backfill) at the end of Open. It is
+	// OFF by default, and that default is deliberate: quick_check reads
+	// and checksums EVERY PAGE of the file, so its cost scales with the
+	// database, not with the work the caller came to do. On the reference
+	// 14.7 GB install it costs >120s — measured, not estimated.
 	//
-	// The long-running daemon (`observer start` / `observer proxy start` /
-	// `observer watch`) ALSO sets this now (2026-07-16): it opens the DB
-	// from several goroutines (proxy, watcher, dashboard, one per feature),
-	// and paying the multi-GB quick_check on each open serialized the
-	// readiness path — on a 9.5 GB DB the three synchronous pre-listener
-	// opens cost ~40s+ of CPU before the dashboard could bind. The daemon
-	// instead runs the probe + backfill EXACTLY ONCE, off the readiness
-	// path, via [RunStartupMaintenance] on a background goroutine after the
-	// listener is already serving. Leave false for tests and the one-shot
-	// `observer backfill` / `observer doctor` commands (they WANT the check
-	// and are not latency-sensitive).
-	SkipIntegrityCheck bool
+	// The polarity was inverted on 2026-07-28 after the same defect
+	// recurred FOUR times under the old opt-out spelling
+	// (`SkipIntegrityCheck`): the MCP server (2026-07-06), the daemon
+	// (2026-07-16), `observer run` (2026-07-23, re-measured 0.16s vs
+	// >120s), and finally every read-only reporting command via
+	// cmd/observer's loadConfigAndDB — 85 call sites that each paid a
+	// full-database checksum to print a table. An opt-out flag has to be
+	// remembered at every new call site and is silent when forgotten; an
+	// opt-in flag fails safe. Memory note
+	// `feedback_hook_db_open_no_timeout` captured the original contention.
+	//
+	// Do NOT set this to make a caller "safe". The probe is a diagnostic,
+	// not a guard — nothing downstream consumes its result, so a caller
+	// that enables it only pays for it. The long-running daemon runs the
+	// probe + backfill EXACTLY ONCE, off its readiness path, via
+	// [RunStartupMaintenance] on a background goroutine after the listener
+	// is already serving; `observer doctor` runs its own quick_check as
+	// the reported `db.integrity` check (internal/diag/doctor.go). Both
+	// are better homes for it than Open. The one caller that legitimately
+	// sets it is `observer db import`, which validates an UNTRUSTED
+	// foreign database file before merging it into the live one.
+	IntegrityCheck bool
 }
 
 // Open opens (or creates) the SQLite database at opts.Path, enables WAL mode,
-// applies any pending migrations, and runs a quick integrity check. The
-// returned *sql.DB is safe for concurrent use.
+// and applies any pending migrations. The returned *sql.DB is safe for
+// concurrent use.
+//
+// Open does NOT verify the database. The `PRAGMA quick_check` probe is opt-in
+// via Options.IntegrityCheck and costs a full-file checksum — see that field
+// for why the default is off and where the probe actually lives.
 //
 // Concurrency note: every transaction acquires the SQLite write lock
 // upfront via _txlock=immediate. The default BEGIN DEFERRED behavior
@@ -117,24 +127,21 @@ func Open(ctx context.Context, opts Options) (*sql.DB, error) {
 	// has no built-in sha256 SQL function). Idempotent: only updates rows
 	// where the hash column is empty AND the source value is non-empty.
 	//
-	// Gated by !SkipIntegrityCheck (Ticket A, 2026-07-12): the probe issues
-	// an UNINDEXED `WHERE source_file_hash = ''` scan of the `actions` /
-	// `token_usage` tables — on a multi-GB `actions` table under WAL
-	// contention that full-scan dominated the hook-path `db.Open` latency
-	// (~100s stalls), even though it finds 0 rows on any already-backfilled
-	// DB. Short-lived opens that pass SkipIntegrityCheck (every claude-code
-	// hook + the MCP server) skip it entirely; the daemon still runs it, but
-	// backfillPathHashes itself short-circuits on a schema_meta done-marker
-	// after the first successful pass, so even the daemon pays the scan at
-	// most once per DB. See docs/plans/claude-code-hook-stall-ticket-and-db-
-	// prune-plan-2026-07-12.md.
-	if !opts.SkipIntegrityCheck {
+	// Gated by IntegrityCheck (Ticket A, 2026-07-12; polarity inverted
+	// 2026-07-28): the backfill issues an UNINDEXED `WHERE
+	// source_file_hash = ''` scan of the `actions` / `token_usage` tables —
+	// on a multi-GB `actions` table under WAL contention that full-scan
+	// dominated the hook-path `db.Open` latency (~100s stalls), even though
+	// it finds 0 rows on any already-backfilled DB. It short-circuits on a
+	// schema_meta done-marker after the first successful pass, so the one
+	// process that does run it — the daemon, via [RunStartupMaintenance] —
+	// pays the scan at most once per DB. See docs/plans/claude-code-hook-
+	// stall-ticket-and-db-prune-plan-2026-07-12.md.
+	if opts.IntegrityCheck {
 		if err := backfillPathHashes(ctx, database); err != nil {
 			_ = database.Close()
 			return nil, err
 		}
-	}
-	if !opts.SkipIntegrityCheck {
 		if err := integrityCheck(ctx, database); err != nil {
 			_ = database.Close()
 			return nil, err
@@ -212,7 +219,7 @@ func isBusy(err error) bool {
 // seconds of CPU), so running it inside every daemon db.Open — proxy,
 // watcher, and dashboard each open the same file synchronously before the
 // listener binds — delayed `observer start` becoming ready by minutes. The
-// daemon now opens with SkipIntegrityCheck=true (fast) and calls this once
+// daemon opens without the probe (the default) and calls this once
 // from a single background goroutine after it is already serving. A
 // corruption result is returned as an error for the caller to log loudly.
 //

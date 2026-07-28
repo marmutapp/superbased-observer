@@ -282,29 +282,32 @@ func TestResumableSessionSet(t *testing.T) {
 // TestResumableSessionSetSkipsResumeNoneTools pins the attach-all-launchers §3
 // capability gate: a KindAttach orphan with a correlated session id is offered
 // for auto-resume ONLY when its tool grounds native resume. A ResumeNone tool
-// (opencode — now attachable but with no native-resume argv) is excluded even
-// though its run is a correlated crash orphan, so the daemon never composes a
-// `--resume` its inner launcher can't parse. A ResumeNative tool (claude-code)
-// in the same shape is still offered.
+// (openclaw — attachable/launchable but with no non-interactive resume surface
+// grounded) is excluded even though its run is a correlated crash orphan, so
+// the daemon never composes a `--resume` its inner launcher can't parse. A
+// ResumeNative tool (claude-code) in the same shape is still offered.
+//
+// The ResumeNone fixture was cursor until 2026-07-25, when cursor's native
+// `--resume <chatId>` was live-confirmed and promoted to ResumeNative.
 func TestResumableSessionSetSkipsResumeNoneTools(t *testing.T) {
 	// Sanity-pin the fixture's capability assumptions so this test fails loudly
 	// if the registry grounding ever changes underneath it.
-	if c, _ := integration.For("opencode"); c.Resume.Kind == integration.ResumeNative {
-		t.Fatal("fixture assumes opencode is ResumeNone")
+	if c, _ := integration.For("openclaw"); c.Resume.Kind == integration.ResumeNative {
+		t.Fatal("fixture assumes openclaw is ResumeNone")
 	}
 	if c, _ := integration.For("claude-code"); c.Resume.Kind != integration.ResumeNative {
 		t.Fatal("fixture assumes claude-code is ResumeNative")
 	}
 	runs := []store.TerminalRunSummary{
 		// ResumeNone tool, correlated crash orphan → EXCLUDED by the gate.
-		{RunID: "op1", Tool: "opencode", Kind: string(termrun.KindAttach), EndedAt: nil, BestSessionID: "sess-opencode"},
+		{RunID: "cu1", Tool: "openclaw", Kind: string(termrun.KindAttach), EndedAt: nil, BestSessionID: "sess-openclaw"},
 		// ResumeNative tool, same shape → INCLUDED.
 		{RunID: "cc1", Tool: "claude-code", Kind: string(termrun.KindAttach), EndedAt: nil, BestSessionID: "sess-claude"},
 		// A tool with no registry row at all → EXCLUDED (For returns ok=false).
 		{RunID: "zz1", Tool: "not-a-real-tool", Kind: string(termrun.KindAttach), EndedAt: nil, BestSessionID: "sess-unknown"},
 	}
 	set := resumableSessionSet(runs)
-	if _, ok := set["sess-opencode"]; ok {
+	if _, ok := set["sess-openclaw"]; ok {
 		t.Error("a ResumeNone tool's orphan must NOT be auto-resumable")
 	}
 	if _, ok := set["sess-unknown"]; ok {
@@ -327,14 +330,14 @@ func TestResumableSessionSetSkipsResumeNoneTools(t *testing.T) {
 func TestValidateAttachCapabilityRejectsResumeForResumeNone(t *testing.T) {
 	// A ResumeNone tool with a resume request → refused.
 	err := validateAttachCapability(attachsock.SpawnRequest{
-		Tool: "opencode", Subcommand: "opencode", ResumeSession: "sess-x",
+		Tool: "openclaw", Subcommand: "openclaw", ResumeSession: "sess-x",
 	})
 	if err == nil || !strings.Contains(err.Error(), "no native resume capability") {
 		t.Fatalf("resume spawn for a ResumeNone tool err = %v, want a no-native-resume rejection", err)
 	}
 	// The SAME tool WITHOUT a resume request → allowed (plain attach is fine).
 	if err := validateAttachCapability(attachsock.SpawnRequest{
-		Tool: "opencode", Subcommand: "opencode",
+		Tool: "openclaw", Subcommand: "openclaw",
 	}); err != nil {
 		t.Fatalf("plain (non-resume) attach for a ResumeNone tool must pass, got %v", err)
 	}
@@ -352,12 +355,13 @@ func TestValidateAttachCapabilityRejectsResumeForResumeNone(t *testing.T) {
 // handover fork (the real mortality backstop), not a native-resume command the
 // tool doesn't have. A ResumeNative tool still gets its native `--resume` hint.
 func TestNativeResumeHintResumeNoneMentionsContinueFrom(t *testing.T) {
-	// opencode: launchable, ResumeNone → the --continue-from degraded hint,
-	// naming its launch verb.
-	oc, _ := integration.For("opencode")
+	// openclaw: launchable, ResumeNone → the --continue-from degraded hint,
+	// naming its launch verb. (Was cursor until 2026-07-25, when cursor's
+	// native `--resume <chatId>` was live-confirmed → ResumeNative.)
+	oc, _ := integration.For("openclaw")
 	got := nativeResumeHint(oc)
-	if !strings.Contains(got, "--continue-from") || !strings.Contains(got, "observer opencode") {
-		t.Errorf("opencode hint = %q, want it to mention `observer opencode --continue-from`", got)
+	if !strings.Contains(got, "--continue-from") || !strings.Contains(got, "observer openclaw") {
+		t.Errorf("openclaw hint = %q, want it to mention `observer openclaw --continue-from`", got)
 	}
 	// claude-code: ResumeNative → the native --resume hint, NOT --continue-from.
 	cc, _ := integration.For("claude-code")

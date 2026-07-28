@@ -955,6 +955,200 @@ func TestCorrelateDiscoveredLinksThenOOBUpgrades(t *testing.T) {
 	}
 }
 
+// correlatingLauncher models the PRODUCTION launcher's ordering exactly: the
+// real ptyLauncher.Spawn starts the OOB drain goroutine BEFORE it returns
+// (cmd/observer/terminal_launch.go), so a trusted session frame can reach
+// Correlate while launch() is still inside Spawn — before byHandle/byRun are
+// installed. Calling Correlate synchronously from Spawn makes that interleave
+// DETERMINISTIC (no sleep, no timing dependence): the correlation provably
+// happens in the pre-registration window on every run.
+type correlatingLauncher struct {
+	// onSpawn receives the LaunchRequest (carrying the minted RunID) so the test
+	// can drive svc.Correlate from inside the window.
+	onSpawn func(req LaunchRequest)
+	handle  string
+	err     error
+	// panicOnSpawn makes Spawn panic AFTER onSpawn, to prove the deferred
+	// catch-all release also frees the reservation on a panicking Launcher.
+	panicOnSpawn bool
+}
+
+func (c *correlatingLauncher) Spawn(req LaunchRequest) (string, error) {
+	if c.onSpawn != nil {
+		c.onSpawn(req)
+	}
+	if c.panicOnSpawn {
+		panic("correlatingLauncher: boom")
+	}
+	if c.err != nil {
+		return "", c.err
+	}
+	return c.handle, nil
+}
+
+// launchingLen / sessionLen read the in-package maps under the lock so the
+// reservation tests can assert that nothing leaks.
+func launchingLen(s *Service) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.launching)
+}
+
+func sessionLen(s *Service) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.bySession)
+}
+
+// TestCorrelateBeforeRegistrationIsKept is the regression test for the
+// correlate-before-registration race. The OOB drain goroutine starts inside
+// Spawn, so a one-shot trusted session frame can reach Correlate before
+// launch() installs byHandle/byRun. Before the launch reservation, Correlate's
+// liveness guard (which exists to stop an ENDED run being resurrected) found an
+// empty byRun and silently DISCARDED the link — and because the frame is
+// one-shot, that run's "Jump in" stayed blank forever. The correlation must now
+// survive: the run is reserved in launching before Spawn, and the reservation is
+// consumed in the same critical section that registers the handle.
+func TestCorrelateBeforeRegistrationIsKept(t *testing.T) {
+	rec := newFakeRecorder()
+	at := time.Unix(1_700_000_100, 0).UTC()
+	var svc *Service
+	l := &correlatingLauncher{handle: "PRH"}
+	l.onSpawn = func(req LaunchRequest) {
+		// Inside the pre-registration window, deterministically.
+		if _, live := svc.HandleForRun(req.RunID); live {
+			t.Errorf("run %q already registered inside Spawn — the test no longer exercises the pre-registration window", req.RunID)
+		}
+		if err := svc.Correlate(context.Background(), req.RunID, "sess-early", termrun.SourceOOB, at); err != nil {
+			t.Errorf("Correlate inside Spawn: %v", err)
+		}
+	}
+	svc = newService(t, Policy{}, rec, l, nil)
+
+	res, err := svc.LaunchAttachable(context.Background(), AttachRequest{Tool: "claude-code", Subcommand: "claude"})
+	if err != nil {
+		t.Fatalf("LaunchAttachable: %v", err)
+	}
+	sid, ok := svc.SessionForRun(res.RunID)
+	if !ok || sid != "sess-early" {
+		t.Fatalf("SessionForRun(%q) = (%q,%v), want (sess-early,true) — a correlation that arrived before the handle was registered was dropped", res.RunID, sid, ok)
+	}
+	// The reservation is consumed by registration, not left behind.
+	if n := launchingLen(svc); n != 0 {
+		t.Fatalf("launching reservations after a successful launch = %d, want 0", n)
+	}
+	// And the normal lifecycle still cleans the link up at exit.
+	svc.EndRunByHandle(context.Background(), res.Handle, 0)
+	if _, ok := svc.SessionForRun(res.RunID); ok {
+		t.Fatal("SessionForRun must be empty after EndRunByHandle")
+	}
+}
+
+// TestCorrelateBeforeRegistrationSpawnFailureNoOrphan pins the other half of the
+// reservation contract. If Correlate writes bySession while the run is only
+// RESERVED and Spawn then FAILS, no handle is ever produced — and bySession is
+// only ever deleted by EndRunByHandle, which is keyed by handle. Such an entry
+// would be permanently unreachable garbage: precisely the resurrection leak the
+// liveness guard exists to prevent. The Spawn-error path must therefore release
+// the reservation AND the session link it may have accumulated.
+func TestCorrelateBeforeRegistrationSpawnFailureNoOrphan(t *testing.T) {
+	rec := newFakeRecorder()
+	at := time.Unix(1_700_000_100, 0).UTC()
+	spawnErr := errors.New("spawn exploded")
+	var svc *Service
+	l := &correlatingLauncher{err: spawnErr}
+	var runID string
+	l.onSpawn = func(req LaunchRequest) {
+		runID = req.RunID
+		if err := svc.Correlate(context.Background(), req.RunID, "sess-orphan", termrun.SourceOOB, at); err != nil {
+			t.Errorf("Correlate inside Spawn: %v", err)
+		}
+	}
+	svc = newService(t, Policy{}, rec, l, nil)
+
+	if _, err := svc.LaunchAttachable(context.Background(), AttachRequest{Tool: "claude-code", Subcommand: "claude"}); !errors.Is(err, spawnErr) {
+		t.Fatalf("LaunchAttachable err = %v, want %v", err, spawnErr)
+	}
+	if runID == "" {
+		t.Fatal("Spawn was never called")
+	}
+	if sid, ok := svc.SessionForRun(runID); ok {
+		t.Fatalf("SessionForRun(%q) = %q after a FAILED spawn — the link is unreachable garbage (no handle exists, so EndRunByHandle can never delete it)", runID, sid)
+	}
+	if n := sessionLen(svc); n != 0 {
+		t.Fatalf("bySession entries after a failed spawn = %d, want 0", n)
+	}
+	if n := launchingLen(svc); n != 0 {
+		t.Fatalf("launching reservations after a failed spawn = %d, want 0", n)
+	}
+	// The durable store row is still written — only the in-memory cache is
+	// released (the run itself is closed out as ended).
+	if len(rec.corr) != 1 {
+		t.Fatalf("store correlations = %d, want 1 (the durable write is unconditional)", len(rec.corr))
+	}
+	if _, ended := rec.ended[runID]; !ended {
+		t.Fatal("a failed spawn must still close the run out as ended")
+	}
+}
+
+// TestCorrelateBeforeRegistrationSpawnPanicNoOrphan proves the LAST path out of
+// launch() after the reservation: a panicking Launcher. The deferred catch-all
+// release is the only thing that runs, and it must free both the reservation and
+// any session link written in the window.
+func TestCorrelateBeforeRegistrationSpawnPanicNoOrphan(t *testing.T) {
+	rec := newFakeRecorder()
+	at := time.Unix(1_700_000_100, 0).UTC()
+	var svc *Service
+	l := &correlatingLauncher{panicOnSpawn: true}
+	var runID string
+	l.onSpawn = func(req LaunchRequest) {
+		runID = req.RunID
+		if err := svc.Correlate(context.Background(), req.RunID, "sess-panic", termrun.SourceOOB, at); err != nil {
+			t.Errorf("Correlate inside Spawn: %v", err)
+		}
+	}
+	svc = newService(t, Policy{}, rec, l, nil)
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("expected the launcher panic to propagate")
+			}
+		}()
+		_, _ = svc.LaunchAttachable(context.Background(), AttachRequest{Tool: "claude-code", Subcommand: "claude"})
+	}()
+
+	if runID == "" {
+		t.Fatal("Spawn was never called")
+	}
+	if _, ok := svc.SessionForRun(runID); ok {
+		t.Fatal("SessionForRun must be empty after a panicking spawn")
+	}
+	if n := launchingLen(svc); n != 0 {
+		t.Fatalf("launching reservations after a panicking spawn = %d, want 0", n)
+	}
+	if n := sessionLen(svc); n != 0 {
+		t.Fatalf("bySession entries after a panicking spawn = %d, want 0", n)
+	}
+}
+
+// TestCorrelateStillRejectsUnknownRunAfterReservation guards against the fix
+// widening the liveness gate too far: membership in `launching` is the ONLY new
+// acceptance, so a run that was never launched (or already released) is still
+// rejected from the in-memory cache.
+func TestCorrelateStillRejectsUnknownRunAfterReservation(t *testing.T) {
+	rec := newFakeRecorder()
+	l := &correlatingLauncher{handle: "GH"}
+	svc := newService(t, Policy{}, rec, l, nil)
+	at := time.Unix(1_700_000_100, 0).UTC()
+	if err := svc.Correlate(context.Background(), "never-launched", "sess-x", termrun.SourceOOB, at); err != nil {
+		t.Fatalf("Correlate: %v", err)
+	}
+	if _, ok := svc.SessionForRun("never-launched"); ok {
+		t.Fatal("a run that was never launched must not enter the in-memory cache")
+	}
+}
+
 func TestCorrelate(t *testing.T) {
 	rec := newFakeRecorder()
 	svc := newService(t, Policy{}, rec, &fakeLauncher{}, nil)

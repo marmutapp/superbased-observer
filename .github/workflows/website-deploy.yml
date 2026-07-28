@@ -22,17 +22,39 @@ jobs:
       - name: Website accuracy check
         run: node website/tools/accuracy-check.mjs
 
+      # Marketing-page drift gate — the SAME check as ci.yml's
+      # `website-build-drift` job, re-run here because ci.yml is a
+      # SEPARATE workflow and therefore cannot block this deploy. Without
+      # it, a hand-edit to a rendered website/*.html pushed to main
+      # deploys to production and CI only reports the drift afterwards,
+      # which is too late.
+      #
+      # Renders website/pages-src/ into a temp dir and diffs against the
+      # committed HTML (never mutates the tree). MUST run BEFORE the strip
+      # step below, which deletes website/pages-src/ + website/docs-tools/
+      # — the source and the generator this gate needs.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: website/docs-tools/go.mod
+          cache-dependency-path: website/docs-tools/go.sum
+
+      - name: Marketing page drift check
+        run: make verify-website-build
+
       # Verification harness (Playwright + headless Chromium) lives at
       # website/tools/ for arcade testing — DEV-ONLY. Strip it before
       # `wrangler pages deploy` so the shoot.mjs / package.json / test
       # files don't ship to superbased.app. node_modules/out/ are already
       # .gitignored; this rm covers the tracked harness files too.
       #
-      # website/docs-src/ (curated Markdown + nav.toml) and
-      # website/docs-tools/ (the Go generator) are likewise DEV-ONLY —
-      # only the RENDERED website/docs/** output is meant to deploy.
-      - name: Strip dev-only verification harness + docs sources
-        run: rm -rf website/tools website/docs-src website/docs-tools
+      # website/docs-src/ (curated Markdown + nav.toml),
+      # website/pages-src/ (TOML front matter + HTML bodies for the
+      # top-level marketing pages) and website/docs-tools/ (the Go
+      # generators `gen` and `pagegen`) are likewise DEV-ONLY — only the
+      # RENDERED website/docs/** and website/*.html output is meant to
+      # deploy.
+      - name: Strip dev-only verification harness + page/docs sources
+        run: rm -rf website/tools website/docs-src website/pages-src website/docs-tools
 
       - name: Deploy to Cloudflare Pages
         uses: cloudflare/wrangler-action@v3

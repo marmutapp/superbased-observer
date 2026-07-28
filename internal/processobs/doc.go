@@ -22,7 +22,9 @@
 //   - SeedLookup — resolves a pid to its session (wraps the existing
 //     internal/pidbridge at the boundary). The bridged pid is the AI-tool
 //     ROOT process; descendants are reached by tree inheritance here, not
-//     by bridge lookup.
+//     by bridge lookup. It is consulted at exec (attribution.go) AND, for
+//     seeds that only appear later, on a bounded deferred pass over the
+//     live tree (lateseed.go, §9.2 rule 11).
 //   - Sink      — persists finished runs (the store implements it and
 //     translates processobs domain types into its own SQL row types at
 //     the boundary, exactly as the cachetrack engine does — domain types

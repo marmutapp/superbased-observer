@@ -37,6 +37,23 @@ type UnattributedCapturer interface {
 	RequiresUnattributedCapture() bool
 }
 
+// NetworkSampler is an OPTIONAL Backend capability: a backend that maintains
+// live per-process CUMULATIVE socket byte counters (today: the Linux eBPF
+// backend's TCP fentry/fexit probes). The daemon feeds NetworkBytes into the
+// metric-sampling backend so the live chart's network series comes from the
+// same MetricSample stream as CPU/RSS/disk.
+//
+// It is a CAPABILITY, not a backend name (CLAUDE.md rule 3): a future ETW or
+// eBPF-socket implementation just implements it. A backend that cannot measure
+// bytes simply does not implement the interface, and the samples then carry
+// NetMeasured=false — "unmeasured", never a fabricated zero.
+type NetworkSampler interface {
+	// NetworkBytes reports cumulative bytes for one pid. ok=false means
+	// accounting is not live (unmeasured); ok=true with (0,0) means measured
+	// and idle.
+	NetworkBytes(pid int) (in, out int64, ok bool)
+}
+
 // Enricher fills OS-specific envelope fields on a RawEvent in place (e.g.
 // the Linux backend reads /proc/<pid>/...) and returns the process
 // environment for posture capture. Optional: a nil Enricher means events
@@ -99,6 +116,43 @@ type Options struct {
 	MaxTracked          int // live-tree cap for never-exiting procs; 0 = unbounded
 	FlushInterval       time.Duration
 	Now                 func() time.Time
+	// LateSeed governs the late-seed re-resolution pass (lateseed.go): the
+	// deferred re-probe that upgrades a live run whose pidbridge seed arrived
+	// AFTER exec — the 30–266s `discovered` correlation lag that exec-time
+	// resolution always loses. The zero value means "all defaults" (the pass
+	// is ON); a negative LateSeed.Interval turns it off.
+	LateSeed LateSeedPolicy
+	// NetworkAccounting is the shared status handle written by whichever
+	// backend owns the per-process byte probes; the Observer only READS it, to
+	// republish in the health snapshot so doctor/dashboard can distinguish
+	// "measured zero" from "not measured". Optional (nil = off).
+	NetworkAccounting *NetworkAccounting
+	// TransportUnavailableReason is the reason a REQUESTED dial-in capture
+	// transport could not be created — a bind conflict on the listen address,
+	// an unwritable token file, the feature's config block left disabled. It
+	// is the "requested but not running" half of the TransportState tri-state
+	// (see HealthSnapshot.TransportState), and empty is the normal case.
+	//
+	// It is a PLAIN VALUE on Options, deliberately, rather than something the
+	// daemon attaches to the Backend. The obvious alternative — wrapping the
+	// assembled backend in a small decorator that answers
+	// TransportUnavailableSource — silently DESTROYS every other optional
+	// capability the wrapped backend implements: embedding an interface
+	// promotes only that interface's method set, so a type assertion for
+	// UnattributedCapturer (or NetworkSampler, or any capability added later)
+	// fails on the wrapper. That is not a hypothetical: the daemon probes
+	// UnattributedCapturer to decide whether cross-OS process rows are
+	// persisted at all, so a wrapper over a bridge-bearing baseline turned
+	// cross-OS capture off, silently, on exactly the path that exists to
+	// report a failure loudly. A decorator that must be revisited whenever a
+	// capability is added is a standing trap (CLAUDE.md rule 6); a field that
+	// never touches the backend cannot lose one.
+	//
+	// A backend that genuinely OWNS a failed transport may still report it
+	// through TransportUnavailableSource; that capability is unchanged and
+	// takes precedence. This field is for the case where the transport never
+	// became a backend at all.
+	TransportUnavailableReason string
 }
 
 // Observer is the orchestrator: it drains the backend, enriches, attributes,
@@ -117,6 +171,7 @@ type Observer struct {
 	batchSize           int
 	maxTracked          int
 	flushInterval       time.Duration
+	lateSeed            LateSeedPolicy
 	now                 func() time.Time
 	health              *Health
 
@@ -142,8 +197,40 @@ func NewObserver(opts Options) *Observer {
 		opts.Now = time.Now
 	}
 	name := ""
+	// transport is the capability probe (never a backend-name check, CLAUDE.md
+	// rule 3): a backend that owns a dial-in capture transport reports its
+	// connection health through it, and every other backend leaves it nil so
+	// the surfaces stay silent about a transport that does not exist.
+	var transport func() (TransportStats, bool)
+	// transportUnavailable is the SECOND half of the same probe: "you asked
+	// for the cross-OS feed and it is not running" must be a reportable state
+	// instead of silence. It has TWO sources, resolved here once and in this
+	// order — a backend that OWNS a failed transport reports it through the
+	// TransportUnavailableSource capability, and otherwise the plain
+	// Options.TransportUnavailableReason carries a transport that never
+	// became a backend at all. The backend is never wrapped to carry it (see
+	// Options.TransportUnavailableReason for what wrapping destroys).
+	var transportUnavailable func() string
+	var backendUnavailable func() string
 	if opts.Backend != nil {
 		name = opts.Backend.Name()
+		if src, ok := opts.Backend.(TransportStatsSource); ok {
+			transport = src.TransportStats
+		}
+		if src, ok := opts.Backend.(TransportUnavailableSource); ok {
+			backendUnavailable = src.TransportUnavailableReason
+		}
+	}
+	if backendUnavailable != nil || opts.TransportUnavailableReason != "" {
+		staticReason := opts.TransportUnavailableReason
+		transportUnavailable = func() string {
+			if backendUnavailable != nil {
+				if r := backendUnavailable(); r != "" {
+					return r
+				}
+			}
+			return staticReason
+		}
 	}
 	var excludeOwn map[string]bool
 	if len(opts.ExcludeOwnBasenames) > 0 {
@@ -167,8 +254,9 @@ func NewObserver(opts Options) *Observer {
 		batchSize:           opts.BatchSize,
 		maxTracked:          opts.MaxTracked,
 		flushInterval:       opts.FlushInterval,
+		lateSeed:            opts.LateSeed.withDefaults(),
 		now:                 opts.Now,
-		health:              newHealth(name),
+		health:              newHealth(name, opts.NetworkAccounting, transport, transportUnavailable),
 	}
 }
 
@@ -225,6 +313,17 @@ func (o *Observer) Run(ctx context.Context) error {
 	ticker := time.NewTicker(o.flushInterval)
 	defer ticker.Stop()
 
+	// Late-seed re-resolution ticker. It runs on THIS goroutine — the same one
+	// that drives the Attributor — so the pass needs no locking, exactly like
+	// exec-time resolution. A nil channel (policy disabled) blocks forever, so
+	// the select arm is simply never taken.
+	var lateSeedC <-chan time.Time
+	if o.lateSeed.Enabled() {
+		lateSeedTicker := time.NewTicker(o.lateSeed.Interval)
+		defer lateSeedTicker.Stop()
+		lateSeedC = lateSeedTicker.C
+	}
+
 	batch := make([]ProcessRun, 0, o.batchSize)
 	flush := func() {
 		if len(batch) == 0 {
@@ -255,7 +354,23 @@ func (o *Observer) Run(ctx context.Context) error {
 			}
 			o.health.setQueueDepth(int64(len(ch)))
 			if run, change := o.handle(&ev); change != ChangeNone && run != nil {
-				batch = append(batch, *run)
+				// SnapshotForPersist (not *run) is the persist boundary: it
+				// downsamples the live-chart ring into a FRESH slice, so the
+				// stored JSON stays small and the batched copy can never be
+				// mutated by subsequent in-place ring refreshes.
+				batch = append(batch, o.attr.SnapshotForPersist(run))
+				if len(batch) >= o.batchSize {
+					flush()
+				}
+			}
+		case <-lateSeedC:
+			// Re-probe the seed source for live runs whose pidbridge row landed
+			// after exec, and re-inherit down their subtrees. Every changed run
+			// is persisted through the same SnapshotForPersist boundary the
+			// lifecycle path uses, so the upgrade reaches the DB (and the
+			// dashboard's resource chart) on the very next flush.
+			for _, run := range o.lateSeedPass() {
+				batch = append(batch, o.attr.SnapshotForPersist(run))
 				if len(batch) >= o.batchSize {
 					flush()
 				}
@@ -264,6 +379,32 @@ func (o *Observer) Run(ctx context.Context) error {
 			flush()
 		}
 	}
+}
+
+// lateSeedPass runs one late-seed re-resolution and returns the runs whose
+// attribution changed. Split out of Run so tests can drive it deterministically
+// without a real ticker.
+//
+// Note what it deliberately does NOT re-apply: the ExcludeOwnBasenames drop and
+// the unattributed-capture policy in handle() are both gated on
+// `!run.Attributed()`, so an upgraded run bypasses them — which is exactly what
+// the exec path does for a run that had a seed at exec time. That is the point
+// for the daemon-launched terminals: `observer <tool>` is the PTY child whose
+// pid gets seeded, and self-exclusion must not survive a direct identity. It
+// can only resurrect runs that were dropped for being UNATTRIBUTED (or
+// self-excluded while unattributed) — the other drop reasons (no_start_time,
+// enrich_failed) reject the event before it ever enters the tree, so there is
+// nothing there for this pass to reach.
+func (o *Observer) lateSeedPass() []*ProcessRun {
+	res := o.attr.ReconcileLateSeeds(o.now(), o.lateSeed)
+	if len(res.Upgraded) == 0 {
+		return nil
+	}
+	o.health.addLateSeedUpgrades(int64(res.Roots), int64(res.Reinherited))
+	for _, run := range res.Upgraded {
+		o.health.incAttributed(run.Attribution.Tool)
+	}
+	return res.Upgraded
 }
 
 func (o *Observer) handleNetworkConnect(ctx context.Context, ev *RawEvent) {
@@ -414,14 +555,39 @@ type Health struct {
 	eventsTotal      map[EventType]int64
 	dropped          map[DropReason]int64
 	attributedByTool map[string]int64
+	// lateSeedRoots / lateSeedReinherited count what the late-seed
+	// re-resolution pass recovered: runs upgraded by a seed that arrived after
+	// exec, and descendants re-inherited from them. Zero on a box where every
+	// seed lands before its process is observed; non-zero is the measure of the
+	// `discovered`-lag gap this pass closes.
+	lateSeedRoots       int64
+	lateSeedReinherited int64
+	// net is the READ-ONLY handle onto the capture backend's network-accounting
+	// status (the backend is its only writer). Nil = off.
+	net *NetworkAccounting
+	// transport is the READ-ONLY probe onto the backend's dial-in transport
+	// stats, resolved ONCE from the TransportStatsSource capability at
+	// construction. Nil (or an ok=false result) means this backend has no such
+	// transport, which the surfaces render as silence — never as a transport
+	// with zero connections.
+	transport func() (TransportStats, bool)
+	// transportUnavailable is the READ-ONLY probe onto the reason a REQUESTED
+	// dial-in transport could not be created, resolved once from the
+	// TransportUnavailableSource capability. Health is the SINGLE resolver of
+	// the resulting tri-state (CLAUDE.md rule 4): every consumer reads
+	// HealthSnapshot.TransportState and none re-derives it from config.
+	transportUnavailable func() string
 }
 
-func newHealth(backendName string) *Health {
+func newHealth(backendName string, net *NetworkAccounting, transport func() (TransportStats, bool), transportUnavailable func() string) *Health {
 	return &Health{
-		backendName:      backendName,
-		eventsTotal:      make(map[EventType]int64),
-		dropped:          make(map[DropReason]int64),
-		attributedByTool: make(map[string]int64),
+		net:                  net,
+		transport:            transport,
+		transportUnavailable: transportUnavailable,
+		backendName:          backendName,
+		eventsTotal:          make(map[EventType]int64),
+		dropped:              make(map[DropReason]int64),
+		attributedByTool:     make(map[string]int64),
 	}
 }
 
@@ -436,6 +602,14 @@ func (h *Health) incAttributed(tool string) {
 		tool = "unknown"
 	}
 	h.attributedByTool[tool]++
+	h.mu.Unlock()
+}
+
+// addLateSeedUpgrades records one late-seed pass's yield.
+func (h *Health) addLateSeedUpgrades(roots, reinherited int64) {
+	h.mu.Lock()
+	h.lateSeedRoots += roots
+	h.lateSeedReinherited += reinherited
 	h.mu.Unlock()
 }
 
@@ -455,21 +629,82 @@ type HealthSnapshot struct {
 	EventsTotal      map[EventType]int64
 	Dropped          map[DropReason]int64
 	AttributedByTool map[string]int64
+	// LateSeedRoots / LateSeedReinherited report what the late-seed
+	// re-resolution pass recovered (see Health.lateSeedRoots).
+	LateSeedRoots       int64
+	LateSeedReinherited int64
+	// NetworkAccountingMode is one of the NetworkAccounting* constants and
+	// NetworkAccountingReason explains a non-live mode ("missing CAP_BPF", …).
+	// This is the honest-degradation surface: "unavailable" means per-process
+	// byte counts are NOT measured, so a consumer must not render them as zero.
+	NetworkAccountingMode   string
+	NetworkAccountingReason string
+	// TransportState is one of the TransportState* constants and is the
+	// honesty gate on the Transport field below. It is a TRI-state, not a
+	// bool, because three different facts have to stay distinguishable:
+	//
+	//   none        — no dial-in transport was requested; the consumer shows
+	//                 NOTHING (the 99% install).
+	//   unavailable — one was requested and could not be created; the
+	//                 consumer must say so, with TransportUnavailableReason.
+	//                 Rendering this as silence is indistinguishable from a
+	//                 feature that was never enabled.
+	//   configured  — the counters in Transport are real, INCLUDING when they
+	//                 are all zero (the never-connected waiting state).
+	//
+	// Same trap as MetricSample.NetMeasured: absent and zero are different
+	// facts, and so are absent and broken.
+	TransportState string
+	// TransportUnavailableReason explains a TransportStateUnavailable, and is
+	// empty in every other state. A state with no reason is not actionable,
+	// so the resolver refuses to claim the state without one.
+	TransportUnavailableReason string
+	// Transport carries the transport's connection counters when
+	// TransportState is configured, and is the zero value otherwise.
+	Transport TransportStats
+}
+
+// TransportConfigured reports whether the snapshot's Transport counters are
+// real. It is a convenience over TransportState — the state itself is the
+// carried fact, so no consumer stores a second boolean.
+func (h HealthSnapshot) TransportConfigured() bool {
+	return h.TransportState == TransportStateConfigured
 }
 
 // Snapshot returns a deep copy of the current counters.
 func (h *Health) Snapshot() HealthSnapshot {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	mode, reason := h.net.Status()
 	s := HealthSnapshot{
-		BackendName:      h.backendName,
-		BackendUp:        h.backendUp,
-		LastError:        h.lastError,
-		QueueDepth:       h.queueDepth,
-		Unattributed:     h.unattributed,
-		EventsTotal:      make(map[EventType]int64, len(h.eventsTotal)),
-		Dropped:          make(map[DropReason]int64, len(h.dropped)),
-		AttributedByTool: make(map[string]int64, len(h.attributedByTool)),
+		NetworkAccountingMode:   mode,
+		NetworkAccountingReason: reason,
+		BackendName:             h.backendName,
+		BackendUp:               h.backendUp,
+		LastError:               h.lastError,
+		QueueDepth:              h.queueDepth,
+		Unattributed:            h.unattributed,
+		LateSeedRoots:           h.lateSeedRoots,
+		LateSeedReinherited:     h.lateSeedReinherited,
+		EventsTotal:             make(map[EventType]int64, len(h.eventsTotal)),
+		Dropped:                 make(map[DropReason]int64, len(h.dropped)),
+		AttributedByTool:        make(map[string]int64, len(h.attributedByTool)),
+	}
+	// Resolve the transport tri-state HERE and nowhere else. An existing
+	// transport wins over a recorded failure: if one is actually up, its
+	// counters are the live truth and a stale "could not start" alongside
+	// them would be the contradiction the whole surface exists to avoid.
+	s.TransportState = TransportStateNone
+	if h.transport != nil {
+		if ts, ok := h.transport(); ok {
+			s.Transport, s.TransportState = ts, TransportStateConfigured
+		}
+	}
+	if s.TransportState == TransportStateNone && h.transportUnavailable != nil {
+		if reason := h.transportUnavailable(); reason != "" {
+			s.TransportState = TransportStateUnavailable
+			s.TransportUnavailableReason = reason
+		}
 	}
 	maps.Copy(s.EventsTotal, h.eventsTotal)
 	maps.Copy(s.Dropped, h.dropped)

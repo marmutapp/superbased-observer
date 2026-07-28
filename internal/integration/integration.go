@@ -182,6 +182,22 @@ type Capability struct {
 	// the dashboard install endpoint, the doctor) dispatch on the SHAPE of
 	// this field, never on tool name (CLAUDE.md #3).
 	Binary *BinaryResolveSpec
+	// AuthEnv lists the environment-variable NAMES (never values) a tool reads
+	// its provider credentials from at runtime. The attach client forwards the
+	// caller's values for these keys claude-style — presence-forwarded (an
+	// absent key is skipped, a present-but-empty `KEY=` forwarded verbatim),
+	// layered last so launchChildEnv's inherited daemon env loses to them
+	// (last-wins) — so a shell-exported-only key (never written to any config
+	// file) reaches the daemon-spawned child exactly as it would a bare launch,
+	// which inherits the caller's os.Environ() directly. A zero value means "no
+	// grounded credential-env" — the tool authenticates via a config file,
+	// OAuth, or a keychain, OR its env surface is unverified — never a
+	// fabricated key. NAMES ONLY: TestAuthEnvWellFormed enforces that no value
+	// leaks in (no `=`, no whitespace, not OBSERVER_-prefixed, not a launcher-
+	// closure-owned routing/profile key, no intra-row duplicate), and
+	// TestAuthEnvImpliesAttachable pins that only an attachable row carries keys
+	// (a bare-only tool has no attach socket to forward across).
+	AuthEnv []string
 }
 
 // registry is the capability table, keyed by the adapter's canonical tool
@@ -226,6 +242,12 @@ var registry = map[string]Capability{
 		// Attachable: `observer claude --attach` hands the PTY to the daemon
 		// (session-attach v1 scope).
 		Attach: &AttachSpec{Subcommand: "claude"},
+		// Credential env forwarded across the attach socket. Grounded:
+		// cmd/observer/claude.go prepareClaudeEnv honors a preset
+		// ANTHROPIC_AUTH_TOKEN (docs/proxy-wrappers.md); ANTHROPIC_API_KEY is
+		// claude-code's standard key env. NAMES only — the caller's values ride
+		// the socket so a shell-exported key reaches the daemon-spawned child.
+		AuthEnv: []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"},
 		// Native resume GROUNDED (session-attach design Phase 3, decision #6:
 		// claude-code first). Verified live 2026-07-19 against the installed
 		// CLI: `claude --help` lists `-r, --resume [value]` — "Resume a
@@ -262,6 +284,9 @@ var registry = map[string]Capability{
 		// Attachable: `observer codex --attach` hands the PTY to the daemon
 		// (session-attach v1 scope).
 		Attach: &AttachSpec{Subcommand: "codex"},
+		// Credential env forwarded across the attach socket. Grounded:
+		// cmd/observer/codex.go's sk-/JWT auth paths read OPENAI_API_KEY.
+		AuthEnv: []string{"OPENAI_API_KEY"},
 		// Native resume GROUNDED (session-attach design Phase 3, decision #6:
 		// codex first). Verified live 2026-07-19 against the installed CLI:
 		// `codex resume [SESSION_ID] [PROMPT]` — "Resume a previous interactive
@@ -296,6 +321,13 @@ var registry = map[string]Capability{
 		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
 		// — no prompt seeding, token capture path unchanged.
 		Attach: &AttachSpec{Subcommand: "opencode"},
+		// Native resume GROUNDED, live-verified 2026-07-24: `opencode --session
+		// <id>` reattaches the real session; id is the raw observer SessionID
+		// (`ses_…`). The `observer opencode` launcher maps `--resume <id>` to it.
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "opencode", IDMechanism: "flag:--session"},
+		// AuthEnv zero: opencode's primary auth is its `opencode auth` file
+		// store; per-provider env keys (OPENAI_API_KEY / ANTHROPIC_API_KEY / …)
+		// are candidates but unverified as the effective runtime source here.
 		// Binary resolution + grounded installs. Unix launcher resolves
 		// "opencode"; npm opencode-ai@latest (any OS) + the official curl
 		// installer on linux/darwin. Its own bin dir (.opencode/bin) is a
@@ -344,6 +376,34 @@ var registry = map[string]Capability{
 		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
 		// — no prompt seeding, token capture path unchanged.
 		Attach: &AttachSpec{Subcommand: "cursor"},
+		// Resume LIVE-CONFIRMED 2026-07-25 (the 2026-07-24 auth block is gone —
+		// operator logged in, `cursor-agent status` → "Logged in as …").
+		// `cursor-agent --help` lists `--resume [chatId]  Select a session to
+		// resume`, and the chatId is our stored SessionID VERBATIM: the on-disk
+		// chat dirs ~/.cursor/chats/<hash>/<chatId>/ are named with the exact
+		// sessions.id values our adapter stores, so NO id transform is needed.
+		// SPELLING (operator-corrected 2026-07-25): pass it JOINED as
+		// `--resume=<chatId>`, not space-separated. The flag takes an OPTIONAL
+		// value (`[chatId]`, help reports `default: false`), so the `=` form is
+		// the unambiguous spelling; the space form relies on the parser electing
+		// to consume the next token instead of leaving the flag bare and letting
+		// the id fall through as a positional. resume_launcher.go's "cursor" row
+		// therefore sets joined:true.
+		// CONTENT-LEVEL PROOF: `cursor-agent --resume=<id> -p …` run against a
+		// chat this session never wrote to, asked to quote the conversation's
+		// first user message, answered with that message verbatim — the prior
+		// transcript really is loaded, not merely a chat re-opened. Structural
+		// proof alongside it: createdAtMs + title preserved, store.db grew,
+		// no new chat dir; CONTROL — the same command WITHOUT --resume created
+		// a new chat dir. Caveat (honest, non-blocking): the call is flaky over
+		// this network — `RetriableError: WritableIterable is closed` against
+		// agentn.global.api5.cursor.sh, typically clearing within 1–3 attempts,
+		// on BOTH argv forms and on non-resume calls too. That is TRANSPORT
+		// flakiness, not a broken resume mechanism; retry before concluding.
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "cursor", IDMechanism: "flag:--resume"},
+		// AuthEnv zero: cursor-agent authenticates via OAuth by default;
+		// CURSOR_API_KEY is upstream-plausible but ungrounded as the runtime
+		// key env, so no key is declared (never fabricate one).
 		// Binary resolution + grounded install. Unix launcher resolves
 		// "cursor-agent"; the installer drops versioned binaries under
 		// .local/share/cursor-agent/versions/*. Official installer script
@@ -435,6 +495,19 @@ var registry = map[string]Capability{
 		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
 		// — no prompt seeding, token capture path unchanged.
 		Attach: &AttachSpec{Subcommand: "copilot-cli"},
+		// Native resume GROUNDED, live-verified 2026-07-24: `copilot
+		// --session-id <id>` reattaches the real session; id is a raw uuid. The
+		// `observer copilot-cli` launcher maps `--resume <id>` to it.
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "copilot-cli", IDMechanism: "flag:--session-id"},
+		// Credential env forwarded across the attach socket. COPILOT_PROVIDER_API_KEY
+		// is the BYOK model-provider key (repo-grounded in copilotcli.go — the
+		// COPILOT_PROVIDER_* BYOK lane). The other three are the upstream-
+		// documented GitHub-auth precedence chain (docs.github.com,
+		// "Authenticating GitHub Copilot CLI"): COPILOT_GITHUB_TOKEN > GH_TOKEN
+		// > GITHUB_TOKEN, and an env value silently overrides stored OAuth — so
+		// forwarding the caller's value preserves the profile a bare launch
+		// would use. NAMES only.
+		AuthEnv: []string{"COPILOT_PROVIDER_API_KEY", "COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"},
 		// Binary resolution + grounded installs. Unix launcher resolves
 		// "copilot"; npm @github/copilot (any OS) + the cask/script/winget
 		// channels (docs.github.com copilot-cli install).
@@ -495,6 +568,13 @@ var registry = map[string]Capability{
 		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
 		// — no prompt seeding, token capture path unchanged.
 		Attach: &AttachSpec{Subcommand: "kilo"},
+		// Native resume GROUNDED, live-verified 2026-07-24: `kilo --session <id>`
+		// (OpenCode-fork surface) reattaches the real session; id is raw. The
+		// `observer kilo` launcher maps `--resume <id>` to it.
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "kilo", IDMechanism: "flag:--session"},
+		// AuthEnv zero: KILO_API_KEY appears in Kilo docs, but the CLI's
+		// env-read of it is ungrounded (it talks to the api.kilo.ai gateway
+		// directly); no key declared until a live read is grounded.
 		// Binary resolution + grounded installs. Unix launcher resolves
 		// "kilo"; npm @kilocode/cli (any OS) + the script/brew channels
 		// (kilo.ai/docs/cli). Windows shim grounded at
@@ -543,6 +623,13 @@ var registry = map[string]Capability{
 		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
 		// — no prompt seeding, token capture path unchanged.
 		Attach: &AttachSpec{Subcommand: "cline-cli"},
+		// Native resume GROUNDED, live-verified 2026-07-24: `cline --id <id>`
+		// reattaches the real session; id is raw (e.g. `1782548283719_prf8j`).
+		// The `observer cline-cli` launcher maps `--resume <id>` to it.
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "cline-cli", IDMechanism: "flag:--id"},
+		// AuthEnv zero: cline-cli reads provider keys from its providers.json
+		// file store (`cline auth … -k`), not an env var — file auth, no
+		// grounded credential-env to forward.
 		// Binary resolution + grounded install. Unix launcher resolves
 		// "cline"; npm-distributed `cline` 3.x (docs/clinecli-adapter.md).
 		Binary: &BinaryResolveSpec{
@@ -626,6 +713,19 @@ var registry = map[string]Capability{
 		// gates --continue-from seeding (incompatible with attach); plain attach
 		// opens the TUI seedless.
 		Attach: &AttachSpec{Subcommand: "hermes"},
+		// Native resume GROUNDED, live-verified 2026-07-24: `hermes --resume
+		// <id>` reattaches the real session; id is raw (`20260627_132748_325fea`
+		// shape). Composes with the config.yaml provider route (the launcher
+		// prepends `--provider observer`). The `observer hermes` launcher maps
+		// `--resume <id>` to it.
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "hermes", IDMechanism: "flag:--resume"},
+		// Credential env forwarded across the attach socket. Grounded:
+		// hermes.go hermesDefaultKeyEnv (OPENROUTER_API_KEY) — the default
+		// key_env the observer provider resolves at runtime. A NON-default
+		// `--key-env NAME` is dynamic and handled at the launcher call site
+		// (hermes.go sets authEnvExtra to that NAME); the registry row carries
+		// only the static default.
+		AuthEnv: []string{"OPENROUTER_API_KEY"},
 		// Binary resolution + grounded install. Unix launcher resolves
 		// "hermes"; its bundled node prefix (.hermes/node/bin) + .hermes/bin
 		// are per-tool extras (the off-PATH hermes-bundled npm prefix from
@@ -685,6 +785,21 @@ var registry = map[string]Capability{
 		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
 		// — no prompt seeding, token capture path unchanged.
 		Attach: &AttachSpec{Subcommand: "gemini"},
+		// Native resume GROUNDED, live-verified 2026-07-24 (v0.49.0): `gemini
+		// --resume <uuid>` honors a full session UUID (help documents only
+		// index/latest; older-UUID disambiguation confirmed live). Each resume
+		// writes a continuation .jsonl carrying the SAME sessionId (native
+		// checkpointing — not a new logical session). The `observer gemini`
+		// launcher maps `--resume <id>` to it.
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "gemini", IDMechanism: "flag:--resume"},
+		// Credential env forwarded across the attach socket. Upstream-verified
+		// at geminicli.com/docs/get-started/authentication: GEMINI_API_KEY =
+		// AI-Studio mode key, GOOGLE_API_KEY = Vertex express-mode key (mode-
+		// specific, NOT a precedence pair); GOOGLE_APPLICATION_CREDENTIALS =
+		// Vertex service-account JSON path; the project var is checked
+		// GOOGLE_CLOUD_PROJECT then GOOGLE_CLOUD_PROJECT_ID; GOOGLE_CLOUD_LOCATION
+		// is required for Vertex. NAMES only.
+		AuthEnv: []string{"GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT_ID", "GOOGLE_CLOUD_LOCATION"},
 		// Binary resolution + grounded install. Unix launcher resolves
 		// "gemini"; npm @google/gemini-cli (any OS).
 		Binary: &BinaryResolveSpec{
@@ -754,6 +869,13 @@ var registry = map[string]Capability{
 		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
 		// — no prompt seeding, token capture path unchanged.
 		Attach: &AttachSpec{Subcommand: "openclaw"},
+		// Resume stays ResumeNone (2026-07-24): no non-interactive resume surface
+		// — the only entry is the picker-only `sessions` command, and the
+		// documented runtime-block (project_openclaw_runtime_block) prevents
+		// probing a resume argv. The dashboard offers the handoff-fork resume.
+		// AuthEnv zero: openclaw authenticates via OAuth tokens in its
+		// agent-dir auth store (auth-profiles.json); no grounded runtime key
+		// env to forward.
 		// Binary resolution + grounded installs. Unix launcher resolves
 		// "openclaw"; the vendor script is primary (docs.openclaw.ai/install),
 		// npm is an alternate (needs `openclaw onboard --install-daemon`
@@ -803,6 +925,16 @@ var registry = map[string]Capability{
 		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
 		// — no prompt seeding, token capture path unchanged.
 		Attach: &AttachSpec{Subcommand: "pi"},
+		// Native resume GROUNDED, live-verified 2026-07-24: `pi --session <id>`
+		// reattaches the real session (accepts full or partial uuid; the
+		// launcher passes the full id). The `observer pi` launcher maps
+		// `--resume <id>` to it.
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "pi", IDMechanism: "flag:--session"},
+		// Credential env forwarded across the attach socket. Grounded: pi.go
+		// writes the "observer" provider with apiKey = the env-var NAME
+		// OPENAI_API_KEY (no secret on disk — pi resolves it from the env at
+		// runtime), so that IS the key env the caller exports. NAMES only.
+		AuthEnv: []string{"OPENAI_API_KEY"},
 		// Binary resolution + grounded installs. Unix launcher resolves
 		// "pi"; npm @earendil-works/pi-coding-agent (earendil-works/pi,
 		// pi.dev — NOT Inflection) + the official install script.
@@ -853,6 +985,13 @@ var registry = map[string]Capability{
 		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
 		// — no prompt seeding, token capture path unchanged.
 		Attach: &AttachSpec{Subcommand: "antigravity-cli"},
+		// Native resume GROUNDED, live-verified 2026-07-24 (structural: id echo +
+		// no new .db; space form accepted): `agy --conversation <UUID>`
+		// reattaches the real session; id is a raw uuid. The `observer
+		// antigravity-cli` launcher maps `--resume <id>` to it.
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "antigravity-cli", IDMechanism: "flag:--conversation"},
+		// AuthEnv zero: the agy CLI authenticates via Google OAuth, not a key
+		// env — no grounded credential-env to forward.
 		// Binary resolution + grounded install. Unix launcher resolves "agy"
 		// (the agy CLI); official install script (antigravity.google/docs/
 		// cli/install). Windows hint is display-only (no Windows binary
@@ -929,6 +1068,13 @@ var registry = map[string]Capability{
 		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
 		// — no prompt seeding, token capture path unchanged.
 		Attach: &AttachSpec{Subcommand: "qwen"},
+		// Native resume GROUNDED, live-verified 2026-07-24: `qwen --resume <id>`
+		// reattaches the real session; id is raw. The `observer qwen` launcher
+		// maps `--resume <id>` to it.
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "qwen", IDMechanism: "flag:--resume"},
+		// AuthEnv zero: qwen-code keys live inside settings.json
+		// (modelProviders[].apiKey / envKey), a file store — no grounded
+		// top-level runtime key env to forward.
 		// Binary resolution + grounded installs. Unix launcher resolves
 		// "qwen"; npm @qwen-code/qwen-code@latest (any OS) + the standalone
 		// install script + brew (QwenLM/qwen-code + official docs).
@@ -973,6 +1119,16 @@ var registry = map[string]Capability{
 		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
 		// — no prompt seeding, token capture path unchanged.
 		Attach: &AttachSpec{Subcommand: "kiro"},
+		// Native resume GROUNDED, live-verified 2026-07-24: `kiro-cli chat
+		// --resume-id <id>` — the resume flag lives on the `chat` SUBCOMMAND. The
+		// `observer kiro` launcher maps `--resume <id>` to it (composes the chat
+		// subcommand + --resume-id).
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "kiro", IDMechanism: "flag:--resume-id"},
+		// AuthEnv zero — DELIBERATE exclusion: kiro-cli uses the AWS credential
+		// chain (SigV4). Forwarding the AWS_* family (AWS_ACCESS_KEY_ID /
+		// AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN / AWS_PROFILE / …) is a much
+		// larger blast radius than a single provider key, so it is deferred, not
+		// declared here.
 		// Binary resolution + grounded install. Unix launcher resolves
 		// "kiro-cli"; official install script (kiro.dev/docs/cli/
 		// installation). Homebrew is explicitly NOT supported per vendor
@@ -1031,6 +1187,14 @@ var registry = map[string]Capability{
 		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
 		// — no prompt seeding, token capture path unchanged.
 		Attach: &AttachSpec{Subcommand: "grok"},
+		// Native resume GROUNDED, live-verified 2026-07-24: `grok --resume <id>`
+		// reattaches the real session; id is raw. The `observer grok` launcher
+		// maps `--resume <id>` to it.
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "grok", IDMechanism: "flag:--resume"},
+		// Credential env forwarded across the attach socket. Upstream-verified
+		// (docs.x.ai/build/overview): XAI_API_KEY is grok's documented
+		// headless / non-browser auth key. NAMES only.
+		AuthEnv: []string{"XAI_API_KEY"},
 		// Binary resolution + grounded installs. Unix launcher resolves
 		// "grok"; npm @xai-official/grok (any OS) + the official install
 		// script (docs.x.ai/build/overview).
@@ -1106,6 +1270,17 @@ var registry = map[string]Capability{
 		// gates --continue-from seeding (incompatible with attach); plain attach
 		// opens the TUI seedless.
 		Attach: &AttachSpec{Subcommand: "kimi"},
+		// Native resume GROUNDED, live-verified 2026-07-24: `kimi --session <id>`
+		// (short `-S`) reattaches the real session, but the id MUST be the
+		// PREFIXED form `session_<uuid>` — a bare uuid HARD-FAILS. Our adapter
+		// already stores the SessionID in exactly that prefixed form (the
+		// `session_<uuid>` directory component — internal/adapter/kimicode/
+		// paths.go::sessionIDFromPath), so the `observer kimi` launcher's
+		// ensure-prefix transform is idempotent (a stored id passes through). The
+		// launcher maps `--resume <id>` to it.
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "kimi", IDMechanism: "flag:--session"},
+		// AuthEnv zero: kimi-code reads its key from [providers.*] in
+		// ~/.kimi-code/config.toml — file auth, no grounded runtime key env.
 		// Binary resolution. Unix launcher resolves "kimi". No grounded
 		// install channel yet (research pending) → Installs nil, Windows nil.
 		Binary: &BinaryResolveSpec{Names: BinaryNames{Unix: []string{"kimi"}}},
@@ -1191,6 +1366,13 @@ var registry = map[string]Capability{
 		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
 		// — no prompt seeding, token capture path unchanged.
 		Attach: &AttachSpec{Subcommand: "devin"},
+		// Native resume GROUNDED, live-verified 2026-07-24: `devin --resume <id>`
+		// reattaches the real session; id is a human MNEMONIC (e.g.
+		// `noon-quince`) — the sessions.db primary key == our SessionID. The
+		// `observer devin` launcher maps `--resume <id>` to it.
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "devin", IDMechanism: "flag:--resume"},
+		// AuthEnv zero: devin talks to Cognition's own backend with no grounded
+		// key env (file/OAuth auth) — no credential-env to forward.
 		// Binary resolution + grounded install. Unix launcher resolves
 		// "devin"; official install script (devin.ai/cli). No official
 		// Windows path — the winget listing is third-party, not shipped.
@@ -1232,6 +1414,12 @@ var registry = map[string]Capability{
 		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
 		// — no prompt seeding, token capture path unchanged.
 		Attach: &AttachSpec{Subcommand: "qoder"},
+		// Native resume GROUNDED, live-verified 2026-07-24: `qodercli --resume
+		// <id>` reattaches the real session; id is a raw uuid (binary is
+		// `qodercli`). The `observer qoder` launcher maps `--resume <id>` to it.
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "qoder", IDMechanism: "flag:--resume"},
+		// AuthEnv zero: qoder uses PAT auth to api.qoder.com (file store), no
+		// grounded runtime key env to forward.
 		// Binary resolution + grounded installs. Unix launcher resolves
 		// "qodercli" (the binary is qodercli, not qoder); npm
 		// @qoder-ai/qodercli (any OS) + the official install script
@@ -1325,6 +1513,16 @@ var registry = map[string]Capability{
 		// Attach grounded 2026-07-24 (attach-all-launchers); PTY handoff only
 		// — no prompt seeding, token capture path unchanged.
 		Attach: &AttachSpec{Subcommand: "goose"},
+		// Native resume GROUNDED, live-verified 2026-07-24: `goose session
+		// --resume --session-id <RAW>` reattaches the real session under the
+		// `session` SUBCOMMAND. Observer stores the SCOPED id `<id>@<hash8>`
+		// (scopedSessionID, internal/adapter/goose/parse.go), so the `observer
+		// goose` launcher STRIPS everything from the first `@` before composing
+		// the native argv. It maps `--resume <id>` to it.
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "goose", IDMechanism: "flag:--session-id"},
+		// AuthEnv zero: goose resolves provider keys from its keyring / config.yaml
+		// by default (per-provider env keys exist but are not the grounded runtime
+		// source here) — file auth, no key declared.
 		// Binary resolution + grounded installs. Unix launcher resolves
 		// "goose"; its installer drops the binary under .local/bin (a
 		// per-tool extra). Official install script + brew (repo moved

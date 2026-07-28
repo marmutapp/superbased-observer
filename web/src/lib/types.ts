@@ -52,6 +52,12 @@ export type StatusSnapshot = {
   // timestamps to auto-clear after a real restart.
   started_at?: string;
   uptime_seconds?: number;
+  // host_os is the DAEMON's runtime.GOOS ("darwin" / "linux" /
+  // "windows") — the machine whose PTYs the terminals attach to, which
+  // is NOT necessarily the machine running this browser. The terminal
+  // key bar labels its modifier keys from it (lib/keyPlatform).
+  // Optional on the wire: an older daemon omits it entirely.
+  host_os?: string;
 };
 
 // ---------- /api/health/watcher ----------
@@ -1340,6 +1346,15 @@ export type ActionFullText = {
 };
 
 export type MessageRow = {
+  // seq is the row's 1..N ordinal in CHRONOLOGICAL order, assigned
+  // server-side over the whole timeline. Stable across pagination and
+  // across any sort_by reordering — the "#" column renders it (a
+  // page-relative index would renumber under a non-default sort).
+  // Non-optional on purpose: the handler assigns it unconditionally, and a
+  // `?? i + 1` style fallback in a renderer would silently reinstate exactly
+  // the page-relative numbering this field exists to replace. It also doubles
+  // as the row-identity fallback for React keys when message_id is empty.
+  seq: number;
   message_id: string;
   timestamp: string;
   role: string;
@@ -1888,6 +1903,22 @@ export type DoctorReport = {
   fail: number;
   all_ok: boolean;
   generated_at: string;
+  // local_detail_withheld marks this response as the remote-facing
+  // projection: the caller reached the route over a remotely-exposed
+  // listener, so every filesystem root the daemon could identify has
+  // been rewritten to a placeholder ("~", "<config>", "<db>", "<exe>",
+  // "<tmp>", "<token-file>", "<other-home>"/"<other-home-N>") in each
+  // check's message and details. Checks, statuses and counts are
+  // unchanged. It is NOT a claim of complete redaction — paths under no
+  // known root, OS-convention paths like /etc/codex/*.toml, and the org
+  // enrolment check's user email all survive it.
+  //
+  // OPTIONAL ON THE WIRE, two ways: the Go field carries `omitempty`, so
+  // even a current daemon omits it on the local projection, and a daemon
+  // older than this feature never sends it at all. `undefined` therefore
+  // means "not withheld" and must render exactly like `false` — never as
+  // a banner.
+  local_detail_withheld?: boolean;
 };
 
 // GET /api/health/failures — recent failures grouped by command

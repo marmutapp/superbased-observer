@@ -8,7 +8,23 @@ import (
 
 // DefaultCapabilityTTL is the execute-capability lifetime — deliberately short
 // (plan §4.2: single-use, short-lived, session- AND action-bound).
-const DefaultCapabilityTTL = 2 * time.Minute
+//
+// Raised 2m → 10m on 2026-07-25 (mobile terminal-continuity arc). The original
+// 2 minutes assumed the owner and the remote device were the same person at two
+// screens; in practice the capability + confirm are conveyed out-of-band (email,
+// chat, a password manager) and the human round-trip — leave the browser, open
+// the mail app, copy two codes, come back — routinely exceeds it, so the code
+// expired mid-transit and had to be re-issued. 10 minutes still bounds a leaked
+// code to a single short window.
+//
+// The bound this widens is EXPOSURE TIME ONLY. Every other property of §4.2 is
+// unchanged and must stay unchanged: the capability is still SINGLE-USE (burned
+// on any lookup hit), still bound to (device session, action, terminal handle),
+// still paired with a server-minted confirm nonce, still minted only by the
+// owner-loopback approve-execute surface, and still dropped wholesale when its
+// session is revoked. Operators who want the old window back set
+// [remote].capability_ttl_minutes = 2.
+const DefaultCapabilityTTL = 10 * time.Minute
 
 // ActionTerminalControl is the fixed action a terminal-control capability is
 // minted against (plan §4.γ.1). The capability is additionally bound to the

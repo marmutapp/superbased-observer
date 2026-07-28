@@ -116,7 +116,7 @@ func TestGuardApproveRevokeCmds(t *testing.T) {
 	}
 
 	// The grant is live in the store lookup the guard consults.
-	database, err := db.Open(context.Background(), db.Options{Path: dbPath, SkipIntegrityCheck: true})
+	database, err := db.Open(context.Background(), db.Options{Path: dbPath})
 	if err != nil {
 		t.Fatal(err)
 	}

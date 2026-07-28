@@ -30,6 +30,66 @@ var (
 	ErrCapabilityRejected = errors.New("termlease: execute capability or bound confirm rejected")
 	// ErrMissingField — a required identity field on the request was empty.
 	ErrMissingField = errors.New("termlease: missing required authorization field")
+	// ErrStandingUnavailable — the standing credential leg denied for a reason
+	// that does NOT blame the secret: standing access is currently switched off,
+	// or the attempt was rate-limited. The refusal is exactly as hard as
+	// ErrCapabilityRejected (no lease is granted), but it carries the fact that
+	// the presented secret was never judged, so a caller must not react by
+	// destroying it. Introduced 2026-07-25 (mobile terminal-continuity arc): the
+	// device UI clears its saved standing secret on a credential rejection, and
+	// folding these transient refusals into ErrCapabilityRejected made a
+	// momentary rate-limit or a disabled-then-re-enabled toggle wipe a perfectly
+	// valid secret, forcing the operator to mint a new one.
+	ErrStandingUnavailable = errors.New("termlease: standing terminal-control temporarily unavailable")
+	// ErrStandingRevoked — the standing credential leg denied because NO
+	// standing secret exists on this server at all: it was revoked (the revoke
+	// path DELETES the hash at rest) and never re-provisioned. Unlike
+	// ErrStandingUnavailable this is a PERMANENT judgement about the presented
+	// secret — not because the secret was compared (it wasn't; there is nothing
+	// to compare it against) but because no secret a device is holding can ever
+	// be accepted again: the only way back is a fresh mint, which issues a
+	// DIFFERENT secret. A device may therefore discard its saved secret here,
+	// exactly as it does for ErrCapabilityRejected.
+	//
+	// It is deliberately distinct from ErrStandingUnavailable, which covers the
+	// states that can flip back on their own (standing access temporarily
+	// switched off with the secret still at rest, rate limiting): discarding a
+	// still-valid secret costs the operator a manual re-mint, so only a state
+	// the server can prove is terminal for that secret may trigger it.
+	// Introduced 2026-07-25 (operator decision A2).
+	ErrStandingRevoked = errors.New("termlease: standing terminal-control secret has been revoked")
+)
+
+// StandingDenial classifies WHY a standing-credential verify denied. It exists
+// so one verify call reports both the outcome and its blame — a separate "why
+// did the last one fail?" query would race concurrent acquires.
+//
+// The classification changes NO authorization outcome (every non-None value
+// denies exactly as hard); it decides only whether the DEVICE should destroy
+// its saved standing secret, which is irreversible for the user (the operator
+// must mint and convey a new one).
+type StandingDenial uint8
+
+const (
+	// StandingDenialNone is the zero value: no denial. Meaningful only when the
+	// verify reported ok — it must never be used to describe a refusal.
+	StandingDenialNone StandingDenial = iota
+	// StandingDenialUnavailable — the verifier refused WITHOUT ever judging the
+	// presented secret, in a state that can flip back on its own: standing
+	// access temporarily switched off (secret still at rest), or rate limiting.
+	// The device MUST keep its secret. This is the fail-safe default for any
+	// condition a verifier cannot positively classify.
+	StandingDenialUnavailable
+	// StandingDenialBadSecret — the verifier JUDGED the presented value and
+	// rejected it (wrong/rotated secret, or an undecodable one). The device may
+	// discard it.
+	StandingDenialBadSecret
+	// StandingDenialRevoked — no standing secret exists at rest at all: it was
+	// revoked and never re-provisioned. No secret any device holds can be
+	// accepted again (a fresh mint issues a different one), so the device may
+	// discard it. Reserved for a state the server can PROVE — never inferred
+	// from a merely-disabled gate.
+	StandingDenialRevoked
 )
 
 // WriterGrant is the unforgeable proof that the full §4.δ conjunction held for
@@ -107,6 +167,33 @@ type StandingVerifier interface {
 	VerifyStandingTerminalControl(secret, deviceSessionID, handle string) bool
 }
 
+// ReasoningStandingVerifier is an ADDITIVE optional interface a StandingVerifier
+// may also implement to report, in the SAME call, HOW a denial should be blamed.
+// It exists so the device UI can distinguish "your secret is dead — stop using
+// it" from "not right now — keep it and retry"; without it every denial looks
+// like a credential rejection and the device throws away a still-valid secret.
+//
+// Returning the classification from the verify call itself (rather than a
+// separate "why did the last one fail?" query) keeps it race-free under
+// concurrent acquires. It changes NO authorization outcome — every denial
+// refuses the lease exactly as hard; only the sentinel, and with it the
+// device's keep-or-discard decision, differs. A verifier that does not
+// implement it keeps the previous behaviour (every denial reported as a
+// credential rejection), so existing fakes are unaffected.
+type ReasoningStandingVerifier interface {
+	// VerifyStandingTerminalControlReason performs the same verification as
+	// VerifyStandingTerminalControl and additionally classifies a denial:
+	// StandingDenialBadSecret when the presented value was itself judged and
+	// rejected (wrong / rotated / undecodable); StandingDenialRevoked when the
+	// server can PROVE no standing secret exists at rest at all; and
+	// StandingDenialUnavailable for every state refusal that never judged the
+	// secret and may flip back on its own (standing access temporarily off,
+	// rate-limited) — which is also the required fail-safe for any condition the
+	// verifier cannot positively classify. The denial is meaningless when ok is
+	// true.
+	VerifyStandingTerminalControlReason(secret, deviceSessionID, handle string) (ok bool, denial StandingDenial)
+}
+
 // AuthorizeRequest carries the raw, request-derived inputs to the single
 // authorization function. The booleans are resolved by the caller AT THE
 // BOUNDARY from listener provenance + the live config snapshot (CLAUDE.md #3 —
@@ -178,8 +265,27 @@ func AuthorizeStanding(req AuthorizeRequest, sessions SessionValidator, policy L
 	}
 	// Verify the reusable standing secret LAST (the CapabilityToken field carries
 	// the wire-encoded standing secret in this path). It is not consumed.
-	if !standing.VerifyStandingTerminalControl(req.CapabilityToken, req.DeviceSessionID, req.Handle) {
-		return WriterGrant{}, ErrCapabilityRejected
+	//
+	// A denial carries one of three sentinels, chosen by the verifier's own
+	// classification. All three deny identically — no lease is granted — and they
+	// differ ONLY in the downstream "should the device discard its saved secret?"
+	// decision:
+	//
+	//	StandingDenialBadSecret   → ErrCapabilityRejected  (judged and rejected)
+	//	StandingDenialRevoked     → ErrStandingRevoked     (no secret at rest at all)
+	//	StandingDenialUnavailable → ErrStandingUnavailable (never judged; may return)
+	if ok, denial := verifyStanding(standing, req); !ok {
+		switch denial {
+		case StandingDenialBadSecret:
+			return WriterGrant{}, ErrCapabilityRejected
+		case StandingDenialRevoked:
+			return WriterGrant{}, ErrStandingRevoked
+		default:
+			// Unavailable AND any value this build does not recognise: keep the
+			// secret. Discarding one is irreversible for the user, so an
+			// unclassifiable denial must fall on the preserving side.
+			return WriterGrant{}, ErrStandingUnavailable
+		}
 	}
 	return WriterGrant{
 		authorized: true,
@@ -188,6 +294,19 @@ func AuthorizeStanding(req AuthorizeRequest, sessions SessionValidator, policy L
 		holderKey:  holderKeyOf(req.DeviceSessionID),
 		standing:   true,
 	}, nil
+}
+
+// verifyStanding runs the standing credential leg, preferring the richer
+// ReasoningStandingVerifier when the injected verifier offers it. A verifier
+// without it is treated exactly as before: a denial blames the secret.
+func verifyStanding(standing StandingVerifier, req AuthorizeRequest) (ok bool, denial StandingDenial) {
+	if reasoning, isReasoning := standing.(ReasoningStandingVerifier); isReasoning {
+		return reasoning.VerifyStandingTerminalControlReason(req.CapabilityToken, req.DeviceSessionID, req.Handle)
+	}
+	if standing.VerifyStandingTerminalControl(req.CapabilityToken, req.DeviceSessionID, req.Handle) {
+		return true, StandingDenialNone
+	}
+	return false, StandingDenialBadSecret
 }
 
 // checkConjunctionPrefix runs every §4.δ conjunction leg EXCEPT the final

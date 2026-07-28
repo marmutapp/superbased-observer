@@ -297,12 +297,32 @@ func (s *Server) remoteAuthz(mux *http.ServeMux, capMap map[string]Capability, r
 		if granted < required {
 			decision := http.StatusForbidden
 			msg := "forbidden: insufficient capability"
+			detail := required.String()
 			if granted == CapabilityPublic {
 				// Anonymous hitting a protected route → 401 (authenticate).
 				decision = http.StatusUnauthorized
 				msg = "unauthorized: authentication required"
+				// Record WHICH KIND of anonymous this is. Principal collapses
+				// four different worlds into CapabilityPublic — no cookie was
+				// sent at all, an unknown session, an expired session, a failed
+				// CSRF check — and they have opposite fixes: "the browser threw
+				// the credential away" is a cookie-attribute problem, while "the
+				// server refused a credential the browser still had" is a
+				// session-lifecycle problem.
+				//
+				// Not knowing which cost two days on the 2026-07-25 mobile-401:
+				// it was "fixed" by widening the session TTL, but the credential
+				// was a cookie the browser had already discarded, so no TTL
+				// could have rescued it and the defect survived the fix. The
+				// discriminator goes on the row that is ALREADY written, so it
+				// costs no extra audit volume on a hot auth path.
+				if sessionCookie(r) == "" {
+					detail += " no_cookie"
+				} else {
+					detail += " cookie_rejected"
+				}
 			}
-			s.auditRemote(r, rc, granted, pattern, "deny", required.String())
+			s.auditRemote(r, rc, granted, pattern, "deny", detail)
 			http.Error(w, msg, decision)
 			return
 		}

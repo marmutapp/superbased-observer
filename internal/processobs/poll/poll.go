@@ -96,6 +96,15 @@ type Options struct {
 	BootID string
 	// Now overrides time.Now for tests.
 	Now func() time.Time
+	// NetworkBytes optionally supplies per-process CUMULATIVE socket byte
+	// counters, so the metric samples this backend produces carry a network
+	// series alongside CPU/RSS/disk. The poll backend cannot measure bytes
+	// itself (/proc has no per-process socket byte counter); the daemon injects
+	// the Linux eBPF backend's counters here when that backend is composed
+	// alongside — a capability seam (processobs.NetworkSampler), not a
+	// backend-name branch. nil = no network series (samples carry
+	// HasNetworkMetrics=false, i.e. UNMEASURED, never a fabricated zero).
+	NetworkBytes processobs.NetworkBytesFunc
 }
 
 // Backend implements processobs.Backend by polling the process table.
@@ -104,6 +113,7 @@ type Backend struct {
 	enumerate EnumerateFunc
 	bootID    string
 	now       func() time.Time
+	netBytes  processobs.NetworkBytesFunc
 
 	out      chan processobs.RawEvent
 	stop     chan struct{}
@@ -137,6 +147,7 @@ func New(opts Options) *Backend {
 		enumerate: opts.Enumerate,
 		bootID:    opts.BootID,
 		now:       opts.Now,
+		netBytes:  opts.NetworkBytes,
 		stop:      make(chan struct{}),
 		tokened:   make(map[procKey]bool),
 	}
@@ -324,6 +335,12 @@ func (b *Backend) forkEvent(p *ProcInfo, ts time.Time) processobs.RawEvent {
 }
 
 func (b *Backend) execEvent(p *ProcInfo, ts time.Time) processobs.RawEvent {
+	ev := b.execEventBase(p, ts)
+	b.applyNetworkBytes(&ev, p.PID)
+	return ev
+}
+
+func (b *Backend) execEventBase(p *ProcInfo, ts time.Time) processobs.RawEvent {
 	return processobs.RawEvent{
 		Type: processobs.EventExec, Timestamp: ts, BootID: b.bootID,
 		PID: p.PID, PPID: p.PPID, StartTimeTicks: p.StartTicks, HasStartTime: p.HasStart,
@@ -341,10 +358,33 @@ func (b *Backend) execEvent(p *ProcInfo, ts time.Time) processobs.RawEvent {
 	}
 }
 
+// applyNetworkBytes stamps the injected per-process socket counters onto a
+// metrics-bearing event. It is the ONLY place the network series enters the
+// poll backend's event stream. When no sampler is injected, or the sampler
+// reports accounting is not live, HasNetworkMetrics stays false and the sample
+// is recorded as UNMEASURED — a chart must then omit the series rather than
+// draw a zero line.
+func (b *Backend) applyNetworkBytes(ev *processobs.RawEvent, pid int) {
+	if b.netBytes == nil {
+		return
+	}
+	in, out, ok := b.netBytes(pid)
+	if !ok {
+		return
+	}
+	ev.NetworkBytesIn, ev.NetworkBytesOut, ev.HasNetworkMetrics = in, out, true
+}
+
 // metricsEvent is the lightweight resource-refresh for a still-live process: it
 // carries identity + the current metric counters only (§dashboard-enhancements
 // EventMetrics) so the Attributor updates the run without re-attribution.
 func (b *Backend) metricsEvent(p *ProcInfo, ts time.Time) processobs.RawEvent {
+	ev := b.metricsEventBase(p, ts)
+	b.applyNetworkBytes(&ev, p.PID)
+	return ev
+}
+
+func (b *Backend) metricsEventBase(p *ProcInfo, ts time.Time) processobs.RawEvent {
 	return processobs.RawEvent{
 		Type: processobs.EventMetrics, Timestamp: ts, BootID: b.bootID,
 		PID: p.PID, StartTimeTicks: p.StartTicks, HasStartTime: p.HasStart,
@@ -357,6 +397,15 @@ func (b *Backend) metricsEvent(p *ProcInfo, ts time.Time) processobs.RawEvent {
 }
 
 func (b *Backend) exitEvent(p *ProcInfo, ts time.Time) processobs.RawEvent {
+	ev := b.exitEventBase(p, ts)
+	// The pid is gone by now, so this reads whatever the counters reached
+	// before the probes' exit cleanup removed the entry — best-effort, and
+	// unmeasured (rather than zero) once the entry is gone.
+	b.applyNetworkBytes(&ev, p.PID)
+	return ev
+}
+
+func (b *Backend) exitEventBase(p *ProcInfo, ts time.Time) processobs.RawEvent {
 	return processobs.RawEvent{
 		Type: processobs.EventExit, Timestamp: ts, BootID: b.bootID,
 		PID: p.PID, StartTimeTicks: p.StartTicks, HasStartTime: p.HasStart,

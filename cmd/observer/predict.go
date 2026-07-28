@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"text/tabwriter"
 	"time"
 
@@ -170,11 +171,14 @@ func printPredict(cmd *cobra.Command, sessionID string, shape store.PredictShape
 	fmt.Fprintln(w)
 
 	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "BAND\tCOST\tTURNS\tOUT/TURN")
-	fmt.Fprintf(tw, "low (quick)\t$%.2f\t%.1f\t%d\n", est.Low.MessageUSD, est.Low.Turns, est.Low.Output)
-	fmt.Fprintf(tw, "mid (typical)\t$%.2f\t%.1f\t%d\n", est.Mid.MessageUSD, est.Mid.Turns, est.Mid.Output)
-	fmt.Fprintf(tw, "high (agentic)\t$%.2f\t%.1f\t%d\n", est.High.MessageUSD, est.High.Turns, est.High.Output)
+	fmt.Fprintln(tw, "BAND\tCOST\tTURNS\tOUT/TURN\tBILLED TOK\tOF WHICH NEW")
+	predictBandRow(tw, "low (quick)", est.Low, est.PrefixTokens)
+	predictBandRow(tw, "mid (typical)", est.Mid, est.PrefixTokens)
+	predictBandRow(tw, "high (agentic)", est.High, est.PrefixTokens)
 	tw.Flush()
+	fmt.Fprintf(w, "\nbilled tok = turns × (cached prefix + fresh input + output) — the same dimensions the cost\n"+
+		"charges for, so the cached prefix is counted once per turn. It is throughput, NOT context size,\n"+
+		"and it excludes cache-WRITE tokens (not modelled), so it is a lower bound.\n")
 
 	if len(est.Warnings) > 0 {
 		fmt.Fprintf(w, "\nnotes: ")
@@ -203,6 +207,23 @@ func printPredict(cmd *cobra.Command, sessionID string, shape store.PredictShape
 	if snap.Window7dUtil != nil {
 		fmt.Fprintf(w, "  weekly cap:     %d%% left%s\n", 100-int(*snap.Window7dUtil*100), resetSuffix(snap.Window7dReset))
 	}
+}
+
+// predictBandRow prints one band row, including the billed-token figure
+// — the token counterpart of the priced formula (per_turn = P·r_cache_read
+// + S·r_input + O·r_output; message = T × per_turn). It counts exactly
+// what the price counts: the cached prefix P is re-read, and billed at
+// the cache-read rate, on EVERY one of the T turns, so it is counted T
+// times. The "of which new" column is T × (S + O) — the genuinely-new
+// half — so the cached dominance stays visible instead of hiding inside
+// one opaque total. Cache-WRITE tokens are not modelled by the
+// estimator and so are not counted here either.
+func predictBandRow(tw *tabwriter.Writer, label string, b predict.Band, prefix int64) {
+	turns := max(0, b.Turns)
+	cached := int64(math.Round(turns * float64(max(0, prefix))))
+	fresh := int64(math.Round(turns * float64(max(0, b.FreshInput)+max(0, b.Output))))
+	fmt.Fprintf(tw, "%s\t$%.2f\t%.1f\t%d\t%s\t%s\n",
+		label, b.MessageUSD, b.Turns, b.Output, fmtTokens(cached+fresh), fmtTokens(fresh))
 }
 
 func resetSuffix(reset *int64) string {

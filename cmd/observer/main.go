@@ -305,7 +305,7 @@ func newWatchCmd() *cobra.Command {
 				return err
 			}
 			defer cleanup()
-			// buildWatcher opens the DB with SkipIntegrityCheck (fast bind);
+			// buildWatcher opens the DB without the integrity probe (fast bind);
 			// run the one-time quick_check + path-hash backfill in the
 			// background so it never delays the watcher on a large DB.
 			go runStartupDBMaintenance(ctx, configPath)
@@ -398,11 +398,11 @@ func buildWatcherWithOverride(ctx context.Context, configPath, adapterFilter str
 	if err := os.MkdirAll(filepath.Dir(cfg.Observer.DBPath), 0o755); err != nil {
 		return nil, nil, fmt.Errorf("ensure db dir: %w", err)
 	}
-	// SkipIntegrityCheck: this is a long-running daemon open (`observer
+	// No integrity probe here: this is a long-running daemon open (`observer
 	// start` / `observer watch`). The multi-GB PRAGMA quick_check is deferred
 	// off the readiness path and run once via db.RunStartupMaintenance after
-	// the listener binds. See db.Options.SkipIntegrityCheck.
-	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+	// the listener binds. See db.Options.IntegrityCheck.
+	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath})
 	if err != nil {
 		return nil, nil, fmt.Errorf("open db %s: %w", cfg.Observer.DBPath, err)
 	}

@@ -130,3 +130,32 @@ func TestResumeArgsGroundedRegistryRows(t *testing.T) {
 		}
 	}
 }
+
+// TestCursorResumeNativeGrounded pins the 2026-07-25 cursor promotion: the
+// cursor row declares ResumeNative under the `cursor` launcher verb with the
+// `flag:--resume` mechanism (`cursor-agent --resume <chatId>`), and the chatId
+// is our stored SessionID VERBATIM — so the composed tail must carry the id
+// byte-for-byte, with no transform anywhere on the path.
+func TestCursorResumeNativeGrounded(t *testing.T) {
+	c, ok := integration.For("cursor")
+	if !ok {
+		t.Fatal("cursor has no registry row")
+	}
+	if c.Resume.Kind != integration.ResumeNative {
+		t.Fatalf("cursor Resume.Kind = %q, want ResumeNative (live-confirmed 2026-07-25)", c.Resume.Kind)
+	}
+	if c.Resume.Subcommand != "cursor" {
+		t.Errorf("cursor Resume.Subcommand = %q, want %q", c.Resume.Subcommand, "cursor")
+	}
+	if c.Resume.IDMechanism != "flag:--resume" {
+		t.Errorf("cursor Resume.IDMechanism = %q, want %q", c.Resume.IDMechanism, "flag:--resume")
+	}
+	const id = "0d0c1289-d163-4743-b9f6-f12ee7c482c0" // a real chat dir == sessions.id
+	got, err := integration.ResumeArgs(c.Resume, id)
+	if err != nil {
+		t.Fatalf("ResumeArgs(cursor) err = %v", err)
+	}
+	if len(got) != 2 || got[0] != "--resume" || got[1] != id {
+		t.Fatalf("ResumeArgs(cursor) = %v, want [--resume %s] (id unchanged)", got, id)
+	}
+}

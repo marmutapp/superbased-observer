@@ -28,8 +28,9 @@ func TestResumeInfoDerivation(t *testing.T) {
 	}{
 		{"claude-code", "native", "claude"},
 		{"codex", "native", "codex"},
-		{"opencode", "handoff", ""}, // launchable, no native resume
-		{"cline", "none", ""},       // VS Code adapter: not launchable, no native resume
+		{"cursor", "native", "cursor"}, // native `cursor-agent --resume <chatId>`, live-confirmed 2026-07-25
+		{"openclaw", "handoff", ""},    // launchable, no grounded native resume surface
+		{"cline", "none", ""},          // VS Code adapter: not launchable, no native resume
 		{"totally-unknown-tool", "none", ""},
 	}
 	for _, tc := range tests {
@@ -111,7 +112,7 @@ func TestResumePOSTUnknownSession(t *testing.T) {
 // native resume, naming the Continue-in… fork fallback.
 func TestResumePOSTNonNativeIs409(t *testing.T) {
 	s := newResumeTestServer(t, &fakeLaunchManager{})
-	seedResumeSession(t, s, "sess-fork", "opencode", "")
+	seedResumeSession(t, s, "sess-fork", "openclaw", "")
 	rec := postSessionResume(t, s.Handler(), "sess-fork")
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("non-native resume: status = %d, want 409 (body=%s)", rec.Code, rec.Body.String())

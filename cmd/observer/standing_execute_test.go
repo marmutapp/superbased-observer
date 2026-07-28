@@ -191,13 +191,22 @@ func TestStandingRejectedNoWriter(t *testing.T) {
 // the lease install). The install-time generation recheck must tear the lease
 // down — the acquire fails and NO writer survives, even though the kill sweep
 // ran before the lease existed.
+//
+// The denial reason is AuthTransient, not Auth (changed 2026-07-25, mobile
+// terminal-continuity arc). The TOCTOU close itself is UNCHANGED and is what
+// this test guards: no writer survives. What changed is only the blame the
+// device is told — the secret verified successfully microseconds earlier, so
+// what moved was the SERVER's generation, i.e. this acquire raced an admin
+// transition. Reporting a credential rejection made the device delete a secret
+// that may still be valid, which is a re-mint the operator then has to perform
+// by hand.
 func TestStandingRevokeDuringVerifyCannotInstallWriter(t *testing.T) {
 	stub := newStandingStub()
 	stub.verifyOK = true
 	stub.bumpDuringVerify = true
 	adapter, mgr, handle := newStandingExecAdapter(t, stub)
 	_, err := adapter.AcquireWriterRemote(standingReq(handle))
-	requireControlDenial(t, err, dashboard.ControlDenialAuth)
+	requireControlDenial(t, err, dashboard.ControlDenialAuthTransient)
 	if holder, held := mgr.WriterHolder(handle); held {
 		t.Fatalf("a verify that raced a revoke installed a SURVIVING writer (holder %q) — the TOCTOU is open", holder)
 	}
@@ -259,9 +268,100 @@ func TestStandingRealControllerAcquireAndRevoke(t *testing.T) {
 	}
 	rl.ReloadStandingTerminalSecret("", false)
 	_, err = adapter.AcquireWriterRemote(req)
-	requireControlDenial(t, err, dashboard.ControlDenialAuth)
+	// AuthTransient, not Auth (2026-07-25): the refusal comes from the DISABLED
+	// master gate, which returns before the secret is ever compared. The denial
+	// is exactly as absolute (asserted below: no lease survives); it simply does
+	// not blame the credential, because "standing access is currently off" is
+	// also what a disable-then-re-enable looks like, and a device that discards
+	// its secret there needs the operator to mint a new one.
+	//
+	// This controller is built WITHOUT a StandingSecretAtRest probe, which is
+	// the "I cannot tell a revoke from a disable" shape — and that shape must
+	// resolve to the preserving side. The sibling test below wires the probe and
+	// gets the permanent verdict.
+	requireControlDenial(t, err, dashboard.ControlDenialAuthTransient)
 	if _, held := mgr.WriterHolder(handle); held {
 		t.Fatal("post-revoke standing acquire left a writer lease")
+	}
+}
+
+// TestStandingRealControllerRevokedSecretIsPermanent is the A2 companion: the
+// SAME end-to-end path, but with the at-rest probe wired as it is in production
+// (cmd/observer stats remotecfg.StandingTerminalSecretPath). A genuine revoke
+// deletes that file, so the denial is reported as PERMANENT and the device
+// clears its saved secret instead of retrying a credential that can never be
+// accepted again.
+//
+// The security assertion is identical to its sibling and must stay that way:
+// the acquire is refused and NO writer lease survives. Only the blame differs.
+func TestStandingRealControllerRevokedSecretIsPermanent(t *testing.T) {
+	rawStanding, encStanding, err := remoteauth.GenerateStandingSecret()
+	if err != nil {
+		t.Fatalf("GenerateStandingSecret: %v", err)
+	}
+	standingHash, err := remoteauth.HashSecret(rawStanding)
+	if err != nil {
+		t.Fatalf("HashSecret: %v", err)
+	}
+	rawPair, encPair, err := remoteauth.GenerateSecret()
+	if err != nil {
+		t.Fatalf("GenerateSecret: %v", err)
+	}
+	pairHash, err := remoteauth.HashSecret(rawPair)
+	if err != nil {
+		t.Fatalf("HashSecret: %v", err)
+	}
+	// secretAtRest models the hash FILE: present until the revoke unlinks it.
+	secretAtRest := true
+	rc := dashboard.NewRemoteController(dashboard.RemoteOptions{
+		HashedSecret:               pairHash,
+		AllowedHosts:               []string{"remote.example:8443"},
+		RateLimitPerMin:            60,
+		StandingTerminalSecretHash: standingHash,
+		StandingTerminalEnabled:    true,
+		StandingSecretAtRest:       func() bool { return secretAtRest },
+		Session:                    remoteauth.SessionParams{TTL: time.Hour, Idle: time.Hour, Max: 5},
+	})
+	device := pairDevice(t, rc, encPair)
+
+	authz, ok := rc.(dashboard.TerminalControlAuthorizer)
+	if !ok {
+		t.Fatal("controller lacks TerminalControlAuthorizer")
+	}
+	adapter, mgr, handle := newStandingExecAdapter(t, authz)
+
+	req := dashboard.RemoteWriterRequest{Handle: handle, DeviceSessionID: device, RemoteExposed: true}
+	req.CapabilityToken = encStanding
+	w, err := adapter.AcquireWriterRemote(req)
+	if err != nil || w == nil {
+		t.Fatalf("baseline standing acquire want grant, got %v / %v", w, err)
+	}
+	w.Release()
+	mgr.RevokeWriter(handle, "test-reset")
+
+	// REVOKE, in the order the dashboard handler uses: kill live access first,
+	// then remove the durable secret.
+	rl, ok := rc.(interface{ ReloadStandingTerminalSecret(string, bool) })
+	if !ok {
+		t.Fatal("controller lacks ReloadStandingTerminalSecret")
+	}
+	rl.ReloadStandingTerminalSecret("", false)
+	secretAtRest = false // remotecfg.StandingTerminalDisable unlinked the hash
+
+	_, err = adapter.AcquireWriterRemote(req)
+	requireControlDenial(t, err, dashboard.ControlDenialAuthRevoked)
+	if _, held := mgr.WriterHolder(handle); held {
+		t.Fatal("post-revoke standing acquire left a writer lease")
+	}
+
+	// And a TEMPORARY disable of the same controller (secret back at rest) is
+	// still transient — the split must be driven by the evidence, not by having
+	// seen a revoke once.
+	secretAtRest = true
+	_, err = adapter.AcquireWriterRemote(req)
+	requireControlDenial(t, err, dashboard.ControlDenialAuthTransient)
+	if _, held := mgr.WriterHolder(handle); held {
+		t.Fatal("post-disable standing acquire left a writer lease")
 	}
 }
 

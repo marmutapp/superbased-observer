@@ -162,6 +162,19 @@ func normalize(v any) any {
 				delete(x, k)
 				continue
 			}
+			// host_os is runtime.GOOS (added to /api/status so the
+			// terminal key bar labels ⌃/⌥ from the DAEMON's platform
+			// rather than the browser's — the browser is usually a
+			// phone that is not the machine being typed into).
+			// TOKENISED, not deleted, unlike uptime_seconds above: the
+			// value differs per host, but the field's PRESENCE does
+			// not, so pinning presence still catches an accidental
+			// removal — the same reason timestamps are tokenised
+			// rather than dropped.
+			if k == "host_os" {
+				x[k] = "<GOOS>"
+				continue
+			}
 			x[k] = normalize(val)
 		}
 		return x

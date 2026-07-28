@@ -34,6 +34,7 @@ func newKimiCmd() *cobra.Command {
 		fromTime     string
 		attach       *bool
 		noAttach     *bool
+		resume       *string
 	)
 	cmd := &cobra.Command{
 		Use:     "kimi [-- kimi-args...]",
@@ -71,13 +72,28 @@ func newKimiCmd() *cobra.Command {
 				// print-and-exit run would be spam.
 				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
 					argsContainHeadlessFlag(args, "-p"),
-				passthrough: kimiAttachPassthrough(binPath),
+				passthrough: append(kimiAttachPassthrough(binPath), resumeAttachPassthrough(*resume)...),
 				toolArgs:    args,
 				stderr:      cmd.ErrOrStderr(),
 			})
 			if outcome.handled {
 				return aErr
 			}
+
+			// Native resume: `--resume <id>` → `kimi --session <id>` (bare path).
+			// kimi requires the PREFIXED `session_<uuid>` id; the shared transform
+			// ensures it (our adapter already stores that form). Distinct from the
+			// DocAssisted --continue-from below (kimi-code has no seed lane).
+			resumedArgs, releaseResume, okResume, resumeErr := applyLauncherResume(launcherResumeSpec{
+				verb: "kimi", label: "kimi", configPath: configPath, id: *resume,
+				continueFrom: continueFrom, carry: carry, fromMessage: fromMessage, fromTime: fromTime,
+				args: args, stderr: cmd.ErrOrStderr(),
+			})
+			if !okResume {
+				return resumeErr
+			}
+			defer releaseResume()
+			args = resumedArgs
 
 			bin, err := resolveToolBin("kimi-code", binPath, "--kimi-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
@@ -118,6 +134,7 @@ func newKimiCmd() *cobra.Command {
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "kimi-code")
+	resume = registerResumeFlag(cmd, "kimi-code")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
 }

@@ -149,6 +149,55 @@ type ProcessNetworkEventRow struct {
 	PID           int                    `json:"pid,omitempty"`
 }
 
+// Attribution MAX-upgrade guard (docs/process-observability.md §9.2.5).
+//
+// The attribution columns are written by TWO feed paths into the one
+// process_runs owner: the capture path (PersistRuns, from the in-memory
+// processobs tree) and the deferred correlation passes (CorrelateCrossOS, and
+// CorrelateProcessActions for the action link). The in-memory run of a process
+// captured UNATTRIBUTED stays unattributed forever, so every later persist for
+// that key — and there is ALWAYS at least the exit update, plus each metrics
+// refresh — used to write `session_id = NULL, source = none, confidence = none`
+// straight back over whatever the correlation pass had just resolved. Since
+// CorrelateCrossOS is the ONLY attribution path for every non-claude-code tool,
+// that silently erased attribution for exactly those tools.
+//
+// The fix mirrors the token_usage ON CONFLICT MAX-upgrade discipline in
+// store.go::InsertTokenEvents: on conflict a column is only overwritten when
+// the incoming value is a STRICT improvement, so the stored state is
+// monotonically non-decreasing — there, in token counts; here, in attribution
+// confidence.
+//
+// PRECEDENCE — none < low < medium < high. Not invented here: it is the SQL
+// mirror of processobs's own `confidenceRank`/`outranks`
+// (internal/processobs/lateseed.go), which itself derives the order from the
+// two rules already encoding it — Attributor.resolveAttribution treats a direct
+// identity (env-token, then pid seed) as ConfHigh and lets it override whatever
+// was inherited, and CorrelateCrossOS (which only ever writes ConfMedium) plus
+// its store seam both refuse to touch a run at ConfHigh ("authoritative —
+// never re-anchored"; that seam's SQL guard is literally
+// `attribution_confidence != 'high'`). Go stays the ONE place the order is
+// decided; these consts are only how the same order is spelled to SQLite.
+//
+// NULL-safe and forward-compatible: an unknown, empty or NULL confidence falls
+// through to rank 0 — exactly `rankOf`'s zero value for an unattributed run.
+const (
+	rankExcludedConfidenceSQL = `(CASE excluded.attribution_confidence
+                                  WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END)`
+	rankStoredConfidenceSQL = `(CASE process_runs.attribution_confidence
+                                  WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END)`
+
+	// attributionOutranksSQL is the SQL spelling of processobs.outranks:
+	// STRICTLY greater, never >=. Strictness is load-bearing for the same two
+	// reasons it is in the Go helper — an equal-rank re-persist is a no-op
+	// (idempotence, no churn in attribution_source), and an equally-confident
+	// signal cannot re-home a row behind the correlator's back. An equal-rank
+	// RE-HOME (medium → medium, different session) remains possible, but only
+	// through the dedicated CorrelateCrossOS UPDATE that is designed for it —
+	// not as a side effect of a metrics/exit upsert.
+	attributionOutranksSQL = rankExcludedConfidenceSQL + ` > ` + rankStoredConfidenceSQL
+)
+
 const upsertProcessRunSQL = `
 INSERT INTO process_runs (
     process_key, boot_id, pid, ppid, start_time_ticks, parent_process_key,
@@ -169,13 +218,26 @@ INSERT INTO process_runs (
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(process_key) DO UPDATE SET
-    session_id             = excluded.session_id,
-    project_id             = excluded.project_id,
-    tool                   = excluded.tool,
+    -- ATTRIBUTION MAX-UPGRADE (§9.2.5). session_id / project_id / tool /
+    -- attribution_source / attribution_confidence are ONE logical fact — the
+    -- processobs.Attribution struct — so they move together or not at all:
+    -- every one of them is gated on the SAME predicate, and upgrading the
+    -- confidence while keeping a stale session (or the reverse) is impossible
+    -- by construction. Guard applies to the CONFLICT path only; a genuine
+    -- first write still INSERTs 'none'/NULL for a process nobody has
+    -- attributed yet.
+    session_id             = CASE WHEN ` + attributionOutranksSQL + `
+                                  THEN excluded.session_id ELSE process_runs.session_id END,
+    project_id             = CASE WHEN ` + attributionOutranksSQL + `
+                                  THEN excluded.project_id ELSE process_runs.project_id END,
+    tool                   = CASE WHEN ` + attributionOutranksSQL + `
+                                  THEN excluded.tool ELSE process_runs.tool END,
     action_id              = COALESCE(excluded.action_id, process_runs.action_id),
     turn_index             = COALESCE(excluded.turn_index, process_runs.turn_index),
-    attribution_source     = excluded.attribution_source,
-    attribution_confidence = excluded.attribution_confidence,
+    attribution_source     = CASE WHEN ` + attributionOutranksSQL + `
+                                  THEN excluded.attribution_source ELSE process_runs.attribution_source END,
+    attribution_confidence = CASE WHEN ` + attributionOutranksSQL + `
+                                  THEN excluded.attribution_confidence ELSE process_runs.attribution_confidence END,
     exe_path               = COALESCE(excluded.exe_path, process_runs.exe_path),
     exe_basename           = COALESCE(excluded.exe_basename, process_runs.exe_basename),
     cwd                    = COALESCE(excluded.cwd, process_runs.cwd),
@@ -206,6 +268,15 @@ ON CONFLICT(process_key) DO UPDATE SET
 // Immutable identity (process_key, pid, start_time, started_at, parent) is
 // preserved by not listing it in the DO UPDATE set; the COALESCE-guarded
 // columns keep an earlier non-NULL value when a later snapshot omits it.
+//
+// ATTRIBUTION IS MAX-UPGRADE, NEVER DOWNGRADE (§9.2.5, see
+// attributionOutranksSQL). This sink is the SECOND writer of the attribution
+// columns — the deferred correlation passes are the first — and its in-memory
+// view of an unattributed process never learns what they resolved. So on
+// conflict the attribution unit (session_id / project_id / tool / source /
+// confidence) is adopted only when the incoming confidence STRICTLY outranks
+// the stored one; an unattributed exit or metrics refresh can no longer blank
+// a correlated row.
 //
 // Returns the count of rows processed. A failure aborts the whole batch
 // (txn rollback); the observer records this as a non-fatal sink-error drop.
@@ -1494,9 +1565,23 @@ func (s *Store) PruneProcessRows(ctx context.Context, retentionDays int) (int, e
 	return removed, nil
 }
 
-// marshalMetricSamples serializes the sparkline ring buffer to compact JSON, or
-// "" when empty (mapped to a NULL column). parseMetricSamples is the inverse
+// marshalMetricSamples serializes the live-chart ring buffer to compact JSON,
+// or "" when empty (mapped to a NULL column). parseMetricSamples is the inverse
 // for the read path.
+//
+// SCHEMA NOTE — no migration is needed to extend a sample. metric_samples_json
+// is a TEXT column holding a JSON array (migration 045), so adding a field to
+// processobs.MetricSample is purely additive at the storage layer: rows written
+// by an older build simply lack the key and decode with the new field at its
+// zero value (encoding/json ignores absent keys), and rows written by a newer
+// build are still valid JSON to an older reader (which ignores unknown keys).
+// That is how net_rx / net_tx / net_measured were added. The one thing that
+// WOULD break old rows is renaming or repurposing an existing json tag — don't.
+//
+// The caller hands us an ALREADY DOWNSAMPLED ring
+// (processobs.Attributor.SnapshotForPersist): the in-memory buffer runs at the
+// live sample rate, while only a bounded, evenly-spaced subset is stored, so
+// this column's size is independent of how fast the daemon samples.
 func marshalMetricSamples(s []processobs.MetricSample) string {
 	if len(s) == 0 {
 		return ""
@@ -1526,6 +1611,11 @@ func boolInt(v bool) int {
 	return 0
 }
 
+// parseMetricSamples decodes the stored ring. It TOLERATES rings written by
+// any earlier build: samples missing net_rx / net_tx / net_measured decode with
+// those fields zero/false, which reads as "network was not measured for this
+// sample" — exactly the honest interpretation. A malformed value yields nil
+// rather than an error, so one bad row can never break a listing.
 func parseMetricSamples(s string) []processobs.MetricSample {
 	if s == "" {
 		return nil

@@ -234,7 +234,7 @@ func newStartCmd() *cobra.Command {
 			// only when [remote] is enabled in tailscale mode AND Ready().
 			var remoteBackendAddr string
 			if !noDashboard {
-				cfg, database, dbCleanup, err := loadConfigAndDBFast(ctx, configPath)
+				cfg, database, dbCleanup, err := loadConfigAndDB(ctx, configPath)
 				if err != nil {
 					return err
 				}
@@ -403,7 +403,7 @@ func newStartCmd() *cobra.Command {
 				// surface is unused here (no dashboard drives it); only the attach
 				// host is taken. surfaces.close reaps the PTY stack before the DB
 				// closes (defer-LIFO ahead of dbCleanup).
-				cfg, database, dbCleanup, err := loadConfigAndDBFast(ctx, configPath)
+				cfg, database, dbCleanup, err := loadConfigAndDB(ctx, configPath)
 				if err != nil {
 					return err
 				}
@@ -462,8 +462,8 @@ func newStartCmd() *cobra.Command {
 				return nil
 			})
 			// One-time DB integrity probe + path-hash backfill, moved OFF the
-			// readiness path (2026-07-16). Every daemon db.Open now passes
-			// SkipIntegrityCheck so the listener binds fast; the multi-GB
+			// readiness path (2026-07-16). db.Open never verifies by default, so
+			// the listener binds fast; the multi-GB
 			// `PRAGMA quick_check` (~14s even warm on the 9.5GB DB, and it used
 			// to run once per synchronous daemon open) runs HERE, exactly once,
 			// after the proxy/dashboard are already serving. Fail-soft (P1):
@@ -593,7 +593,7 @@ func newStartCmd() *cobra.Command {
 				// channel — the §14.2 compat posture) and P1 like every
 				// sibling: never propagates an error.
 				g.Go(func() error {
-					pcfg, pdb, pcleanup, perr := loadConfigAndDBFast(gctx, configPath)
+					pcfg, pdb, pcleanup, perr := loadConfigAndDB(gctx, configPath)
 					if perr != nil {
 						return nil
 					}
@@ -622,7 +622,7 @@ func newStartCmd() *cobra.Command {
 			// feature configured (reputation alone is the on-demand
 			// CLI surface).
 			g.Go(func() error {
-				ccfg, cdb, ccleanup, cerr := loadConfigAndDBFast(gctx, configPath)
+				ccfg, cdb, ccleanup, cerr := loadConfigAndDB(gctx, configPath)
 				if cerr != nil {
 					return nil
 				}
@@ -665,7 +665,7 @@ func newStartCmd() *cobra.Command {
 				// like every sibling; the exporter's Stop above flushes
 				// whatever this tail emitted.
 				g.Go(func() error {
-					tcfg, tdb, tcleanup, terr := loadConfigAndDBFast(gctx, configPath)
+					tcfg, tdb, tcleanup, terr := loadConfigAndDB(gctx, configPath)
 					if terr != nil {
 						return nil
 					}
@@ -692,7 +692,7 @@ func newStartCmd() *cobra.Command {
 			// only unless allow_non_loopback. Fail-soft + P1: a bind failure
 			// logs and returns nil, never cancelling siblings.
 			g.Go(func() error {
-				rcfg, rdb, rcleanup, rerr := loadConfigAndDBFast(gctx, configPath)
+				rcfg, rdb, rcleanup, rerr := loadConfigAndDB(gctx, configPath)
 				if rerr != nil {
 					return nil
 				}
@@ -739,7 +739,7 @@ func newStartCmd() *cobra.Command {
 			// Fail-soft + P1: a bind failure logs and returns nil, never
 			// cancelling siblings.
 			g.Go(func() error {
-				bcfg, bdb, bcleanup, berr := loadConfigAndDBFast(gctx, configPath)
+				bcfg, bdb, bcleanup, berr := loadConfigAndDB(gctx, configPath)
 				if berr != nil {
 					return nil
 				}
@@ -809,7 +809,7 @@ func newStartCmd() *cobra.Command {
 			// computing. Self-contained config+DB handle; best-effort
 			// (P1) — failures log and never cancel siblings.
 			g.Go(func() error {
-				acfg, adb, acleanup, aerr := loadConfigAndDBFast(gctx, configPath)
+				acfg, adb, acleanup, aerr := loadConfigAndDB(gctx, configPath)
 				if aerr != nil || !acfg.Advisor.Enabled {
 					return nil
 				}
@@ -858,7 +858,7 @@ func newStartCmd() *cobra.Command {
 			// runners and never cancel siblings. Live config edits
 			// re-check via the shared watcher trigger (guardwire.go).
 			g.Go(func() error {
-				mcfg, mdb, mcleanup, merr := loadConfigAndDBFast(gctx, configPath)
+				mcfg, mdb, mcleanup, merr := loadConfigAndDB(gctx, configPath)
 				if merr != nil {
 					return nil
 				}

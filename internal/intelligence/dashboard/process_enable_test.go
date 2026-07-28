@@ -74,10 +74,15 @@ func postEnableCapture(t *testing.T, server *Server) (int, enableCaptureResponse
 
 // TestProcessEnableCapture_SwitchesNonRunnableBackendToAuto proves the verb
 // flips a backend the daemon's selector constructs NOTHING for (off / empty /
-// the etw+endpointsecurity stubs) to "auto" and flags the switch. These are
-// exactly the values processBackendRunnable reports false for.
+// the endpointsecurity stub) to "auto" and flags the switch. These are exactly
+// the values processBackendRunnable reports false for.
+//
+// "etw" is deliberately NOT in this set any more: since W3 the selector really
+// does construct a Backend for it (the "auto" baseline plus the ETW accept
+// listener), so switching it to "auto" would silently discard the operator's
+// elevated feed. See TestProcessBackendRunnableMirrorsTheSelector.
 func TestProcessEnableCapture_SwitchesNonRunnableBackendToAuto(t *testing.T) {
-	for _, backend := range []string{"off", "", "etw", "endpointsecurity"} {
+	for _, backend := range []string{"off", "", "endpointsecurity"} {
 		t.Run("backend="+backend, func(t *testing.T) {
 			server, cfgPath := enableCaptureTestServer(t, false, backend)
 			code, resp := postEnableCapture(t, server)
@@ -306,5 +311,44 @@ func TestProcessEnableCapture_RefusedOnRemoteListener(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("remote POST /api/process/enable-capture = %d, want 403 (Local route)", rec.Code)
+	}
+}
+
+// TestProcessBackendRunnableMirrorsTheSelector pins the whole backend
+// vocabulary, not just the values one handler happens to exercise.
+//
+// It exists because this mapping silently drifted: "etw" was correctly false
+// while the selector returned "not yet implemented", and stayed false after W3
+// made the selector construct a real Backend for it. Nothing went red, because
+// the only coverage was a handler test asserting the OLD answer — so the
+// enable verb would have quietly switched a working ETW configuration to
+// "auto" and discarded the operator's elevated feed.
+//
+// Every row here is a claim about cmd/observer/processobs.go's
+// selectProcessBackend. If you change that selector's cases, this table is the
+// thing that must change with it.
+func TestProcessBackendRunnableMirrorsTheSelector(t *testing.T) {
+	tests := []struct {
+		backend string
+		want    bool
+		why     string
+	}{
+		{"poll", true, "constructs the poll backend"},
+		{"bridge", true, "constructs the WSL cross-OS bridge"},
+		{"both", true, "constructs a poll+bridge composite"},
+		{"auto", true, "picks the best available backend"},
+		{"linux_ebpf", true, "constructs the eBPF composite, falling back when unavailable"},
+		{"etw", true, "since W3: the auto baseline PLUS the additive ETW accept listener"},
+		{"off", false, "selector returns an error: backend set to off"},
+		{"endpointsecurity", false, "selector returns an error: not yet implemented (P6)"},
+		{"", false, "selector's default: unknown process backend"},
+		{"nonsense", false, "selector's default: unknown process backend"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.backend, func(t *testing.T) {
+			if got := processBackendRunnable(tt.backend); got != tt.want {
+				t.Fatalf("processBackendRunnable(%q) = %v, want %v (%s)", tt.backend, got, tt.want, tt.why)
+			}
+		})
 	}
 }

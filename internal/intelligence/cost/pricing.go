@@ -350,6 +350,47 @@ func BakedInDefaults() map[string]Pricing {
 // Combined this over-billed Opus 4.5+ traffic by ~3× and over-billed all
 // 1h cache writes by 25%.
 var defaultPricing = map[string]Pricing{
+	// Anthropic — Claude Opus 5 (`claude-opus-5`), the current Opus
+	// flagship. Verified against platform.claude.com/docs/en/about-claude/
+	// pricing on 2026-07-25: $5 input / $25 output, cache read $0.50,
+	// 5m-write $6.25, 1h-write $10, web search $10/1000 calls ($0.01/call).
+	// Numerically IDENTICAL to the claude-opus-4-8 row above/below,
+	// FastMultiplier included — do NOT "fix" this row to a higher tier on
+	// the assumption that a newer flagship must cost more. Opus 5 is a
+	// drop-in upgrade at Opus 4.8's pricing; the $10/$50 tier belongs to
+	// Fable 5 / Mythos 5, not here.
+	//
+	// Dateless pinned snapshot — Anthropic stopped putting dates in IDs as
+	// of the 4.6 gen, so there is NO `-YYYYMMDD` variant to add. The long-
+	// context tag `claude-opus-5[1m]` is not an exact key either; because
+	// this bare key carries no date suffix it doubles as a family prefix,
+	// so `claude-opus-5[1m]` matches HERE (PricingSourceFamily, this row's
+	// rates, FastMultiplier included) rather than falling through to the
+	// generic `claude-opus` row — "claude-opus-5" is longer and wins the
+	// longest-first sort in familyKeys. Same path a dated Opus-5 SKU would
+	// take. Inheriting FastMultiplier is correct here: it is the same SKU
+	// under a context tag, not a different model.
+	//
+	// Added 2026-07-25 to close a MISS-to-$0 defect: before this row
+	// `claude-opus-5` resolved to PricingSourceMiss and costed at $0.00,
+	// because the family ladder had no bare `claude-opus` key and
+	// "claude-opus-4" is not a prefix of "claude-opus-5". Measured on the
+	// author's own node the day the row landed: 78 Opus-5 turns over ~3 days
+	// (16.76M cache-read + 1.26M cache-write tokens) reported $0.00, which
+	// re-costed to $18.04 once this row existed — the under-count grew with
+	// every turn until then. Same defect CLASS as the
+	// 2026-07-12 claude-fable-5 incident (a wrong-tier anchor under-billing
+	// 299 rows), caught the same way: a flagship SKU silently mispriced.
+	//
+	// FastMultiplier=2: fast mode IS supported on Opus 5 at $10 input /
+	// $50 output — exactly 2× every per-token dimension, so the flat
+	// multiplier is mathematically equivalent to a second rate card. Set
+	// ONLY on this explicit SKU, never on the family prefix.
+	//
+	// Batch API pricing (50% off — $2.50 / $12.50) is context only: the
+	// Pricing struct carries no batch field and one must not be invented
+	// here.
+	"claude-opus-5": {Input: 5, Output: 25, CacheRead: 0.50, CacheCreation: 6.25, CacheCreation1h: 10, WebSearchPerRequest: 0.01, FastMultiplier: 2},
 	// Anthropic — Claude Opus 4.5 / 4.6 / 4.7 / 4.8 (current generation,
 	// $5/$25 input/output — 1/3 of Opus 4.x legacy rates). Web search billed
 	// at $10/1000 calls ($0.01 per call) on top of token costs.
@@ -406,7 +447,55 @@ var defaultPricing = map[string]Pricing{
 	// (claude-opus-4-8, claude-opus-4-9...) inherit current pricing rather
 	// than legacy.
 	"claude-opus-4": {Input: 5, Output: 25, CacheRead: 0.50, CacheCreation: 6.25, CacheCreation1h: 10, WebSearchPerRequest: 0.01},
+	// claude-opus (no generation) — the family-prefix SAFETY NET, added
+	// 2026-07-25 alongside the claude-opus-5 pin. Set to the current
+	// generation tier ($5/$25) per the same platform.claude.com card, so a
+	// future `claude-opus-6` inherits current pricing instead of MISSing to
+	// $0 — the exact hole `claude-opus-5` fell through, since
+	// "claude-opus-4" is not a prefix of "claude-opus-5". (Opus-5 context
+	// tags and dated variants do NOT land here — they match the longer
+	// `claude-opus-5` key first; see that row.) Extends the bare-family-row
+	// convention started by claude-fable / claude-mythos to EVERY current-gen
+	// Anthropic family: the sibling `claude-sonnet` and `claude-haiku` rows
+	// below were added in the same change, because until then they had the
+	// identical hole (`claude-sonnet-5` is not a prefix of a future
+	// `claude-sonnet-6`, nor `claude-haiku-4` of `claude-haiku-5`). The
+	// convention is only worth stating because it is now actually complete —
+	// do not add a new Anthropic family without its bare row.
+	//
+	// NO FastMultiplier — deliberately left 0 so future SKUs opt in
+	// explicitly, exactly as the claude-opus-4 comment above reasons. A
+	// fast tier is a per-SKU capability, never inherited by prefix.
+	//
+	// Verified non-shadowing (familyKeys sorts longest-first and returns
+	// the first prefix match): `claude-3-opus` does NOT start with
+	// "claude-opus" so the legacy $15/$75 rows are untouched, and every
+	// `claude-opus-4*` key is strictly longer than "claude-opus" so they
+	// all win the sort — including the legacy claude-opus-4-1 row.
+	//
+	// HONEST LIMIT of this safety net: it does NOT catch vendor-decorated
+	// ids. normalizeUnpricedModel strips only `capi:` / `sweagent-capi:`
+	// prefixes and leading path segments — never a DOTTED vendor prefix — so
+	// Bedrock/Vertex-style ids like `us.anthropic.claude-opus-5:v1` and
+	// `anthropic.claude-opus-5` still resolve to PricingSourceMiss → $0.00
+	// despite this row. That gap is pre-existing and class-wide (Opus 4.8
+	// has it too); it is recorded here so nobody assumes the family row
+	// covers it. Pinned by TestTable_DottedVendorPrefixStillMisses.
+	"claude-opus": {Input: 5, Output: 25, CacheRead: 0.50, CacheCreation: 6.25, CacheCreation1h: 10, WebSearchPerRequest: 0.01},
 	// Anthropic — Claude Opus 4 / 4.1 (legacy rates, $15/$75).
+	//
+	// `claude-opus-4-0` is Anthropic's documented undated ALIAS for legacy
+	// Claude Opus 4 — the same model as the dated `claude-opus-4-20250514`
+	// row below, at the same legacy $15/$75. It needs its own row because of
+	// a LEGACY-ALIAS TRAP: the `claude-opus-4` family row is deliberately
+	// pinned to CURRENT-gen rates ($5/$25) so future SKUs inherit current
+	// pricing, and `claude-opus-4-0` is the one LEGACY id that shares that
+	// prefix. Without this row it fell through to the family row and billed
+	// at $5/$25 — a 3× UNDER-bill of real legacy-Opus-4 traffic. Rates
+	// mirror the claude-opus-4-1 row exactly, including the absence of
+	// WebSearchPerRequest (matching its legacy siblings, which predate the
+	// server-side web_search fee being modelled).
+	"claude-opus-4-0":          {Input: 15, Output: 75, CacheRead: 1.5, CacheCreation: 18.75, CacheCreation1h: 30},
 	"claude-opus-4-1":          {Input: 15, Output: 75, CacheRead: 1.5, CacheCreation: 18.75, CacheCreation1h: 30},
 	"claude-opus-4-1-20250805": {Input: 15, Output: 75, CacheRead: 1.5, CacheCreation: 18.75, CacheCreation1h: 30},
 	"claude-opus-4-20250514":   {Input: 15, Output: 75, CacheRead: 1.5, CacheCreation: 18.75, CacheCreation1h: 30},
@@ -457,11 +546,60 @@ var defaultPricing = map[string]Pricing{
 		LongContextCacheCreation: 7.50, LongContextCacheCreation1h: 12,
 	},
 	"claude-sonnet-3-7": {Input: 3, Output: 15, CacheRead: 0.30, CacheCreation: 3.75, CacheCreation1h: 6}, // deprecated
+	// claude-sonnet (no generation) — the Sonnet family-prefix SAFETY NET,
+	// the sibling of the bare `claude-opus` row above. Without it a future
+	// `claude-sonnet-6` MISSes to $0.00: "claude-sonnet-5" is not a prefix
+	// of "claude-sonnet-6", and neither is "claude-sonnet-4" — the exact
+	// hole `claude-opus-5` fell through. internal/routing/tiers.go already
+	// carried a bare `claude-sonnet` tier, so before this row the two
+	// registries disagreed about whether the family was known.
+	//
+	// Rates are the STANDARD $3/$15 card (cache 0.30 / 3.75 / 6), NOT
+	// Sonnet 5's $2/$10 INTRODUCTORY rate. That is deliberate: the intro
+	// window closes 2026-08-31, after which standard Sonnet pricing is
+	// $3/$15 — a family fallback that inherited the intro rate would
+	// silently UNDER-bill every unpinned Sonnet SKU from 2026-09-01 onward.
+	// A fallback should err toward the durable published rate, and the
+	// explicit `claude-sonnet-5` row keeps billing the intro rate correctly
+	// for the SKU that actually has it (it is longer, so it wins
+	// familyKeys' longest-first sort).
+	//
+	// NO FastMultiplier — fast mode is an Opus-tier capability today; leave
+	// 0 so a future fast-capable Sonnet opts in explicitly on its own row.
+	//
+	// NO LongContextThreshold — the LC tier is a per-SKU property (4 / 4.5
+	// have it, 4.6 and 5 do not), so the family fallback must not invent one.
+	//
+	// Non-shadowing: `claude-3-5-sonnet*` and `claude-3-sonnet-*` do not
+	// START with "claude-sonnet", so the legacy rows are untouched; every
+	// existing `claude-sonnet-*` key is strictly longer and wins the sort.
+	"claude-sonnet": {Input: 3, Output: 15, CacheRead: 0.30, CacheCreation: 3.75, CacheCreation1h: 6, WebSearchPerRequest: 0.01},
 	// Anthropic — Haiku 4.5. Web search billed at $0.01/call.
 	"claude-haiku-4-5-20251001": {Input: 1, Output: 5, CacheRead: 0.10, CacheCreation: 1.25, CacheCreation1h: 2, WebSearchPerRequest: 0.01},
 	"claude-haiku-4-5":          {Input: 1, Output: 5, CacheRead: 0.10, CacheCreation: 1.25, CacheCreation1h: 2, WebSearchPerRequest: 0.01},
 	"claude-haiku-4.5":          {Input: 1, Output: 5, CacheRead: 0.10, CacheCreation: 1.25, CacheCreation1h: 2, WebSearchPerRequest: 0.01}, // dot variant — GitHub Copilot CLI emits this name
 	"claude-haiku-4":            {Input: 1, Output: 5, CacheRead: 0.10, CacheCreation: 1.25, CacheCreation1h: 2, WebSearchPerRequest: 0.01},
+	// claude-haiku (no generation) — the Haiku family-prefix SAFETY NET,
+	// completing the bare-row set with `claude-opus` / `claude-sonnet`.
+	// Without it a future `claude-haiku-5` MISSes to $0.00 ("claude-haiku-4"
+	// is not a prefix of "claude-haiku-5"), the same hole `claude-opus-5`
+	// fell through. internal/routing/tiers.go already carried a bare
+	// `claude-haiku` tier, so the two registries disagreed until now.
+	//
+	// Rates are the current-generation Haiku 4.5 card ($1/$5, cache
+	// 0.10 / 1.25 / 2, web search $0.01/call) — family prefixes point at
+	// the LATEST tier so new SKUs inherit current pricing, never legacy.
+	// The legacy 3.5 / 3 Haiku rows are cheaper but they are pinned
+	// explicitly and unreachable from this prefix.
+	//
+	// NO FastMultiplier — fast mode is Opus-tier only; a future fast-capable
+	// Haiku must opt in on its own row.
+	//
+	// Non-shadowing: `claude-3-5-haiku*` and `claude-3-haiku-*` do not START
+	// with "claude-haiku", so the legacy rows are untouched; every existing
+	// `claude-haiku-*` key (including the `claude-haiku-4.5` dot variant
+	// Copilot CLI emits) is strictly longer and wins the longest-first sort.
+	"claude-haiku": {Input: 1, Output: 5, CacheRead: 0.10, CacheCreation: 1.25, CacheCreation1h: 2, WebSearchPerRequest: 0.01},
 	// Anthropic — Claude 3.5.
 	"claude-3-5-sonnet-20241022": {Input: 3, Output: 15, CacheRead: 0.30, CacheCreation: 3.75, CacheCreation1h: 6},
 	"claude-3-5-sonnet-20240620": {Input: 3, Output: 15, CacheRead: 0.30, CacheCreation: 3.75, CacheCreation1h: 6},

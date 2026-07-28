@@ -420,7 +420,7 @@ func runRetention(ctx context.Context, cfg config.Config, database *sql.DB) (ret
 // ≤ 0 disables the loop. The first tick fires one full interval after
 // startup — prune_on_startup already covers the boot pass.
 func retentionTickLoop(ctx context.Context, configPath string) {
-	cfg, database, cleanup, err := loadConfigAndDBFast(ctx, configPath)
+	cfg, database, cleanup, err := loadConfigAndDB(ctx, configPath)
 	if err != nil {
 		return
 	}

@@ -195,7 +195,7 @@ func handleBrowserHook(ctx context.Context, event, configPath string) {
 	// out the contention. The generous window gives that busy_timeout headroom.
 	workCtx, cancel := context.WithTimeout(ctx, cfg.Browser.IngestTimeout())
 	defer cancel()
-	database, err := db.Open(workCtx, db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+	database, err := db.Open(workCtx, db.Options{Path: cfg.Observer.DBPath})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "observer-browser: %s db: %v\n", label, err)
 		return

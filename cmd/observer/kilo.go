@@ -36,6 +36,7 @@ func newKiloCmd() *cobra.Command {
 		fromTime     string
 		attach       *bool
 		noAttach     *bool
+		resume       *string
 	)
 	cmd := &cobra.Command{
 		Use:   "kilo [-- kilo-args...]",
@@ -66,13 +67,25 @@ func newKiloCmd() *cobra.Command {
 				flagNoAttach: *noAttach,
 				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
 					argsLeadWithSubcommand(args, kiloAttachHeadlessSubcommands),
-				passthrough: kiloAttachPassthrough(kiloPath),
+				passthrough: append(kiloAttachPassthrough(kiloPath), resumeAttachPassthrough(*resume)...),
 				toolArgs:    args,
 				stderr:      cmd.ErrOrStderr(),
 			})
 			if outcome.handled {
 				return aErr
 			}
+
+			// Native resume: `--resume <id>` → `kilo --session <id>` (bare path).
+			resumedArgs, releaseResume, okResume, resumeErr := applyLauncherResume(launcherResumeSpec{
+				verb: "kilo", label: "kilo", configPath: configPath, id: *resume,
+				continueFrom: continueFrom, carry: carry, fromMessage: fromMessage, fromTime: fromTime,
+				args: args, stderr: cmd.ErrOrStderr(),
+			})
+			if !okResume {
+				return resumeErr
+			}
+			defer releaseResume()
+			args = resumedArgs
 
 			bin, err := resolveToolBin("kilo-code-cli", kiloPath, "--kilo-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
@@ -118,6 +131,7 @@ func newKiloCmd() *cobra.Command {
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "kilo-code-cli")
+	resume = registerResumeFlag(cmd, "kilo-code-cli")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
 }

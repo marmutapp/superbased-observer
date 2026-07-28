@@ -53,6 +53,55 @@ func (c *Composite) RequiresUnattributedCapture() bool {
 	return false
 }
 
+// TransportStats implements TransportStatsSource by walking the children and
+// aggregating whichever of them own a dial-in transport (mergeTransportStats:
+// counters sum, Connected ORs, timestamps take the max).
+//
+// It is the ONLY way to reach those stats in production: the wiring wraps the
+// accept listener in a Composite and drops the concrete handle
+// (selectProcessBackend's withETW), so without this forwarder the listener's
+// counters have no reader at all.
+//
+// ok=false when NO child implements the capability — "there is no such
+// transport", which consumers must render as silence. Returning ok=true with
+// zeroed counters would claim a transport exists and has never been connected
+// to, which is a different (and alarming) fact.
+func (c *Composite) TransportStats() (TransportStats, bool) {
+	var (
+		agg   TransportStats
+		found bool
+	)
+	for _, b := range c.backends {
+		ts, ok := TransportStatsOf(b)
+		if !ok {
+			continue
+		}
+		found = true
+		agg = mergeTransportStats(agg, ts)
+	}
+	if !found {
+		return TransportStats{}, false
+	}
+	return agg, true
+}
+
+// TransportUnavailableReason implements TransportUnavailableSource by asking
+// the children in order and returning the first non-empty reason — a
+// composite whose child lost a requested transport has lost it, and the
+// reason must not be swallowed by the wrapping.
+//
+// Reasons are not joined: each is a whole sentence about one transport, and
+// splicing two would produce text no component ever wrote. Empty (the normal
+// case) means no child was asked for a transport it could not create.
+func (c *Composite) TransportUnavailableReason() string {
+	for _, b := range c.backends {
+		if reason := TransportUnavailableReasonOf(b); reason != "" {
+			return reason
+		}
+	}
+	return ""
+}
+
 // Start starts every child, fans their channels into one merged channel, and
 // returns it. A child that fails to Start is skipped (onChildError + continue);
 // only when NO child starts does Start return an error. The merged channel

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -117,6 +118,16 @@ type RawEvent struct {
 	WriteOps        int64
 	ThreadCount     int32
 	HandleCount     int32
+
+	// HasNetworkMetrics gates NetworkBytesIn/NetworkBytesOut on a metrics-
+	// bearing event (exec / EventMetrics / exit). It is the "measured" bit that
+	// keeps a genuine zero distinguishable from "never measured": only a
+	// backend with live per-process socket accounting (today: the Linux eBPF
+	// backend's fentry/fexit TCP probes, surfaced through
+	// poll.Options.NetworkBytes) sets it. False everywhere else — including
+	// every Windows-captured process, where per-process byte accounting needs
+	// ETW and is not implemented. Never infer zero bytes from a false here.
+	HasNetworkMetrics bool
 
 	// Security / isolation posture (P4) — userspace-enriched at exec.
 	// Compact identifiers only (spec §8 Security + Isolation groups). The
@@ -244,12 +255,20 @@ type ProcessRun struct {
 	ThreadCount     int32
 	HandleCount     int32
 
-	// MetricSamples is a capped, time-throttled ring buffer of recent resource
-	// readings driving the per-process sparkline. Appended on exec + each
-	// EventMetrics refresh (≥ metricSampleInterval apart), capped at
-	// maxMetricSamples (oldest dropped). The store serializes it to the
-	// metric_samples_json column; it resets if the daemon restarts (in-memory).
+	// MetricSamples is the live-chart ring buffer of recent resource readings.
+	// Appended on exec + each EventMetrics refresh (≥ MetricPolicy.
+	// SampleInterval apart), evicted past MetricPolicy.Window and capped at
+	// MetricPolicy.MaxSamples (oldest dropped). The store serializes a
+	// DOWNSAMPLED copy to the metric_samples_json column at the (much slower)
+	// MetricPolicy.PersistInterval; the full-resolution ring is in-memory only
+	// and resets if the daemon restarts.
 	MetricSamples []MetricSample
+
+	// lastMetricPersistAt is the ring's DB-write bookkeeping: the timestamp of
+	// the last metrics refresh that was reported as ChangeUpdated (i.e. that
+	// caused a row rewrite). Unexported — it is Attributor state that happens
+	// to live per-run, never part of the persisted envelope.
+	lastMetricPersistAt time.Time
 
 	// IsBoundary marks init/systemd/WSL-relay processes (§9.2.6): they are
 	// attribution boundaries and never propagate inheritance to children.
@@ -308,15 +327,244 @@ type EventSink interface {
 	PersistProcessEvents(ctx context.Context, events []ProcessEvent) (int, error)
 }
 
-// MetricSample is one timestamped resource reading for the sparkline ring
-// buffer (CPU cumulative ms, current working set, cumulative disk bytes).
+// MetricSample is one timestamped resource reading for the live-chart ring
+// buffer (CPU cumulative ms, current working set, cumulative disk bytes,
+// cumulative socket bytes).
+//
+// EVERY counter here except WorkingSet is CUMULATIVE — monotonically
+// non-decreasing over the life of the process — so a consumer drawing rates
+// must DIFFERENTIATE consecutive samples (Δvalue / ΔT) and treat a DECREASE as
+// a counter reset (drop the interval rather than plotting a negative rate).
+// WorkingSet is an instantaneous gauge and is plotted as-is.
+//
+// The JSON tags are the on-disk wire format of process_runs.metric_samples_json
+// (a JSON ring — no migration is needed to add a field, and a ring written by
+// an older build simply decodes with the new fields at their zero value).
+// NetRx/NetTx/NetMeasured were added that way; never RENAME an existing tag.
 type MetricSample struct {
 	T          time.Time `json:"t"`
 	CPUMs      int64     `json:"cpu_ms"`
 	WorkingSet int64     `json:"ws"`
 	ReadBytes  int64     `json:"rb"`
 	WriteBytes int64     `json:"wb"`
+
+	// NetRxBytes / NetTxBytes are CUMULATIVE per-process socket bytes received
+	// / sent since the capture probes attached (NOT since process start — a
+	// process that predates the daemon starts from 0 here). TCP ONLY: the
+	// Linux eBPF backend counts tcp_sendmsg / tcp_cleanup_rbuf payload bytes,
+	// so UDP (incl. QUIC / HTTP-3), unix-domain, and raw sockets are NOT
+	// included, and neither are IP/TCP headers or retransmits. Meaningful only
+	// when NetMeasured is true.
+	NetRxBytes int64 `json:"net_rx,omitempty"`
+	NetTxBytes int64 `json:"net_tx,omitempty"`
+
+	// NetMeasured reports that per-process network accounting was LIVE for
+	// this sample, so a zero in NetRx/NetTx is a real "no bytes moved" rather
+	// than "not measured". False means UNMEASURED — the eBPF probes are not
+	// attached (no CAP_BPF/CAP_PERFMON, unsupported kernel, feature off), the
+	// process was captured on Windows (needs ETW, unimplemented), or the ring
+	// predates this field. A chart MUST render an unmeasured series as absent,
+	// never as a flat zero line.
+	NetMeasured bool `json:"net_measured,omitempty"`
 }
+
+// MetricPolicy governs the live-chart ring buffer: how often a point is
+// appended in memory, how long a window is retained, and — decoupled from
+// both — how often the ring is written to the DB.
+//
+// The two cadences are deliberately independent (docs/process-observability.md
+// §"Live metrics ring"). The ring is persisted inside process_runs.
+// metric_samples_json, so EVERY persist rewrites the whole row: sampling at
+// the poll rate while persisting at the poll rate would multiply write
+// amplification by the sampling factor on a DB that is already multi-GB. So we
+// sample often (fresh chart) and persist rarely (cheap), and downsample the
+// persisted copy so the column size is independent of the sample rate.
+type MetricPolicy struct {
+	// SampleInterval throttles in-memory ring appends. A refresh arriving
+	// sooner updates the newest point IN PLACE (values move, the point count
+	// and its timestamp do not), so the buffer can never grow faster than
+	// one point per interval no matter how fast the backend polls.
+	// A sample can never be fresher than the backend poll that produced it —
+	// setting this below [observer.process].poll_interval_ms does NOT make the
+	// chart finer, it just makes every poll append instead of refresh.
+	SampleInterval time.Duration
+	// Window is the retained time span: on append, points older than
+	// newest-Window are evicted. This is the bound the operator actually sees
+	// ("the chart shows the last N minutes"), independent of sample rate.
+	Window time.Duration
+	// MaxSamples is the absolute in-memory cap (belt-and-braces against a
+	// pathological Window/SampleInterval ratio). ≤ 0 = derived from
+	// Window/SampleInterval only.
+	MaxSamples int
+	// PersistInterval throttles DB writes for metrics-only refreshes: a
+	// refresh sooner than this updates memory but reports ChangeNone, so the
+	// row is not rewritten. Lifecycle events (exec/exit) always persist, so a
+	// finished process always lands with its final ring. ≤ 0 = persist every
+	// refresh (the pre-decoupling behaviour; tests use it).
+	PersistInterval time.Duration
+	// PersistMaxSamples caps the number of points written to the DB. When the
+	// in-memory ring is longer it is downsampled evenly, ALWAYS keeping the
+	// oldest and — load-bearing for a live chart — the NEWEST point exactly.
+	// ≤ 0 = persist the whole ring.
+	PersistMaxSamples int
+}
+
+// Default live-chart ring constants. See docs/process-observability.md for the
+// write-amplification arithmetic behind them.
+const (
+	// DefaultMetricSampleInterval matches the default process poll cadence
+	// (2s), so every poll yields a fresh point instead of 7 of every 8 being
+	// discarded by the old 15s throttle.
+	DefaultMetricSampleInterval = 2 * time.Second
+	// DefaultMetricWindow is the retained live window (5 min at 2s = 150
+	// points), replacing the old fixed 60-point/15-min buffer.
+	DefaultMetricWindow = 5 * time.Minute
+	// DefaultMetricMaxSamples hard-caps the in-memory ring regardless of the
+	// Window/SampleInterval ratio (300 points ≈ 24 KB/process worst case).
+	DefaultMetricMaxSamples = 300
+	// DefaultMetricPersistInterval is the DB write cadence for metrics-only
+	// refreshes. At the 2s poll default this is 7.5× FEWER row rewrites than
+	// the pre-decoupling behaviour (which persisted on every poll).
+	DefaultMetricPersistInterval = 15 * time.Second
+	// DefaultMetricPersistMaxSamples downsamples the persisted ring so the
+	// JSON column stays the size it was before the sample rate went up.
+	DefaultMetricPersistMaxSamples = 60
+)
+
+// DefaultMetricPolicy returns the shipped live-chart ring policy.
+func DefaultMetricPolicy() MetricPolicy {
+	return MetricPolicy{
+		SampleInterval:    DefaultMetricSampleInterval,
+		Window:            DefaultMetricWindow,
+		MaxSamples:        DefaultMetricMaxSamples,
+		PersistInterval:   DefaultMetricPersistInterval,
+		PersistMaxSamples: DefaultMetricPersistMaxSamples,
+	}
+}
+
+// withDefaults fills unset (≤ 0) fields from DefaultMetricPolicy, EXCEPT
+// PersistInterval and PersistMaxSamples, whose ≤ 0 values are meaningful
+// ("persist every refresh" / "persist the whole ring").
+func (p MetricPolicy) withDefaults() MetricPolicy {
+	d := DefaultMetricPolicy()
+	if p.SampleInterval <= 0 {
+		p.SampleInterval = d.SampleInterval
+	}
+	if p.Window <= 0 {
+		p.Window = d.Window
+	}
+	return p
+}
+
+// ringCap is the effective in-memory point cap: the window's worth of samples
+// (plus one, so a full window is representable), clamped by MaxSamples.
+func (p MetricPolicy) ringCap() int {
+	n := 1
+	if p.SampleInterval > 0 && p.Window > 0 {
+		n = int(p.Window/p.SampleInterval) + 1
+	}
+	if n < 1 {
+		n = 1
+	}
+	if p.MaxSamples > 0 && n > p.MaxSamples {
+		n = p.MaxSamples
+	}
+	return n
+}
+
+// NetworkAccounting is the shared, concurrency-safe status of per-process
+// network byte accounting. The capture backend that owns the probes is the
+// only writer; Health reads it so `observer doctor` / the dashboard can tell
+// "measured zero bytes" from "not measured at all" — a flat zero line drawn
+// for an unmeasured process is a lie, so the distinction is carried, never
+// inferred.
+//
+// The zero value is valid and reports NetworkAccountingOff.
+type NetworkAccounting struct {
+	mu     sync.Mutex
+	mode   string
+	reason string
+}
+
+// Network-accounting modes (NetworkAccounting.Mode).
+const (
+	// NetworkAccountingOff — not requested (feature disabled by config).
+	NetworkAccountingOff = "off"
+	// NetworkAccountingUnavailable — requested but the probes could not
+	// attach (no CAP_BPF/CAP_PERFMON, no BTF, kernel without fentry/fexit,
+	// non-Linux). Capture degrades to lifecycle-only; bytes are UNMEASURED.
+	NetworkAccountingUnavailable = "unavailable"
+	// NetworkAccountingTCP — live, counting TCP payload bytes only.
+	NetworkAccountingTCP = "tcp"
+)
+
+// networkAccountingModes is the CLOSED vocabulary of accounting modes this
+// build understands. It is the one owner of that list (CLAUDE.md rule 4):
+// every consumer that has to decide "is this a mode I recognise?" asks
+// KnownNetworkAccountingMode rather than keeping its own copy.
+var networkAccountingModes = []string{
+	NetworkAccountingOff,
+	NetworkAccountingUnavailable,
+	NetworkAccountingTCP,
+}
+
+// KnownNetworkAccountingMode reports whether mode is one this build defines.
+//
+// It exists because a mode can arrive from OFF THIS MACHINE: the cross-OS
+// capturer states its own accounting mode in its hello frame, over a socket
+// that (under WSL's localhostForwarding) any process on the Windows host can
+// dial. An unrecognised string must therefore never be adopted as-is — an
+// arbitrary name would otherwise satisfy "not off, not unavailable, so it
+// must be live" and let a remote assert a POSITIVE measurement claim under a
+// mode nothing in this build has ever seen, and would land verbatim in a
+// Prometheus label. Callers reject or normalise; nobody guesses.
+//
+// The empty string is NOT known: it means "the far side said nothing", which
+// every consumer already handles as unknown rather than as a mode.
+func KnownNetworkAccountingMode(mode string) bool {
+	for _, m := range networkAccountingModes {
+		if m == mode {
+			return true
+		}
+	}
+	return false
+}
+
+// NetworkAccountingModes returns the closed mode vocabulary, newly allocated
+// so a caller cannot mutate the package's copy. Used by the metrics exporter,
+// which emits one series per mode as an enum-style state set.
+func NetworkAccountingModes() []string {
+	return append([]string(nil), networkAccountingModes...)
+}
+
+// Set records the current mode and a human-readable reason (may be empty).
+func (n *NetworkAccounting) Set(mode, reason string) {
+	if n == nil {
+		return
+	}
+	n.mu.Lock()
+	n.mode, n.reason = mode, reason
+	n.mu.Unlock()
+}
+
+// Status returns the current mode and reason. A nil receiver reports "off".
+func (n *NetworkAccounting) Status() (mode, reason string) {
+	if n == nil {
+		return NetworkAccountingOff, ""
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.mode == "" {
+		return NetworkAccountingOff, ""
+	}
+	return n.mode, n.reason
+}
+
+// NetworkBytesFunc reports the CUMULATIVE socket bytes a pid has received and
+// sent since accounting began. ok=false means accounting is not live at all
+// (unmeasured); ok=true with (0,0) means the process is measured and has moved
+// no bytes yet — the two are never conflated.
+type NetworkBytesFunc func(pid int) (in, out int64, ok bool)
 
 // Attributed reports whether the run carries a session attribution.
 func (r *ProcessRun) Attributed() bool {

@@ -423,3 +423,58 @@ func TestCanonicalBase(t *testing.T) {
 		}
 	}
 }
+
+// TestParsedCommandsAlwaysHaveArgv pins the Command.Argv non-empty
+// invariant, in the only place it can be pinned: over the parser's
+// real output for the shapes that stress its construction sites.
+//
+// It is a guard against a class, not a bug fix. Seven matchers range
+// over `Argv[1:]` with no length check, so ONE unit with a
+// zero-length Argv panics the entire evaluation — a strictly worse
+// failure than any verdict, and one an attacker would control the
+// input for. It was reachable: the round-4 fail-closed path for a
+// substitution at the depth cap has to emit a unit for a line that
+// lexed to no words at all, and the first version of it emitted one
+// with no Argv (docs/security.md H5 round 4).
+func TestParsedCommandsAlwaysHaveArgv(t *testing.T) {
+	t.Parallel()
+	lines := []string{
+		"",
+		"   ",
+		"$()",
+		"$(crontab -e)",
+		"`crontab -e`",
+		"$($($($($($(crontab -e))))))",
+		"''",
+		`"" `,
+		"|",
+		";;;",
+		"() ",
+		"FOO=1",
+		"sudo",
+		"wsl '' crontab -e",
+		"start ''",
+		`start "" ""`,
+		"sh -c ''",
+		`sh -c "$(crontab -e)"`,
+		strings.Repeat("cmd /c ", 7) + "$(crontab -e)",
+		strings.Repeat("wsl -- ", 6) + "$($(crontab))",
+		"echo > ",
+		"cat <<EOF\nbody\nEOF",
+	}
+	for _, line := range lines {
+		for _, d := range []Dialect{DialectPosix, DialectCmd, DialectPowerShell} {
+			for i, c := range ParseCommand(line, d) {
+				if len(c.Argv) == 0 {
+					t.Errorf("[%s] %q unit %d has an empty Argv (Base=%q Raw=%q Unanalyzed=%q)",
+						d, line, i, c.Base, c.Raw, c.Unanalyzed)
+				}
+			}
+			for i, c := range ParseArgv(strings.Fields(line), d) {
+				if len(c.Argv) == 0 {
+					t.Errorf("[%s] argv %q unit %d has an empty Argv", d, line, i)
+				}
+			}
+		}
+	}
+}

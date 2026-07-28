@@ -331,14 +331,47 @@ var (
 )
 
 // ControlDenialReason is the stable wire taxonomy for a refused remote writer
-// acquire. Only ControlDenialAuth means a credential was genuinely rejected;
-// callers must not clear a standing secret for any other reason.
+// acquire. Exactly TWO values are permanent verdicts on the presented
+// credential — ControlDenialAuth (it was judged and rejected) and
+// ControlDenialAuthRevoked (no standing secret exists on the server at all).
+// Callers must not clear a standing secret for any other reason.
 type ControlDenialReason string
 
 const (
 	// ControlDenialAuth means the capability/confirm or standing secret failed
-	// its credential check.
+	// its credential check — the credential WAS judged and rejected. It is the
+	// ONLY reason a device may treat as proof that a saved standing secret is
+	// dead (and therefore the only one it may clear the secret for).
 	ControlDenialAuth ControlDenialReason = "auth"
+	// ControlDenialAuthTransient means the credential leg refused WITHOUT ever
+	// judging the presented credential — standing access is currently switched
+	// off, the attempt was rate-limited, or the acquire raced an admin
+	// transition (the standing generation moved between verify and install).
+	// The refusal is exactly as hard as ControlDenialAuth; the difference is
+	// purely diagnostic, and the device MUST keep its saved standing secret.
+	// Added 2026-07-25: these cases used to report "auth", which made a
+	// momentary rate-limit or a disabled-then-re-enabled toggle wipe a valid
+	// secret and force the operator to mint a new one. Clients that predate this
+	// value fall through their default branch to the neutral "temporarily
+	// unavailable, secret not cleared" handling, which is the correct behaviour.
+	ControlDenialAuthTransient ControlDenialReason = "auth_transient"
+	// ControlDenialAuthRevoked means the standing terminal-control secret has
+	// been REVOKED on this server and not re-provisioned: the revoke path
+	// deletes the hash at rest, so there is nothing left for any device's saved
+	// secret to match, now or later (a fresh mint issues a DIFFERENT secret).
+	// Like ControlDenialAuth it is a PERMANENT verdict on the presented
+	// credential and the device should clear it — unlike ControlDenialAuth the
+	// secret was never compared, because there was nothing to compare it
+	// against.
+	//
+	// Added 2026-07-25 (operator decision A2). It splits the one genuinely
+	// terminal case out of ControlDenialAuthTransient, which had swept up
+	// "revoked forever" with "switched off for a minute" and left devices
+	// retrying a dead secret indefinitely. The server emits it ONLY when it can
+	// prove no secret exists at rest; a merely-disabled gate stays transient.
+	// Clients that predate this value fall through to their default branch and
+	// keep the secret, which is the safe direction.
+	ControlDenialAuthRevoked ControlDenialReason = "auth_revoked"
 	// ControlDenialHeldLocally means a local/native writer holds control and the
 	// authenticated-remote takeover policy is disabled.
 	ControlDenialHeldLocally ControlDenialReason = "held_locally"
@@ -630,6 +663,73 @@ func watchSessionLifetime(raw string, lt deviceSessionLifetimer, done <-chan str
 			// Deadline reached — loop re-reads liveness. If the session was
 			// idle-refreshed by other activity it is still live with a fresh
 			// deadline; otherwise SessionLifetime now reports live=false → cancel.
+		}
+	}
+}
+
+// viewerSessionTouchInterval is how often an ATTACHED terminal websocket
+// refreshes its device session's idle clock. It is a package var (not a const)
+// solely so a test can shorten it; production callers never write it.
+//
+// 60s is far below any supported session_idle_minutes, and the store throttles
+// the DURABLE write to once per Idle/4, so the SQLite cost is negligible.
+var viewerSessionTouchInterval = 60 * time.Second
+
+// deviceSessionToucher is the ADDITIVE optional write seam that lets an attached
+// terminal websocket count as device-session activity. It is deliberately
+// SEPARATE from deviceSessionLifetimer — that interface's SessionLifetime is
+// contractually read-only and several callers depend on it never extending a
+// session, so this is a distinct, explicitly-named method rather than a change
+// to that contract. Type-asserted off the RemoteController, so nil/fake/loopback
+// controllers stay valid (CLAUDE.md #6). Satisfied by *remoteController.
+type deviceSessionToucher interface {
+	// TouchDeviceSession refreshes a LIVE device session's idle clock and
+	// reports whether it was live. It can only extend an already-live session —
+	// never resurrect a revoked/expired one, and never past the absolute TTL.
+	TouchDeviceSession(raw string) bool
+}
+
+// keepDeviceSessionAliveWhileAttached starts the heartbeat that stops a device
+// session idling out from under a user who is actively watching a terminal
+// (2026-07-25, mobile terminal-continuity arc). Before this, an open terminal
+// viewer generated no HTTP requests at all, so nothing refreshed the idle clock:
+// a phone left on a live terminal expired mid-watch, the socket was cancelled
+// through bindViewerLifetime, and the user was told to re-pair.
+//
+// No-op for an empty cookie or a controller without the touch seam (the local
+// loopback dashboard has no device session at all). The goroutine exits when the
+// socket's done channel closes, so it never leaks.
+func (s *Server) keepDeviceSessionAliveWhileAttached(raw string, done <-chan struct{}) {
+	if raw == "" {
+		return
+	}
+	tr, ok := s.opts.Remote.(deviceSessionToucher)
+	if !ok {
+		return
+	}
+	go viewerSessionHeartbeat(raw, tr, done, viewerSessionTouchInterval)
+}
+
+// viewerSessionHeartbeat is the testable core of
+// keepDeviceSessionAliveWhileAttached: it touches the device session every
+// interval while the viewer stays attached, and returns as soon as the viewer
+// disconnects OR the session stops being live (a revoked/expired session is
+// never resurrected — the bound viewer's own lifetime watcher owns the teardown,
+// so this simply stops touching).
+func viewerSessionHeartbeat(raw string, tr deviceSessionToucher, done <-chan struct{}, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-t.C:
+			if !tr.TouchDeviceSession(raw) {
+				return // session already dead — nothing to keep alive
+			}
 		}
 	}
 }
@@ -1379,6 +1479,22 @@ type wsControl struct {
 	Confirm string `json:"confirm,omitempty"`
 	// By identifies the requester that superseded this writer (local|remote).
 	By string `json:"by,omitempty"`
+	// Expiry marks a control_revoked whose cause was the writer lease AGEING
+	// OUT (idle lifetime or hard cap) rather than a takeover or a
+	// trust-withdrawing revoke. It is the wire half of the demote-instead-of-
+	// close rule (shouldCloseOnRevoke): the socket stays up, and the client
+	// needs to know WHICH kind of revocation it just saw, because the two call
+	// for opposite reactions.
+	//
+	// An expiry says nothing about the device's trust, so a client holding a
+	// standing secret may silently re-present it and carry on — that is the
+	// "the client can then silently re-acquire" behaviour this arc promised.
+	// A revoke by a local/remote takeover, or any trust-withdrawing revoke,
+	// must NOT be auto-answered: the owner just took control back, and a device
+	// that immediately re-acquired would be fighting them. Without this flag
+	// both arrive as {"t":"control_revoked","by":""} and are indistinguishable.
+	// Added 2026-07-25 (review B3).
+	Expiry bool `json:"expiry,omitempty"`
 	// Reason carries the typed denial taxonomy on control_denied.
 	Reason ControlDenialReason `json:"reason,omitempty"`
 }
@@ -1413,6 +1529,80 @@ func writePTYSize(ctx context.Context, c *websocket.Conn, g ptyGeometry) {
 		T: "pty_size", Rows: g.rows, Cols: g.cols,
 		InitialRows: g.initialRows, InitialCols: g.initialCols,
 	})
+}
+
+// applyResizeFrame forwards ONE client {"t":"resize"} frame to a live writer
+// lease and, on a reattaching client's no-op resize, spends the bridge's
+// one-shot repaint nudge. It returns the new "already nudged" state.
+//
+// Why the nudge exists: a reconnecting client (mobile page reload) replays the
+// session's output ring and then sends a resize carrying the SAME dimensions the
+// PTY already has. Linux tty_do_resize() skips SIGWINCH when the winsize is
+// unchanged (measured: 3 TIOCSWINSZ calls produced only 2 SIGWINCHs), so that
+// resize is a silent no-op — and a full-screen TUI (Claude Code lives in the
+// ?1049h alternate buffer) NEVER repaints, leaving whatever corrupted or partial
+// screen was on the wire at reconnect time stuck there indefinitely. Bouncing
+// the PTY through (rows-1, cols) and straight back forces exactly ONE guaranteed
+// SIGWINCH, so the child redraws its whole screen. Do NOT "simplify" this into a
+// single resize: an identical winsize raises no signal at all.
+//
+// The geometry snapshot is deliberately taken BEFORE the client's own resize is
+// applied — afterwards the manager's snapshot has already converged on the
+// requested size and every resize would misread as a no-op.
+//
+// Best-effort like the other control writes: a failed resize never breaks the
+// connection. The nudge rides the writer lease (a read-only viewer's resize
+// frame is dropped before this call, and WriterLease.Resize would return
+// ErrNotWriter anyway) and fires at most once per bridge, so the momentary
+// one-row flicker that every viewer of this PTY sees stays bounded.
+func applyResizeFrame(writer LaunchWriter, geo func() ptyGeometry, rows, cols uint16, alreadyNudged bool) bool {
+	var before ptyGeometry
+	if geo != nil {
+		before = geo()
+	}
+	_ = writer.Resize(rows, cols)
+	mid, ok := repaintNudgeRows(before, rows, cols, alreadyNudged)
+	if !ok {
+		return alreadyNudged
+	}
+	_ = writer.Resize(mid, cols)
+	_ = writer.Resize(rows, cols)
+	return true
+}
+
+// repaintNudgeRows decides whether a writer's resize frame needs the forced-
+// SIGWINCH reattach repaint nudge (see bridgeTerminalWS's resize branch for the
+// kernel behaviour that makes it necessary) and, when it does, returns the
+// intermediate row count to bounce the PTY through before restoring rows.
+//
+// before is the PTY geometry snapshot taken BEFORE the client's own resize was
+// applied — after it, the snapshot has already converged on the requested size
+// and every resize would misread as a no-op. rows/cols are the client's request.
+//
+// A nudge is issued only when all three hold: this bridge has not nudged yet
+// (alreadyNudged is false), the geometry is KNOWN (an all-zero snapshot means
+// "size not yet known" and there is nothing to bounce around), and the requested
+// size is IDENTICAL to the live one — a resize that actually changes the winsize
+// already raises SIGWINCH on its own, so nudging it would be redundant churn.
+//
+// The intermediate row count shrinks by one rather than growing, so the PTY is
+// never briefly taller than the client's real viewport; a 1-row terminal bounces
+// upward instead because 0 rows is not a legal winsize.
+func repaintNudgeRows(before ptyGeometry, rows, cols uint16, alreadyNudged bool) (uint16, bool) {
+	if alreadyNudged || before.rows == 0 || before.cols == 0 {
+		return 0, false
+	}
+	if rows != before.rows || cols != before.cols {
+		return 0, false
+	}
+	switch {
+	case rows > 1:
+		return rows - 1, true
+	case rows == 1:
+		return rows + 1, true
+	default:
+		return 0, false
+	}
 }
 
 // handleLaunchWS serves GET /ws/launch/<handle> — the owner-local terminal
@@ -1538,6 +1728,12 @@ func (s *Server) handleLaunchWS(w http.ResponseWriter, r *http.Request) {
 		device := sessionCookie(r)
 		deviceFP := deviceFingerprint(device)
 		peer := hostnameOnly(r.RemoteAddr)
+		// An attached terminal socket IS device activity: keep its device
+		// session's idle clock fresh for as long as this socket lives, so a user
+		// watching a terminal does not have the session expire underneath them
+		// (2026-07-25). Extends only — it can never resurrect a revoked/expired
+		// session, and the absolute TTL is untouched.
+		s.keepDeviceSessionAliveWhileAttached(device, r.Context().Done())
 		// Writer-acquire lifecycle audit (plan §8.1), metadata only. The single-
 		// use capability + confirm are NEVER recorded — only the request, the
 		// coarse outcome, and the device/handle correlation. termlease.Authorize
@@ -1625,14 +1821,45 @@ func (s *Server) handleLaunchWS(w http.ResponseWriter, r *http.Request) {
 // nanoseconds. They are atomics (not plain consts) solely so a test can lower
 // the cadence race-free while a bridge goroutine reads it concurrently; the
 // production defaults (set in init) are unchanged.
+// terminalPingFailuresAllowed is how many CONSECUTIVE ping failures the bridge
+// tolerates before declaring the peer dead (default 5 ⇒ ~3.3 minutes at the
+// 30s/10s defaults). A mobile browser FREEZES a backgrounded tab: the user
+// leaving to copy a pairing code from their mail app stops the tab answering
+// pings, and the previous one-strike rule tore the bridge down inside ~40s. The
+// check is not removed — a genuinely dead peer is still reaped, just after the
+// grace window.
 var (
-	terminalPingIntervalNs atomic.Int64
-	terminalPingTimeoutNs  atomic.Int64
+	terminalPingIntervalNs    atomic.Int64
+	terminalPingTimeoutNs     atomic.Int64
+	terminalPingFailureBudget atomic.Int64
 )
 
 func init() {
 	terminalPingIntervalNs.Store(int64(30 * time.Second))
 	terminalPingTimeoutNs.Store(int64(10 * time.Second))
+	terminalPingFailureBudget.Store(5)
+}
+
+// SetTerminalPingPolicy live-applies the terminal websocket liveness bounds:
+// the ping interval, the per-pong timeout, and how many CONSECUTIVE failures are
+// tolerated before the bridge tears down. Non-positive values leave the
+// corresponding default in place, so a config that omits a key (or seeds 0) is a
+// no-op for that key.
+//
+// It is a package-level setter rather than an Options field because the bounds
+// are read by long-lived per-bridge goroutines, so they must be readable
+// race-free from any Server instance; the same atomics are the existing test
+// seam. Called once at daemon assembly from the [terminal] config block.
+func SetTerminalPingPolicy(interval, timeout time.Duration, failuresAllowed int) {
+	if interval > 0 {
+		terminalPingIntervalNs.Store(int64(interval))
+	}
+	if timeout > 0 {
+		terminalPingTimeoutNs.Store(int64(timeout))
+	}
+	if failuresAllowed > 0 {
+		terminalPingFailureBudget.Store(int64(failuresAllowed))
+	}
 }
 
 // bridgeTerminalWS bridges a terminal Subscription (output) and an optional
@@ -1735,13 +1962,19 @@ func (s *Server) bridgeTerminalWS(parent context.Context, c *websocket.Conn, sub
 				if rb, ok := wl.(interface{ RevokedBy() string }); ok && wl.RevokeIsTakeover() {
 					by = rb.RevokedBy()
 				}
-				_ = wsjson.Write(ctx, c, wsControl{T: "control_revoked", By: by, Gen: launchWriterGen(wl)})
+				_ = wsjson.Write(ctx, c, wsControl{
+					T: "control_revoked", By: by, Gen: launchWriterGen(wl),
+					// Tell the client WHY it lost control: an age-out (which it
+					// may silently answer with a stored standing secret) or a
+					// takeover / trust-withdrawing revoke (which it must not).
+					Expiry: launchWriterRevokeIsExpiry(wl),
+				})
 				// Re-affirm geometry on the control handoff (Feature 2, cheap):
 				// after a native-terminal reclaim the client should re-fit to the
 				// PTY's current dims.
 				sendPTYSize()
 				ctrlSeqMu.Unlock()
-				if closeOnHardRevoke && !wl.RevokeIsTakeover() {
+				if shouldCloseOnRevoke(wl, closeOnHardRevoke) {
 					cancel()
 				}
 			case <-ctx.Done():
@@ -1803,6 +2036,11 @@ func (s *Server) bridgeTerminalWS(parent context.Context, c *websocket.Conn, sub
 	// ONLY frame that can establish a writer is the acquire-writer control frame,
 	// and only through the §4.δ conjunction (acquire) — never a client "oob" or
 	// any other forged frame type.
+	//
+	// repaintNudged records whether this bridge has already spent its one-shot
+	// reattach repaint nudge (see the resize branch). Read/written only by this
+	// single read-loop goroutine, so it needs no synchronisation.
+	repaintNudged := false
 	for {
 		typ, data, rerr := c.Read(ctx)
 		if rerr != nil {
@@ -1825,7 +2063,7 @@ func (s *Server) bridgeTerminalWS(parent context.Context, c *websocket.Conn, sub
 					watchRevoke(newlyAcquired)
 				}
 			case ctrl.T == "resize" && writer != nil:
-				_ = writer.Resize(ctrl.Rows, ctrl.Cols)
+				repaintNudged = applyResizeFrame(writer, geo, ctrl.Rows, ctrl.Cols, repaintNudged)
 			default:
 				if writer == nil {
 					denied.note() // forged/dropped control frame with no live lease (§4.β)
@@ -1858,6 +2096,56 @@ func launchWriterGen(wl LaunchWriter) uint64 {
 		return withGen.Gen()
 	}
 	return 0
+}
+
+// shouldCloseOnRevoke is the single decision table for "does this writer-lease
+// revocation tear the websocket down?". Three ordered rules:
+//
+//	closeOnHardRevoke == false (the owner-local loopback bridge) → never close
+//	the revocation was a TAKEOVER (device still trusted)         → never close
+//	the revocation was an EXPIRY (credential aged out)           → never close
+//	otherwise (admin disable / rotate / device revoke /
+//	allow_terminal→false — the device lost trust)                → CLOSE
+//
+// The expiry row is the 2026-07-25 addition. A lease that merely aged out says
+// nothing about the device's trust, and closing the socket for it is what forced
+// a remote user to re-establish the terminal — and re-issue credentials — every
+// 30 minutes. All three "never close" outcomes still DEMOTE the client to a
+// read-only viewer, and the lease is gone either way: input stays fenced until a
+// fresh §4.δ conjunction succeeds.
+//
+// The expiry row alone is only half the behaviour: keeping the socket open means
+// the client's on-open standing auto-present never re-fires, so the revocation
+// frame also carries wsControl.Expiry and the client answers THAT with a fresh
+// standing acquire (review B3). Takeovers and trust-withdrawing revokes are
+// deliberately left un-answerable — the owner just took control.
+func shouldCloseOnRevoke(wl LaunchWriter, closeOnHardRevoke bool) bool {
+	if !closeOnHardRevoke {
+		return false
+	}
+	if wl.RevokeIsTakeover() {
+		return false
+	}
+	return !launchWriterRevokeIsExpiry(wl)
+}
+
+// launchWriterRevokeIsExpiry reports whether a revoked lease aged out (idle
+// lifetime / hard cap) rather than being revoked for loss of trust. Read through
+// an ADDITIVE optional interface so the narrow LaunchWriter seam and every
+// existing dashboard fake stay source-compatible; a writer without the method
+// reports false, which preserves the pre-2026-07-25 close-on-any-non-takeover
+// behaviour for those callers.
+//
+// The remote bridge uses it to DEMOTE rather than CLOSE on an expiry: a lease
+// that merely aged out says nothing about the device's trust, and closing the
+// socket for it is what forced a remote user to re-establish the terminal (and,
+// with it, re-issue credentials). Trust-withdrawing revokes — admin disable,
+// rotate, device revoke, allow_terminal→false — are unaffected and still close.
+func launchWriterRevokeIsExpiry(wl LaunchWriter) bool {
+	if withExpiry, ok := wl.(interface{ RevokeIsExpiry() bool }); ok {
+		return withExpiry.RevokeIsExpiry()
+	}
+	return false
 }
 
 // bridgeAcquireWriter handles one {"t":"acquire-writer"} control frame for
@@ -1903,13 +2191,28 @@ func bridgeAcquireWriter(ctx context.Context, c *websocket.Conn, ctrl wsControl,
 }
 
 // pingLoop probes the websocket peer every terminalPingInterval and cancels the
-// bridge (via cancel) if a ping fails or times out — detecting a dead/half-open
-// connection without evicting a legitimately-idle-but-alive viewer. It relies on
-// the bridge's concurrent main read loop to read the pong (coder/websocket's
-// Ping requires a concurrent Reader). Returns when the bridge context is done.
+// bridge (via cancel) once terminalPingFailureBudget CONSECUTIVE pings fail or
+// time out — detecting a dead/half-open connection without evicting a
+// legitimately-idle-but-alive viewer. It relies on the bridge's concurrent main
+// read loop to read the pong (coder/websocket's Ping requires a concurrent
+// Reader). Returns when the bridge context is done.
+//
+// The consecutive-failure budget (added 2026-07-25, mobile terminal-continuity
+// arc) is the FROZEN-TAB tolerance: a backgrounded mobile tab is suspended by
+// the OS and answers nothing, so a single missed pong is not evidence of a dead
+// peer. One success anywhere in the window resets the budget, so a peer that is
+// genuinely gone still exhausts it and is reaped — the check is weakened in
+// LATENCY (~40s → ~3.3 min at the defaults), never removed. Deliberately kept
+// as a plain counter rather than a wall-clock grace so the existing atomics test
+// seam still drives it deterministically.
 func pingLoop(ctx context.Context, c *websocket.Conn, cancel context.CancelFunc) {
 	t := time.NewTicker(time.Duration(terminalPingIntervalNs.Load()))
 	defer t.Stop()
+	budget := terminalPingFailureBudget.Load()
+	if budget < 1 {
+		budget = 1
+	}
+	var consecutiveFailures int64
 	for {
 		select {
 		case <-ctx.Done():
@@ -1918,7 +2221,17 @@ func pingLoop(ctx context.Context, c *websocket.Conn, cancel context.CancelFunc)
 			pctx, pcancel := context.WithTimeout(ctx, time.Duration(terminalPingTimeoutNs.Load()))
 			err := c.Ping(pctx)
 			pcancel()
-			if err != nil {
+			if err == nil {
+				consecutiveFailures = 0
+				continue
+			}
+			// The bridge context itself ending is a teardown, not a dead peer —
+			// return without a redundant cancel.
+			if ctx.Err() != nil {
+				return
+			}
+			consecutiveFailures++
+			if consecutiveFailures >= budget {
 				cancel() // dead peer: tear the socket down
 				return
 			}

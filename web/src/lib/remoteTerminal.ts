@@ -143,10 +143,16 @@ export const STANDING_REVOKED_MSG =
   "Standing access was revoked or rotated — the saved secret no longer works and has been cleared from this device. Ask the owner for a new standing secret, or use a one-time approval.";
 
 // TerminalControlDenialReason mirrors the websocket control_denied taxonomy.
-// Only "auth" proves a credential rejection; every other reason must preserve
-// a saved standing secret.
+// Exactly two reasons are permanent verdicts on the credential: "auth" (it was
+// judged and rejected) and "auth_revoked" (the server has no standing secret at
+// rest at all, so nothing can ever match it again). Every other reason —
+// including "auth_transient" (standing access momentarily disabled,
+// rate-limited, or an acquire that raced an admin transition: the secret was
+// refused WITHOUT being judged) — must preserve a saved standing secret.
 export type TerminalControlDenialReason =
   | "auth"
+  | "auth_revoked"
+  | "auth_transient"
   | "held_locally"
   | "held_by_remote"
   | "terminal_disabled"
@@ -168,6 +174,18 @@ export function terminalControlDenialMessage(
       return usedStanding
         ? STANDING_REVOKED_MSG
         : "Control was denied — the capability or confirm code was wrong or already used. Ask the owner to Grant control again.";
+    case "auth_revoked":
+      // The server proved there is no standing secret at rest: it was revoked
+      // and never re-issued. Distinct copy from "auth" because nothing was
+      // wrong with what the device sent — the credential simply no longer
+      // exists on the other end.
+      return usedStanding
+        ? STANDING_REVOKED_MSG
+        : "Standing terminal access has been revoked on this machine. Ask the owner for a one-time approval, or to mint a new standing secret.";
+    case "auth_transient":
+      return usedStanding
+        ? "Standing access is not available right now — it may be switched off, or too many attempts arrived at once. Your saved standing secret has NOT been cleared; it will be presented again automatically on the next connection."
+        : "Terminal control is not available right now — try again in a moment.";
     case "held_locally":
     case "held_by_remote":
       return usedStanding

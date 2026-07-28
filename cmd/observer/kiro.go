@@ -39,6 +39,7 @@ func newKiroCmd() *cobra.Command {
 		fromTime     string
 		attach       *bool
 		noAttach     *bool
+		resume       *string
 	)
 	cmd := &cobra.Command{
 		Use:     "kiro [-- kiro-cli-args...]",
@@ -69,13 +70,26 @@ func newKiroCmd() *cobra.Command {
 				flagAttach:   *attach,
 				flagNoAttach: *noAttach,
 				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime),
-				passthrough:  kiroAttachPassthrough(binPath),
+				passthrough:  append(kiroAttachPassthrough(binPath), resumeAttachPassthrough(*resume)...),
 				toolArgs:     args,
 				stderr:       cmd.ErrOrStderr(),
 			})
 			if outcome.handled {
 				return aErr
 			}
+
+			// Native resume: `--resume <id>` → `kiro-cli chat --resume-id <id>`
+			// (the resume flag lives on the `chat` subcommand).
+			resumedArgs, releaseResume, okResume, resumeErr := applyLauncherResume(launcherResumeSpec{
+				verb: "kiro", label: "kiro", configPath: configPath, id: *resume,
+				continueFrom: continueFrom, carry: carry, fromMessage: fromMessage, fromTime: fromTime,
+				args: args, stderr: cmd.ErrOrStderr(),
+			})
+			if !okResume {
+				return resumeErr
+			}
+			defer releaseResume()
+			args = resumedArgs
 
 			bin, err := resolveToolBin("kiro-cli", binPath, "--kiro-cli-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
@@ -133,6 +147,7 @@ func newKiroCmd() *cobra.Command {
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "kiro-cli")
+	resume = registerResumeFlag(cmd, "kiro-cli")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
 }

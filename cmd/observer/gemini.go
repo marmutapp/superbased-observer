@@ -36,6 +36,7 @@ func newGeminiCmd() *cobra.Command {
 		fromTime     string
 		attach       *bool
 		noAttach     *bool
+		resume       *string
 	)
 	cmd := &cobra.Command{
 		Use:   "gemini [-- gemini-args...]",
@@ -70,13 +71,25 @@ func newGeminiCmd() *cobra.Command {
 				flagNoAttach:  *noAttach,
 				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
 					argsContainHeadlessFlag(args, "-p", "--prompt"),
-				passthrough: geminiAttachPassthrough(binPath),
+				passthrough: append(geminiAttachPassthrough(binPath), resumeAttachPassthrough(*resume)...),
 				toolArgs:    args,
 				stderr:      cmd.ErrOrStderr(),
 			})
 			if outcome.handled {
 				return err
 			}
+			// Native resume: `--resume <id>` → `gemini --resume <uuid>` (bare path;
+			// full session UUID honored — verified live v0.49.0).
+			resumedArgs, releaseResume, okResume, resumeErr := applyLauncherResume(launcherResumeSpec{
+				verb: "gemini", label: "gemini", configPath: configPath, id: *resume,
+				continueFrom: continueFrom, carry: carry, fromMessage: fromMessage, fromTime: fromTime,
+				args: args, stderr: cmd.ErrOrStderr(),
+			})
+			if !okResume {
+				return resumeErr
+			}
+			defer releaseResume()
+			args = resumedArgs
 			cfg, err := config.Load(config.LoadOptions{GlobalPath: configPath})
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
@@ -140,6 +153,7 @@ func newGeminiCmd() *cobra.Command {
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "gemini-cli")
+	resume = registerResumeFlag(cmd, "gemini-cli")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
 }

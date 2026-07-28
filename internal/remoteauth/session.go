@@ -71,12 +71,47 @@ type SessionPersister interface {
 	Reset(ctx context.Context, gen uint64) error
 }
 
+// Device-session lifetime defaults (plan §4.3), applied by NewSessionStore to
+// any zero field.
+//
+// Both were widened on 2026-07-25 (mobile terminal-continuity arc) at the
+// operator's explicit request: idle 1h → 24h, absolute 12h → 48h.
+//
+//   - DefaultSessionIdle is the target the operator asked for: a paired phone
+//     that is put down for a night and picked up the next morning must still be
+//     paired. The old 1h idle meant a device watching a terminal (which sends no
+//     HTTP requests, so nothing refreshed the clock) silently expired mid-watch
+//     and the user had to re-pair — the exact "re-issue the codes" complaint.
+//     A live attached viewer now ALSO refreshes the clock (TouchAttachedViewer),
+//     so 24h is measured from genuine inactivity, not from the last page load.
+//   - DefaultSessionTTL is the absolute re-pair bound. It must EXCEED the idle
+//     bound or the idle target is unreachable — a 12h absolute cap makes a 24h
+//     idle window impossible to ever reach. 48h is the operator's chosen value
+//     (2026-07-25 decision, replacing an implementation that had proposed 7d):
+//     it clears one full 24h idle window plus a full day of headroom, so the
+//     idle rule genuinely decides the common case, while capping a stolen
+//     cookie's total life at two days instead of a week.
+//
+// What this widens: a stolen/persisted device-session cookie stays usable for up
+// to 24h of disuse (was 1h) and at most 48h total (was 12h). What it does NOT
+// widen: the cookie is still HttpOnly+Secure, still stored only as a sha256
+// hash, still killed instantly by Revoke/RevokeByHash/Rotate (`observer remote
+// rotate`, dashboard logout, terminate-all), and still generation-fenced. Both
+// are config-exposed as [remote].session_idle_minutes / session_ttl_minutes for
+// operators who want the old bounds back.
+const (
+	// DefaultSessionTTL is the absolute device-session lifetime (48 hours).
+	DefaultSessionTTL = 48 * time.Hour
+	// DefaultSessionIdle is the device-session inactivity timeout (24 hours).
+	DefaultSessionIdle = 24 * time.Hour
+)
+
 // SessionParams tunes the device-session lifecycle (plan §4.3). Zero fields
 // fall back to safe defaults in NewSessionStore.
 type SessionParams struct {
-	// TTL is the absolute session lifetime. Default 12h.
+	// TTL is the absolute session lifetime. Default DefaultSessionTTL (48h).
 	TTL time.Duration
-	// Idle is the inactivity timeout. Default 1h.
+	// Idle is the inactivity timeout. Default DefaultSessionIdle (24h).
 	Idle time.Duration
 	// Max is the cap on concurrent live sessions. Default 5. 0 ⇒ default.
 	Max int
@@ -126,10 +161,10 @@ type SessionStore struct {
 // and logs loudly (remote access is optional — the daemon still boots).
 func NewSessionStore(p SessionParams) *SessionStore {
 	if p.TTL <= 0 {
-		p.TTL = 12 * time.Hour
+		p.TTL = DefaultSessionTTL
 	}
 	if p.Idle <= 0 {
-		p.Idle = time.Hour
+		p.Idle = DefaultSessionIdle
 	}
 	if p.Max <= 0 {
 		p.Max = 5
@@ -151,8 +186,28 @@ func NewSessionStore(p SessionParams) *SessionStore {
 	return s
 }
 
+// TTL reports the absolute device-session lifetime this store enforces, with
+// the NewSessionStore defaults already applied. It exists so a caller that must
+// stay consistent with the session's own lifetime — notably the HTTP layer
+// setting the device cookie's Max-Age — derives that lifetime from the ONE
+// owner instead of re-deriving it from config or hardcoding a second constant.
+// Always > 0.
+func (s *SessionStore) TTL() time.Duration { return s.params.TTL }
+
 // restore loads the durable generation + non-expired current-gen sessions. Fail
 // closed on any error (empty store, DB untouched, loud log).
+//
+// The restored set honours the Max cap exactly as Create does. Without this a
+// table holding more than Max live rows (possible whenever Max was lowered, or
+// rows accumulated under an older build) put the in-memory store ABOVE the cap
+// at boot, and every subsequent pairing then failed with ErrTooManySessions
+// even though the operator had never seen Max devices. The cap is applied to
+// the MOST-RECENTLY-SEEN sessions — the ones most likely still in a user's
+// hand — and the surplus is pruned DURABLY so memory and the table agree
+// (otherwise the same surplus would be re-read on the next restart). A prune
+// delete that fails is logged and the session still stays out of memory: the
+// in-memory map is the sole source of truth for liveness, and the next restore
+// re-applies the cap over whatever is left.
 func (s *SessionStore) restore() {
 	ctx, cancel := context.WithTimeout(context.Background(), persistTimeout)
 	defer cancel()
@@ -163,6 +218,7 @@ func (s *SessionStore) restore() {
 	}
 	s.gen = gen
 	now := s.now()
+	live := make([]*deviceSession, 0, len(rows))
 	for _, r := range rows {
 		if r.Gen != gen {
 			continue // superseded generation
@@ -175,7 +231,34 @@ func (s *SessionStore) restore() {
 		if s.isExpiredLocked(ds, now) {
 			continue // TTL/idle-expired at load — never restore
 		}
-		s.sessions[r.IDHash] = ds
+		live = append(live, ds)
+	}
+	// Newest activity first; createdAt then the (stable, opaque) hash break
+	// ties so the kept set is deterministic for a given table.
+	sort.Slice(live, func(i, j int) bool {
+		if !live[i].lastSeen.Equal(live[j].lastSeen) {
+			return live[i].lastSeen.After(live[j].lastSeen)
+		}
+		if !live[i].createdAt.Equal(live[j].createdAt) {
+			return live[i].createdAt.After(live[j].createdAt)
+		}
+		return live[i].id < live[j].id
+	})
+	if len(live) > s.params.Max {
+		for _, ds := range live[s.params.Max:] {
+			pctx, pcancel := s.pctx()
+			derr := s.persister.Delete(pctx, ds.id)
+			pcancel()
+			if derr != nil {
+				slog.Warn("remoteauth: failed to prune an over-cap persisted device session (it stays out of memory; the cap is re-applied at next restore)", "error", derr)
+			}
+		}
+		slog.Warn("remoteauth: persisted device sessions exceeded max_sessions — kept the most recently seen and pruned the rest",
+			"loaded", len(live), "max", s.params.Max, "pruned", len(live)-s.params.Max)
+		live = live[:s.params.Max]
+	}
+	for _, ds := range live {
+		s.sessions[ds.id] = ds
 	}
 }
 
@@ -185,7 +268,17 @@ func (s *SessionStore) pctx() (context.Context, context.CancelFunc) {
 }
 
 // Create mints a new session id after evicting any expired sessions and
-// enforcing the Max cap. When a persister is set the row is saved DURABLE-FIRST
+// enforcing the Max cap.
+//
+// The Max cap interacts with the absolute TTL: eviction only removes sessions
+// that have actually EXPIRED, so if all Max (default 5) slots are held by live
+// sessions on devices the operator no longer has — a lost phone, a wiped
+// browser profile — no new device can pair until one ages out, now up to 48h
+// (was 12h). That is bounded and recoverable: `observer remote rotate` (also
+// the dashboard "Reset & unpair all devices") clears every session instantly.
+// Documented in docs/security.md R6 rather than mitigated in code, because
+// evicting a LIVE session to make room for a new pairing would let anyone
+// holding the pairing secret silently displace a legitimate device. When a persister is set the row is saved DURABLE-FIRST
 // (before the cookie is returned): a persist failure returns an error and never
 // mints a cookie. The returned id is the RAW 256-bit crypto/rand token (base64url);
 // only its HASH is stored in memory and on disk.
@@ -310,6 +403,43 @@ func (s *SessionStore) SessionLifetime(raw string) (<-chan struct{}, time.Durati
 		until = 0
 	}
 	return ds.revoked, until, true
+}
+
+// TouchAttachedViewer refreshes the idle clock of a LIVE device session on
+// behalf of a currently-ATTACHED terminal viewer, and reports whether the
+// session was live (an unknown / expired / superseded session returns false and
+// is dropped, exactly as Validate would).
+//
+// It exists because SessionLifetime is deliberately READ-ONLY: a bound viewer is
+// bound TO a session's lifetime and must not silently extend it. That contract
+// is preserved — SessionLifetime is unchanged and every caller that must not
+// extend keeps using it. This is the EXPLICIT opt-in counterpart, called only
+// while a real websocket is attached and streaming, so "someone is watching a
+// terminal right now" counts as the activity it plainly is instead of the
+// session idling out from under the person watching (2026-07-25, mobile
+// terminal-continuity arc).
+//
+// Security note: this can only EXTEND an already-live session's idle clock. It
+// cannot resurrect an expired or revoked session, cannot cross a generation
+// bump, and does nothing about the absolute TTL — a watched session still dies
+// at its hard deadline, and Revoke/Rotate still kill it instantly. The idle
+// refresh is persisted best-effort through the same throttled touchLocked path
+// Validate uses.
+func (s *SessionStore) TouchAttachedViewer(raw string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ds, ok := s.sessions[HashSessionID(raw)]
+	if !ok {
+		return false
+	}
+	now := s.now()
+	if ds.gen != s.gen || s.isExpiredLocked(ds, now) {
+		s.dropLocked(ds)
+		return false
+	}
+	ds.lastSeen = now
+	s.touchLocked(ds, now)
+	return true
 }
 
 // Revoke drops one session (logout) by its RAW cookie and closes its revocation

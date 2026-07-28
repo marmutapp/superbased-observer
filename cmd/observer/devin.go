@@ -31,6 +31,7 @@ func newDevinCmd() *cobra.Command {
 		fromTime     string
 		attach       *bool
 		noAttach     *bool
+		resume       *string
 	)
 	cmd := &cobra.Command{
 		Use:   "devin [-- devin-args...]",
@@ -60,13 +61,26 @@ func newDevinCmd() *cobra.Command {
 				flagAttach:   *attach,
 				flagNoAttach: *noAttach,
 				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime),
-				passthrough:  devinAttachPassthrough(binPath),
+				passthrough:  append(devinAttachPassthrough(binPath), resumeAttachPassthrough(*resume)...),
 				toolArgs:     args,
 				stderr:       cmd.ErrOrStderr(),
 			})
 			if outcome.handled {
 				return aErr
 			}
+
+			// Native resume: `--resume <id>` → `devin --resume <id>` (bare path;
+			// id is the human mnemonic == sessions.db primary key).
+			resumedArgs, releaseResume, okResume, resumeErr := applyLauncherResume(launcherResumeSpec{
+				verb: "devin", label: "devin", configPath: configPath, id: *resume,
+				continueFrom: continueFrom, carry: carry, fromMessage: fromMessage, fromTime: fromTime,
+				args: args, stderr: cmd.ErrOrStderr(),
+			})
+			if !okResume {
+				return resumeErr
+			}
+			defer releaseResume()
+			args = resumedArgs
 
 			bin, err := resolveToolBin("devin", binPath, "--devin-path", configPath, cmd.ErrOrStderr())
 			if err != nil {
@@ -114,6 +128,7 @@ func newDevinCmd() *cobra.Command {
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "devin")
+	resume = registerResumeFlag(cmd, "devin")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
 }

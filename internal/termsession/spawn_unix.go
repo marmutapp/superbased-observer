@@ -59,11 +59,28 @@ func (unixSpawner) Spawn(spec Spec) (PTY, error) {
 	return &unixPTY{f: f, cmd: cmd}, nil
 }
 
+// The unix backend reports its child's pid, so the Manager can publish a
+// ProcessEvent for it (compile-time pin — the windows sibling has the same
+// assertion, so neither platform can silently lose the seam).
+var _ ProcessReporter = (*unixPTY)(nil)
+
 // unixPTY wraps a creack/pty master fd and its process.
 type unixPTY struct {
 	f        *os.File
 	cmd      *exec.Cmd
 	killOnce sync.Once
+}
+
+// Pid implements [ProcessReporter]: the OS pid of the launcher child, which
+// is also its process-group id (StartWithSize sets Setsid). 0 once the
+// process handle is gone. This is the pid an injected process-attribution
+// sink seeds against — the whole `observer <tool>` → `<tool>` subtree hangs
+// off it.
+func (p *unixPTY) Pid() int {
+	if p.cmd == nil || p.cmd.Process == nil {
+		return 0
+	}
+	return p.cmd.Process.Pid
 }
 
 func (p *unixPTY) Read(b []byte) (int, error)  { return p.f.Read(b) }

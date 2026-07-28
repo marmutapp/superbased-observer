@@ -4,7 +4,10 @@ import { HelpInd, TitleWithHelp } from "@/components/HelpInd";
 import { useApi } from "@/lib/useApi";
 import { fetchJSON } from "@/lib/api";
 import { markRestartPending } from "@/lib/restartPending";
-import { LaunchTerminal } from "@/components/LaunchTerminal";
+import {
+  LaunchTerminal,
+  type Status as LaunchTerminalStatus,
+} from "@/components/LaunchTerminal";
 import { useLaunchDock, type DockSession } from "@/components/LaunchDock";
 
 // Remote page (dashboard-management-surface plan §9-§11). Arms/disarms tailnet
@@ -487,7 +490,7 @@ export function RemotePage() {
 
   // When the operator-grant terminal exits, tear it down and auto-retry serve —
   // which now succeeds unprivileged.
-  function onGrantTerminalStatus(s: "connecting" | "open" | "exited" | "error") {
+  function onGrantTerminalStatus(s: LaunchTerminalStatus) {
     if (s === "exited") {
       setGrantHandle(null);
       void setupServe();
@@ -520,7 +523,7 @@ export function RemotePage() {
 
   // On login-terminal exit, tear it down and re-detect — a successful
   // `tailscale up` flips the card to the "up" state.
-  function onLoginTerminalStatus(s: "connecting" | "open" | "exited" | "error") {
+  function onLoginTerminalStatus(s: LaunchTerminalStatus) {
     if (s === "exited") {
       setLoginHandle(null);
       tailscale.reload();
@@ -553,7 +556,7 @@ export function RemotePage() {
 
   // On install-terminal exit, tear it down and re-detect — a successful install
   // flips the card from "not installed" to "installed, log in next".
-  function onInstallTerminalStatus(s: "connecting" | "open" | "exited" | "error") {
+  function onInstallTerminalStatus(s: LaunchTerminalStatus) {
     if (s === "exited") {
       setInstallHandle(null);
       tailscale.reload();
@@ -1145,21 +1148,21 @@ function TailscaleCard({
   grantBusy: boolean;
   grantHandle: string | null;
   grantErr: string | null;
-  onGrantStatus: (s: "connecting" | "open" | "exited" | "error") => void;
+  onGrantStatus: (s: LaunchTerminalStatus) => void;
   onCancelGrant: () => void;
   // Guided login (`tailscale up`) terminal (state 2).
   onRunLogin: () => void;
   loginBusy: boolean;
   loginHandle: string | null;
   loginErr: string | null;
-  onLoginStatus: (s: "connecting" | "open" | "exited" | "error") => void;
+  onLoginStatus: (s: LaunchTerminalStatus) => void;
   onCancelLogin: () => void;
   // Guided install (install.sh) terminal, Linux only (state 1).
   onRunInstall: () => void;
   installBusy: boolean;
   installHandle: string | null;
   installErr: string | null;
-  onInstallStatus: (s: "connecting" | "open" | "exited" | "error") => void;
+  onInstallStatus: (s: LaunchTerminalStatus) => void;
   onCancelInstall: () => void;
   // Scroll to the arm/config section (used before remote is on).
   onGoToPairing: () => void;
@@ -1515,7 +1518,10 @@ function SetupTerminalEmbed({
   handle: string;
   label: string;
   hint: string;
-  onStatus: (s: "connecting" | "open" | "exited" | "error") => void;
+  // Widened to the full LaunchTerminal Status union so the added
+  // "reconnecting" state flows through unchanged (a setup PTY drops its socket
+  // like any other; the terminal reconnects rather than tombstoning).
+  onStatus: (s: LaunchTerminalStatus) => void;
   onCancel: () => void;
 }) {
   return (

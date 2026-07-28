@@ -36,6 +36,7 @@ func newOpencodeCmd() *cobra.Command {
 		fromTime     string
 		attach       *bool
 		noAttach     *bool
+		resume       *string
 	)
 	cmd := &cobra.Command{
 		Use:   "opencode [-- opencode-args...]",
@@ -75,13 +76,27 @@ func newOpencodeCmd() *cobra.Command {
 				flagNoAttach:  *noAttach,
 				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
 					argsLeadWithSubcommand(args, opencodeHeadlessSubcommands),
-				passthrough: opencodeAttachPassthrough(opencodePath),
+				passthrough: append(opencodeAttachPassthrough(opencodePath), resumeAttachPassthrough(*resume)...),
 				toolArgs:    args,
 				stderr:      cmd.ErrOrStderr(),
 			})
 			if outcome.handled {
 				return err
 			}
+			// Native resume (native-resume wave): translate `--resume <id>` to
+			// `opencode --session <id>` on the bare path. Mutually exclusive with
+			// the handoff-fork family (rejected loud); the attach branch above
+			// already forwarded --resume to the daemon-spawned inner launcher.
+			resumedArgs, releaseResume, okResume, resumeErr := applyLauncherResume(launcherResumeSpec{
+				verb: "opencode", label: "opencode", configPath: configPath, id: *resume,
+				continueFrom: continueFrom, carry: carry, fromMessage: fromMessage, fromTime: fromTime,
+				args: args, stderr: cmd.ErrOrStderr(),
+			})
+			if !okResume {
+				return resumeErr
+			}
+			defer releaseResume()
+			args = resumedArgs
 			// --continue-from: distill a handover from the source session and
 			// seed it via opencode's --prompt flag before the launcher builds
 			// the child argv. The proxy env (OPENAI_BASE_URL) is injected
@@ -135,6 +150,7 @@ func newOpencodeCmd() *cobra.Command {
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "opencode")
+	resume = registerResumeFlag(cmd, "opencode")
 	cmd.Flags().SetInterspersed(false)
 	return cmd
 }

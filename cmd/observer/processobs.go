@@ -7,9 +7,11 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/marmutapp/superbased-observer/internal/config"
+	"github.com/marmutapp/superbased-observer/internal/diag"
 	"github.com/marmutapp/superbased-observer/internal/pidbridge"
 	"github.com/marmutapp/superbased-observer/internal/processobs"
 	"github.com/marmutapp/superbased-observer/internal/processobs/bridge"
@@ -32,7 +34,7 @@ const processObserverMaxTracked = 8192
 // proxy/watcher/dashboard (acceptance criterion 6). Mirrors the guard-cloud /
 // otel sibling goroutines: loads its own config+DB, returns nil on any miss.
 func runProcessObserver(ctx context.Context, configPath string) error {
-	cfg, db, cleanup, err := loadConfigAndDBFast(ctx, configPath)
+	cfg, db, cleanup, err := loadConfigAndDB(ctx, configPath)
 	if err != nil {
 		return nil
 	}
@@ -42,7 +44,14 @@ func runProcessObserver(ctx context.Context, configPath string) error {
 	}
 	logger := newLogger(cfg.Observer.LogLevel)
 
-	backend, berr := selectProcessBackend(cfg.Observer.Process, logger)
+	// Shared status handle for per-process network byte accounting. The
+	// capture backend is its only writer; the Observer's health snapshot reads
+	// it so `observer doctor` and the dashboard can tell "measured zero bytes"
+	// from "not measured at all".
+	netAccounting := &processobs.NetworkAccounting{}
+	netAccounting.Set(processobs.NetworkAccountingOff, "not enabled ([observer.process.network].process_bytes)")
+
+	backend, transportUnavailable, berr := selectProcessBackend(cfg.Observer.Process, filepath.Dir(cfg.Observer.DBPath), logger, netAccounting)
 	if berr != nil {
 		logger.Warn("process observability: no backend — capture disabled (daemon continues)",
 			"backend", cfg.Observer.Process.Backend, "reason", berr.Error())
@@ -98,6 +107,7 @@ func runProcessObserver(ctx context.Context, configPath string) error {
 	// Windows boundary where the pidbridge pid seed cannot. A miss falls back to
 	// the medium CorrelateCrossOS pass.
 	attributor := processobs.NewAttributor(seed, scrubber, nil)
+	attributor.SetMetricPolicy(resolveMetricPolicy(cfg.Observer.Process, logger))
 	attributor.SetTokenLookup(func(token string) (processobs.Seed, bool) {
 		s, ok, lerr := st.SessionSeedByID(ctx, token)
 		if lerr != nil || !ok {
@@ -135,6 +145,12 @@ func runProcessObserver(ctx context.Context, configPath string) error {
 		CaptureUnattributedAISubtree: true,
 		BatchSize:                    cfg.Observer.Process.BatchSize,
 		MaxTracked:                   processObserverMaxTracked,
+		NetworkAccounting:            netAccounting,
+		// "You asked for the cross-OS feed and it is not running" travels as
+		// a PLAIN VALUE from the one place that knows it, never as a wrapper
+		// around the backend — see processobs.Options.TransportUnavailableReason
+		// for the capability-loss that wrapping caused.
+		TransportUnavailableReason: transportUnavailable,
 	})
 
 	// Refresh the active-session project roots that gate cwd-anchored capture
@@ -195,7 +211,20 @@ func runProcessObserver(ctx context.Context, configPath string) error {
 		}
 	}()
 
-	logger.Info("process observability: starting", "backend", backend.Name())
+	netMode, netReason := netAccounting.Status()
+	logger.Info("process observability: starting",
+		"backend", backend.Name(), "network_accounting", netMode, "network_accounting_reason", netReason)
+
+	// Publish the runtime health where the out-of-process surfaces can read
+	// it (see diag.ProcessHealth for why a file). This must be a REFRESHING
+	// publisher, not a one-shot write at start: the eBPF backend decides
+	// whether per-process network accounting attached inside its Start, which
+	// runs below inside obs.Run — so the mode known at this point is still
+	// the pessimistic pre-attach guess.
+	stopHealth := publishProcessHealth(ctx, cfg.Observer.DBPath,
+		func() processobs.HealthSnapshot { return obs.Health().Snapshot() }, logger)
+	defer stopHealth()
+
 	if rerr := obs.Run(ctx); rerr != nil && !errors.Is(rerr, context.Canceled) {
 		// Backend Start failure (unsupported OS / missing CAP_BPF / no /proc)
 		// or a fatal runtime error — degraded, never propagated. The DB-derived
@@ -207,23 +236,191 @@ func runProcessObserver(ctx context.Context, configPath string) error {
 	return nil
 }
 
+// processHealthRecord maps the Observer's in-memory health snapshot onto the
+// on-disk record the out-of-process surfaces read. It is a boundary mapping
+// on purpose: internal/diag stays free of processobs types, so the file is a
+// plain wire shape rather than a leaked struct (CLAUDE.md rule 2).
+// The transport half is flattened to plain scalars for the same reason: the
+// backend-agnostic processobs.TransportStats does not cross into diag either,
+// and the TRI-state is carried explicitly so a reader can tell "no dial-in
+// transport was requested" from "one was requested and could not start" from
+// "a transport nobody has ever connected to". Those are three different facts
+// and two of them used to render as the same silence.
+func processHealthRecord(h processobs.HealthSnapshot) diag.ProcessHealth {
+	r := diag.ProcessHealth{
+		Backend:                 h.BackendName,
+		BackendUp:               h.BackendUp,
+		QueueDepth:              h.QueueDepth,
+		LastError:               h.LastError,
+		NetworkAccountingMode:   h.NetworkAccountingMode,
+		NetworkAccountingReason: h.NetworkAccountingReason,
+	}
+	switch h.TransportState {
+	case processobs.TransportStateConfigured:
+		r.TransportState = processobs.TransportStateConfigured
+		r.TransportAddr = h.Transport.Addr
+		r.TransportConnections = h.Transport.Connections
+		r.TransportAuthFailures = h.Transport.AuthFailures
+		// The refusal REASON is the only thing that may be presented as the
+		// cause of a refusal; dropping it here would leave the surfaces with
+		// a bare counter and force them back to guessing "bad token".
+		r.TransportLastAuthError = h.Transport.LastAuthError
+		// Its bounded twin travels with it — the text surfaces read the
+		// reason, the metrics exporter reads the class, and neither has to
+		// re-derive the other by matching on words.
+		r.TransportLastAuthErrorClass = h.Transport.LastAuthErrorClass
+		r.TransportConnected = h.Transport.Connected
+		r.TransportLastConnectAt = h.Transport.LastConnectAt
+		r.TransportLastDisconnectAt = h.Transport.LastDisconnectAt
+		// The capturer's own decode counters travel WITH their presence flag.
+		// Copying the counters without it would turn "no decoder ever
+		// reported" into "zero events were refused" the moment the record hit
+		// disk — the exact absence-rendered-as-zero inversion the flag exists
+		// to stop.
+		r.TransportCapturerDecodeReported = h.Transport.CapturerDecodeReported
+		r.TransportCapturerDropped = h.Transport.CapturerDecode.NetworkDropped
+		r.TransportCapturerUnsupportedVersion = h.Transport.CapturerDecode.NetworkUnsupportedVersion
+		// The positive half of the same report, under the same flag. Without
+		// it the record can only say what the decoder REFUSED, and a provider
+		// whose event ids were renumbered refuses nothing while classifying
+		// nothing — a clean-looking record for a decoder measuring zero.
+		r.TransportCapturerDecoded = h.Transport.CapturerDecode.NetworkDecoded
+		r.TransportCapturerIgnored = h.Transport.CapturerDecode.NetworkIgnored
+		r.TransportCapturerDecodeAt = h.Transport.CapturerDecodeAt
+	case processobs.TransportStateUnavailable:
+		r.TransportState = processobs.TransportStateUnavailable
+		r.TransportUnavailableReason = h.TransportUnavailableReason
+	}
+	return r
+}
+
+// publishProcessHealth republishes the Observer's runtime health beside the
+// DB every diag.ProcessHealthRefreshInterval, so `observer doctor` and the
+// `observer metrics` exporter — both separate processes that cannot read this
+// daemon's memory — can report whether per-process network accounting is
+// actually live, and why not when it is not.
+//
+// It REFRESHES rather than writing once because the interesting state
+// settles late: the eBPF backend records the accounting outcome inside its
+// Start, and an ETW capturer that fails to elevate does the same. The
+// returned stop func removes the record and waits for the goroutine, so a
+// daemon that exits leaves nothing behind for doctor to misread as live.
+// Every failure is best-effort: a health file that cannot be written must
+// never affect capture.
+func publishProcessHealth(ctx context.Context, dbPath string, snapshot func() processobs.HealthSnapshot, logger *slog.Logger) func() {
+	dir := diag.ProcessHealthDir(dbPath)
+	if dir == "" || snapshot == nil {
+		return func() {}
+	}
+	stopCh := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var (
+			path   string
+			warned bool
+		)
+		publish := func() {
+			p, err := diag.WriteProcessHealth(dir, processHealthRecord(snapshot()))
+			if err != nil {
+				if !warned && logger != nil {
+					logger.Warn("process observability: could not publish runtime health — `observer doctor` and /metrics will report that no daemon is reporting",
+						"dir", dir, "err", err)
+					warned = true
+				}
+				return
+			}
+			path = p
+		}
+		publish()
+		t := time.NewTicker(diag.ProcessHealthRefreshInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				_ = diag.RemoveProcessHealth(path)
+				return
+			case <-stopCh:
+				_ = diag.RemoveProcessHealth(path)
+				return
+			case <-t.C:
+				publish()
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(stopCh) })
+		<-done
+	}
+}
+
 // selectProcessBackend resolves [observer.process].backend to a concrete
 // Backend, or an error explaining why none is available (the caller then
 // fail-opens). The poll backend (§5.4) and the real-time linux_ebpf backend
-// (§5.2, fail-opens to poll when uncapable) are implemented; etw /
-// endpointsecurity are still stubs. "auto" PREFERS the eBPF stack when the box
-// can load BPF (capability-probed; usually false for the unprivileged daemon →
-// poll), composing it with poll (metric sampler + initial snapshot, dedup on
+// (§5.2, fail-opens to poll when uncapable) are implemented; endpointsecurity
+// is still a stub. "auto" PREFERS the eBPF stack when the box can load BPF
+// (capability-probed; usually false for the unprivileged daemon → poll),
+// composing it with poll (metric sampler + initial snapshot, dedup on
 // process_key) + the bridge. Branching is on the configured capability, not host
 // identity (the backend's own Start probe decides OS support and fail-opens).
-func selectProcessBackend(pc config.ProcessConfig, logger *slog.Logger) (processobs.Backend, error) {
+//
+// The ETW feed is HYBRID (plan option C), and deliberately not a `backend`
+// alternative: whatever baseline the switch below picks, an enabled
+// [observer.process.etw] block ADDS the accept listener as a second child. The
+// zero-privilege poll/bridge baseline is untouched, and an install where no
+// elevated capturer ever connects behaves exactly as it does today.
+//
+// observerDir is the directory holding the observer DB — where the listener's
+// shared token is generated/persisted. netStatus is the shared handle the
+// byte-capable backend writes its per-process network-accounting state to; nil
+// is tolerated (nothing listens).
+//
+// The second return value is the reason a REQUESTED dial-in transport is not
+// running (empty in the normal case). It is returned BESIDE the backend, not
+// attached to it: the previous shape wrapped the backend in a decorator that
+// answered processobs.TransportUnavailableSource, and embedding an interface
+// promotes only that interface's methods — so every OPTIONAL capability the
+// baseline implemented (UnattributedCapturer above all, which is what makes
+// cross-OS process rows persist at all) stopped being visible to a type
+// assertion. Returning a value keeps the assembled backend untouched, and no
+// future capability can be lost by a decorator nobody remembered to update.
+func selectProcessBackend(pc config.ProcessConfig, observerDir string, logger *slog.Logger, netStatus *processobs.NetworkAccounting) (processobs.Backend, string, error) {
+	// Pessimistic default: per-process byte counters only exist on the eBPF
+	// backend, so every other selection leaves them UNMEASURED. The eBPF path
+	// overwrites this with the real outcome when it attaches.
+	if pc.Network.ProcessBytes {
+		netStatus.Set(processobs.NetworkAccountingUnavailable,
+			"per-process byte counters need the linux_ebpf backend, which is not active")
+	}
 	pollMS, bridgeMS := resolveProcessPollIntervals(pc)
 	pollOpts := poll.Options{Interval: time.Duration(pollMS) * time.Millisecond}
+	// The cross-OS capturer reports its OWN per-process network-accounting
+	// status in its hello frame (an ETW capture that could not elevate, or one
+	// that is live), so on a bridge deployment the handle's truth comes from
+	// Windows rather than from this host's pessimistic guess. It is handed over
+	// only where the bridge is the sole byte-capable source — see
+	// bridgeOptsNoNet below for the one place it is not.
 	bridgeOpts := bridge.Options{
 		WindowsBinaryPath: pc.WindowsBinaryPath,
 		PollIntervalMS:    bridgeMS,
 		Logger:            logger,
+		NetworkAccounting: netStatus,
 	}
+	// One owner, again: when the ETW accept feed is enabled it is the
+	// byte-capable source on this topology (the spawned bridge capturer is the
+	// NON-elevated one and can never count bytes), so it takes the handle and
+	// the spawn bridge gives it up. Without this, a poll-only capturer's
+	// honest "off" would clobber the elevated capturer's live "tcp".
+	if pc.ETW.Enabled {
+		bridgeOpts.NetworkAccounting = nil
+	}
+	// Same bridge, minus ownership of the shared status handle. One owner per
+	// piece of state (CLAUDE.md rule 4): when the eBPF stack is running, the
+	// eBPF backend owns the handle, and a Windows capturer reporting "off"
+	// would otherwise clobber a locally-true "tcp".
+	bridgeOptsNoNet := bridgeOpts
+	bridgeOptsNoNet.NetworkAccounting = nil
 	onChildErr := func(name string, err error) {
 		logger.Warn("process observability: composite child unavailable (capture continues with the rest)", "child", name, "err", err)
 	}
@@ -237,6 +434,12 @@ func selectProcessBackend(pc config.ProcessConfig, logger *slog.Logger) (process
 			bridge.New(bridgeOpts),
 		}, onChildErr)
 	}
+	// ebpfOwnsNetwork records that the eBPF backend took ownership of the
+	// shared network-accounting handle, so the ETW listener does not also
+	// write it (one owner per piece of state, CLAUDE.md rule 4). It is set by
+	// newEBPFComposite, which runs inside the switch below — always before
+	// withETW is applied to its result.
+	ebpfOwnsNetwork := false
 	// newEBPFComposite is the real-time stack: the eBPF backend (§5.2, Linux
 	// lifecycle — catches the sub-poll-interval processes the poller misses) PLUS
 	// the poll backend, which serves as the metric sampler + initial-snapshot
@@ -247,43 +450,113 @@ func selectProcessBackend(pc config.ProcessConfig, logger *slog.Logger) (process
 	// doubling. The Windows bridge joins on WSL (distinct boot-id). Only built
 	// when linuxebpf.Available passed.
 	newEBPFComposite := func() processobs.Backend {
+		ebpfOwnsNetwork = true
+		eb := linuxebpf.New(linuxebpf.Options{
+			Logger:            logger,
+			NetworkAccounting: pc.Network.ProcessBytes,
+			NetworkStatus:     netStatus,
+		})
+		// Per-process network bytes are measured by the eBPF backend but
+		// SAMPLED by the poll backend (it owns the metric-refresh stream), so
+		// the counters travel through the NetworkSampler capability seam — a
+		// capability check, never a backend-name check (CLAUDE.md rule 3).
+		netPollOpts := pollOpts
+		if ns, ok := eb.(processobs.NetworkSampler); ok {
+			netPollOpts.NetworkBytes = ns.NetworkBytes
+		}
 		children := []processobs.Backend{
-			linuxebpf.New(linuxebpf.Options{Logger: logger}),
-			poll.New(pollOpts),
+			eb,
+			poll.New(netPollOpts),
 		}
 		if bridge.AvailableInWSL(pc.WindowsBinaryPath) {
-			children = append(children, bridge.New(bridgeOpts))
+			children = append(children, bridge.New(bridgeOptsNoNet))
 		}
 		return processobs.NewComposite(children, onChildErr)
 	}
 
+	// withETW appends the accept-mode listener to whatever baseline the switch
+	// below chose. Fail-open at every step: a bind conflict, a token that
+	// cannot be written, or a disabled block all leave the CAPTURE baseline
+	// exactly as it was.
+	//
+	// Fail-open is not fail-silent, though. When the operator ASKED for the
+	// cross-OS feed and it did not come up, the baseline is returned UNTOUCHED
+	// alongside the reason, so the health record can say "you asked for ETW
+	// and it is not running" instead of printing exactly what an install that
+	// never enabled ETW prints — a bind conflict on the listen address being
+	// the likeliest way to get here. The baseline is deliberately not wrapped:
+	// see this function's doc comment.
+	withETW := func(base processobs.Backend) (processobs.Backend, string) {
+		if !pc.ETW.Enabled {
+			// backend = "etw" is itself a request for the feed, and on its own
+			// it starts nothing. Silence would make that config typo permanent
+			// and invisible.
+			if pc.Backend == "etw" {
+				return base, `[observer.process.etw].enabled is false, so no accept listener was started ` +
+					`(backend = "etw" alone does not start one — set [observer.process.etw].enabled = true)`
+			}
+			return base, ""
+		}
+		// The eBPF backend owns the network handle when it is running (it
+		// measures THIS host's bytes and has already attached); the listener
+		// then reports events only. Otherwise the listener owns it.
+		lnStatus := netStatus
+		if ebpfOwnsNetwork {
+			lnStatus = nil
+		}
+		ln, lerr := newProcessBridgeListener(pc, observerDir, logger, lnStatus)
+		if lerr != nil {
+			logger.Warn("process observability: ETW accept listener unavailable — continuing without the elevated cross-OS feed",
+				"addr", pc.ETW.ListenAddr, "err", lerr)
+			lnStatus.Set(processobs.NetworkAccountingUnavailable,
+				"the cross-OS process capturer listener could not start: "+lerr.Error())
+			// The network-accounting handle above is deliberately nil when the
+			// eBPF backend owns it (one owner per piece of state), so on that
+			// host it carries NO signal at all — this reason is the only
+			// operator-visible trace of the failure.
+			return base, lerr.Error()
+		}
+		logger.Info("process observability: ETW accept listener ready — waiting for an elevated capturer to connect",
+			"addr", ln.Addr())
+		return processobs.NewComposite([]processobs.Backend{base, ln}, onChildErr), ""
+	}
+
+	// autoBackend is the "best available for this host" baseline: prefer the
+	// real-time eBPF stack when this box can actually load BPF
+	// (capability-probed; the unprivileged daemon usually can't, so this is
+	// normally false → poll). When eBPF is available, compose it with poll
+	// (metrics + initial snapshot, dedup on process_key) + the bridge.
+	// Otherwise the legacy path: poll+bridge on WSL, else the single poll
+	// backend (Linux /proc or, on a Windows host, the ToolHelp snapshot).
+	autoBackend := func() processobs.Backend {
+		if linuxebpf.Available(logger) {
+			logger.Info("process observability: auto selected linux_ebpf — real-time capture + poll metric sampler")
+			return newEBPFComposite()
+		}
+		if bridge.AvailableInWSL(pc.WindowsBinaryPath) {
+			return newComposite()
+		}
+		return poll.New(pollOpts)
+	}
+
 	switch pc.Backend {
 	case "off":
-		return nil, errors.New("backend set to off")
+		return nil, "", errors.New("backend set to off")
 	case "poll":
-		return poll.New(pollOpts), nil
+		b, reason := withETW(poll.New(pollOpts))
+		return b, reason, nil
 	case "bridge":
 		// Cross-OS bridge (§5.5): exec the Windows observer.exe over WSL
 		// interop. Start fail-opens if not under WSL or the binary is missing.
-		return bridge.New(bridgeOpts), nil
+		b, reason := withETW(bridge.New(bridgeOpts))
+		return b, reason, nil
 	case "both":
 		// Explicit: Linux poll + Windows bridge together (see newComposite).
-		return newComposite(), nil
+		b, reason := withETW(newComposite())
+		return b, reason, nil
 	case "auto":
-		// Prefer the real-time eBPF stack when this box can actually load BPF
-		// (capability-probed; the unprivileged daemon usually can't, so this is
-		// normally false → poll). When eBPF is available, compose it with poll
-		// (metrics + initial snapshot, dedup on process_key) + the bridge.
-		// Otherwise the legacy path: poll+bridge on WSL, else the single poll
-		// backend (Linux /proc or, on a Windows host, the ToolHelp snapshot).
-		if linuxebpf.Available(logger) {
-			logger.Info("process observability: auto selected linux_ebpf — real-time capture + poll metric sampler")
-			return newEBPFComposite(), nil
-		}
-		if bridge.AvailableInWSL(pc.WindowsBinaryPath) {
-			return newComposite(), nil
-		}
-		return poll.New(pollOpts), nil
+		b, reason := withETW(autoBackend())
+		return b, reason, nil
 	case "linux_ebpf":
 		// Explicitly request the real-time Linux stack (§5.2): catches the
 		// sub-poll-interval processes the /proc poller misses. The P0 gate is
@@ -293,23 +566,57 @@ func selectProcessBackend(pc config.ProcessConfig, logger *slog.Logger) (process
 		if !linuxebpf.Available(logger) {
 			logger.Info("process observability: linux_ebpf unavailable (needs CAP_BPF+CAP_PERFMON and a BPF-capable kernel) — falling back to poll capture")
 			if bridge.AvailableInWSL(pc.WindowsBinaryPath) {
-				return newComposite(), nil
+				b, reason := withETW(newComposite())
+				return b, reason, nil
 			}
-			return poll.New(pollOpts), nil
+			b, reason := withETW(poll.New(pollOpts))
+			return b, reason, nil
 		}
 		logger.Info("process observability: linux_ebpf backend active — real-time fork/exec/exit capture + poll metric sampler")
-		return newEBPFComposite(), nil
+		b, reason := withETW(newEBPFComposite())
+		return b, reason, nil
 	case "etw":
-		// ETW is the high-fidelity Windows backend (§5.2: real-time fork/exec/
-		// exit + network/file providers); the poll backend (ToolHelp snapshot)
-		// already captures Windows process trees today.
-		return nil, errors.New(`etw backend not yet implemented (§5.2 high-fidelity follow-on); use backend = "poll" for Windows process capture`)
+		// ETW (§5.2) is an ELEVATED, OPTIONAL, ADDITIVE feed — never a
+		// baseline. What it contributes (per-process network bytes, W2) rides
+		// on top of the process trees the zero-privilege poll/bridge stack
+		// already captures, and it arrives over a socket a capturer may never
+		// dial. So this case selects the same baseline "auto" would and ADDS
+		// the listener; it never trades working capture for a feed that might
+		// not show up (plan option C, hybrid).
+		if !pc.ETW.Enabled {
+			logger.Warn(`process observability: backend = "etw" but [observer.process.etw].enabled is false — ` +
+				"no accept listener is started (set it to true); capture continues on the poll/bridge baseline")
+		}
+		b, reason := withETW(autoBackend())
+		return b, reason, nil
 	case "endpointsecurity":
-		return nil, errors.New("endpointsecurity backend not yet implemented (P6)")
+		return nil, "", errors.New("endpointsecurity backend not yet implemented (P6)")
 	default:
-		return nil, fmt.Errorf("unknown process backend %q", pc.Backend)
+		return nil, "", fmt.Errorf("unknown process backend %q", pc.Backend)
 	}
 }
+
+// NOTE — there is deliberately NO decorator here. The reason a requested
+// dial-in transport is missing used to be carried by wrapping the assembled
+// backend in a type that embedded processobs.Backend and added
+// TransportUnavailableReason. That is a capability shredder: embedding an
+// INTERFACE promotes only that interface's method set, so `backend.(X)` for
+// every optional capability X the wrapped value implements — UnattributedCapturer,
+// NetworkSampler, TransportStatsSource — fails on the wrapper. The concrete
+// harm was silent and total: runProcessObserver probes UnattributedCapturer
+// to decide whether cross-OS process rows are captured at all, so on the two
+// ordinary configurations that reach the wrapper (a bridge/both/auto baseline
+// whose ETW listener loses the :8823 bind, and backend = "etw" with the block
+// disabled) Windows process rows simply stopped being persisted — on exactly
+// the path whose purpose is to report a failure LOUDLY.
+//
+// The replacement is a plain string returned beside the backend
+// (selectProcessBackend's second result → processobs.Options.TransportUnavailableReason).
+// It cannot lose a capability, and it cannot lose one that has not been
+// invented yet either — which an explicit-forwarding decorator would, the
+// next time someone adds a capability and does not think of this file
+// (CLAUDE.md rule 6). TestSelectProcessBackendPreservesBackendCapabilities
+// fails if a wrapper ever comes back.
 
 // resolveProcessPollIntervals turns the [observer.process] config into the
 // concrete (Linux-poll, Windows-bridge) snapshot cadences in milliseconds.
@@ -327,6 +634,43 @@ func resolveProcessPollIntervals(pc config.ProcessConfig) (pollMS, bridgeMS int)
 		bridgeMS = pollMS
 	}
 	return pollMS, bridgeMS
+}
+
+// resolveMetricPolicy turns [observer.process.metrics] into the live-chart
+// ring policy, applying the "0 = inherit the default" contract the other
+// process intervals use.
+//
+// It also enforces the honesty rule about the sampling ceiling: a metric
+// sample can never be fresher than the poll that produces it, so a
+// sample_interval_ms BELOW poll_interval_ms cannot deliver the resolution it
+// names. We do NOT silently raise the poll rate (that is the operator's CPU
+// budget to spend) and we do NOT silently clamp the config; we WARN once at
+// start, naming both numbers, and let the ring append every poll.
+func resolveMetricPolicy(pc config.ProcessConfig, logger *slog.Logger) processobs.MetricPolicy {
+	p := processobs.DefaultMetricPolicy()
+	if pc.Metrics.SampleIntervalMS > 0 {
+		p.SampleInterval = time.Duration(pc.Metrics.SampleIntervalMS) * time.Millisecond
+	}
+	if pc.Metrics.WindowSeconds > 0 {
+		p.Window = time.Duration(pc.Metrics.WindowSeconds) * time.Second
+	}
+	if pc.Metrics.MaxSamples > 0 {
+		p.MaxSamples = pc.Metrics.MaxSamples
+	}
+	if pc.Metrics.PersistIntervalMS != 0 {
+		p.PersistInterval = time.Duration(pc.Metrics.PersistIntervalMS) * time.Millisecond
+	}
+	if pc.Metrics.PersistMaxSamples != 0 {
+		p.PersistMaxSamples = pc.Metrics.PersistMaxSamples
+	}
+	pollMS, _ := resolveProcessPollIntervals(pc)
+	pollInterval := time.Duration(pollMS) * time.Millisecond
+	if logger != nil && p.SampleInterval < pollInterval {
+		logger.Warn("process observability: metrics.sample_interval_ms is below the process poll interval — samples cannot be fresher than the poll that produces them; raise poll_interval_ms too (it costs a /proc scan) or the extra resolution is not real",
+			"sample_interval_ms", p.SampleInterval.Milliseconds(),
+			"poll_interval_ms", pollInterval.Milliseconds())
+	}
+	return p
 }
 
 // resolveCorrelateInterval turns [observer.process].correlate_interval_ms into

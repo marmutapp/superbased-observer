@@ -461,6 +461,11 @@ type Proxy struct {
 	// contention is low — one Load + one Store per session, lifetime
 	// of the daemon.
 	codexVariantWarned sync.Map
+	// unknownUpstreamWarned dedups the stripUpstreamPrefix warning for an
+	// unknown `/up/<id>/` routing id. Keyed by the id (a small, config-shaped
+	// vocabulary — an operator's typo set, not user input at scale), value
+	// unused: one Warn per distinct id for the daemon's lifetime.
+	unknownUpstreamWarned sync.Map
 }
 
 // codexVariantRe matches OpenAI-shape model identifiers that belong to
@@ -1894,6 +1899,11 @@ func (p *Proxy) upstreamForPath(path, provider string, chatgptAuth bool) *url.UR
 	return p.anthropicURL
 }
 
+// unknownUpstreamWarnCap bounds the unknownUpstreamWarned dedup map (and thus
+// the number of distinct unknown ids ever warned about) so a long-running
+// daemon cannot grow it without limit.
+const unknownUpstreamWarnCap = 64
+
 // stripUpstreamPrefix detects a `/up/<id>/` routing prefix on r.URL.Path
 // (Phase C). When present AND <id> maps to a configured explicit upstream,
 // it rewrites r.URL.Path (and clears RawPath so net/http re-derives it) to
@@ -1916,6 +1926,20 @@ func (p *Proxy) stripUpstreamPrefix(r *http.Request) *url.URL {
 	id := rest[:slash]
 	up, ok := p.explicitUpstreams[id]
 	if !ok {
+		// Fail-open (unchanged): the request keeps its unstripped `/up/<id>/…`
+		// path and goes to the fixed upstream, where it dies as an opaque
+		// 404/401 that names nothing. Say it ONCE per unknown id (mirrors
+		// codexVariantWarned) so a typo'd/missing `[proxy.upstreams]` entry is
+		// diagnosable instead of silent — this is exactly how a launcher's
+		// `--upstream` typo presents. Routing behaviour is untouched.
+		// The size gate wraps the store (not just the log) so the dedup map
+		// stays bounded even if something sprays distinct ids at the proxy.
+		if mapLen(&p.unknownUpstreamWarned) < unknownUpstreamWarnCap {
+			if _, seen := p.unknownUpstreamWarned.LoadOrStore(id, struct{}{}); !seen {
+				p.logger.Warn("proxy: unknown /up/ upstream id — not routed, falling back to the fixed upstream",
+					"id", id, "path", r.URL.Path, "configured", len(p.explicitUpstreams))
+			}
+		}
 		return nil
 	}
 	r.URL.Path = rest[slash:] // keep the leading slash of the canonical path

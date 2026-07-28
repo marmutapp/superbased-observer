@@ -114,7 +114,7 @@ func newGuardStatusCmd() *cobra.Command {
 			// DB-backed half: verdict counts + chain check. A missing/
 			// unopenable DB degrades to config-only output — status
 			// must work on a fresh install before first capture.
-			database, err := db.Open(cmd.Context(), db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+			database, err := db.Open(cmd.Context(), db.Options{Path: cfg.Observer.DBPath})
 			if err != nil {
 				fmt.Fprintf(out, "\n(DB unavailable — verdict counts and chain check skipped: %v)\n", err)
 				return nil
@@ -503,7 +503,7 @@ func newGuardVerifyAuditCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
 			}
-			database, err := db.Open(cmd.Context(), db.Options{Path: cfg.Observer.DBPath, SkipIntegrityCheck: true})
+			database, err := db.Open(cmd.Context(), db.Options{Path: cfg.Observer.DBPath})
 			if err != nil {
 				return fmt.Errorf("open db: %w", err)
 			}

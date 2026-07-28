@@ -328,7 +328,15 @@ func (a *launchManagerAdapter) wireRemoteExecute(authz dashboard.TerminalControl
 			// the just-installed lease must not survive.
 			recheck := func() dashboard.ControlDenialReason {
 				if standing.StandingTerminalGeneration() != gen {
-					return dashboard.ControlDenialAuth
+					// AuthTransient, not Auth (2026-07-25): the secret VERIFIED
+					// successfully microseconds ago — what moved is the server's
+					// standing generation, i.e. this acquire raced an admin
+					// mint/rotate/revoke/disable. The lease is still refused
+					// (the TOCTOU close is unchanged), but blaming the device's
+					// credential made it delete a secret that may well still be
+					// valid; if it is genuinely dead the very next attempt is
+					// judged and returns a real Auth denial.
+					return dashboard.ControlDenialAuthTransient
 				}
 				if authz.Validate(req.DeviceSessionID) != nil {
 					return dashboard.ControlDenialSessionInvalid
@@ -502,6 +510,18 @@ func mapRemoteAcquireDenial(err error, capabilityConsumed bool) error {
 	switch {
 	case errors.Is(err, termlease.ErrCapabilityRejected):
 		reason = dashboard.ControlDenialAuth
+	case errors.Is(err, termlease.ErrStandingRevoked):
+		// The standing secret has been revoked and not re-provisioned: nothing
+		// exists at rest for the device's saved secret to match, now or ever
+		// (a re-mint issues a different one). PERMANENT — the device should
+		// clear it, exactly as for a judged rejection.
+		reason = dashboard.ControlDenialAuthRevoked
+	case errors.Is(err, termlease.ErrStandingUnavailable):
+		// The standing leg refused without judging the secret AND the refusal
+		// may lift on its own (standing access momentarily switched off with
+		// the secret still at rest, or rate-limited) — deny, but never blame
+		// the credential.
+		reason = dashboard.ControlDenialAuthTransient
 	case errors.Is(err, termlease.ErrTerminalDisabled):
 		reason = dashboard.ControlDenialTerminalDisabled
 	case errors.Is(err, termlease.ErrNoDeviceSession):

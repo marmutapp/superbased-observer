@@ -400,6 +400,48 @@ export const SECTION_SPECS: Record<string, SectionSpec> = {
           },
         ],
       },
+      {
+        id: "etw",
+        label: "Elevated ETW capturer (Windows)",
+        path: ["Observer", "Process", "ETW"],
+        description:
+          "The daemon-side ACCEPT listener that the elevated Windows ETW capturer dials into. It is what makes per-process NETWORK BYTES available: ETW session control always requires elevation, so the capturer runs as a Scheduled Task and connects here. Additive — with it off, everything else captures exactly as before. Windows/WSL only. The shared token is deliberately NOT editable here: it gates a loopback port that WSL2 exposes to the whole Windows host, and leaving it empty (the default) lets the daemon generate and persist one at the token path below. The setup card underneath registers the Scheduled Task for you.",
+        fields: [
+          {
+            id: "Enabled",
+            label: "Enabled",
+            kind: "bool",
+            help: "Starts the accept listener. Default off — it opens a port, and the feed behind it needs an elevated Windows Scheduled Task. Binds at daemon start, so a change needs a restart.",
+          },
+          {
+            id: "ListenAddr",
+            label: "Listen address",
+            kind: "text",
+            help: "Loopback bind for the capturer's inbound connection, as host:port. Empty inherits 127.0.0.1:8823. The capturer dials IN (WSL cannot reach a Windows-bound listener, but Windows→WSL loopback works), so this address is baked into the Scheduled Task — changing it means re-registering the task.",
+          },
+          {
+            id: "TokenPath",
+            label: "Token file path",
+            kind: "text",
+            help: "Where a generated shared token is persisted 0600. Empty puts `process-bridge-token` next to the observer DB. The elevated capturer reads it with --token-file, so on WSL it must be a path Windows can open (the setup card's command handles the \\\\wsl.localhost translation).",
+          },
+          {
+            id: "HandshakeTimeoutMS",
+            label: "Handshake timeout (ms)",
+            kind: "int",
+            min: 0,
+            max: 600000,
+            step: 1000,
+            help: "Bounds the authentication exchange only — an authenticated stream is legitimately idle for long stretches and is never deadlined. Default 10000 (10s); 0 inherits it.",
+          },
+          {
+            id: "AllowNonLoopback",
+            label: "Allow non-loopback bind",
+            kind: "bool",
+            help: "Permits binding the listener to a non-loopback address. Default off, and the listener refuses one otherwise. Leave off: even the loopback bind is reachable from every process on the Windows host under WSL2 localhostForwarding, which is why the shared token is load-bearing.",
+          },
+        ],
+      },
     ],
   },
   advisor: {
