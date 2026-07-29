@@ -1,0 +1,24 @@
+{
+  "customModels": [
+    {
+      "model": "gpt-5.4-mini",
+      "id": "custom:GPT-5.4-Mini-[OpenAI-BYOK]-0",
+      "index": 0,
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": "REDACTED-PLACEHOLDER-DO-NOT-USE",
+      "displayName": "GPT-5.4 Mini [OpenAI BYOK]",
+      "maxOutputTokens": 32768,
+      "noImageSupport": false,
+      "provider": "openai"
+    }
+  ],
+  "logoAnimation": "off",
+  "trustedFolders": {
+    "/home/marmutapp/needlehaystack": {
+      "trustedAt": "2026-07-28T17:32:02.077Z"
+    }
+  },
+  "ideExtensionPromptedAt": {
+    "vscode": 1785259932902
+  }
+}

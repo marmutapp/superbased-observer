@@ -54,6 +54,9 @@ const ATTACH_SUBCOMMANDS: Record<string, string> = {
   devin: "devin",
   qoder: "qoder",
   goose: "goose",
+  droid: "droid",
+  "open-interpreter": "open-interpreter",
+  "command-code": "command-code",
 };
 
 function relaunchCommand(tool: string): string {

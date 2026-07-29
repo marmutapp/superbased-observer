@@ -30,6 +30,9 @@ export type ToolKey =
   | "aider"
   | "qoder"
   | "goose"
+  | "droid"
+  | "open-interpreter"
+  | "command-code"
   // Browser-chatbot rail (Phase 2) — captured by the opt-in MV3 browser
   // extension, NOT coding CLIs. Tokens are ALWAYS estimated.
   | "chatgpt-web"
@@ -220,6 +223,27 @@ const TOOLS: Record<string, ToolMeta> = {
     key: "goose",
     label: "goose",
     colorVar: "var(--tool-goose)",
+    provider: "agnostic",
+  },
+  // 2026-07-29 wave. All three are BYOK/multi-backend or closed-gateway
+  // products with no single true upstream vendor, so provider stays
+  // "agnostic" — the honest value (see the wave-2 note above).
+  droid: {
+    key: "droid",
+    label: "droid",
+    colorVar: "var(--tool-droid)",
+    provider: "agnostic",
+  },
+  "open-interpreter": {
+    key: "open-interpreter",
+    label: "Open Interpreter",
+    colorVar: "var(--tool-open-interpreter)",
+    provider: "agnostic",
+  },
+  "command-code": {
+    key: "command-code",
+    label: "Command Code",
+    colorVar: "var(--tool-command-code)",
     provider: "agnostic",
   },
   // Browser-chatbot rail (Phase 2). provider names the vendor whose web app

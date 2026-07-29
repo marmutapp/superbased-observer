@@ -207,24 +207,111 @@ func argsContainHeadlessFlag(args []string, flags ...string) bool {
 	return false
 }
 
+// leadingVerbScan is ONE launcher's grounded argv shape for the
+// leading-subcommand guard: the headless verb set plus the tool's own flag
+// grammar, read verbatim off that tool's `--help` (each launcher file
+// documents its source). It exists because the scanner CANNOT know which
+// flags take a SPLIT value without per-tool data, and a split value occupies
+// the operand position the guard reads:
+//
+//	droid --append-system-prompt x=y exec "…"
+//
+// A flag-blind scan stops at `x=y` (the VALUE), finds no verb, and lets the
+// headless `exec` through — the very bypass the guard exists to prevent. So
+// the data is per-tool (CLAUDE.md #5: a data table, never a new branch).
+//
+// Three flag classes, resolved at the token:
+//
+//   - valueFlags — grounded `--flag <value>` / `<VALUE>`-required spellings:
+//     the scanner skips the flag AND the following token.
+//   - boolFlags — grounded switches: the flag consumes nothing.
+//   - everything else — UNKNOWN, OPTIONAL-value (`[value]`, which commander
+//     and clap consume inconsistently), or VARIADIC (`<FILE>...`): the
+//     scanner cannot align operands any more, so it goes AMBIGUOUS.
+//
+// A `=`-joined token (`--auto=high`) is self-delimiting and consumes nothing,
+// whatever its class.
+//
+// The AMBIGUOUS direction is deliberately CONSERVATIVE. Once alignment is
+// lost the scanner stops trusting "the first operand is the verb" and instead
+// tests EVERY remaining operand-position token against subs. For a fail-fast
+// guard a false REJECTION (an exotic argv refused with a named error) is
+// strictly safer than a false PASS (silently launching a headless verb, or
+// silently seeding a handover into a run that exits) — the argv is exotic by
+// construction, since every documented flag of the tool is in one of the two
+// grounded sets. In the clean case (all flags grounded) the scan stays
+// precise: only the true operand position is tested, so a multi-word bare
+// prompt whose Nth word happens to equal a verb (`droid fix the mcp config`)
+// is NOT rejected.
+//
+// A launcher with NO grounded flag data (zero valueFlags and zero boolFlags)
+// keeps the ORIGINAL flag-blind semantics verbatim — skip every `-`-prefixed
+// token, test the first operand, done. That is the LEGACY path the 19
+// pre-existing launchers ride via argsLeadWithSubcommand; they carry the
+// split-value gap above as a known, unchanged limitation until each one's
+// flag grammar is grounded off its own `--help`.
+type leadingVerbScan struct {
+	subs       map[string]bool // headless/management verbs to reject
+	valueFlags map[string]bool // flags that consume the FOLLOWING token
+	boolFlags  map[string]bool // flags that consume NOTHING
+}
+
+// leads reports whether args forward one of the scan's headless subcommands in
+// an operand position. See leadingVerbScan for the flag-class table and the
+// conservative ambiguity rule.
+func (s leadingVerbScan) leads(args []string) bool {
+	_, ok := s.leadingVerb(args)
+	return ok
+}
+
+// leadingVerb returns the forwarded headless subcommand the scan found (so a
+// launcher's fail-fast error can NAME it) and whether one was found at all.
+// The scan STOPS at a bare `--` (tokens after it are positional text the tool
+// reads as a prompt, never a verb), mirroring argsContainHeadlessFlag's
+// boundary.
+func (s leadingVerbScan) leadingVerb(args []string) (string, bool) {
+	grounded := len(s.valueFlags) > 0 || len(s.boolFlags) > 0
+	ambiguous := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--":
+			return "", false // positional remainder — no subcommand
+		case strings.HasPrefix(a, "-"):
+			if strings.ContainsRune(a, '=') {
+				// `--flag=value` is self-delimiting: consumes nothing, and
+				// never costs alignment whatever the flag's class.
+				continue
+			}
+			switch {
+			case s.valueFlags[a]:
+				i++ // skip the SPLIT value so the operand position stays true
+			case s.boolFlags[a]:
+				// A grounded switch consumes nothing — alignment holds.
+			case grounded:
+				ambiguous = true
+			}
+		default:
+			if s.subs[a] {
+				return a, true
+			}
+			if !ambiguous {
+				return "", false // aligned: the first operand IS the verb slot
+			}
+			// Ambiguous: keep testing later operand-position tokens.
+		}
+	}
+	return "", false
+}
+
 // argsLeadWithSubcommand reports whether the FIRST bare word in the forwarded
 // tool args (skipping any leading flags) is one of the headless subcommands in
 // subs — the generic analogue of argsAreCodexHeadless for launchers whose
-// non-interactive mode is a leading verb (opencode/kilo/goose `run`). The scan
-// STOPS at a bare `--` (tokens after are positional, no subcommand precedes it →
-// false), mirroring argsAreCodexHeadless's boundary. Leading `-`-prefixed tokens
-// are skipped as flags without value-pairing (these launchers lack codex's
-// value-flag surface); the first non-flag token is the subcommand.
+// non-interactive mode is a leading verb (opencode/kilo/goose `run`). It is the
+// UNGROUNDED (flag-blind) form of leadingVerbScan.leads: no per-tool flag
+// grammar, so a SPLIT flag value in the operand position hides a following verb
+// (see leadingVerbScan). Launchers that have grounded their tool's flag grammar
+// build a leadingVerbScan instead.
 func argsLeadWithSubcommand(args []string, subs map[string]bool) bool {
-	for _, a := range args {
-		switch {
-		case a == "--":
-			return false // positional remainder — no leading subcommand
-		case strings.HasPrefix(a, "-"):
-			continue // skip a leading flag, keep scanning for the subcommand
-		default:
-			return subs[a]
-		}
-	}
-	return false
+	return leadingVerbScan{subs: subs}.leads(args)
 }

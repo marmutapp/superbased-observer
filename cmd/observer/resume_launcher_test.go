@@ -57,6 +57,25 @@ func TestInjectNativeResume(t *testing.T) {
 		{"kiro strips leading chat", "kiro", "uuid-k", []string{"chat", "--foo"}, []string{"chat", "--resume-id", "uuid-k", "--foo"}},
 		{"kiro keeps non-chat remainder", "kiro", "uuid-k", []string{"--foo"}, []string{"chat", "--resume-id", "uuid-k", "--foo"}},
 
+		// droid (live-confirmed 2026-07-29, zero-spend): JOINED
+		// `--resume=<uuid>` — droid declares `-r, --resume [sessionId]` with
+		// an OPTIONAL value, the same commander.js shape as cursor. The id is
+		// our stored SessionID verbatim (no transform).
+		{"droid --resume=", "droid", "0d65bff4-ac87-464c-976d-de33e49f5f51", nil, []string{"--resume=0d65bff4-ac87-464c-976d-de33e49f5f51"}},
+		{"droid + remainder", "droid", "uuid-d", []string{"--auto", "high"}, []string{"--resume=uuid-d", "--auto", "high"}},
+
+		// command-code: `--session <id>` is the REQUIRED-value resume
+		// spelling, so the plain two-token form is correct (not joined).
+		{"command-code --session", "command-code", "c2bfd6d1-cc09-4661-ab19-164580a1323e", nil, []string{"--session", "c2bfd6d1-cc09-4661-ab19-164580a1323e"}},
+		{"command-code + remainder", "command-code", "uuid-cc", []string{"--model", "x"}, []string{"--session", "uuid-cc", "--model", "x"}},
+
+		// open-interpreter: `resume <SESSION_ID>` — the subcommand-scoped
+		// POSITIONAL shape (codex's contract, this fork being codex). A
+		// user-forwarded leading `resume` is not doubled.
+		{"open-interpreter resume positional", "open-interpreter", "019f6f69-23a0-7e32-bdba-9a9fabc946be", nil, []string{"resume", "019f6f69-23a0-7e32-bdba-9a9fabc946be"}},
+		{"open-interpreter strips leading resume", "open-interpreter", "uuid-i", []string{"resume", "--last"}, []string{"resume", "uuid-i", "--last"}},
+		{"open-interpreter keeps remainder", "open-interpreter", "uuid-i", []string{"-m", "gpt-5"}, []string{"resume", "uuid-i", "-m", "gpt-5"}},
+
 		// Fail-open: an unknown verb leaves args untouched.
 		{"unknown verb unchanged", "not-a-verb", "x", []string{"a"}, []string{"a"}},
 	}

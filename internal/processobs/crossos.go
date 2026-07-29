@@ -82,6 +82,21 @@ var DefaultCrossOSToolBasenames = map[string][]string{
 	"aider":     {"aider.exe", "aider", "python.exe", "python"}, // pip aider-chat — python console-script entry
 	"qoder":     {"qoder.exe", "qoder", "node.exe", "node"},     // Alibaba Qoder CLI — CC-shaped node-family (no local install to probe)
 	"goose":     {"goose.exe", "goose"},                         // Block goose (binary `goose`) — native Rust ELF
+	// 2026-07-29 wave. Same runtime rule as above: a natively compiled
+	// binary takes ONLY its own name; an npm-shim CLI also carries node.
+	"droid": {"droid.exe", "droid"}, // Factory AI droid — distributed as its own binary, not an npm/python shim
+	// Open Interpreter is the OpenAI Codex CLI Rust codebase rebuilt under
+	// a different product name — a native binary, so no node/python.
+	"open-interpreter": {"interpreter.exe", "interpreter"},
+	// Command Code is an npm package whose bin entries all load the same
+	// node bundle, so node belongs here (the cline-cli/copilot-cli/crush
+	// precedent). It installs FOUR bin aliases — `commandcode`,
+	// `command-code`, `cmd`, `cmdc` — but only the two unambiguous
+	// spellings are matched: `cmd`/`cmd.exe` is the Windows command
+	// prompt and `cmdc` is generic enough to collide, and a false anchor
+	// here misattributes an unrelated process to a session (cwd + the
+	// time window are the only other discriminators).
+	"command-code": {"command-code.exe", "command-code", "commandcode.exe", "commandcode", "node.exe", "node"},
 }
 
 // DefaultCrossOSToolLaunchers maps a session tool to the branded IDE/desktop
@@ -177,6 +192,17 @@ var DefaultRefreshLauncherBasenames = map[string]bool{
 	"qoder":        true,
 	"goose.exe":    true, // goose (Block goose — native Rust ELF)
 	"goose":        true,
+	// 2026-07-29 wave — distinctive branded launcher names only, same
+	// rule as above (the generic node/node.exe that command-code's npm
+	// shim also presents is deliberately NOT added: no cwd guard here).
+	"droid.exe":        true, // droid (Factory AI — own binary)
+	"droid":            true,
+	"interpreter.exe":  true, // open-interpreter (rebadged Codex CLI Rust binary)
+	"interpreter":      true,
+	"command-code.exe": true, // command-code (npm bin alias; `cmd`/`cmdc` excluded as ambiguous)
+	"command-code":     true,
+	"commandcode.exe":  true,
+	"commandcode":      true,
 	// NOTE: roo-code (node-only, no branded launcher), pi (`pi` too short/
 	// generic to match on name alone without the cwd guard), and cowork (claude
 	// launcher already covered) are intentionally NOT added here — they still

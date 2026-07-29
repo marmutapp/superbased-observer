@@ -2,6 +2,172 @@
 
 All notable changes to SuperBased Observer are documented here.
 
+## [1.27.0] — 2026-07-29
+
+### Added
+
+- **feat(adapter): three new adapters — Factory `droid`, Open Interpreter
+  and Command Code (26 → 29).** All three were Phase-0 grounded against
+  live installs on WSL *and* Windows before any parser was written, then
+  put through one adversarial review over the combined diff (four
+  confirmed findings, each fixed with a revert-proof regression test —
+  see Fixed below). All three are **Tier-2 log capture**: none has a
+  verified proxy lane and none exposes a hook mechanism, so every token
+  figure they produce is the tool's own reported number read out of its
+  local transcript, never a proxy-exact one.
+  - **`droid`** (`internal/adapter/droid/`, `models.ToolDroid`) is
+    Factory AI's terminal agent — the company is Factory AI, the product
+    is droid, and Observer names adapters after the product. Two flat
+    files per session and no SQLite anywhere: the JSONL transcript at
+    `~/.factory/sessions/<dashed-cwd>/<uuid>.jsonl` plus a
+    `<uuid>.settings.json` sidecar. There is **no per-message usage
+    envelope anywhere in the corpus** (`"usage"` occurs zero times across
+    the nine captured sessions), so tokens are SESSION-level cumulative
+    only — the goose precedent. Only the self-only `tokenUsage` block is
+    emitted, under the stable id `tokens:<session-id>`, so a later parse
+    of a grown sidecar rewrites the same `(source_file, source_event_id)`
+    row and the store's `ON CONFLICT … MAX(…)` upgrade keeps the counts
+    monotonically non-decreasing; `inclusiveTokenUsage` and
+    `lastCallTokenUsage` are deliberately NOT emitted (both would
+    double-count — mission child sessions get their own transcript and
+    sidecar), and `factoryCredits` has no `TokenBundle` counterpart at
+    all. Tier `source='jsonl'`, `reliability='approximate'`. Project root
+    comes from the inline `session_start.cwd`; `compaction_state` maps to
+    `ActionContextCompacted` with its git-output snapshots dropped. The
+    adapter never reads the `~/.factory` root — `auth.v2.*` and the
+    top-level `settings.json` carry plaintext BYOK keys — and sidecar
+    reads refuse symlinks (a new house idiom).
+  - **Open Interpreter** is deliberately **not a new package.** The
+    `interpreter` binary is the OpenAI Codex CLI Rust codebase recompiled
+    under another product name, and the evidence is not circumstantial:
+    every subcommand's `--help` is titled "Codex", the Rust module
+    namespace is `codex_*`, the session file's `base_instructions` say
+    "You are Codex", `CODEX_HOME` is renamed to `INTERPRETER_HOME`, and
+    every `token_count` event's `rate_limits.limit_id` is still the
+    literal string `"codex"`. So `codex.NewOpenInterpreter()` retags the
+    existing codex parser at the §2.1 boundary seam (CLAUDE.md rule 3 —
+    branch on capability, not source identity) with watch root
+    `~/.openinterpreter/sessions`; because the on-disk shape is
+    *identical* to codex's, root-based watcher dispatch is the only thing
+    keeping the two apart. Tier 2 JSONL `token_count`, with gross input
+    netted against `cached_input_tokens` exactly as codex's own path does.
+    Its four SQLite stores are index/debug only and are not read.
+  - **Command Code** (`internal/adapter/commandcode/`,
+    `models.ToolCommandCode`) is the closed-source `command-code` npm CLI
+    (v1.4.5 at capture) — one binary behind four bin aliases (`cmd`,
+    `cmdc`, `command-code`, `commandcode`), not a two-product split.
+    Claude-Code-shaped JSONL under `~/.commandcode/projects/`, with
+    per-assistant-message usage inline. **`inputTokens` is GROSS** — it
+    includes `cacheReadTokens` — so the adapter emits the netted figure,
+    clamped at zero (mutation-proved), and carries the cached count
+    separately. The provider's own `costUsd` is carried through as an
+    estimated cost (the opencode / pi precedent) because Command Code
+    resells ~48 mostly open-weight models through its own gateway, for
+    which Observer has no pricing rows. `.checkpoints.jsonl`, meta,
+    config and history files are excluded by `IsSessionFile`, and
+    `auth.json` is never read.
+  - **Registration.** `enabled_adapters` goes 26 → 29, with one
+    `internal/integration` capability row each (droid and open-interpreter
+    `probe_required`; command-code `after_bridge` — its API-URL knob
+    points at its own closed gateway, not an Anthropic/OpenAI-shaped
+    endpoint), guard conformance rows, cross-OS process-attribution
+    basenames (the `cmd` / `cmdc` aliases are deliberately excluded — they
+    collide with `cmd.exe`), `defaults.Adapters()`, and dashboard tool
+    label + colour rows (CIE76-checked). `RegistryVersion` stays at 1 by
+    the browserchat precedent: a bump revokes aggregate consent receipts,
+    and adding tools is not a consent-shape change. As with every new
+    adapter, a daemon built before this release has no compiled-in support
+    — rebuild and restart before expecting rows.
+- **feat(launch): full terminal parity for the wave — 19 → 22 launchers.**
+  `observer droid`, `observer open-interpreter` (alias `interpreter`) and
+  `observer command-code` (alias `commandcode`) each open a real PTY from
+  the dashboard or a shell. Every seed and resume contract was read out of
+  the tool's own `--help` on 2026-07-29 rather than inferred: droid takes
+  the distilled handover as a **trailing positional** and resumes with a
+  JOINED `--resume=<uuid>` (its flag declares an optional value, so a
+  space-separated form would swallow the next argument); Open Interpreter
+  resumes through the `resume <uuid>` **subcommand**, codex's shape, which
+  landed as a new positional `resumeTranslation` shape expressed as DATA
+  rather than a new code path; Command Code resumes with `--session <id>`,
+  chosen over its optional-value, name-resolving `-r`. All three launch
+  **non-proxied** on purpose — no proxy lane has been probed for any of
+  them, and `observer open-interpreter` deliberately does not copy
+  `observer codex`'s `openai_base_url` injection. Attach, attach-by-default,
+  Jump-in and the Session Cockpit come for free, because those dispatch on
+  the launcher capability rather than the tool name (new-adapter checklist
+  §3.6a). Totals after the pass, read out of the registry: **22 launcher
+  verbs** (20 seeded + 2 doc-assisted), **22 attachable**, **21 of 22 with
+  native resume** — openclaw is the sole holdout, picker-only — **22
+  `Binary` rows**, and **21 with at least one grounded install hint**
+  (`kimi-code` is the sole gap, no official channel grounded). Factory's
+  Windows `irm` one-liner is deliberately NOT offered as an install hint:
+  it is undocumented upstream.
+- **docs: the adapter-coverage parity matrix is re-derived from code.**
+  `docs/plans/adapter-coverage-parity-plan-2026-06-26.md` §15 is now a
+  34-row matrix — every cell read out of the `internal/integration`
+  registry and the launcher wiring on 2026-07-29 and cross-checked against
+  `observer adapters`, with `—` meaning the registry's honest zero ("no
+  grounded capability"), never "probably". It also writes down the four
+  adapter numbers that are routinely confused and are not a discrepancy:
+  **29** CLI/IDE/desktop adapters, **34** registry rows (the 29 plus the
+  five browser-rail `*-web` tool identities, which are one package),
+  **35** `enabled_adapters` entries (the 34 plus `roo-code`, which has no
+  package and no row), and `integration.Tools()` — not `EnabledAdapters` —
+  as the canonical closed tool vocabulary. `docs/new-adapter-checklist.md`
+  gains §3.6a, "what a new launcher gets for FREE".
+
+### Fixed
+
+- **fix(adapter): a tool result that lands in the NEXT parse tick is no
+  longer dropped.** Found by adversarial review over the wave's combined
+  diff, not by a test: when a poll ends between a `tool_use` record and
+  its `tool_result`, the outcome arrives in a later parse and the action
+  had already been written without it. Both new JSONL parsers now defer —
+  an unanswered trailing `tool_use` rewinds `NewOffset` back to that
+  record's start (never below `fromOffset`), bounded by a 1 MiB tail and a
+  90-minute mtime grace so a genuinely abandoned session cannot pin the
+  cursor forever. **Honest scope: this fixes the two new parsers only.**
+  claudecode, qwencode, qoder, kimicode and grok carry the same latent
+  defect, and the right fix there is one store seam (an `ON CONFLICT`
+  outcome upgrade, or a `ParseResult` outcome-update channel) rather than
+  five more copies of the deferral — that arc is deferred and recorded
+  rather than quietly bundled here.
+- **fix(codex): duplicate token and system-prompt rows when identical
+  snapshots straddle a poll boundary.** Surfaced while reviewing the
+  Open Interpreter retag, but it is a **codex bug and the fix benefits
+  codex itself**: `prefetchSessionContext` did not seed its dedup state
+  from the already-parsed prefix, so a `token_count` snapshot whose totals
+  were unchanged across a poll — and, separately, a re-seen system prompt
+  — produced a second row. It now seeds both `seenModernTotal` and
+  `seenSystemPrompts` by a state-only prefix replay: rescan-idempotent,
+  with no change to the `SourceEventID` scheme, and it closes a
+  pre-existing codex system-prompt duplicate class along the way.
+- **fix(dashboard): the messages-table sort survives a reload and follows
+  you across sessions.** v1.26.0 made every header sortable but the choice
+  was per-mount state, so any reload or session switch silently reverted to
+  chronological. The selection now persists in `localStorage`, is validated
+  on read (an unknown column or direction falls back to today's exact
+  chronological default rather than erroring), and is *removed* rather than
+  written when the sort IS the default — so a stored value never
+  out-lives the preference that created it.
+- **fix(adapter): two smaller findings from the same review.** Command
+  Code's meta-model fallback was reachable only at offset 0, so a session
+  first parsed mid-file never recovered its model; it is now lazy and
+  fires at any offset. And a racy `WithName` mutator was removed outright —
+  the adapter name is construction-only, so a setter that could run
+  concurrently with a parse had no reason to exist.
+
+### Changed
+
+- **test(terminal): the repaint-nudge geometry read is now pinned.**
+  v1.26.0's reconnect repaint nudge shipped with the gap written into its
+  own commit message: the geometry snapshot must be taken BEFORE the
+  forwarded resize (after it, the manager's snapshot has already converged
+  and every resize misreads as identical), but nothing pinned that order,
+  because the package's fake `Snapshot()` never converged — so a refactor
+  moving the read below the resize would have passed the whole suite while
+  nudging on every resize. A converging fake closes it; mutation-proved.
+
 ## [1.26.0] — 2026-07-28
 
 ### Added

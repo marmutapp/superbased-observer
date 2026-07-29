@@ -105,6 +105,12 @@ func ConformanceMatrix() []ConformanceEntry {
 		models.ToolQwenCode, models.ToolKiroCLI, models.ToolCrush,
 		models.ToolKimiCode, models.ToolGrok, models.ToolDevin,
 		models.ToolQoder, models.ToolAider, models.ToolGoose,
+		// 2026-07-29 wave: all three are watcher-path adapters (JSONL
+		// tail) with no hook mechanism grounded (registry Hook is
+		// HookNone for each), so the post-hoc watcher row is their ONLY
+		// guard surface — exactly the F2 coverage this table makes
+		// visible rather than hiding.
+		models.ToolDroid, models.ToolOpenInterpreter, models.ToolCommandCode,
 	} {
 		entries = append(entries, watcherEntry(client))
 	}

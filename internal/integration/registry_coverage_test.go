@@ -29,6 +29,14 @@ func TestRegistryCoversEveryRegisteredAdapter(t *testing.T) {
 
 // TestRegistryHasNoOrphanRows pins the reverse: every registry row maps to a
 // registered adapter (no stale rows for removed adapters).
+//
+// A multi-phase adapter build may temporarily land a registry row ahead of
+// its parser package + defaults.Adapters() entry; the sanctioned way to do
+// that is a documented, dated exception map here that is DELETED the moment
+// the package lands. The 2026-07-29 wave (droid / open-interpreter /
+// command-code) used one and it was retired when those three registered —
+// so this test currently guards the general case with no exceptions, which
+// is the state it should normally be in.
 func TestRegistryHasNoOrphanRows(t *testing.T) {
 	registered := map[string]bool{}
 	for _, a := range adapterdefaults.Adapters() {

@@ -23,6 +23,11 @@ type repaintRecordingWriter struct {
 	*recordingWriter
 	mu    sync.Mutex
 	sizes [][2]uint16
+	// onResize, when set, is invoked with every size this lease APPLIES, so the
+	// owning fake manager can fold it back into its live snapshot the way the
+	// real launch manager's resize funnel does. Guarded by mu (it is read from
+	// the websocket read loop) even though it is only ever set at construction.
+	onResize func(rows, cols uint16)
 }
 
 // newRepaintRecordingWriter builds a sequence-recording writer lease.
@@ -30,12 +35,25 @@ func newRepaintRecordingWriter() *repaintRecordingWriter {
 	return &repaintRecordingWriter{recordingWriter: newRecordingWriter()}
 }
 
-// Resize appends (rows, cols) to the ordered log, then delegates to the
-// embedded recordingWriter so its counter stays authoritative too.
+// setOnResize installs the manager's convergence callback.
+func (w *repaintRecordingWriter) setOnResize(fn func(rows, cols uint16)) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.onResize = fn
+}
+
+// Resize appends (rows, cols) to the ordered log, notifies the owning manager
+// so its snapshot converges on the applied size, then delegates to the embedded
+// recordingWriter so its counter stays authoritative too. The callback runs
+// OUTSIDE w.mu so the writer lock is never held across the manager lock.
 func (w *repaintRecordingWriter) Resize(rows, cols uint16) error {
 	w.mu.Lock()
 	w.sizes = append(w.sizes, [2]uint16{rows, cols})
+	onResize := w.onResize
 	w.mu.Unlock()
+	if onResize != nil {
+		onResize(rows, cols)
+	}
 	return w.recordingWriter.Resize(rows, cols)
 }
 
@@ -52,23 +70,82 @@ func (w *repaintRecordingWriter) seq() [][2]uint16 {
 // repaintLaunchManager reuses the package's recordingLaunchManager seam but
 // hands the OWNER-LOCAL writer path a sequence-recording lease (the recording
 // manager's own localWriter field is typed to the counting fake, so it cannot
-// carry one). Every other manager method is promoted unchanged.
+// carry one). Every manager method except Snapshot and AcquireWriterLocal is
+// promoted unchanged.
+//
+// Its snapshot CONVERGES: unlike the embedded recording manager's static
+// snapshot field, every size the writer lease actually applies is folded back
+// into the matching LaunchInfo row, the way the real manager's resize funnel
+// updates its live session table. That is what makes ptySizeForHandle a moving
+// target — and therefore what lets a test pin WHEN applyResizeFrame reads it
+// (see TestTerminalRepaintNudgeReadsGeometryBeforeResize). A static fake can
+// never observe that ordering, because it never converges.
 type repaintLaunchManager struct {
 	*recordingLaunchManager
 	writer LaunchWriter
+
+	// mu guards snap and handle. Snapshot() is read from the bridge's goroutine
+	// while Resize (hence applyResize) is driven from the websocket read loop.
+	mu sync.Mutex
+	// snap is this fake's OWN live-session table — deliberately not the embedded
+	// recording manager's snapshot field, which is unsynchronised and shared with
+	// the other launch tests. Snapshot() is overridden to read this one.
+	snap []LaunchInfo
+	// handle is the session whose row converges, bound when the bridge takes the
+	// owner-local writer lease.
+	handle string
 }
 
 // newRepaintLaunchManager wires a recording manager whose AcquireWriterLocal
 // returns w, with snap as the live-session snapshot ptySizeForHandle reads.
-func newRepaintLaunchManager(w LaunchWriter, snap []LaunchInfo) *repaintLaunchManager {
-	inner := newRecordingLaunchManager(nil)
-	inner.snapshot = snap
-	return &repaintLaunchManager{recordingLaunchManager: inner, writer: w}
+// snap is COPIED: the rows are mutated as resizes land, and the package-level
+// repaintGeometry fixture is shared across tests.
+func newRepaintLaunchManager(w *repaintRecordingWriter, snap []LaunchInfo) *repaintLaunchManager {
+	m := &repaintLaunchManager{
+		recordingLaunchManager: newRecordingLaunchManager(nil),
+		writer:                 w,
+		snap:                   append([]LaunchInfo(nil), snap...),
+	}
+	w.setOnResize(m.applyResize)
+	return m
 }
 
-// AcquireWriterLocal grants the sequence-recording lease on the loopback path.
-func (m *repaintLaunchManager) AcquireWriterLocal(string) (LaunchWriter, error) {
+// Snapshot returns a defensive copy of the live session table, mutex-guarded.
+// It overrides the embedded recording manager's unsynchronised accessor rather
+// than editing that shared fake.
+func (m *repaintLaunchManager) Snapshot() []LaunchInfo {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]LaunchInfo, len(m.snap))
+	copy(out, m.snap)
+	return out
+}
+
+// applyResize folds an APPLIED winsize back into the live snapshot, so a later
+// Snapshot() reports the geometry the PTY actually has now.
+//
+// An unknown handle stays unknown: with no matching row nothing is invented, so
+// ptySizeForHandle keeps reporting all-zero ("size not yet known"). InitialRows
+// and InitialCols are never touched — they are the launch-time size, which no
+// resize changes.
+func (m *repaintLaunchManager) applyResize(rows, cols uint16) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.snap {
+		if m.snap[i].ID == m.handle {
+			m.snap[i].Rows, m.snap[i].Cols = rows, cols
+			return
+		}
+	}
+}
+
+// AcquireWriterLocal grants the sequence-recording lease on the loopback path
+// and binds the handle whose snapshot row converges with it.
+func (m *repaintLaunchManager) AcquireWriterLocal(handle string) (LaunchWriter, error) {
 	m.recordingLaunchManager.localCalls.Add(1)
+	m.mu.Lock()
+	m.handle = handle
+	m.mu.Unlock()
 	return m.writer, nil
 }
 
@@ -299,5 +376,56 @@ func TestTerminalRepaintNudgeSkippedWhenResizeAlreadyDiffers(t *testing.T) {
 	want := [][2]uint16{{30, 100}}
 	if !sameSeq(got, want) {
 		t.Fatalf("resize sequence = %v, want %v (a real size change needs no nudge)", got, want)
+	}
+}
+
+// TestTerminalRepaintNudgeReadsGeometryBeforeResize pins the ORDER of the two
+// statements at the top of applyResizeFrame: the geometry snapshot must be read
+// BEFORE writer.Resize applies the client's request, never after.
+//
+// Why it matters: the manager's snapshot converges on whatever size was last
+// applied. Read it afterwards and `before` always equals the request, so
+// repaintNudgeRows sees "identical size" on EVERY resize and fires a spurious
+// nudge even on a genuine size change — a one-row bounce, and the visible
+// flicker/churn it costs every viewer of the PTY, on a resize that already
+// raised SIGWINCH by itself.
+//
+// This test is the reason repaintLaunchManager's snapshot converges. Against a
+// STATIC fake — one whose Snapshot() keeps returning the construction-time rows
+// — the assertion below would hold under BOTH orderings (the fake never
+// converges, so a late read still sees 40x120 ≠ 30x100) and would therefore
+// prove nothing. It is a live-geometry fake that turns this into a real pin;
+// mutating applyResizeFrame to read after the resize makes it fail with
+// [[30 100] [29 100] [30 100]].
+func TestTerminalRepaintNudgeReadsGeometryBeforeResize(t *testing.T) {
+	w := newRepaintRecordingWriter()
+	lm := newRepaintLaunchManager(w, repaintGeometry) // live PTY is 40x120
+	t.Cleanup(func() { close(lm.sub.release) })
+	ts := httptest.NewServer(newLaunchTestServer(t, lm).Handler())
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c := dialRepaintWS(t, ctx, ts)
+	defer func() { _ = c.CloseNow() }()
+
+	// A GENUINELY different size: 30x100 against a live 40x120.
+	if err := c.Write(ctx, websocket.MessageText, []byte(`{"t":"resize","rows":30,"cols":100}`)); err != nil {
+		t.Fatalf("write resize: %v", err)
+	}
+
+	got := waitResizeSeq(t, w, 1)
+	want := [][2]uint16{{30, 100}}
+	if !sameSeq(got, want) {
+		t.Fatalf("resize sequence = %v, want %v — the geometry snapshot was read AFTER the resize, "+
+			"so the converged size misread as a no-op and a spurious nudge fired", got, want)
+	}
+	// The fake really did converge — otherwise the assertion above is vacuous.
+	if g := lm.Snapshot(); len(g) != 1 || g[0].Rows != 30 || g[0].Cols != 100 {
+		t.Fatalf("snapshot = %v, want the live row converged on 30x100 (a non-converging fake cannot pin the ordering)", g)
+	}
+	// InitialRows/InitialCols are launch-time facts a resize must not rewrite.
+	if g := lm.Snapshot(); g[0].InitialRows != 24 || g[0].InitialCols != 80 {
+		t.Fatalf("snapshot initial size = %dx%d, want 24x80 (a resize must not touch it)", g[0].InitialRows, g[0].InitialCols)
 	}
 }

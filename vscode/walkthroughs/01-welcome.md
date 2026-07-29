@@ -5,7 +5,7 @@ tool, 100% local.**
 
 SuperBased captures, normalises, and analyses tool-call activity from
 Claude Code, Codex, Cursor, Cline (and forks like Roo Code), Copilot,
-Gemini, Devin, Aider, and 18 more — 26 adapters in all — entirely on
+Gemini, Devin, Aider, and 21 more — 29 adapters in all — entirely on
 your machine. No telemetry. No data leaves your machine.
 
 This walkthrough takes about **5 minutes** and covers:

@@ -34,6 +34,33 @@ import (
 type Adapter struct {
 	scrubber  *scrub.Scrubber
 	watchRoot string
+
+	// name overrides the tool identity returned by Name() (and, via
+	// the ParseSessionFile retag pass below, every ToolEvent/
+	// TokenEvent this adapter instance emits). Empty means the
+	// default codex identity, models.ToolCodex. Set by
+	// NewOpenInterpreter for the Open Interpreter variant — see
+	// docs/openinterpreter-adapter.md and
+	// docs/plans/openinterpreter-adapter-plan-2026-07-29.md.
+	//
+	// CONSTRUCTION-ONLY, deliberately: there is no exported mutator.
+	// An adapter instance is published to the watcher's registry at
+	// startup and then used concurrently (Name() is read from the
+	// dispatch path while ParseSessionFile runs), so a post-
+	// registration setter would be an unsynchronized write against
+	// live readers — a real -race failure, not a theoretical one. A
+	// variant is a new constructor (NewOpenInterpreter), never a
+	// mutation of an existing instance.
+	name string
+
+	// homeEnvVar overrides the single-explicit-root env var checked
+	// by WatchPaths (default "CODEX_HOME"). Set to "INTERPRETER_HOME"
+	// for the Open Interpreter variant.
+	homeEnvVar string
+	// homeDirName overrides the per-cross-mount-home subdirectory
+	// name checked by WatchPaths (default ".codex"). Set to
+	// ".openinterpreter" for the Open Interpreter variant.
+	homeDirName string
 }
 
 // New returns a Codex adapter with defaults.
@@ -50,7 +77,32 @@ func NewWithOptions(s *scrub.Scrubber, watchRoot string) *Adapter {
 }
 
 // Name implements adapter.Adapter.
-func (*Adapter) Name() string { return models.ToolCodex }
+func (a *Adapter) Name() string {
+	if a.name != "" {
+		return a.name
+	}
+	return models.ToolCodex
+}
+
+// homeEnv returns the env var WatchPaths checks for a single explicit
+// session root. "CODEX_HOME" unless overridden (Open Interpreter
+// variant: "INTERPRETER_HOME").
+func (a *Adapter) homeEnv() string {
+	if a.homeEnvVar != "" {
+		return a.homeEnvVar
+	}
+	return "CODEX_HOME"
+}
+
+// homeDir returns the per-cross-mount-home subdirectory name
+// WatchPaths expands. ".codex" unless overridden (Open Interpreter
+// variant: ".openinterpreter").
+func (a *Adapter) homeDir() string {
+	if a.homeDirName != "" {
+		return a.homeDirName
+	}
+	return ".codex"
+}
 
 // WatchPaths returns the canonical Codex sessions directory. Honors
 // CODEX_HOME when set (single explicit path — cross-mount expansion
@@ -58,16 +110,20 @@ func (*Adapter) Name() string { return models.ToolCodex }
 // where to look). Otherwise expands to ".codex/sessions" under every
 // cross-mount-resolved $HOME so observer in WSL2 picks up sessions
 // from /mnt/c/Users/<u>/.codex (and vice-versa).
+//
+// The Open Interpreter variant (NewOpenInterpreter) follows the exact
+// same shape against INTERPRETER_HOME / ".openinterpreter" instead —
+// see homeEnv/homeDir.
 func (a *Adapter) WatchPaths() []string {
 	if a.watchRoot != "" {
 		return []string{a.watchRoot}
 	}
-	if home := os.Getenv("CODEX_HOME"); home != "" {
+	if home := os.Getenv(a.homeEnv()); home != "" {
 		return []string{filepath.Join(home, "sessions")}
 	}
 	var roots []string
 	for _, h := range crossmount.AllHomes() {
-		roots = append(roots, filepath.Join(h.Path, ".codex", "sessions"))
+		roots = append(roots, filepath.Join(h.Path, a.homeDir(), "sessions"))
 	}
 	return roots
 }
@@ -720,7 +776,29 @@ func readRecord(r *bufio.Reader, maxBytes int64) (data []byte, consumed int64, o
 	}
 }
 
+// ParseSessionFile implements adapter.Adapter. It delegates to
+// parseSessionFile (the ~20-site internal parser, unchanged since it
+// still hardcodes models.ToolCodex throughout) and then retags every
+// emitted ToolEvent/TokenEvent with this adapter instance's identity —
+// the single-seam variant-retag pattern (docs/new-adapter-checklist.md
+// §2.1(b), mirrors antigravity.Adapter.ParseSessionFile). For the
+// default codex.New() instance a.Name() == models.ToolCodex, so the
+// retag is a no-op and every pre-existing codex behavior is
+// byte-identical. CacheObservations and SessionLineages carry no Tool
+// field and need no retag.
 func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset int64) (adapter.ParseResult, error) {
+	res, err := a.parseSessionFile(ctx, path, fromOffset)
+	name := a.Name()
+	for i := range res.ToolEvents {
+		res.ToolEvents[i].Tool = name
+	}
+	for i := range res.TokenEvents {
+		res.TokenEvents[i].Tool = name
+	}
+	return res, err
+}
+
+func (a *Adapter) parseSessionFile(ctx context.Context, path string, fromOffset int64) (adapter.ParseResult, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return adapter.ParseResult{}, fmt.Errorf("codex.ParseSessionFile: open %s: %w", path, err)
@@ -780,13 +858,18 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 	// so it must NOT re-emit — the guarded SQL would fire every poll.
 	sessionMetaObservedThisChunk := false
 
+	// resumed carries the dedup state rebuilt from the pre-offset bytes
+	// (token-total baseline + already-emitted system-prompt hashes). It
+	// is applied to the seen* maps further down, where they're declared.
+	var resumed resumePrefix
 	lineOffset := 0
 	if fromOffset > 0 {
-		if hdr, track, lineCount, ok := prefetchSessionContext(f, fromOffset); ok {
-			ctxState = mergeSessionContext(sessionContext{}, hdr)
+		if pre, ok := prefetchSessionContext(f, fromOffset); ok {
+			ctxState = mergeSessionContext(sessionContext{}, pre.ctx)
 			hasRealSessionID = ctxState.SessionID != ""
-			lineOffset = lineCount
-			forkTrack = track
+			lineOffset = pre.lineCount
+			forkTrack = pre.track
+			resumed = pre
 		}
 		if _, err := f.Seek(fromOffset, io.SeekStart); err != nil {
 			return adapter.ParseResult{}, fmt.Errorf("codex.ParseSessionFile: seek: %w", err)
@@ -835,6 +918,32 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 	// keyed by SessionID; tokenUsage is a value-type struct so == is
 	// correct.
 	seenModernTotal := map[string]tokenUsage{}
+	// Cross-parse seeding (incremental resume only). Both seen* maps
+	// above are per-parse, so before this seeding a resumed parse
+	// started with an EMPTY dedup state: a token_count Codex re-emits
+	// 2-3s later (identical last_token_usage AND total_token_usage)
+	// that happened to straddle the resume boundary re-emitted as a
+	// fresh row, and the same base/developer instructions body
+	// re-emitted an ActionSystemPrompt row. Neither is caught
+	// downstream: SourceEventID (and, for token rows, MessageID) embeds
+	// the LINE NUMBER, which differs between the original and the
+	// re-emission, so store.InsertTokenEvents' UNIQUE(source_file,
+	// source_event_id) upsert and its (tool, session_id, message_id)
+	// tuple-dedup sweep both miss it. prefetchSessionContext replays the
+	// pre-offset lines in STATE-ONLY mode (no emission) and hands back
+	// exactly the state the same bytes would have produced in a
+	// fromOffset==0 parse, so the duplicate suppresses identically.
+	//
+	// Rescan-safe by construction: this seeds state only, never
+	// SourceEventIDs, so `observer scan --force` (fromOffset==0, no
+	// prefetch) still produces byte-identical ids for every historical
+	// row and keeps upserting onto them.
+	if resumed.haveTotal {
+		seenModernTotal[ctxState.SessionID] = resumed.modernTotal
+	}
+	for hash := range resumed.systemPrompts {
+		seenSystemPrompts[hash] = true
+	}
 	// runningWebSearchCount tallies event_msg/web_search_end records
 	// seen since the last NON-deduped token_count emission. Flushed
 	// onto TokenEvent.WebSearchRequests when the next token_count row
@@ -3344,6 +3453,55 @@ func sessionIDFromPath(path string) string {
 	return base
 }
 
+// resumePrefix is the state prefetchSessionContext reconstructs from
+// the bytes preceding an incremental resume offset. Everything in it
+// is state a fromOffset==0 parse would have accumulated by the time it
+// reached that offset — it never carries emitted events, so replaying
+// the prefix stays side-effect-free.
+type resumePrefix struct {
+	// ctx is the session context (SessionID, Cwd, Model, GitBranch,
+	// EffortLevel) latched from the leading session_meta/turn_context.
+	ctx sessionContext
+	// track is the fork-replay tracker (owner latch + fork mark + turn
+	// governance) rebuilt from the same prefix lines.
+	track forkReplayTracker
+	// lineCount is the number of terminated records that fit entirely
+	// before the resume offset; the resumed parse continues its
+	// absolute lineNum from here so `:L<n>:` SourceEventIDs stay stable
+	// against a full rescan.
+	lineCount int
+	// modernTotal / haveTotal carry the last non-zero
+	// total_token_usage seen in the prefix — the baseline the resumed
+	// parse's seenModernTotal must start from so a token_count Codex
+	// re-emits across the poll boundary is recognized as the
+	// duplicate it is.
+	modernTotal tokenUsage
+	haveTotal   bool
+	// systemPrompts holds shortHash values of system-prompt bodies
+	// (session_meta base_instructions, turn_context
+	// developer_instructions) already emitted before the offset, so the
+	// resumed parse's seenSystemPrompts suppresses the repeats exactly
+	// as an uninterrupted parse would. Response-item developer/user-
+	// envelope bodies are deliberately NOT seeded here — see the
+	// docstring of prefetchSessionContext.
+	systemPrompts map[string]bool
+}
+
+// noteSystemPrompt records the hash of a system-prompt body under the
+// exact same trim + hash rules systemPromptEvent applies, so a seeded
+// hash always matches the one the live parse would have stored. No-op
+// for empty bodies.
+func (p *resumePrefix) noteSystemPrompt(body string) {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return
+	}
+	if p.systemPrompts == nil {
+		p.systemPrompts = map[string]bool{}
+	}
+	p.systemPrompts[shortHash(body)] = true
+}
+
 // prefetchSessionContext scans the file's leading bytes (up to `until`)
 // for session_meta / session_configured / turn_context lines and returns
 // the most recent context fields seen before the resume offset, a
@@ -3356,10 +3514,12 @@ func sessionIDFromPath(path string) string {
 //     event would be dropped by store.Ingest (empty ProjectRoot is a
 //     hard skip) and effort_level metadata would never populate on
 //     resumed cycles.
+//
 //  2. The absolute line count up to the resume offset. SourceEventIDs
 //     that embed `:L<linenum>:` need this to be stable across re-parses
 //     — without it, a chunk-relative line number drifts from the
 //     absolute one and `observer scan --force` creates duplicate rows.
+//
 //  3. The forkReplayTracker state (owner latch + fork mark + turn
 //     governance) rebuilt from the same prefix lines, so a watcher poll
 //     that ends mid-replay-burst resumes with correct fork-replay
@@ -3367,22 +3527,41 @@ func sessionIDFromPath(path string) string {
 //     history as live. Rebuilt from the bytes already read — no second
 //     file pass.
 //
+//  4. The cross-parse DEDUP state — the last non-zero
+//     total_token_usage (seenModernTotal's baseline) and the set of
+//     system-prompt body hashes already emitted (seenSystemPrompts).
+//     Both are per-parse maps, so without this a re-emitted
+//     token_count / instructions body that straddles the resume
+//     boundary produced a duplicate row that no store-side key could
+//     collapse (their ids embed the line number). Replayed in
+//     STATE-ONLY mode: nothing is emitted, and the only extra decode
+//     work is parseModernTokenCount on token_count payloads — the
+//     instruction hashes come from the session_meta / turn_context
+//     payloads this scan already unmarshals. The third system-prompt
+//     source (response_item messages with role developer / a `<`-
+//     prefixed user envelope) is deliberately NOT seeded: harvesting
+//     it would mean deep-decoding every response_item message line of
+//     the prefix on EVERY watcher poll, and unlike
+//     developer_instructions those bodies don't repeat per turn. A
+//     missing seed only costs a duplicate row, never a lost one.
+//
 // The function leaves the file cursor positioned wherever Seek-by-caller
 // chooses; ParseSessionFile re-seeks to fromOffset right after this
 // returns. Returns ok=false only if the file cannot be re-read from
 // the start; in that case the caller falls back to the filename-derived
 // SessionID, empty cwd, and lineNum starting at 0 (the pre-fix
 // behavior — accepting the duplication risk).
-func prefetchSessionContext(f *os.File, until int64) (sessionContext, forkReplayTracker, int, bool) {
-	var track forkReplayTracker
+func prefetchSessionContext(f *os.File, until int64) (resumePrefix, bool) {
+	var pre resumePrefix
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return sessionContext{}, track, 0, false
+		return resumePrefix{}, false
 	}
 	reader := bufio.NewReaderSize(f, 64*1024)
 	var (
 		bytesRead int64
 		lineNum   int
 		out       sessionContext
+		track     forkReplayTracker
 	)
 	for {
 		lineStr, consumed, oversized, err := readRecord(reader, maxRecordBytes)
@@ -3445,6 +3624,11 @@ func prefetchSessionContext(f *os.File, until int64) (sessionContext, forkReplay
 					created, have,
 				)
 				out = mergeSessionContext(out, meta.sessionContext)
+				// Same source + same trim as the live parse's
+				// systemPromptEvent call site, so the seeded hash
+				// matches byte-for-byte what a fromOffset==0 parse
+				// would have recorded.
+				pre.noteSystemPrompt(meta.BaseInstructions.Text)
 			}
 		case "event_msg":
 			// Feed task_started governance into the reconstructed tracker
@@ -3452,13 +3636,26 @@ func prefetchSessionContext(f *os.File, until int64) (sessionContext, forkReplay
 			// before its token_counts) still classifies them as replayed.
 			// Mirror the live parse: a malformed task_started CLEARS
 			// governance (fail-open to live); other event_msg payloads are
-			// context-irrelevant to the tracker and skipped here.
-			if payloadType(line.Payload) == "task_started" {
+			// context-irrelevant to the tracker and skipped here — except
+			// token_count, whose cumulative total seeds the dedup baseline
+			// (see resumePrefix).
+			switch payloadType(line.Payload) {
+			case "task_started":
 				var started taskStarted
 				if err := json.Unmarshal(line.Payload, &started); err == nil {
 					track.observeTaskStarted(started.StartedAt, started.StartedAt != 0)
 				} else {
 					track.observeTaskStarted(0, false)
+				}
+			case "token_count":
+				// State-only: mirror the live parse's
+				// seenModernTotal update (same parse function, same
+				// non-zero-total gate) WITHOUT emitting anything.
+				// The live parse updates the baseline for replayed
+				// token_counts too, so no fork-replay branch here.
+				if _, total, ok := parseModernTokenCount(line.Payload); ok && total != (tokenUsage{}) {
+					pre.modernTotal = total
+					pre.haveTotal = true
 				}
 			}
 		case "session_configured", "session_start", "turn_context":
@@ -3477,10 +3674,14 @@ func prefetchSessionContext(f *os.File, until int64) (sessionContext, forkReplay
 					sc.EffortLevel = effort
 				}
 				out = mergeSessionContext(out, sc)
+				pre.noteSystemPrompt(meta.DeveloperInstructions)
 			}
 		}
 	}
-	return out, track, lineNum, true
+	pre.ctx = out
+	pre.track = track
+	pre.lineCount = lineNum
+	return pre, true
 }
 
 // mergeSessionContext copies non-empty fields from `from` over `into`

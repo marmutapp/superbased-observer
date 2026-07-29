@@ -2676,7 +2676,7 @@ func Default() Config {
 				PollIntervalSeconds: 2,
 				MaxFileSizeMB:       50,
 				EnabledAdapters: []string{
-					"claude-code", "codex", "cline", "cline-cli", "roo-code", "cursor", "copilot", "copilot-cli", "cowork", "opencode", "openclaw", "pi", "gemini-cli", "antigravity", "antigravity-cli", "hermes", "kilo-code", "kilo-code-cli", "qwen-code", "kiro-cli", "crush", "kimi-code", "grok", "devin", "qoder", "aider", "goose", "chatgpt-web", "claude-web", "perplexity-web", "gemini-web", "copilot-web",
+					"claude-code", "codex", "cline", "cline-cli", "roo-code", "cursor", "copilot", "copilot-cli", "cowork", "opencode", "openclaw", "pi", "gemini-cli", "antigravity", "antigravity-cli", "hermes", "kilo-code", "kilo-code-cli", "qwen-code", "kiro-cli", "crush", "kimi-code", "grok", "devin", "qoder", "aider", "goose", "chatgpt-web", "claude-web", "perplexity-web", "gemini-web", "copilot-web", "droid", "open-interpreter", "command-code",
 				},
 			},
 			Freshness: FreshnessConfig{

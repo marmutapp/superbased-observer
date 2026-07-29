@@ -84,6 +84,21 @@ var shapeFixturePathByAdapter = map[string]string{
 	// Windows %APPDATA%\Block\goose\data\sessions\). Root-gating
 	// rejects a foreign sessions/sessions.db.
 	"goose": "/tmp/foreign/.local/share/goose/sessions/sessions.db",
+	// droid (Factory AI) — <uuid>.jsonl under .factory/sessions/<dir>/.
+	// The shape predicate binds the `/.factory/sessions/` segment, so the
+	// fixture repeats it below /tmp/foreign; the sibling
+	// <uuid>.settings.json sidecar is rejected by the .jsonl suffix.
+	"droid": "/tmp/foreign/.factory/sessions/proj/1b6f2f3c-0000-0000-0000-000000000000.jsonl",
+	// open-interpreter — the rebadged Codex CLI Rust build, so the shape
+	// predicate is codex's verbatim (rollout-*.jsonl). Only the watch root
+	// differs (.openinterpreter/sessions vs .codex/sessions), which is
+	// exactly what this test proves: a foreign rollout file is rejected,
+	// and the codex/open-interpreter split is root-based, not shape-based.
+	"open-interpreter": "/tmp/foreign/rollout-2026-07-29-oi.jsonl",
+	// command-code — <uuid>.jsonl under .commandcode/projects/<slug>/.
+	// The <uuid>.checkpoints.jsonl sidecar shares the extension and is
+	// rejected by the adapter's own suffix test, not by the root gate.
+	"command-code": "/tmp/foreign/.commandcode/projects/-tmp-foo/9f4c1a20-0000-0000-0000-000000000000.jsonl",
 	// chatgpt-web — hook-only browser adapter with NO watch paths and an
 	// IsSessionFile that always returns false. Any shaped path is rejected
 	// (there is no on-disk session file), so the reject test passes and the

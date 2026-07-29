@@ -1,7 +1,7 @@
 // attach_launchers_matrix_test.go — cross-launcher coverage for the
 // attach-all-launchers wave (design §6). Two tables:
 //
-//  1. TestEveryLauncherRegistersAttachFlags walks all 19 Launch-grounded
+//  1. TestEveryLauncherRegistersAttachFlags walks all 22 Launch-grounded
 //     `observer <verb>` commands and asserts each registers --attach/--no-attach
 //     (mirrors resume_test.go's grounded-flag registration pattern). The flags
 //     are capability-gated in registerAttachFlags, so their presence is the
@@ -14,6 +14,7 @@
 package main
 
 import (
+	"sort"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -54,6 +55,11 @@ func allLauncherVerbs() []struct {
 		{"devin", "devin", newDevinCmd()},
 		{"antigravity-cli", "antigravity-cli", newAntigravityCmd()},
 		{"kimi", "kimi-code", newKimiCmd()},
+		// The 2026-07-29 adapter wave (droid / open-interpreter /
+		// command-code), wired in this session — hard-enforced below.
+		{"droid", "droid", newDroidCmd()},
+		{"open-interpreter", "open-interpreter", newOpenInterpreterCmd()},
+		{"command-code", "command-code", newCommandCodeCmd()},
 	}
 }
 
@@ -75,6 +81,9 @@ func TestEveryLauncherRegistersAttachFlags(t *testing.T) {
 		"claude": true, "codex": true,
 		"kilo": true, "qwen": true, "kiro": true, "qoder": true, "grok": true,
 		"goose": true, "devin": true, "antigravity-cli": true, "kimi": true,
+		// The 2026-07-29 wave was wired with attach from the start, so it
+		// joins the hard-enforced set rather than the EXPECTED-PENDING tail.
+		"droid": true, "open-interpreter": true, "command-code": true,
 	}
 	for _, lv := range allLauncherVerbs() {
 		lv := lv
@@ -123,6 +132,19 @@ func launcherArgsIncompatible(tool string, args []string) bool {
 		// kimi-code's `-p` prints and EXITS (a genuine headless one-shot per the
 		// registry note), so it must fall through to the bare path, not attach.
 		return argsContainHeadlessFlag(args, "-p")
+	case "droid":
+		// `droid exec` (+ the management verbs) run and exit. GROUNDED scan
+		// since FINDING-2: droid's own flag grammar, so a split value cannot
+		// hide the verb behind it.
+		return droidHeadlessScan.leads(args)
+	case "open-interpreter":
+		// The codex-shaped non-interactive lanes: `exec`/`e` and `review`.
+		return openInterpreterHeadlessScan.leads(args)
+	case "command-code":
+		// `-p/--print` is the headless one-shot; every listed subcommand
+		// prints and exits rather than opening the TUI.
+		return argsContainHeadlessFlag(args, "-p", "--print") ||
+			commandCodeHeadlessScan.leads(args)
 	default:
 		// kiro-cli / grok / devin / antigravity-cli: no extra predicate — the
 		// both-TTY guard + continue-from family are the only gates.
@@ -175,6 +197,38 @@ func TestLauncherIncompatiblePredicates(t *testing.T) {
 		{"antigravity -p (not grounded here)", "antigravity-cli", []string{"-p", "hi"}, false},
 		{"kimi -p (prints+exits headless one-shot)", "kimi-code", []string{"-p", "hi"}, true},
 		{"kimi interactive", "kimi-code", []string{"--model", "x"}, false},
+
+		// droid — leading `exec` (and the management verbs) run and exit.
+		{"droid exec leads", "droid", []string{"exec", "analyze"}, true},
+		{"droid mcp leads", "droid", []string{"mcp"}, true},
+		{"droid exec after flag", "droid", []string{"--auto=high", "exec"}, true},
+		{"droid interactive", "droid", []string{"--auto=high"}, false},
+		{"droid exec after -- is positional", "droid", []string{"--", "exec"}, false},
+
+		// open-interpreter — codex-shaped non-interactive lanes.
+		{"open-interpreter exec leads", "open-interpreter", []string{"exec", "do it"}, true},
+		{"open-interpreter e alias", "open-interpreter", []string{"e"}, true},
+		{"open-interpreter review", "open-interpreter", []string{"review"}, true},
+		{"open-interpreter resume is interactive", "open-interpreter", []string{"resume", "uuid"}, false},
+		{"open-interpreter interactive", "open-interpreter", []string{"-m", "gpt-5"}, false},
+
+		// command-code — headless -p/--print plus the print-and-exit verbs.
+		{"command-code -p", "command-code", []string{"-p", "hi"}, true},
+		{"command-code --print=", "command-code", []string{"--print=hi"}, true},
+		{"command-code status", "command-code", []string{"status"}, true},
+		{"command-code interactive", "command-code", []string{"--model", "x"}, false},
+		{"command-code -p after -- is positional", "command-code", []string{"--", "-p"}, false},
+
+		// FINDING-2: a SPLIT flag value used to occupy the operand slot the
+		// leading-verb scan reads, so the headless verb behind it slipped
+		// through and the launch attached (or seeded) into a run that exits.
+		{"droid split value then exec", "droid", []string{"--auto", "high", "exec"}, true},
+		{"droid split system-prompt then exec", "droid", []string{"--append-system-prompt", "x=y", "exec"}, true},
+		{"droid split value then a prompt stays interactive", "droid", []string{"--auto", "high"}, false},
+		{"open-interpreter split model then exec", "open-interpreter", []string{"-m", "gpt-5", "exec"}, true},
+		{"open-interpreter split sandbox then review", "open-interpreter", []string{"-s", "workspace-write", "review"}, true},
+		{"command-code split model then status", "command-code", []string{"--model", "kimi", "status"}, true},
+		{"command-code split config then info", "command-code", []string{"--config", "theme=dark", "info"}, true},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -184,4 +238,73 @@ func TestLauncherIncompatiblePredicates(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestEveryLaunchCapabilityIsRegisteredOnRoot walks the ACTUAL cobra tree
+// newRootCmd() assembles and requires a registered command for every registry
+// row that declares a Handoff.Launch. It exists because every other launcher
+// contract test in this package (allLauncherVerbs above, TestContinueFromLauncher
+// in continuefrom_test.go) drives HAND-MAINTAINED tables: deleting
+// `root.AddCommand(newDroidCmd())` — or renaming a command's Use field — left
+// all of them green while `observer droid` stopped existing, and the dashboard
+// terminal / handoff surfaces that spawn `observer <verb>` broke at runtime.
+// Pinning the real tree kills that drift class for ALL launchers at once, not
+// just the ones someone remembered to add to a table.
+func TestEveryLaunchCapabilityIsRegisteredOnRoot(t *testing.T) {
+	root := newRootCmd()
+
+	byName := map[string]*cobra.Command{}
+	for _, c := range root.Commands() {
+		byName[c.Name()] = c
+	}
+
+	launchable := 0
+	for _, capab := range integration.Capabilities() {
+		if !capab.Handoff.Launchable() {
+			continue
+		}
+		launchable++
+		verb := capab.Handoff.Launch.Subcommand
+		t.Run(verb, func(t *testing.T) {
+			cmd, ok := byName[verb]
+			if !ok {
+				t.Fatalf("adapter %q declares Launch.Subcommand %q, but newRootCmd() registers no command with that Name() — the AddCommand wiring or the command's Use field drifted (registered: %v)",
+					capab.Tool, verb, sortedCommandNames(byName))
+			}
+			// Name() is derived from Use, so this also pins that Use's first
+			// word is the verb the registry (and the dashboard) spawns.
+			if cmd.Name() != verb {
+				t.Fatalf("adapter %q: registered command Name() = %q, want %q", capab.Tool, cmd.Name(), verb)
+			}
+			// Every alias the launcher file declares must resolve back to the
+			// SAME command through cobra's own lookup — an alias that collides
+			// with another command silently steals the invocation.
+			for _, alias := range cmd.Aliases {
+				found, _, err := root.Find([]string{alias})
+				if err != nil || found == nil {
+					t.Errorf("alias %q of %q does not resolve on the root command: %v", alias, verb, err)
+					continue
+				}
+				if found.Name() != verb {
+					t.Errorf("alias %q of %q resolves to command %q instead", alias, verb, found.Name())
+				}
+			}
+		})
+	}
+	// Guard against a vacuous pass if Capabilities() ever comes back empty.
+	if launchable < len(allLauncherVerbs()) {
+		t.Fatalf("registry reported only %d launchable adapters, but %d launcher verbs are wired — the registry lost Launch rows",
+			launchable, len(allLauncherVerbs()))
+	}
+}
+
+// sortedCommandNames renders the registered command names for a legible
+// failure message.
+func sortedCommandNames(byName map[string]*cobra.Command) []string {
+	out := make([]string, 0, len(byName))
+	for n := range byName {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
 }

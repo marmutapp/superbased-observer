@@ -310,6 +310,38 @@ const (
 	// transport from the SSE sites. Tokens estimated. Phase-2 *-web member;
 	// site = DATA discriminator.
 	ToolCopilotWeb = "copilot-web"
+	// ToolDroid is Factory AI's agentic CLI ("droid", binary droid,
+	// distinct from the company name "Factory AI"). Stores per-session
+	// transcripts as append-only JSONL at
+	// ~/.factory/sessions/<dash-encoded-cwd>/<uuid>.jsonl plus a sidecar
+	// <uuid>.settings.json (+ a .settings.json.bak snapshot of the PRIOR
+	// settings state) carrying SESSION-LEVEL cumulative token usage — no
+	// per-message token field exists in the JSONL itself. The
+	// dash-encoded directory name is LOSSY; the authoritative project
+	// root is the inline `cwd` field on the session's session_start
+	// event. BYOK custom models (settings.json customModels[]) call the
+	// underlying provider directly, bypassing Factory's own gateway.
+	ToolDroid = "droid"
+	// ToolOpenInterpreter is a rebadge of the OpenAI Codex CLI Rust
+	// codebase, installed under ~/.openinterpreter instead of ~/.codex —
+	// NOT the older Python "Open Interpreter" project. Its rollout JSONL
+	// format and token_count event shape are byte-identical to
+	// ToolCodex's (GROSS input, netted the same way); model_provider is
+	// "openai". Distinguished from ToolCodex purely by install path and
+	// binary name, not by wire shape.
+	ToolOpenInterpreter = "open-interpreter"
+	// ToolCommandCode is commandcode.ai's npm CLI package (binary
+	// command-code, UNLICENSED closed-source obfuscated bundle).
+	// Persists Claude-Code-shaped per-project dash-encoded transcript
+	// directories under ~/.commandcode/projects/ — the dash-encoding
+	// differs from ToolClaudeCode's (no leading dash; underscores also
+	// fold to dashes). Token capture is per-assistant-message usage
+	// envelopes (inputTokens/outputTokens/cacheReadTokens/
+	// cacheWriteTokens/costUsd); inputTokens is almost certainly GROSS
+	// (high confidence, not proxy-confirmed). COMMANDCODE_API_URL /
+	// COMMAND_CODE_API_KEY / COMMANDCODE_API_ENV point at Command Code's
+	// own closed gateway, not a BYOK Anthropic/OpenAI-shaped endpoint.
+	ToolCommandCode = "command-code"
 )
 
 // Normalized action types. See spec §5. Adapters map their tool-specific

@@ -91,6 +91,17 @@
   /* goose (2026-07-09) — plum; the open ΔE region after wave 3 (minΔE
      29.6 vs qoder here, 36.6 vs copilot in light — same CIE76 check). */
   --tool-goose: #cc7aa8;
+  /* 2026-07-29 wave — same CIE76 ΔE check as wave 3, run against all 30
+     existing tool hues in BOTH themes. droid pale-blue (minΔE 19.9 vs
+     cline-cli), open-interpreter pale-yellow (21.0 vs aider),
+     command-code rose (20.5 vs claude-web); pairwise ≥ 57 among the
+     three. Every one clears the shipped palette's own tightest pair
+     (cline/copilot-cli at 9.8), and open-interpreter is deliberately NOT
+     given codex's color — it's a different vendor's rebadge, not a
+     product-family sibling like gemini/gemini-cli. */
+  --tool-droid: #93c5fd;
+  --tool-open-interpreter: #efef8f;
+  --tool-command-code: #fca5a5;
   /* Browser-chatbot rail (Phase 2, 2026-07-10) — brand-evocative hues,
      CIE76 ΔE-validated ≥ 21 vs every existing tool + each other (same
      check as wave 3). chatgpt teal-green, claude terracotta, perplexity
@@ -221,6 +232,11 @@
   --tool-aider: #4d7c0f;
   --tool-qoder: #86198f;
   --tool-goose: #a05888;
+  /* 2026-07-29 wave — light-theme variants, same ΔE check (minΔE 17.5 /
+     26.4 / 16.4 respectively). */
+  --tool-droid: #312e81;
+  --tool-open-interpreter: #a1a112;
+  --tool-command-code: #b91c1c;
   /* Browser-chatbot rail (Phase 2) — light-theme variants, ΔE-validated. */
   --tool-chatgpt-web: #19e6ce;
   --tool-claude-web: #bf5b40;

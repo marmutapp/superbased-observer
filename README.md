@@ -1,7 +1,7 @@
 # SuperBased
 
 > The exact tokens your AI provider billed you — cache splits,
-> reasoning tokens, long-context surcharges — reconciled across 26
+> reasoning tokens, long-context surcharges — reconciled across 29
 > coding tools, entirely on your own machine. Nothing you build here
 > ever leaves your machine unless you opt a node into it.
 
@@ -57,19 +57,20 @@ can't give you, in order of how much they matter:
    rollup server ships only hashed metadata by default; raw content
    ships only when **the node** opts in, never a remote admin toggle.
    Full details: [`PRIVACY.md`](PRIVACY.md).
-3. **One capture layer, every tool you actually use.** 26 adapters —
+3. **One capture layer, every tool you actually use.** 29 adapters —
    Claude Code, Codex, Cursor, Cline + Cline CLI, GitHub Copilot +
    Copilot CLI, Gemini CLI, OpenCode, Google Antigravity, Cowork,
    Hermes Agent, Kilo Code, Aider, Goose, Devin, Qoder, Crush, Grok,
-   Kiro CLI, Kimi Code, Qwen Code, OpenClaw, Pi, and more — parsed
-   into one normalized schema, queryable from a local dashboard, an
-   MCP server (so the tools themselves can query it), and a CLI.
-   (Five of the 26 are `*-web` adapters for ChatGPT/Claude.ai/Gemini/
-   Copilot/Perplexity in the browser — those need the browser-capture
-   extension, which today only installs unpacked; every tool listed
-   above works out of the box.) Nineteen of those are also full CLI
-   launchers you can run as real terminals — from the dashboard or
-   your own shell, captured through the same pipeline — see
+   Kiro CLI, Kimi Code, Qwen Code, OpenClaw, Pi, Factory Droid,
+   Open Interpreter, Command Code, and more — parsed into one
+   normalized schema, queryable from a local dashboard, an MCP server
+   (so the tools themselves can query it), and a CLI. (Five *more*
+   `*-web` adapters cover ChatGPT/Claude.ai/Gemini/Copilot/Perplexity
+   in the browser — those need the browser-capture extension, which
+   today only installs unpacked; every tool listed above works out of
+   the box.) Twenty-two of those are also full CLI launchers you can
+   run as real terminals — from the dashboard or your own shell,
+   captured through the same pipeline — see
    [Terminals](#terminals--launch-join-and-track-your-ai-clis) below.
 
 Raw token counting across tools is table stakes here — it's the
@@ -580,10 +581,11 @@ The dashboard doesn't just watch your AI tools after the fact — it
 can launch them, and any paired device can join a session that's
 already running.
 
-- **Launch from the dashboard or any shell.** All 19 CLI launchers
+- **Launch from the dashboard or any shell.** All 22 CLI launchers
   (claude, codex, opencode, cursor, copilot-cli, kilo, cline-cli,
   hermes, gemini, openclaw, pi, antigravity, qwen, kiro, grok, kimi,
-  devin, qoder, goose) launch as real PTY terminals from the
+  devin, qoder, goose, droid, open-interpreter, command-code) launch
+  as real PTY terminals from the
   dashboard ("Launch here") or via `observer <verb>`; Linux/macOS +
   native Windows (ConPTY, Win10 1809+). Guided one-click install when
   the tool binary isn't found.
@@ -624,9 +626,10 @@ already running.
 - **Workspace grid.** Up to 9 live terminal tiles at once, drag to
   resize, layouts persist server-side; read-only when viewed from a
   remote device.
-- **Restarts & continuity.** On a daemon restart, claude and codex
-  auto-resume the same transcript (native resume); every other tool's
-  attached session ends. Fork any tool's session forward with
+- **Restarts & continuity.** On a daemon restart, 21 of the 22
+  launchers auto-resume the same transcript (native resume) —
+  openclaw is the sole holdout, because its resume is picker-only.
+  Fork any tool's session forward with
   `observer <verb> --continue-from <id>` — a new session id seeded
   with a distilled handover as the first prompt.
 - **Remote posture.** Remote access is opt-in, tailnet-only
@@ -843,7 +846,7 @@ your client through the proxy — the one-click button path in the
 
 ```
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│ Claude Code  │     │    Cursor    │     │    Codex     │    ... 26 adapters total
+│ Claude Code  │     │    Cursor    │     │    Codex     │    ... 29 adapters total
 └──────┬───────┘     └──────┬───────┘     └──────┬───────┘
        │ JSONL              │ hook events        │ rollout files
        ▼                    ▼                    ▼

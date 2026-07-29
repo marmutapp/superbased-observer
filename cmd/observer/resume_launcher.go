@@ -57,8 +57,14 @@ type resumeTranslation struct {
 	// an OPTIONAL value (commander.js `--resume [chatId]`, which reports
 	// `default: false`): such options do not reliably consume the following
 	// token, so the space-separated form leaves the flag bare and lets the id
-	// fall through as a positional. cursor is the grounded case.
+	// fall through as a positional. cursor + droid are the grounded cases.
 	joined bool
+	// positional marks a subcommand-scoped row whose id is the subcommand's
+	// POSITIONAL argument rather than a flag value — `<tool> resume <id>`
+	// (open-interpreter, whose `resume --help` declares
+	// `[SESSION_ID] [PROMPT]`). It requires a non-empty subcommand and an
+	// empty flag; the composer emits `<sub> [preFlags…] <id> [rest]`.
+	positional bool
 }
 
 // resumeTranslations is the per-verb native-resume argv table. Keyed by the
@@ -86,6 +92,21 @@ var resumeTranslations = map[string]resumeTranslation{
 	// and unambiguous spelling; the space-separated form relies on the parser
 	// choosing to consume the next token rather than leaving the flag bare.
 	"cursor": {flag: "--resume", joined: true},
+	// droid: `droid --resume=<sessionId>` (live-confirmed 2026-07-29,
+	// zero-spend: a real ~/.factory/sessions uuid reopened that session's TUI,
+	// a bogus one exited silently). The sessionId is our stored SessionID
+	// VERBATIM — the transcript is `<uuid>.jsonl` and its `session_start` line
+	// carries the same `id` — so no transform. joined: droid declares
+	// `-r, --resume [sessionId]` with an OPTIONAL value (the commander.js
+	// shape cursor hit), so `=` is the unambiguous spelling.
+	"droid": {flag: "--resume", joined: true},
+	// command-code: `commandcode --session <id>`. `--session <path|id>` is the
+	// REQUIRED-value resume spelling ("Resume a session by transcript path
+	// (.jsonl) or a unique session-id prefix"), so the plain two-token form is
+	// correct; the sibling `-r/--resume [name]` is optional-value and also
+	// resolves display names, so it is deliberately not used. The id is our
+	// stored SessionID verbatim (the `<uuid>.jsonl` basename).
+	"command-code": {flag: "--session"},
 	// kimi: `-S/--session` needs the PREFIXED id `session_<uuid>` (bare uuid
 	// HARD-FAILS). Our adapter already stores the prefixed form, so the
 	// transform is an idempotent ensure-prefix.
@@ -97,6 +118,13 @@ var resumeTranslations = map[string]resumeTranslation{
 	// subcommand from the seed lane (`run`), and the id must be the raw goose
 	// id, so the scoped `<id>@<hash8>` observer SessionID is stripped.
 	"goose": {flag: "--session-id", subcommand: "session", preFlags: []string{"--resume"}, transform: stripGooseScope},
+	// open-interpreter: `interpreter resume <SESSION_ID>` — the codex shape
+	// (this fork IS codex), grounded on its own `resume --help`:
+	// `Usage: interpreter resume [OPTIONS] [SESSION_ID] [PROMPT]`,
+	// `[SESSION_ID]  Session id (UUID) or session name`. The id is our stored
+	// SessionID verbatim (the rollout `session_meta` UUID the codex parser
+	// adopts), so no transform.
+	"open-interpreter": {subcommand: "resume", positional: true},
 }
 
 // injectNativeResume translates the uniform observer `--resume <id>` into the
@@ -123,8 +151,10 @@ func injectNativeResume(verb, id string, args []string) []string {
 		}
 		return append([]string{t.flag, nid}, args...)
 	}
-	// Subcommand-scoped: `<sub> [preFlags…] <flag> <id> [rest]`. Strip a
-	// user-forwarded duplicate of the leading subcommand so it is not doubled.
+	// Subcommand-scoped: `<sub> [preFlags…] <flag> <id> [rest]`, or
+	// `<sub> [preFlags…] <id> [rest]` when the id is the subcommand's
+	// positional. Strip a user-forwarded duplicate of the leading subcommand
+	// so it is not doubled.
 	rest := args
 	if len(rest) > 0 && rest[0] == t.subcommand {
 		rest = rest[1:]
@@ -132,7 +162,10 @@ func injectNativeResume(verb, id string, args []string) []string {
 	out := make([]string, 0, len(t.preFlags)+3+len(rest))
 	out = append(out, t.subcommand)
 	out = append(out, t.preFlags...)
-	out = append(out, t.flag, nid)
+	if !t.positional {
+		out = append(out, t.flag)
+	}
+	out = append(out, nid)
 	return append(out, rest...)
 }
 

@@ -1,0 +1,33 @@
+{
+  "assistantActiveTimeMs": 13974,
+  "model": "custom:GPT-5.4-Mini-[OpenAI-BYOK]-0",
+  "reasoningEffort": "low",
+  "interactionMode": "auto",
+  "autonomyLevel": "off",
+  "autonomyMode": "normal",
+  "compactionThresholdCheckEnabled": true,
+  "tokenUsage": {
+    "inputTokens": 18320,
+    "outputTokens": 327,
+    "cacheCreationTokens": 0,
+    "cacheReadTokens": 67072,
+    "thinkingTokens": 92,
+    "factoryCredits": 0
+  },
+  "childInclusiveTokenUsageBySessionId": {},
+  "inclusiveTokenUsage": {
+    "inputTokens": 18320,
+    "outputTokens": 327,
+    "cacheCreationTokens": 0,
+    "cacheReadTokens": 67072,
+    "thinkingTokens": 92,
+    "factoryCredits": 0
+  },
+  "providerLock": "openai",
+  "providerLockTimestamp": "2026-07-28T17:17:31.217Z",
+  "lastCallTokenUsage": {
+    "inputTokens": 303,
+    "outputTokens": 46,
+    "cacheReadTokens": 16896
+  }
+}

@@ -21,12 +21,14 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/adapter/cline"
 	"github.com/marmutapp/superbased-observer/internal/adapter/clinecli"
 	"github.com/marmutapp/superbased-observer/internal/adapter/codex"
+	"github.com/marmutapp/superbased-observer/internal/adapter/commandcode"
 	"github.com/marmutapp/superbased-observer/internal/adapter/copilot"
 	"github.com/marmutapp/superbased-observer/internal/adapter/copilotcli"
 	"github.com/marmutapp/superbased-observer/internal/adapter/cowork"
 	"github.com/marmutapp/superbased-observer/internal/adapter/crush"
 	"github.com/marmutapp/superbased-observer/internal/adapter/cursor"
 	"github.com/marmutapp/superbased-observer/internal/adapter/devin"
+	"github.com/marmutapp/superbased-observer/internal/adapter/droid"
 	"github.com/marmutapp/superbased-observer/internal/adapter/gemini"
 	"github.com/marmutapp/superbased-observer/internal/adapter/goose"
 	"github.com/marmutapp/superbased-observer/internal/adapter/grok"
@@ -84,6 +86,14 @@ func Adapters() []adapter.Adapter {
 		qoder.New(),
 		aider.New(),
 		goose.New(),
+		// 2026-07-29 wave. droid + command-code have their own parser
+		// packages; open-interpreter is a rebadged Codex CLI Rust build,
+		// so it reuses the codex parser and re-tags every emitted event
+		// at the single boundary seam (the §2.1 variant-adapter pattern,
+		// like antigravity.NewCLI) rather than forking a package.
+		droid.New(),
+		codex.NewOpenInterpreter(),
+		commandcode.New(),
 		// Browser-chatbot rail. Hook-only: no WatchPaths (capture arrives
 		// via the browser extension's native-messaging bridge / loopback
 		// listener, not the file watcher). One adapter per *-web site; the

@@ -1627,6 +1627,238 @@ var registry = map[string]Capability{
 		TokenTier:   TokenTier{Best: "browser_extension", Gap: "no server-side usage field; estimated only; WebSocket-frame parser (cf_clearance-gated)"},
 		Handoff:     HandoffCapability{},
 	},
+	// Factory AI's "droid" CLI (docs/plans/factory-droid-adapter-plan-2026-07-29.md).
+	// Phase-0 research only — no adapter package yet (Phase A wiring row).
+	"droid": {
+		Tool: "droid",
+		// No live-verified route today; BYOK custom models call the
+		// underlying provider directly (the only near-routable_now
+		// candidate) but that's unverified — no live turn through :8820.
+		Proxy:       nil,
+		Routability: RouteStatusProbeRequired,
+		// No hook subcommand found in `droid --help`.
+		Hook: HookSpec{Mechanism: HookNone},
+		// ~/.factory/mcp.json reuses claude-code/cursor's {"mcpServers":{}}
+		// shape (format confirmed live via a zero-cost `droid mcp add`/
+		// `remove` probe), but MCP must be nil here: no writer exists yet
+		// (TestMCPTargets requires nil for every tool without a grounded
+		// implemented writer) — the format finding is preserved in the
+		// plan doc for the Phase-B/C adapter build.
+		MCP:    nil,
+		Native: NativeRails{},
+		// Sidecar <uuid>.settings.json carries session-level cumulative
+		// tokens only — no per-message token field in the JSONL itself.
+		TokenTier: TokenTier{Best: "jsonl", Gap: "no per-message tokens; no proxy path verified; Factory-hosted built-in-model wire shape entirely unconfirmed (no active subscription in this corpus)"},
+		Handoff: HandoffCapability{
+			Transcript: TranscriptFull,
+			Inject:     []InjectKind{InjectFile, InjectPrompt},
+			// Seed contract grounded 2026-07-29 against `droid --help`
+			// (v0.181.0): `Usage: droid [options] [command] [prompt...]`
+			// with the worked example `droid "review app.tsx"   Start with
+			// an initial prompt` — the initial prompt is a bare positional
+			// on the DEFAULT (TUI) command, so the launcher appends the
+			// handover as the TRAILING positional after any forwarded
+			// flags. `droid exec [prompt]` is the headless one-shot ("Run
+			// non-interactively (for scripts/automation)") and is rejected
+			// under --continue-from rather than silently seeded.
+			Launch: &LaunchSpec{Subcommand: "droid", Mode: LaunchSeeded},
+		},
+		// Attachable: `observer droid --attach` hands the PTY to the daemon.
+		Attach: &AttachSpec{Subcommand: "droid"},
+		// Native resume: `droid --resume=<sessionId>`. Grounded 2026-07-29
+		// zero-spend on the live install: `-r, --resume [sessionId]` is a
+		// commander.js OPTIONAL-value option, so the JOINED `=` spelling is
+		// the unambiguous form (the cursor precedent); a REAL uuid from
+		// ~/.factory/sessions reopened that session's TUI (no model call,
+		// transcript mtime unchanged) while a bogus uuid exited silently —
+		// the two outcomes discriminate, so the flag really consumes the
+		// value. The id IS our stored SessionID verbatim: the transcript is
+		// `<uuid>.jsonl` and its `session_start` line carries the same
+		// `"id"` (internal/adapter/droid/adapter.go), so no transform.
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "droid", IDMechanism: "flag:--resume"},
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{
+				Unix:    []string{"droid"},
+				Windows: []string{"droid.exe", "droid.cmd", "droid"},
+			},
+			// ~/.local/bin is where the live install landed (2026-07-29);
+			// Factory's docs describe the installer dropping the binary
+			// under ~/.factory/bin, which exists on this install too.
+			ProbeDirs: []ProbeDir{
+				{OS: ProbeUnix, Rel: ".local/bin"},
+				{OS: ProbeUnix, Rel: ".factory/bin"},
+				{OS: ProbeWindows, Rel: ".factory/bin"},
+			},
+			// Officially documented channels only. The macOS/Linux line is
+			// the installer script's OWN documented usage (fetched
+			// 2026-07-29, its first comment reads
+			// `# Usage: curl -fsSL https://app.factory.ai/cli | sh`). The
+			// npm package name `droid` is registry-confirmed as Factory's
+			// own (repo github.com/Factory-AI/factory, directory apps/cli,
+			// bin {"droid":"bin/droid"}); it carries OS "" so it is also
+			// the Windows answer.
+			//
+			// NO Windows script hint on purpose: app.factory.ai/cli/windows
+			// documents a THREE-step, optionally cookie-authenticated flow
+			// (`curl.exe -b 'session=…' … -o install.ps1` → `powershell
+			// -ExecutionPolicy Bypass -File install.ps1` → `del`), not a
+			// one-liner — so a piped `irm | iex` hint would be ours, not
+			// theirs.
+			Installs: []InstallHint{
+				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://app.factory.ai/cli | sh"}, Display: "curl -fsSL https://app.factory.ai/cli | sh"},
+				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://app.factory.ai/cli | sh"}, Display: "curl -fsSL https://app.factory.ai/cli | sh"},
+				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "droid"}, Display: "npm install -g droid"},
+			},
+		},
+	},
+	// Rebadged OpenAI Codex CLI Rust build, installed under
+	// ~/.openinterpreter (docs/plans/openinterpreter-adapter-plan-2026-07-29.md).
+	// Phase-0 research only — no adapter package yet (Phase A wiring row);
+	// the eventual implementation is expected to retag internal/adapter/codex
+	// (antigravity/antigravity-cli pattern), not a fresh package.
+	"open-interpreter": {
+		Tool: "open-interpreter",
+		// config schema present (base_url/wire_api strings confirmed in
+		// the binary) but not live-verified on this fork.
+		Proxy:       nil,
+		Routability: RouteStatusProbeRequired,
+		// Codex's hook mechanism (HookCodexConfig) may port, but this
+		// fork's config.toml has no [hooks] observed live — unverified.
+		Hook: HookSpec{Mechanism: HookNone},
+		// [mcp_servers] TOML table almost certainly matches codex's format,
+		// but MCP must be nil here: no writer exists yet (TestMCPTargets
+		// requires nil for every tool without a grounded implemented
+		// writer) — the format finding is preserved in the plan doc for
+		// the Phase-B/C adapter build.
+		MCP:    nil,
+		Native: NativeRails{},
+		// Rollout JSONL byte-identical to codex's; token_count event GROSS
+		// input, nets the same way — Tier 2 until proxy routability
+		// confirmed.
+		TokenTier: TokenTier{Best: "jsonl", Gap: "no proxy path verified on this fork; hook mechanism unconfirmed"},
+		Handoff: HandoffCapability{
+			Transcript: TranscriptFull,
+			Inject:     []InjectKind{InjectFile, InjectPrompt},
+			// Seed contract grounded 2026-07-29 against THIS fork's own
+			// help (not codex's): `interpreter --help` prints
+			// `Usage: interpreter [OPTIONS] [PROMPT]` and
+			// `Arguments: [PROMPT]  Optional user prompt to start the
+			// session` — the codex trailing-positional shape. A live
+			// zero-spend parse smoke confirmed the argv is accepted
+			// (`interpreter "seed text"` reaches the TTY gate — "stdin is
+			// not a terminal" — while an unknown token is rejected by clap
+			// with "unexpected argument", so acceptance discriminates).
+			Launch: &LaunchSpec{Subcommand: "open-interpreter", Mode: LaunchSeeded},
+		},
+		// Attachable: `observer open-interpreter --attach`.
+		Attach: &AttachSpec{Subcommand: "open-interpreter"},
+		// Native resume: `interpreter resume <SESSION_ID>` — the codex
+		// subcommand shape, grounded 2026-07-29 on `interpreter resume
+		// --help`: `Usage: interpreter resume [OPTIONS] [SESSION_ID]
+		// [PROMPT]`, `[SESSION_ID]  Session id (UUID) or session name`. A
+		// live zero-spend smoke accepted the argv (reached the TTY gate)
+		// while clap rejects an unknown token, so acceptance is real. The
+		// id is our stored SessionID verbatim: the rollout's `session_meta`
+		// carries the same UUID the codex parser adopts as SessionID.
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "open-interpreter", IDMechanism: "subcommand:resume"},
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{Unix: []string{"interpreter"}, Windows: []string{"interpreter.exe"}},
+			// Live install layout (2026-07-29): ~/.local/bin/interpreter is
+			// a symlink into the standalone package's own bin dir.
+			ProbeDirs: []ProbeDir{
+				{OS: ProbeUnix, Rel: ".local/bin"},
+				{OS: ProbeUnix, Rel: ".openinterpreter/packages/standalone/current/bin"},
+			},
+			// Officially documented channels (openinterpreter.com
+			// /docs/terminal/install): the shell installer only — the docs
+			// list no npm or Homebrew channel. NOTE: `pip install
+			// open-interpreter` is the UNRELATED Python project of the same
+			// name and must never be offered here.
+			Installs: []InstallHint{
+				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://www.openinterpreter.com/install | sh"}, Display: "curl -fsSL https://www.openinterpreter.com/install | sh"},
+				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://www.openinterpreter.com/install | sh"}, Display: "curl -fsSL https://www.openinterpreter.com/install | sh"},
+				{OS: "windows", Channel: "script", Argv: []string{"powershell", "-Command", "irm https://www.openinterpreter.com/install.ps1 | iex"}, Display: "irm https://www.openinterpreter.com/install.ps1 | iex"},
+			},
+		},
+	},
+	// commandcode.ai's npm CLI (docs/plans/commandcode-adapter-plan-2026-07-29.md).
+	// Phase-0 research only — no adapter package yet (Phase A wiring row).
+	"command-code": {
+		Tool: "command-code",
+		// COMMANDCODE_API_URL / COMMAND_CODE_API_KEY / COMMANDCODE_API_ENV
+		// point at Command Code's OWN closed gateway (not a BYOK
+		// Anthropic/OpenAI-shaped endpoint) — a knob exists but it isn't
+		// routable_now-shaped, so after_bridge rather than native_exempt.
+		Proxy:       nil,
+		Routability: RouteStatusAfterBridge,
+		// No hook mechanism grounded.
+		Hook: HookSpec{Mechanism: HookNone},
+		// A real `commandcode mcp` subcommand exists but its config file
+		// location was not investigated — MCP stays nil for v1.
+		MCP:    nil,
+		Native: NativeRails{},
+		// Per-assistant-message usage envelope (inputTokens/outputTokens/
+		// cacheReadTokens/cacheWriteTokens/costUsd); inputTokens almost
+		// certainly GROSS (high confidence, not proxy-confirmed).
+		TokenTier: TokenTier{Best: "jsonl", Gap: "no Tier-1 proxy path; costUsd trusted as-is for open-weight models with no observer pricing table"},
+		Handoff: HandoffCapability{
+			Transcript: TranscriptFull,
+			Inject:     []InjectKind{InjectFile, InjectPrompt},
+			// Seed contract grounded 2026-07-29 against `commandcode
+			// --help` (v1.4.5), whose Options block states the two default-
+			// command forms verbatim: `commandcode   Start interactive
+			// session` and `commandcode "message"   Start with initial
+			// message` — a bare positional on the default TUI command, so
+			// the launcher appends the handover as the TRAILING positional.
+			// `-p, --print [query]` is the headless one-shot ("Run in
+			// non-interactive mode, output response and exit") and is a
+			// declared conflict.
+			Launch: &LaunchSpec{Subcommand: "command-code", Mode: LaunchSeeded},
+		},
+		// Attachable: `observer command-code --attach`.
+		Attach: &AttachSpec{Subcommand: "command-code"},
+		// Native resume: `commandcode --session <id>`. Grounded 2026-07-29
+		// on `commandcode --help`: `--session <path|id>   Resume a session
+		// by transcript path (.jsonl) or a unique session-id prefix`. This
+		// is the REQUIRED-value spelling, so the plain two-token form is
+		// unambiguous — deliberately preferred over `-r, --resume [name]`,
+		// which is an OPTIONAL-value option (the shape that forced cursor's
+		// joined `=` workaround) and resolves names as well as ids. The id
+		// is our stored SessionID verbatim (sessionIDFromPath: the
+		// `<uuid>.jsonl` basename under ~/.commandcode/projects/<enc-cwd>/).
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "command-code", IDMechanism: "flag:--session"},
+		Binary: &BinaryResolveSpec{
+			// The npm package installs FOUR bin aliases for one binary
+			// (`cmd`, `cmdc`, `command-code`, `commandcode` — registry-
+			// confirmed). Only the two unambiguous spellings are listed:
+			// `cmd`/`cmdc` are omitted deliberately (on Windows `cmd`
+			// resolves to the system shell — a shadowing hazard, the same
+			// exclusion internal/processobs already makes).
+			//
+			// Windows spellings are the npm SHIM forms, not `.exe`. The
+			// package's bins are JavaScript entry points, so a global npm
+			// install writes `<name>.cmd` (+ a `.ps1` and a bare POSIX-shell
+			// shim for Git Bash/MSYS) into the npm prefix — it never
+			// produces a `<name>.exe`. Both aliases get the same pair, which
+			// also fixes an asymmetry: `command-code` previously claimed
+			// only a `.cmd` while `commandcode` claimed three forms.
+			// `.ps1` is left out on purpose: toolresolve stats a candidate
+			// and then EXECS it, and a PowerShell script is not directly
+			// executable. Resolution order is not load-bearing here —
+			// toolresolve.orderNamesByPathExt re-sorts Windows candidates by
+			// the operator's own PATHEXT.
+			Names: BinaryNames{
+				Unix:    []string{"commandcode", "command-code"},
+				Windows: []string{"commandcode.cmd", "commandcode", "command-code.cmd", "command-code"},
+			},
+			// Official channel: the npm package `command-code` (registry-
+			// confirmed name/description/bins). No script or brew channel
+			// is documented.
+			Installs: []InstallHint{
+				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "command-code"}, Display: "npm install -g command-code"},
+			},
+		},
+	},
 }
 
 // RegistryVersion is the version of the adapter capability registry's

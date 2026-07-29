@@ -169,6 +169,10 @@ func TestContinueFromLauncher(t *testing.T) {
 		"qoder":           "observer qoder",
 		"goose":           "observer goose",
 		"devin":           "observer devin",
+		// The 2026-07-29 adapter wave.
+		"droid":            "observer droid",
+		"open-interpreter": "observer open-interpreter",
+		"command-code":     "observer command-code",
 	}
 	for tool, want := range wired {
 		if got := continueFromLauncher(tool); got != want {

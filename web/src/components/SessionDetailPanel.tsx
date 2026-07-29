@@ -144,6 +144,40 @@ const MESSAGE_COLUMNS: {
   { key: "content", label: "Content", className: "pl-3 pr-3" },
 ];
 
+// Messages-table sort persistence — user-reported bug: closing and
+// reopening a session (or reloading the page) reset the sort to "#"
+// ascending, discarding whatever order the operator picked. Chosen scope is
+// GLOBAL (survives switching sessions), not per-session, per the report.
+// Follows the sb_* localStorage naming convention (sb_theme, sb_dock_pos,
+// sb_win, etc.) rather than the older "namespace:feature:v1" style seen in
+// FiltersDrawer.
+const MSG_SORT_LS_KEY = "sb_msg_sort";
+const MESSAGE_SORT_KEYS = new Set<MessageSortKey>(
+  MESSAGE_COLUMNS.map((c) => c.key),
+);
+
+// loadStoredMsgSort reads + validates the persisted sort. A stored value
+// that doesn't parse to a known column key + "asc"/"desc" (stale key from a
+// future/older build, hand-edited storage, etc.) must not survive into an
+// invalid sort_by/sort_dir query param — fall back to the default instead.
+function loadStoredMsgSort(): { by: MessageSortKey; dir: SortDir } {
+  try {
+    const raw = localStorage.getItem(MSG_SORT_LS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as { by?: unknown; dir?: unknown };
+      if (
+        MESSAGE_SORT_KEYS.has(parsed.by as MessageSortKey) &&
+        (parsed.dir === "asc" || parsed.dir === "desc")
+      ) {
+        return { by: parsed.by as MessageSortKey, dir: parsed.dir };
+      }
+    }
+  } catch {
+    // localStorage unavailable (private mode) or corrupt JSON; fall through.
+  }
+  return { by: DEFAULT_MSG_SORT, dir: DEFAULT_MSG_DIR };
+}
+
 // watchFollowEdge decides which edge of the table live watch-mode should
 // track under the active sort. The chat-follow default assumes "newest is
 // last" — true only for the chronological ascending orders. Under a
@@ -239,11 +273,33 @@ export function SessionDetailPanel({
   // Messages-table sort. Lifted here (next to msgPage) so it survives the
   // auto-refresh poll and so it can be fed into the request params. Held as
   // one object so the click handler's updater stays pure (a nested setState
-  // would double-toggle under StrictMode).
-  const [msgSort, setMsgSort] = useState<{ by: MessageSortKey; dir: SortDir }>({
-    by: DEFAULT_MSG_SORT,
-    dir: DEFAULT_MSG_DIR,
-  });
+  // would double-toggle under StrictMode). Lazy-initialized from
+  // localStorage (see loadStoredMsgSort) so a chosen sort survives a page
+  // reload, not just a session switch.
+  const [msgSort, setMsgSort] = useState<{ by: MessageSortKey; dir: SortDir }>(
+    loadStoredMsgSort,
+  );
+  // Mirror every sort change to storage — a plain effect keyed on the
+  // primitive by/dir values, not a write inside onSortMessages' updater, so
+  // StrictMode's double-invoke of the updater can't double-write (the effect
+  // itself is idempotent: it just reflects whatever msgSort currently is).
+  // Storing the default explicitly would make "no stored preference" and
+  // "operator picked the default" indistinguishable, so the default removes
+  // the key instead of writing it.
+  useEffect(() => {
+    try {
+      if (msgSort.by === DEFAULT_MSG_SORT && msgSort.dir === DEFAULT_MSG_DIR) {
+        localStorage.removeItem(MSG_SORT_LS_KEY);
+      } else {
+        localStorage.setItem(MSG_SORT_LS_KEY, JSON.stringify(msgSort));
+      }
+    } catch {
+      // localStorage unavailable (private mode, quota); the in-memory sort
+      // still works for the CURRENT session view, but without storage the
+      // session-switch effect below re-reads the (empty) store and falls
+      // back to the default — an accepted limitation of storage-less mode.
+    }
+  }, [msgSort.by, msgSort.dir]);
   // See stickToEdge above: re-arm chat-follow on session / watch-mode / sort
   // change. Declared here because it depends on msgSort.
   useEffect(() => {
@@ -255,7 +311,10 @@ export function SessionDetailPanel({
     setFocusMid(null);
     setShowRawEvents(false);
     setRawPage(1);
-    setMsgSort({ by: DEFAULT_MSG_SORT, dir: DEFAULT_MSG_DIR });
+    // Apply the saved sort (global, not per-session — see loadStoredMsgSort)
+    // rather than hardcoded defaults, so switching sessions doesn't discard
+    // the operator's chosen order.
+    setMsgSort(loadStoredMsgSort());
   }, [sessionId]);
   // onSortMessages — click a header: a new column selects it (ascending,
   // except Time which starts descending so "newest first" is one click

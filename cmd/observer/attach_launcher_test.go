@@ -201,3 +201,75 @@ func TestArgsLeadWithSubcommand(t *testing.T) {
 		})
 	}
 }
+
+// TestLeadingVerbScanUngroundedIsFlagBlind pins that a scan with NO per-tool
+// flag grammar behaves EXACTLY like the original flag-blind scanner — this is
+// the path the 19 pre-existing launchers ride through argsLeadWithSubcommand,
+// and their contract tests depend on it byte for byte. In particular a SPLIT
+// flag value still occupies the operand slot and still hides a following verb
+// (the documented, unchanged legacy gap), and no unknown flag may trigger the
+// grounded scan's conservative widened search.
+func TestLeadingVerbScanUngroundedIsFlagBlind(t *testing.T) {
+	scan := leadingVerbScan{subs: map[string]bool{"run": true}}
+	cases := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"leading run", []string{"run", "prompt"}, true},
+		{"run after a bare flag", []string{"--flag", "run"}, true},
+		{"split value hides the verb (legacy gap, unchanged)", []string{"--model", "x", "run"}, false},
+		{"unknown flag does NOT widen the search", []string{"--flag", "prompt", "run"}, false},
+		{"non-headless verb", []string{"chat"}, false},
+		{"after bare -- is positional", []string{"--", "run"}, false},
+		{"empty", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := scan.leads(tc.args); got != tc.want {
+				t.Fatalf("leads(%v) = %v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLeadingVerbScanGroundedClosesSplitValueBypass is the FINDING-2
+// regression: with the tool's flag grammar grounded, a SPLIT-value flag no
+// longer parks its VALUE in the operand slot, so a headless verb behind one is
+// caught instead of silently launching. It also pins the conservative
+// ambiguity rule (an unknown / optional-value / variadic flag widens the
+// search to every later operand token) and the precision guarantee that keeps
+// it from firing on ordinary multi-word prompts.
+func TestLeadingVerbScanGroundedClosesSplitValueBypass(t *testing.T) {
+	scan := leadingVerbScan{
+		subs:       map[string]bool{"exec": true, "status": true},
+		valueFlags: map[string]bool{"--append-system-prompt": true, "--model": true},
+		boolFlags:  map[string]bool{"--use-spec": true, "-h": true},
+	}
+	cases := []struct {
+		name     string
+		args     []string
+		want     bool
+		wantVerb string
+	}{
+		{"THE BYPASS: split value then a headless verb", []string{"--append-system-prompt", "x=y", "exec"}, true, "exec"},
+		{"split value then a management verb", []string{"--model", "gpt-5", "status"}, true, "status"},
+		{"joined value then a headless verb", []string{"--model=gpt-5", "exec"}, true, "exec"},
+		{"bool flag then a headless verb", []string{"--use-spec", "exec"}, true, "exec"},
+		{"split value then an ordinary prompt", []string{"--model", "gpt-5", "fix the bug"}, false, ""},
+		{"the value itself is NOT read as the operand", []string{"--model", "exec"}, false, ""},
+		{"aligned scan ignores later prompt words", []string{"--use-spec", "fix", "the", "exec", "path"}, false, ""},
+		{"unknown flag widens the search (conservative reject)", []string{"--brand-new-flag", "v", "exec"}, true, "exec"},
+		{"widened search still stops at a bare --", []string{"--brand-new-flag", "--", "exec"}, false, ""},
+		{"no verb anywhere", []string{"--use-spec", "--model", "x"}, false, ""},
+		{"empty", nil, false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			verb, got := scan.leadingVerb(tc.args)
+			if got != tc.want || verb != tc.wantVerb {
+				t.Fatalf("leadingVerb(%v) = (%q, %v), want (%q, %v)", tc.args, verb, got, tc.wantVerb, tc.want)
+			}
+		})
+	}
+}

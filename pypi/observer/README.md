@@ -18,11 +18,12 @@
 **Claude Code cost tracking. Cursor token usage. Codex spend.
 AI coding agent observability — one local tool, proxy-accurate.**
 SuperBased captures, normalizes, and analyzes every AI
-coding tool call across **26 adapters** — Claude Code, Codex, Cursor,
+coding tool call across **29 adapters** — Claude Code, Codex, Cursor,
 Cline + Cline CLI, GitHub Copilot (VS Code) + Copilot CLI, Gemini CLI,
 OpenCode, Google Antigravity, Cowork, Nous Research's Hermes Agent,
 Kilo Code (legacy IDE extension + CLI), Aider, Goose, Devin, OpenClaw,
-Pi, and more — in one local single-binary tool. An optional API proxy
+Pi, Factory Droid, Open Interpreter, Command Code, and more — in one
+local single-binary tool. An optional API proxy
 reconciles the *exact* tokens your provider billed (net input, cache
 5m/1h splits, reasoning tokens, long-context surcharges) instead of a
 JSONL-derived estimate. No telemetry, no cloud, no data leaves your
@@ -740,9 +741,10 @@ two people type at once.
 
 ### Launch any supported AI CLI as a real terminal
 
-Nineteen CLI launchers — claude, codex, opencode, cursor, copilot-cli,
+Twenty-two CLI launchers — claude, codex, opencode, cursor, copilot-cli,
 kilo, cline-cli, hermes, gemini, openclaw, pi, antigravity, qwen,
-kiro, grok, kimi, devin, qoder, goose — start from the dashboard's
+kiro, grok, kimi, devin, qoder, goose, droid, open-interpreter,
+command-code — start from the dashboard's
 **Launch here** control or from the command line as `observer <verb>`
 (`observer claude`, `observer codex`, and so on). Each opens a **real
 PTY** — a native pseudo-terminal on Linux and macOS, and a native
@@ -751,9 +753,9 @@ tool's binary isn't on your `$PATH`, the launcher offers a guided
 one-click install rather than failing. Dashboard launching is gated by
 `[handoff].allow_dashboard_launch` (default `true`).
 
-(The count is nineteen *launchers*, not the adapter count — observer
-tracks 26 adapters in total, but only these nineteen ship a first-class
-terminal launcher.)
+(The count is twenty-two *launchers*, not the adapter count — observer
+tracks 29 adapters in total, but only these twenty-two ship a
+first-class terminal launcher.)
 
 ### Attach-by-default
 
@@ -828,13 +830,14 @@ paired remote device the grid is read-only.
 
 ### Restarts & continuity
 
-claude and codex **auto-resume the same transcript** after a daemon
-restart — a verified native resume, so the conversation continues where
-it left off. Every other tool's attached session ends when the daemon
-restarts; to pick the work back up, fork it with
-`observer <verb> --continue-from <session-id>`. That opens a new session
-id and seeds a distilled handover of the prior session as its first
-prompt — it works for all nineteen launchers.
+Twenty-one of the twenty-two launchers **auto-resume the same
+transcript** after a daemon restart — a verified native resume, so the
+conversation continues where it left off. openclaw is the sole holdout:
+its resume is picker-only, so its attached session ends when the daemon
+restarts. To pick any session back up — including openclaw's — fork it
+with `observer <verb> --continue-from <session-id>`. That opens a new
+session id and seeds a distilled handover of the prior session as its
+first prompt — it works for all twenty-two launchers.
 
 ### Remote posture
 

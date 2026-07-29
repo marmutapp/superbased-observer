@@ -1,0 +1,5 @@
+[projects.'c:\programsx\regulation']
+trust_level = "trusted"
+
+[windows]
+sandbox = "unelevated"

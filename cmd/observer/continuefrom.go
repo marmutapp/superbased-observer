@@ -471,6 +471,12 @@ func continueFromLauncher(tool string) string {
 		return "observer goose"
 	case "devin":
 		return "observer devin"
+	case "droid":
+		return "observer droid"
+	case "open-interpreter":
+		return "observer open-interpreter"
+	case "command-code":
+		return "observer command-code"
 	default:
 		return ""
 	}
