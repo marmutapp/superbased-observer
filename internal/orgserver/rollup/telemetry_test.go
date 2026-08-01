@@ -8,6 +8,10 @@ import (
 	"testing"
 )
 
+// testSeatPriceUSD is the Copilot Business plan price the telemetry rollup
+// multiplies seat counts by.
+const testSeatPriceUSD = 19.0
+
 // seedTelemetry populates the three native-console analytics tables with a
 // small cross-vendor fixture inside the w30 window (fixedNow = 2026-05-26):
 //   - Claude Code: cost, tokens, an accept/reject pair, and engagement counts.
@@ -82,7 +86,7 @@ func vendorMap(in []VendorTelemetry) map[string]VendorTelemetry {
 // run, so Configured is false and Vendors is an empty (non-nil) slice.
 func TestTelemetry_EmptyIsNotConfigured(t *testing.T) {
 	d := newDB(t)
-	got, err := Telemetry(context.Background(), d, w30, fixedNow)
+	got, err := Telemetry(context.Background(), d, w30, fixedNow, testSeatPriceUSD)
 	if err != nil {
 		t.Fatalf("Telemetry: %v", err)
 	}
@@ -100,7 +104,7 @@ func TestTelemetry_EmptyIsNotConfigured(t *testing.T) {
 func TestTelemetry_CrossVendor(t *testing.T) {
 	d := newDB(t)
 	seedTelemetry(t, d)
-	got, err := Telemetry(context.Background(), d, w30, fixedNow)
+	got, err := Telemetry(context.Background(), d, w30, fixedNow, testSeatPriceUSD)
 	if err != nil {
 		t.Fatalf("Telemetry: %v", err)
 	}
@@ -167,7 +171,7 @@ func TestTelemetry_Degradation(t *testing.T) {
 		 VALUES ('2026-05-23','__org__','org','engagement','count','chats',5,'org1','acme','2026-05-26T04:00:00Z')`); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	got, err := Telemetry(ctx, d, w30, fixedNow)
+	got, err := Telemetry(ctx, d, w30, fixedNow, testSeatPriceUSD)
 	if err != nil {
 		t.Fatalf("Telemetry: %v", err)
 	}
@@ -193,7 +197,7 @@ func TestTelemetry_Degradation(t *testing.T) {
 func TestTelemetry_NoSentinelColumns(t *testing.T) {
 	d := newDB(t)
 	seedTelemetry(t, d)
-	got, err := Telemetry(context.Background(), d, w30, fixedNow)
+	got, err := Telemetry(context.Background(), d, w30, fixedNow, testSeatPriceUSD)
 	if err != nil {
 		t.Fatalf("Telemetry: %v", err)
 	}
@@ -207,5 +211,83 @@ func TestTelemetry_NoSentinelColumns(t *testing.T) {
 	}
 	if strings.Contains(s, "/repo/") || strings.Contains(s, "alice") {
 		t.Errorf("Telemetry JSON leaked an identity/path:\n%s", s)
+	}
+}
+
+// TestTelemetryCopilotSeatSubscriptionPricing pins the seat→USD conversion and
+// the unit trap around it.
+//
+// Copilot has TWO cost feeds with different shapes: a per-day metered overage
+// (additive USD) and a seat subscription (point-in-time, monthly). The seats
+// API returns counts only, so the subscription is priced from the configured
+// plan price. Before this surface existed, per_seat_price_usd was a configured
+// value nothing read, and an admin saw 50 seats and $4.00 while the actual
+// dominant cost — $950/mo — was nowhere on the endpoint.
+func TestTelemetryCopilotSeatSubscriptionPricing(t *testing.T) {
+	d := newDB(t)
+	seedTelemetry(t, d)
+
+	got, err := Telemetry(context.Background(), d, w30, fixedNow, testSeatPriceUSD)
+	if err != nil {
+		t.Fatalf("Telemetry: %v", err)
+	}
+	cop, ok := vendorMap(got.Vendors)["copilot"]
+	if !ok || cop.Seats == nil {
+		t.Fatalf("copilot seats missing: %+v", cop)
+	}
+	wantMonthly := 50 * testSeatPriceUSD // the latest snapshot's 50 seats
+	if !near(cop.Seats.MonthlyUSD, wantMonthly) {
+		t.Errorf("Seats.MonthlyUSD = %v, want %v (50 seats × $%v)", cop.Seats.MonthlyUSD, wantMonthly, testSeatPriceUSD)
+	}
+	if !near(cop.Seats.PerSeatPriceUSD, testSeatPriceUSD) {
+		t.Errorf("Seats.PerSeatPriceUSD = %v, want %v", cop.Seats.PerSeatPriceUSD, testSeatPriceUSD)
+	}
+	// THE UNIT TRAP: the monthly subscription must never be folded into the
+	// additive per-day metered overage. CostUSD stays the seeded 4.00.
+	if !near(cop.CostUSD, 4.00) {
+		t.Errorf("CostUSD = %v, want 4.00 — the $%v subscription must not be summed into metered overage",
+			cop.CostUSD, wantMonthly)
+	}
+
+	// Unconfigured price: omit the cost rather than assert seats are free.
+	unpriced, err := Telemetry(context.Background(), d, w30, fixedNow, 0)
+	if err != nil {
+		t.Fatalf("Telemetry(price=0): %v", err)
+	}
+	cop2 := vendorMap(unpriced.Vendors)["copilot"]
+	if cop2.Seats == nil {
+		t.Fatalf("seat counts should still be reported without a price")
+	}
+	if cop2.Seats.MonthlyUSD != 0 || cop2.Seats.PerSeatPriceUSD != 0 {
+		t.Errorf("unpriced seats = %+v, want no priced fields", cop2.Seats)
+	}
+	if cop2.Seats.Total != 50 {
+		t.Errorf("unpriced Seats.Total = %v, want the counts to survive", cop2.Seats.Total)
+	}
+	b, err := json.Marshal(cop2.Seats)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, key := range []string{"monthly_usd", "per_seat_price_usd"} {
+		if strings.Contains(string(b), key) {
+			t.Errorf("unconfigured price still emits %q: %s", key, b)
+		}
+	}
+
+	// A misconfigured NEGATIVE price must not produce a negative subscription.
+	// This is what makes the `> 0` guard load-bearing: at exactly 0 the guard
+	// is observably equivalent to `>= 0`, because 0 × seats is 0 and omitempty
+	// hides it either way. Only a negative price distinguishes them, so only
+	// this case can catch the guard being dropped.
+	neg, err := Telemetry(context.Background(), d, w30, fixedNow, -19)
+	if err != nil {
+		t.Fatalf("Telemetry(price=-19): %v", err)
+	}
+	cop3 := vendorMap(neg.Vendors)["copilot"]
+	if cop3.Seats == nil {
+		t.Fatalf("seat counts should survive a bad price")
+	}
+	if cop3.Seats.MonthlyUSD != 0 || cop3.Seats.PerSeatPriceUSD != 0 {
+		t.Errorf("negative price produced %+v, want no priced fields (never a negative subscription)", cop3.Seats)
 	}
 }

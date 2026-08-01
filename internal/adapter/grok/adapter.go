@@ -466,6 +466,13 @@ func (st *parseState) applyToolUpdate(line *acpLine, res *adapter.ParseResult) {
 	}
 	idx, ok := st.pendingCall[u.ToolCallID]
 	if !ok || idx >= len(res.ToolEvents) {
+		// No cross-tick ActionOutcomeUpdate here, unlike the CC-shaped
+		// adapters: a grok action's SourceEventID is the ACP line's
+		// _meta.eventId (st.eventID(line, 0)), NOT the toolCallId, so
+		// the update's (source_file, source_event_id) key cannot be
+		// reconstructed from an update record alone. Exposure is low —
+		// tool_call and its updates arrive milliseconds apart on the
+		// same ACP stream, so a poll tick rarely splits them.
 		return
 	}
 	ev := &res.ToolEvents[idx]

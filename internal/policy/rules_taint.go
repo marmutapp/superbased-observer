@@ -210,6 +210,16 @@ func matchTaintCrossServerMCP(ctx *MatchContext) (bool, string) {
 // Exported because the guard layer uses the same extraction when it
 // records the mcp_unpinned mark's origin — both sides of the
 // comparison must agree on the parse.
+//
+// NOT DELEGATED to internal/tooltax (the taxonomy plan's §1 single MCP
+// identity owner) on purpose: TestPackageImports_Bounded pins
+// internal/policy at ZERO observer imports (guard spec §17.1, "the
+// strongest form of the invariant"), which a tooltax import would
+// break. The bodies here stay a deliberate local copy; equivalence with
+// the owner is pinned from the other side by
+// internal/tooltax/mcp_test.go::TestPolicyParsersMatchTooltax, which
+// also records the ONE tolerated divergence (tooltax drops the
+// zero-corpus-row "server/tool" shape; this copy keeps it).
 func MCPServerFromTarget(target string) string {
 	t := strings.TrimSpace(target)
 	if t == "" {
@@ -233,6 +243,9 @@ func MCPServerFromTarget(target string) string {
 // no tool half yields "". Exported for the same reason: the guard
 // layer's §9.3 poisoning heuristics key tool-name collisions off the
 // bare name, and both sides must agree on the parse.
+//
+// Not delegated to internal/tooltax for the same §17.1 reason as
+// MCPServerFromTarget above.
 func MCPToolFromTarget(target string) string {
 	t := strings.TrimSpace(target)
 	if t == "" {

@@ -5,8 +5,8 @@ import { useApi } from "@/lib/useApi";
 import type { StatusSnapshot } from "@/lib/types";
 
 // FirstCaptureToast — delight moment D-2 (usability arc P5.1 / §9.3):
-// the moment the sessions count goes 0→1 WHILE the dashboard is open,
-// one corner toast with the brand's celebration (Obs jump-pulse,
+// when the sessions count is OBSERVED going 0→1 while the dashboard is
+// open, one corner toast with the brand's celebration (Obs jump-pulse,
 // teal→gold). Restraint rules §9.4: fires ONCE EVER (node-local
 // flag), dismissable, never interrupts (passive corner card, no
 // focus steal, no sound, no confetti); installs that already have
@@ -38,6 +38,11 @@ export function FirstCaptureToast() {
   // Poll only while the moment can still happen: flag unseen AND
   // either we haven't observed a count yet or we're armed at zero.
   // Steady-state installs cost zero traffic (flag set on first look).
+  //
+  // The toast trails the actual first capture by up to one poll interval
+  // plus the daemon's ~15s /api/status memoization — call it half a minute
+  // in the worst case. That is fine for a celebration and is why the copy
+  // says "first capture", never "just now": nothing here is a live tick.
   const status = useApi<StatusSnapshot>(
     done.current || show ? null : "/api/status",
     undefined,

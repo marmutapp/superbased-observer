@@ -12,6 +12,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/marmutapp/superbased-observer/internal/adapter/mirrorbase"
 	"github.com/marmutapp/superbased-observer/internal/models"
 	"github.com/marmutapp/superbased-observer/internal/platform/crossmount"
 )
@@ -369,9 +370,12 @@ func TestParseSessionFile_VariantStampsEffortLevelOnAssistantRows(t *testing.T) 
 		"opencode.assistant_text": {raw: "opencode.assistant_text", effort: "high"},
 		// The terminus row stamps the source finish reason into the
 		// canonical Metadata.StopReason column alongside the effort.
-		"assistant.stop":       {raw: "assistant.stop", effort: "high", stop: "stop"},
-		"bash":                 {raw: "bash", effort: "high"},
-		"opencode.reasoning":   {raw: "opencode.reasoning", effort: "high"},
+		"assistant.stop": {raw: "assistant.stop", effort: "high", stop: "stop"},
+		"bash":           {raw: "bash", effort: "high"},
+		// UPDATED 2026-07-31 (B3 convergence): the `opencode.reasoning`
+		// row is gone — reasoning is threaded onto its successor's
+		// PrecedingReasoning, never minted as an action of its own — so
+		// there is no reasoning row left to carry effort metadata.
 		"opencode.step_finish": {raw: "opencode.step_finish", effort: "high"},
 	}
 	seen := map[string]bool{}
@@ -445,14 +449,18 @@ func TestParseSessionFile_ResolveProjectRootTranslatesForeignCwd(t *testing.T) {
 	}
 }
 
-// TestParseSessionFile_ReasoningPartEmitsRow pins F4 from the audit.
+// TestParseSessionFile_ReasoningPartThreadsAndMintsNoRow is the B3
+// successor of TestParseSessionFile_ReasoningPartEmitsRow (2026-07-31).
 // OpenCode Desktop and the CLI both emit `reasoning`-typed parts
-// carrying the model's chain-of-thought body (verified 2026-05-21 on a
-// live Desktop session: 11 reasoning parts across 11 messages).
-// Pre-fix the adapter dropped them silently. This test seeds one
-// reasoning part and asserts a single ActionTaskComplete row lands
-// with RawToolName=opencode.reasoning and the body in ToolOutput.
-func TestParseSessionFile_ReasoningPartEmitsRow(t *testing.T) {
+// carrying the model's chain-of-thought (verified 2026-05-21 on a live
+// Desktop session: 11 reasoning parts across 11 messages). The adapter
+// used to mint an `opencode.reasoning` task_complete row per part; it
+// now mints NONE and threads the body onto the successor part's
+// PrecedingReasoning instead. This pins all three semantics at once:
+// no row, consumed-once (the tool takes the first thought, the text
+// part does NOT re-take it), and last-wins (the two thoughts between
+// the tool and the text collapse to the newest).
+func TestParseSessionFile_ReasoningPartThreadsAndMintsNoRow(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "opencode.db")
 	setupOpenCodeDBWithReasoning(t, path)
@@ -463,31 +471,58 @@ func TestParseSessionFile_ReasoningPartEmitsRow(t *testing.T) {
 		t.Fatalf("ParseSessionFile: %v", err)
 	}
 
-	var reasoning []models.ToolEvent
+	byRaw := map[string]models.ToolEvent{}
 	for _, ev := range res.ToolEvents {
 		if ev.RawToolName == "opencode.reasoning" {
-			reasoning = append(reasoning, ev)
+			t.Fatalf("opencode.reasoning row minted: %+v", ev)
+		}
+		byRaw[ev.RawToolName] = ev
+	}
+
+	tool, ok := byRaw["bash"]
+	if !ok {
+		t.Fatalf("no tool row; events=%+v", res.ToolEvents)
+	}
+	if tool.PrecedingReasoning != "Considering the next step..." {
+		t.Errorf("tool PrecedingReasoning = %q, want the reasoning body (it must beat the part title %q)",
+			tool.PrecedingReasoning, "Run ls")
+	}
+	asst, ok := byRaw["opencode.assistant_text"]
+	if !ok {
+		t.Fatalf("no assistant_text row; events=%+v", res.ToolEvents)
+	}
+	if asst.PrecedingReasoning != "Second thought, the newer one." {
+		t.Errorf("assistant_text PrecedingReasoning = %q, want the LAST reasoning before it", asst.PrecedingReasoning)
+	}
+}
+
+// TestParseSessionFile_ReasoningThreadsAcrossParseWindow pins the
+// widened index window: a poll tick can land between the reasoning part
+// and the successor it belongs to. The successor's own batch sees no
+// reasoning part at all under the incremental `time_updated > ?` filter,
+// so the index deliberately re-reads every part of the messages that
+// batch touches.
+func TestParseSessionFile_ReasoningThreadsAcrossParseWindow(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "opencode.db")
+	setupOpenCodeDBWithReasoning(t, path)
+
+	a := NewWithOptions(nil, []string{root})
+	// fromOffset past the reasoning part's time_updated (3500) but
+	// before the tool part's (4500).
+	res, err := a.ParseSessionFile(context.Background(), path, 4000)
+	if err != nil {
+		t.Fatalf("ParseSessionFile: %v", err)
+	}
+	for _, ev := range res.ToolEvents {
+		if ev.RawToolName == "bash" {
+			if ev.PrecedingReasoning != "Considering the next step..." {
+				t.Errorf("cross-window tool PrecedingReasoning = %q", ev.PrecedingReasoning)
+			}
+			return
 		}
 	}
-	if len(reasoning) != 1 {
-		t.Fatalf("opencode.reasoning rows: got %d want 1 (events=%+v)", len(reasoning), res.ToolEvents)
-	}
-	ev := reasoning[0]
-	if ev.ActionType != models.ActionTaskComplete {
-		t.Errorf("ActionType = %q, want task_complete", ev.ActionType)
-	}
-	if ev.ToolOutput != "Considering the next step..." {
-		t.Errorf("ToolOutput = %q, want %q", ev.ToolOutput, "Considering the next step...")
-	}
-	if ev.DurationMs != 4500 {
-		t.Errorf("DurationMs = %d, want 4500 (end-start)", ev.DurationMs)
-	}
-	if ev.MessageID != "msg_asst" {
-		t.Errorf("MessageID = %q, want msg_asst", ev.MessageID)
-	}
-	if ev.SourceEventID != "reasoning:prt_reasoning" {
-		t.Errorf("SourceEventID = %q, want reasoning:prt_reasoning", ev.SourceEventID)
-	}
+	t.Fatalf("no tool row in the incremental batch; events=%+v", res.ToolEvents)
 }
 
 // TestParseSessionFile_StepFinishPartEmitsToolEventOnly pins F5 from
@@ -666,6 +701,42 @@ func TestStageMirrorIfForeign_CopiesTrioAndReusesOnRepeat(t *testing.T) {
 	}
 }
 
+// TestStageMirrorIfForeign_RespectsProcessBaseOverride pins F1: the
+// mirror staging directory is derived from the single-owner
+// mirrorbase.Base() seam, so installing a per-process override (the
+// one-shot usage report's "nothing written outside a scratch dir"
+// contract) redirects the mirror write there instead of the default
+// os.UserCacheDir()-derived location.
+func TestStageMirrorIfForeign_RespectsProcessBaseOverride(t *testing.T) {
+	srcRoot := t.TempDir()
+	overrideBase := t.TempDir()
+	mirrorbase.SetBaseForProcess(overrideBase)
+	t.Cleanup(func() { mirrorbase.SetBaseForProcess("") })
+
+	orig := allHomesFunc
+	t.Cleanup(func() { allHomesFunc = orig })
+	allHomesFunc = func() []crossmount.HomeRoot {
+		return []crossmount.HomeRoot{
+			{Path: srcRoot, OS: crossmount.OSWindows, Origin: "wsl-mnt:fake"},
+		}
+	}
+	srcDB := filepath.Join(srcRoot, "opencode.db")
+	if err := os.WriteFile(srcDB, []byte("DBv1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := stageMirrorIfForeign(srcDB)
+	if err != nil {
+		t.Fatalf("stageMirrorIfForeign: %v", err)
+	}
+	if !strings.HasPrefix(got, overrideBase) {
+		t.Errorf("mirror path %q must be under process override base %q, want redirect", got, overrideBase)
+	}
+	if _, err := os.Stat(got); err != nil {
+		t.Errorf("mirrored db not staged at %q: %v", got, err)
+	}
+}
+
 // TestStageMirrorIfForeign_RefreshesOnSourceWALAdvance pins the WAL-
 // triggered refresh — the main .db's mtime can stay stable while the
 // WAL advances on every flush, so the mirror must re-copy when the
@@ -770,7 +841,11 @@ func setupOpenCodeDBWithReasoning(t *testing.T, path string) {
 			('msg_asst', 'ses_1', 2000, 7500,
 			 '{"role":"assistant","agent":"build","modelID":"gpt-5.4-nano","providerID":"openai","path":{"cwd":"/tmp/oc"},"time":{"created":2000,"completed":7500},"finish":"stop"}')`,
 		`INSERT INTO part(id, message_id, session_id, time_created, time_updated, data) VALUES
-			('prt_reasoning', 'msg_asst', 'ses_1', 3000, 7500, '{"type":"reasoning","text":"Considering the next step...","time":{"start":3000,"end":7500}}')`,
+			('prt_reasoning', 'msg_asst', 'ses_1', 3000, 3500, '{"type":"reasoning","text":"Considering the next step...","time":{"start":3000,"end":7500}}'),
+			('prt_tool', 'msg_asst', 'ses_1', 4000, 4500, '{"type":"tool","tool":"bash","callID":"c1","state":{"status":"completed","input":{"command":"ls"},"output":"ok","title":"Run ls","time":{"start":4000,"end":4500}}}'),
+			('prt_reasoning_2', 'msg_asst', 'ses_1', 5000, 5100, '{"type":"reasoning","text":"First thought, superseded.","time":{"start":5000,"end":5100}}'),
+			('prt_reasoning_3', 'msg_asst', 'ses_1', 5500, 5600, '{"type":"reasoning","text":"Second thought, the newer one.","time":{"start":5500,"end":5600}}'),
+			('prt_text', 'msg_asst', 'ses_1', 6000, 6100, '{"type":"text","text":"Done."}')`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {

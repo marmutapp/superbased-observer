@@ -63,9 +63,13 @@ type Submission struct {
 
 // Cell is the unit of aggregation, keyed by (month, model_family, tool). Every
 // volume/cost metric is split by provenance class (design §3.2, finding #8):
-// the _acc twin holds proxy-accurate turns only; the _est twin holds every
-// non-"accurate" reliability class (approximate|unreliable|unknown), so the
-// report can build a genuinely proxy-only cut and quantify the estimated
+// the _acc twin holds reliability="accurate" turns only (the gate is the
+// reliability TAG, not the capture source — proxy rows are always accurate,
+// and a few adapters ground accurate provider-usage objects from local logs:
+// cowork/cursor/openclaw; verified 2026-07-31 wave-round F2); the _est twin
+// holds every non-"accurate" reliability class
+// (approximate|unreliable|unknown), so the
+// report can build a genuinely accuracy-clean cut and quantify the estimated
 // remainder separately, never blending them.
 type Cell struct {
 	ModelFamily string `json:"model_family"` // closed vocab (Family); unknown → "other"
@@ -108,7 +112,8 @@ type Cell struct {
 // ModelToolStat is the aggregate package's OWN input DTO (design §6.1) so the
 // pure package need not import internal/intelligence/cost. One stat is one
 // (model, tool) group already rolled up at the read seam, tagged with whether
-// every contributing turn was proxy-accurate.
+// every contributing turn carried reliability="accurate" (see the Cell doc:
+// the accuracy gate is the reliability tag, not proxy provenance).
 type ModelToolStat struct {
 	// Model is the RAW model id (normalized to a family by Build).
 	Model string

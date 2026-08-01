@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/marmutapp/superbased-observer/internal/contentcap"
 	"github.com/marmutapp/superbased-observer/internal/models"
 )
 
@@ -175,8 +176,8 @@ func TestParseSimpleSession(t *testing.T) {
 	// Event 1: claudecode.assistant_text — emitted before the sibling Read
 	// tool_use because the text block precedes it in content-block order.
 	asst := res.ToolEvents[1]
-	if asst.ActionType != models.ActionTaskComplete {
-		t.Errorf("event 1 action_type: %q want task_complete", asst.ActionType)
+	if asst.ActionType != models.ActionAssistantMessage {
+		t.Errorf("event 1 action_type: %q want assistant_message", asst.ActionType)
 	}
 	if asst.RawToolName != "claudecode.assistant_text" {
 		t.Errorf("event 1 raw_tool_name: %q want claudecode.assistant_text", asst.RawToolName)
@@ -255,7 +256,7 @@ func TestParseMultiToolTurn(t *testing.T) {
 		t.Fatalf("expected 4 tool events, got %d", len(res.ToolEvents))
 	}
 	// Leading assistant_text ("Searching in parallel") + three tool_use rows.
-	want := []string{models.ActionTaskComplete, models.ActionSearchText, models.ActionSearchFiles, models.ActionWebSearch}
+	want := []string{models.ActionAssistantMessage, models.ActionSearchText, models.ActionSearchFiles, models.ActionWebSearch}
 	for i, w := range want {
 		if res.ToolEvents[i].ActionType != w {
 			t.Errorf("event %d: %s, want %s", i, res.ToolEvents[i].ActionType, w)
@@ -703,9 +704,9 @@ func TestAssistantTextEmission(t *testing.T) {
 		wantMessageID   string
 		wantSourceEvent string
 	}{
-		{0, "First block.", "claudecode.assistant_text", models.ActionTaskComplete, "msg_a", "line-1:text:0"},
-		{1, "Second block.", "claudecode.assistant_text", models.ActionTaskComplete, "msg_a", "line-1:text:1"},
-		{2, "Compaction-style — no msg.id.", "claudecode.assistant_text", models.ActionTaskComplete, "asst:line-2", "line-2:text:0"},
+		{0, "First block.", "claudecode.assistant_text", models.ActionAssistantMessage, "msg_a", "line-1:text:0"},
+		{1, "Second block.", "claudecode.assistant_text", models.ActionAssistantMessage, "msg_a", "line-1:text:1"},
+		{2, "Compaction-style — no msg.id.", "claudecode.assistant_text", models.ActionAssistantMessage, "asst:line-2", "line-2:text:0"},
 	}
 	for _, c := range checks {
 		ev := res.ToolEvents[c.idx]
@@ -1275,5 +1276,173 @@ func TestStampEffortFromSidecar_LookupError(t *testing.T) {
 		if ev.Metadata != nil && ev.Metadata.EffortLevel != "" {
 			t.Errorf("tool_use %s: stamped despite lookup error", ev.SourceEventID)
 		}
+	}
+}
+
+// TestToolResultCrossTickEmitsOutcomeUpdate pins the parser half of the
+// store outcome-update seam. A tool_use and its tool_result are separate
+// JSONL records; when a watcher poll tick ends between them the call row
+// is already persisted optimistically successful, and the next parse
+// window resumes past the tool_use with an empty correlation map. The
+// result must leave as an ActionOutcomeUpdate keyed by the SAME
+// (source_file, bare tool_use id) pair toolUseEvent used — anything else
+// silently drops the outcome, which the store's action upsert cannot
+// recover (ON CONFLICT never touches success / error_message).
+func TestToolResultCrossTickEmitsOutcomeUpdate(t *testing.T) {
+	t.Parallel()
+	const toolUseLine = `{"sessionId":"s","cwd":"/tmp","timestamp":"2026-07-09T10:00:00Z","uuid":"u-1","message":{"id":"msg_a","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"tool_use","id":"toolu_xt","name":"Bash","input":{"command":"go test ./..."}}]}}`
+
+	cases := []struct {
+		name       string
+		resultLine string
+		wantOK     bool
+		wantErrMsg bool
+		wantOutput string
+	}{
+		{
+			name:       "error result",
+			resultLine: `{"sessionId":"s","cwd":"/tmp","timestamp":"2026-07-09T10:00:05Z","uuid":"u-2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_xt","content":"--- FAIL: TestFoo\nexit status 1","is_error":true}]}}`,
+			wantOK:     false,
+			wantErrMsg: true,
+			wantOutput: "--- FAIL: TestFoo",
+		},
+		{
+			name:       "success result",
+			resultLine: `{"sessionId":"s","cwd":"/tmp","timestamp":"2026-07-09T10:00:05Z","uuid":"u-2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_xt","content":"ok 12 tests","is_error":false}]}}`,
+			wantOK:     true,
+			wantOutput: "ok 12 tests",
+		},
+		{
+			name:       "result with no tool_use_id is unkeyable and dropped",
+			resultLine: `{"sessionId":"s","cwd":"/tmp","timestamp":"2026-07-09T10:00:05Z","uuid":"u-2","message":{"role":"user","content":[{"type":"tool_result","content":"orphan","is_error":true}]}}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			p := filepath.Join(t.TempDir(), "session.jsonl")
+
+			// Window 1: the transcript ends right after the tool_use.
+			if err := os.WriteFile(p, []byte(toolUseLine+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			res1, err := New().ParseSessionFile(context.Background(), p, 0)
+			if err != nil {
+				t.Fatalf("first parse: %v", err)
+			}
+			if len(res1.ToolEvents) != 1 || res1.ToolEvents[0].SourceEventID != "toolu_xt" {
+				t.Fatalf("first parse: got %+v, want one toolu_xt event", res1.ToolEvents)
+			}
+			if !res1.ToolEvents[0].Success {
+				t.Error("first parse: call should be optimistically successful")
+			}
+			if !res1.ToolEvents[0].OutcomePending {
+				t.Error("first parse: an unanswered call must be flagged OutcomePending, or the store files failure-context bookkeeping on an outcome nobody observed")
+			}
+			if len(res1.OutcomeUpdates) != 0 {
+				t.Errorf("first parse emitted %d outcome updates, want 0", len(res1.OutcomeUpdates))
+			}
+
+			// Window 2: the result lands and the cursor resumes past the call.
+			if err := os.WriteFile(p, []byte(toolUseLine+"\n"+tc.resultLine+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			res2, err := New().ParseSessionFile(context.Background(), p, res1.NewOffset)
+			if err != nil {
+				t.Fatalf("second parse: %v", err)
+			}
+			if len(res2.ToolEvents) != 0 {
+				t.Errorf("second parse re-emitted %d tool events, want 0", len(res2.ToolEvents))
+			}
+			if tc.wantOutput == "" {
+				if len(res2.OutcomeUpdates) != 0 {
+					t.Fatalf("unkeyable result produced %+v, want no updates", res2.OutcomeUpdates)
+				}
+				return
+			}
+
+			// The same transcript parsed WHOLE resolves the pair
+			// in-window, so nothing is left pending.
+			resFull, err := New().ParseSessionFile(context.Background(), p, 0)
+			if err != nil {
+				t.Fatalf("full parse: %v", err)
+			}
+			if len(resFull.ToolEvents) == 0 || resFull.ToolEvents[0].OutcomePending {
+				t.Errorf("in-window pairing left OutcomePending set: %+v", resFull.ToolEvents)
+			}
+			if len(res2.OutcomeUpdates) != 1 {
+				t.Fatalf("OutcomeUpdates: got %d want 1 (%+v)", len(res2.OutcomeUpdates), res2.OutcomeUpdates)
+			}
+			up := res2.OutcomeUpdates[0]
+			if up.SourceFile != p {
+				t.Errorf("SourceFile = %q, want %q", up.SourceFile, p)
+			}
+			if up.SourceEventID != "toolu_xt" {
+				t.Errorf("SourceEventID = %q, want the BARE tool_use id toolu_xt", up.SourceEventID)
+			}
+			if up.Success != tc.wantOK {
+				t.Errorf("Success = %v, want %v", up.Success, tc.wantOK)
+			}
+			if tc.wantErrMsg && up.ErrorMessage == "" {
+				t.Error("ErrorMessage empty on an is_error result")
+			}
+			if !tc.wantErrMsg && up.ErrorMessage != "" {
+				t.Errorf("ErrorMessage = %q on a clean result, want empty", up.ErrorMessage)
+			}
+			if !strings.Contains(up.ToolOutput, tc.wantOutput) {
+				t.Errorf("ToolOutput = %q, want it to contain %q", up.ToolOutput, tc.wantOutput)
+			}
+			if up.DurationMs != 0 {
+				t.Errorf("DurationMs = %d, want 0 (the call timestamp lived in the prior window)", up.DurationMs)
+			}
+		})
+	}
+}
+
+// TestToolResultOutputCappedAtContract pins the models.ToolEvent
+// ToolOutput contract (1 MiB, enforced by internal/contentcap) on the
+// claudecode tool_result path — in-window AND cross-tick, which share
+// one harvest. A multi-megabyte result body (a `cat` of a large file,
+// a verbose test log) previously left the adapter uncapped and rode
+// straight into actions.raw_tool_output.
+func TestToolResultOutputCappedAtContract(t *testing.T) {
+	t.Parallel()
+	huge := strings.Repeat("A", 3*contentcap.DefaultMaxBytes)
+	body := strings.Join([]string{
+		`{"sessionId":"s","cwd":"/tmp","timestamp":"2026-07-09T10:00:00Z","uuid":"u-1","message":{"id":"msg_a","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"tool_use","id":"toolu_big","name":"Bash","input":{"command":"cat big.log"}}]}}`,
+		`{"sessionId":"s","cwd":"/tmp","timestamp":"2026-07-09T10:00:01Z","uuid":"u-2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_big","content":"` + huge + `","is_error":false}]}}`,
+	}, "\n") + "\n"
+	p := filepath.Join(t.TempDir(), "big.jsonl")
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// contentcap.Cap appends a truncation marker, so the ceiling is the
+	// cap PLUS that marker — measured, not assumed.
+	ceiling := len(contentcap.Cap(strings.Repeat("B", contentcap.DefaultMaxBytes+1), contentcap.DefaultMaxBytes))
+
+	res, err := New().ParseSessionFile(context.Background(), p, 0)
+	if err != nil {
+		t.Fatalf("ParseSessionFile: %v", err)
+	}
+	if len(res.ToolEvents) != 1 {
+		t.Fatalf("ToolEvents: got %d want 1", len(res.ToolEvents))
+	}
+	if got := len(res.ToolEvents[0].ToolOutput); got > ceiling {
+		t.Errorf("in-window ToolOutput = %d bytes, want <= %d (1 MiB + marker)", got, ceiling)
+	}
+
+	// Cross-tick: same harvest, same ceiling.
+	half := int64(len(body) - len(strings.Split(body, "\n")[1]) - 1)
+	res2, err := New().ParseSessionFile(context.Background(), p, half)
+	if err != nil {
+		t.Fatalf("resume parse: %v", err)
+	}
+	if len(res2.OutcomeUpdates) != 1 {
+		t.Fatalf("OutcomeUpdates: got %d want 1", len(res2.OutcomeUpdates))
+	}
+	if got := len(res2.OutcomeUpdates[0].ToolOutput); got > ceiling {
+		t.Errorf("cross-tick ToolOutput = %d bytes, want <= %d (1 MiB + marker)", got, ceiling)
 	}
 }

@@ -74,6 +74,17 @@ func (c *Client) FetchRoutingPolicy(ctx context.Context) (bool, error) {
 			return false, nil // already current
 		}
 	}
+	// ONE org distribution identity across rails (orgpin.go). Symmetric
+	// with FetchOrgAnnouncement on purpose: this rail's first fetch on a
+	// node that already pinned the key elsewhere must present THAT key,
+	// not merely some key. Cheap (one single-row read of a table this
+	// package already owns) and non-breaking (the org server signs both
+	// rails with the same key, so the pins can only disagree when the
+	// key genuinely changed — which this rail already refuses once it
+	// has a pin of its own).
+	if err := c.checkOrgKeyIdentity(ctx, routingPolicyRail, doc.PublicKey); err != nil {
+		return false, fmt.Errorf("orgclient.FetchRoutingPolicy: %w", err)
+	}
 	if err := routingpolicy.Verify(doc, pinned); err != nil {
 		return false, fmt.Errorf("orgclient.FetchRoutingPolicy: %w", err)
 	}

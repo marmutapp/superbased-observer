@@ -2,11 +2,13 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/marmutapp/superbased-observer/internal/claudeplugin"
 	"github.com/marmutapp/superbased-observer/internal/proxyroute"
 )
 
@@ -134,11 +136,13 @@ func TestRunInteractiveInit_EOFAborts(t *testing.T) {
 // TestRegisterClaudeCodeWindows_WritesLocalhostRoute under forced WSL).
 // Candidate homes are temp dirs so any write on a real WSL host stays in temp.
 func TestRunWindowsRouteDisambiguation_PicksHome(t *testing.T) {
-	homeA, homeB := t.TempDir(), t.TempDir()
+	sandbox := t.TempDir()
+	homes := sandboxWinHomes(t, sandbox, 2)
+	homeA, homeB := homes[0], homes[1]
 	cands := map[string][]string{"claude-code-windows": {homeA, homeB}}
 	var out strings.Builder
 	p := &initPrompter{in: bufio.NewReader(strings.NewReader("1\n")), out: &out}
-	if err := runWindowsRouteDisambiguation(&out, p, cands, 18820, interactiveInitOptions{HomeDir: t.TempDir()}); err != nil {
+	if err := runWindowsRouteDisambiguation(&out, p, cands, 18820, interactiveInitOptions{HomeDir: sandbox}); err != nil {
 		t.Fatalf("runWindowsRouteDisambiguation: %v\n%s", err, out.String())
 	}
 	s := out.String()
@@ -158,14 +162,16 @@ func TestRunWindowsRouteDisambiguation_PicksHome(t *testing.T) {
 // cross-OS writers engage on any host; the picked home is a temp dir.
 func TestRunWindowsRouteDisambiguation_WiresHooksIntoPickedHome(t *testing.T) {
 	defer proxyroute.SetWSLForTest(true)()
-	homeA, homeB := t.TempDir(), t.TempDir()
+	sandbox := t.TempDir()
+	homes := sandboxWinHomes(t, sandbox, 2)
+	homeA, homeB := homes[0], homes[1]
 	cands := map[string][]string{"claude-code-windows": {homeA, homeB}}
 	var out strings.Builder
 	// pick 1, then consent to the separate hook prompt.
 	p := &initPrompter{in: bufio.NewReader(strings.NewReader("1\ny\n")), out: &out}
 	err := runWindowsRouteDisambiguation(&out, p, cands, 18820, interactiveInitOptions{
 		BinaryPath: "/bin/observer",
-		HomeDir:    t.TempDir(),
+		HomeDir:    sandbox,
 		WSLDistro:  "Ubuntu",
 	})
 	if err != nil {
@@ -193,13 +199,15 @@ func TestRunWindowsRouteDisambiguation_WiresHooksIntoPickedHome(t *testing.T) {
 // "n") writes the proxy route but leaves hooks unwritten.
 func TestRunWindowsRouteDisambiguation_HookDeclinedWritesRouteOnly(t *testing.T) {
 	defer proxyroute.SetWSLForTest(true)()
-	homeA := t.TempDir()
-	cands := map[string][]string{"claude-code-windows": {homeA, t.TempDir()}}
+	sandbox := t.TempDir()
+	homes := sandboxWinHomes(t, sandbox, 2)
+	homeA := homes[0]
+	cands := map[string][]string{"claude-code-windows": {homeA, homes[1]}}
 	var out strings.Builder
 	p := &initPrompter{in: bufio.NewReader(strings.NewReader("1\nn\n")), out: &out}
 	err := runWindowsRouteDisambiguation(&out, p, cands, 18820, interactiveInitOptions{
 		BinaryPath: "/bin/observer",
-		HomeDir:    t.TempDir(),
+		HomeDir:    sandbox,
 		WSLDistro:  "Ubuntu",
 	})
 	if err != nil {
@@ -223,7 +231,9 @@ func TestRunWindowsRouteDisambiguation_HookDeclinedWritesRouteOnly(t *testing.T)
 // picker consumes only the "1" (no answer for a hook prompt is needed).
 func TestRunWindowsRouteDisambiguation_RouteRefusedSkipsHook(t *testing.T) {
 	defer proxyroute.SetWSLForTest(true)()
-	homeA := t.TempDir()
+	sandbox := t.TempDir()
+	homes := sandboxWinHomes(t, sandbox, 2)
+	homeA := homes[0]
 	// Seed a conflicting third-party route the observer writer must refuse to
 	// clobber (no --force in this path).
 	claudeDir := filepath.Join(homeA, ".claude")
@@ -234,13 +244,13 @@ func TestRunWindowsRouteDisambiguation_RouteRefusedSkipsHook(t *testing.T) {
 		[]byte(`{"env":{"ANTHROPIC_BASE_URL":"https://third-party.example/api"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cands := map[string][]string{"claude-code-windows": {homeA, t.TempDir()}}
+	cands := map[string][]string{"claude-code-windows": {homeA, homes[1]}}
 	var out strings.Builder
 	// Only "1" — if a hook prompt were (wrongly) offered, EOF would error.
 	p := &initPrompter{in: bufio.NewReader(strings.NewReader("1\n")), out: &out}
 	err := runWindowsRouteDisambiguation(&out, p, cands, 18820, interactiveInitOptions{
 		BinaryPath: "/bin/observer",
-		HomeDir:    t.TempDir(),
+		HomeDir:    sandbox,
 		WSLDistro:  "Ubuntu",
 	})
 	if err != nil {
@@ -297,4 +307,86 @@ func TestRunWindowsRouteDisambiguation_NoCandidatesIsNoOp(t *testing.T) {
 	if out.Len() != 0 {
 		t.Errorf("no candidates should print nothing, got %q", out.String())
 	}
+}
+
+// TestRunInteractiveInit_PluginWiredOffersNoConsent is codex finding
+// M4's interactive half: with the Claude Code plugin installed, the
+// checklist must NOT offer to register hooks or the MCP server. Offering
+// a consent the registrar would then decline is a lie in both
+// directions — the user says yes and nothing happens.
+//
+// The old behaviour rendered the skipped hook preview as "already set
+// in <path>" (false: the path holds nothing) and the skipped MCP preview
+// as a pending consent item.
+func TestRunInteractiveInit_PluginWiredOffersNoConsent(t *testing.T) {
+	home := interactiveHome(t)
+	// Install the plugin, exactly as `/plugin install` records it.
+	if err := os.WriteFile(filepath.Join(home, ".claude", "settings.json"),
+		[]byte(`{"enabledPlugins":{"`+claudeplugin.EnabledKey+`":true}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out strings.Builder
+	// Only the proxy-route consent should be asked for claude-code (the
+	// plugin declares no route). The padding declines anything else the
+	// environment surfaces.
+	in := strings.NewReader("n\n" + strings.Repeat("n\n", 12))
+
+	if err := runInteractiveInit(&out, in, interactiveInitOptions{
+		BinaryPath: filepath.Join(home, "observer"),
+		ProxyPort:  18820,
+		HomeDir:    home,
+	}); err != nil {
+		t.Fatalf("runInteractiveInit: %v\noutput:\n%s", err, out.String())
+	}
+	text := out.String()
+
+	if !strings.Contains(text, "hooks: wired via the Claude Code plugin") {
+		t.Errorf("hook line does not report plugin wiring:\n%s", text)
+	}
+	if !strings.Contains(text, "mcp: wired via the Claude Code plugin") {
+		t.Errorf("mcp line does not report plugin wiring:\n%s", text)
+	}
+	if strings.Contains(text, "hooks: already set") {
+		t.Errorf("skipped hooks rendered as 'already set' — nothing is in that file:\n%s", text)
+	}
+	// The two consent questions must not have been asked at all.
+	if strings.Contains(text, "register hooks for claude-code?") {
+		t.Errorf("offered a hook consent it would then skip:\n%s", text)
+	}
+	if strings.Contains(text, "register the MCP server for claude-code?") {
+		t.Errorf("offered an MCP consent it would then skip:\n%s", text)
+	}
+
+	// And nothing was written.
+	settings, err := os.ReadFile(filepath.Join(home, ".claude", "settings.json"))
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	if strings.Contains(string(settings), "hook claude-code") {
+		t.Errorf("hooks were written despite the plugin:\n%s", settings)
+	}
+	if raw, err := os.ReadFile(filepath.Join(home, ".claude.json")); err == nil &&
+		strings.Contains(string(raw), `"observer"`) {
+		t.Errorf("an MCP entry landed despite the plugin:\n%s", raw)
+	}
+}
+
+// sandboxWinHomes creates n Windows USER homes NESTED under sandbox and
+// returns them. Nesting is required, not tidy: once a caller pins HomeDir, a
+// Windows-home override is honoured only when it resolves UNDER that home
+// (crossmount.AutoDetectSuppressed → PathUnder, the 2026-07-31 follow-up
+// round). In production this flow runs with HomeDir empty and the candidates
+// are the real /mnt/c/Users/<u> homes, which is unaffected.
+func sandboxWinHomes(t *testing.T, sandbox string, n int) []string {
+	t.Helper()
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		dir := filepath.Join(sandbox, "mnt", "c", "Users", fmt.Sprintf("tester%d", i))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, dir)
+	}
+	return out
 }

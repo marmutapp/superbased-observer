@@ -2,13 +2,21 @@ package integration_test
 
 import (
 	"context"
+	"go/ast"
+	"go/build"
+	"go/parser"
+	"go/token"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	adapterdefaults "github.com/marmutapp/superbased-observer/internal/adapter/defaults"
 	"github.com/marmutapp/superbased-observer/internal/integration"
 	"github.com/marmutapp/superbased-observer/internal/models"
+	"github.com/marmutapp/superbased-observer/internal/tooltax"
+	"github.com/marmutapp/superbased-observer/internal/tooltax/conformast"
 )
 
 // TestRegistryCoversEveryRegisteredAdapter pins that every adapter in the
@@ -47,6 +55,344 @@ func TestRegistryHasNoOrphanRows(t *testing.T) {
 			t.Errorf("registry row %q has no registered adapter — remove the stale row", c.Tool)
 		}
 	}
+}
+
+// registryRowlessTaxonomyTools is the FROZEN, acknowledged set of tool ids
+// that internal/tooltax carries tool-specific vocabulary rows for while
+// internal/integration deliberately carries NO capability row. The value is
+// the grounded reason the asymmetry is correct, not a TODO.
+//
+// Why the set is not simply empty: a registry row is keyed on ADAPTER
+// IDENTITY, not on the `sessions.tool` value a row can end up tagged with.
+// The registry's own contract says so from both sides —
+// TestRegistryCoversEveryRegisteredAdapter (every defaults.Adapters() entry
+// needs a row) plus TestRegistryHasNoOrphanRows (every row needs a
+// defaults.Adapters() entry), and tests/invariant/adapter_registry_sync_test.go
+// pins the same set equality a third time. tooltax, by contrast, is keyed on
+// the emitted `tool` COLUMN, because that is what Resolve(tool, native) is
+// handed at read time. The two key spaces differ by exactly the adapters that
+// retag their events per-file, and this map is where that difference is
+// declared out loud.
+//
+// The teeth: a FUTURE tooltax alias (internal/tooltax/table.go::toolAliases)
+// or any new tool-specific tooltax vocabulary that silently lacks a registry
+// row now fails here instead of being discovered in a prose note.
+var registryRowlessTaxonomyTools = map[string]string{
+	"roo-code": "roo-code has no adapter identity: internal/adapter/cline.Adapter " +
+		"watches BOTH saoudrizwan.claude-dev/tasks and rooveterinaryinc.roo-cline/tasks " +
+		"and picks the emitted Tool per-FILE from the enclosing extension dir " +
+		"(adapter.go toolFromPath), while its Name() is models.ToolCline. There is no " +
+		"roo-code entry in defaults.Adapters(), no roo-code hook registrar, no roo-code " +
+		"MCP registrar and no roo-code proxy route or launcher — so every cell of a " +
+		"roo-code Capability would either be zero or be copied from cline's row, which " +
+		"the registry's honesty rule forbids (a zero value means \"no grounded " +
+		"capability\", never an inferred one). Contrast kilo-code, which DOES have a row " +
+		"because kilocode.NewLegacy() is a registered adapter with its own Name() and " +
+		"its own watch roots even though it wraps the same cline parser.",
+}
+
+// TestRegistryRowlessTaxonomyToolsAreFrozen makes the tooltax-vs-registry key-
+// space asymmetry STRUCTURAL rather than a prose note in the taxonomy plan
+// (docs/plans/tool-taxonomy-standardization-plan-2026-07-31.md §6 WP-T3).
+//
+// It is the mirror image of TestVocabularyDeclaredForEveryAdapter: that test
+// walks registry rows and demands each declare its tooltax coverage; this one
+// walks tooltax tools and demands each either HAVE a registry row or be an
+// acknowledged, reasoned exception. Together the two directions close the set.
+//
+// Both staleness directions are checked, so the exception map cannot rot:
+// an entry naming a tool tooltax no longer carries, or an entry for a tool
+// that has since GAINED a registry row, both fail and must be deleted.
+func TestRegistryRowlessTaxonomyToolsAreFrozen(t *testing.T) {
+	taxonomyTools := map[string]bool{}
+	for _, tool := range tooltax.Tools() {
+		taxonomyTools[tool] = true
+	}
+	if len(taxonomyTools) < 20 {
+		t.Fatalf("only %d tool-specific tooltax tools — the taxonomy table shape probably changed", len(taxonomyTools))
+	}
+
+	// Direction 1: every tooltax tool without a registry row must be a
+	// declared, reasoned exception.
+	for tool := range taxonomyTools {
+		if _, ok := integration.For(tool); ok {
+			continue
+		}
+		reason, acknowledged := registryRowlessTaxonomyTools[tool]
+		if !acknowledged {
+			t.Errorf("tool %q has tool-specific rows in internal/tooltax but no "+
+				"integration.Capability row. Either add the registry row (the normal "+
+				"answer: a new adapter lands in defaults.Adapters() + the registry + "+
+				"config.Default().EnabledAdapters together), or — if the tool is an "+
+				"event-level retag with no adapter identity — add it to "+
+				"registryRowlessTaxonomyTools with the grounded reason.", tool)
+			continue
+		}
+		if strings.TrimSpace(reason) == "" {
+			t.Errorf("registryRowlessTaxonomyTools[%q] has an empty reason — an "+
+				"acknowledged asymmetry must say WHY no row can be grounded", tool)
+		}
+	}
+
+	// Direction 2: no stale exceptions.
+	registeredAdapters := map[string]bool{}
+	for _, a := range adapterdefaults.Adapters() {
+		registeredAdapters[a.Name()] = true
+	}
+	for tool := range registryRowlessTaxonomyTools {
+		if !taxonomyTools[tool] {
+			t.Errorf("registryRowlessTaxonomyTools names %q, which internal/tooltax no "+
+				"longer carries tool-specific rows for — delete the stale exception", tool)
+		}
+		if _, ok := integration.For(tool); ok {
+			t.Errorf("registryRowlessTaxonomyTools names %q, which now HAS an "+
+				"integration.Capability row — delete the stale exception", tool)
+		}
+		if registeredAdapters[tool] {
+			t.Errorf("registryRowlessTaxonomyTools names %q, which is now a registered "+
+				"adapter in defaults.Adapters() — it has an adapter identity, so it "+
+				"needs a registry row; delete the exception", tool)
+		}
+	}
+}
+
+// TestRegistryRowlessTaxonomyToolsAreServedByAnotherAdapter grounds the
+// exception map's central claim — "no adapter identity, but the sessions
+// ARE captured" — against the code rather than the comment. A tool listed
+// here must be reachable as an emitted `tool` value from some registered
+// adapter's parser; if nothing in the tree can ever emit it, the tooltax
+// rows are dead vocabulary and the honest fix is to delete THOSE, not to
+// keep an exception alive.
+//
+// The check is deliberately narrow (a source scan of internal/adapter for
+// the tool's models.Tool* constant, or the bare literal) because the emit
+// is a per-file branch inside another adapter's parser, which no
+// registry-shaped lookup can see.
+func TestRegistryRowlessTaxonomyToolsAreServedByAnotherAdapter(t *testing.T) {
+	for tool := range registryRowlessTaxonomyTools {
+		found, where := emittedByAnAdapterPackage(t, tool)
+		if !found {
+			t.Errorf("registryRowlessTaxonomyTools names %q, but no adapter package "+
+				"under internal/adapter emits it — the tooltax rows for %q are dead "+
+				"vocabulary; delete them rather than keeping the exception", tool, tool)
+			continue
+		}
+		t.Logf("%q emitted by %s (no adapter identity of its own)", tool, where)
+	}
+}
+
+// modelsToolConstant returns the internal/models identifier whose value is
+// the given tool id (e.g. "roo-code" -> "ToolRooCode"). Adapters emit the
+// CONSTANT, never the literal, so a source scan has to know its name.
+func modelsToolConstant(t *testing.T, tool string) string {
+	t.Helper()
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, "../models", func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parsing internal/models: %v", err)
+	}
+	want := strconv.Quote(tool)
+	for _, pkg := range pkgs {
+		for _, f := range pkg.Files {
+			for _, decl := range f.Decls {
+				gd, ok := decl.(*ast.GenDecl)
+				if !ok || gd.Tok != token.CONST {
+					continue
+				}
+				for _, spec := range gd.Specs {
+					vs, ok := spec.(*ast.ValueSpec)
+					if !ok || len(vs.Names) != 1 || len(vs.Values) != 1 {
+						continue
+					}
+					lit, ok := vs.Values[0].(*ast.BasicLit)
+					if !ok || lit.Kind != token.STRING || lit.Value != want {
+						continue
+					}
+					return vs.Names[0].Name
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// emittedByAnAdapterPackage reports whether any non-test, build-selected
+// file under internal/adapter references the tool's models.Tool* constant
+// as an ACTUAL EXPRESSION IN EXECUTABLE CODE — the sole ground truth the
+// codex review demanded, replacing the earlier raw substring scan (which a
+// comment, a `var _ =` dead anchor, or a build-excluded file could satisfy
+// without the tool ever actually being emitted).
+//
+// Three tightenings over the substring scan, all load-bearing:
+//
+//  1. Only the models.<Const> CONSTANT counts — never the bare string
+//     literal — so a mutation that swaps `return models.ToolRooCode` for a
+//     hardcoded string literal (leaving the constant name only in a
+//     comment) is caught rather than passed on the literal's coincidental
+//     presence.
+//  2. The reference must sit in one of the executable-code sites the
+//     finding named: a return statement, the RHS of an assignment or a
+//     non-blank var declaration, a composite-literal element (keyed or
+//     not), or a function-call argument — see validCodeSite. Because the
+//     check walks the AST rather than scanning bytes, a comment can never
+//     satisfy it (comments are not represented as expression nodes), and a
+//     `var _ = models.ToolX` dead anchor is explicitly rejected even
+//     though it is syntactically a var declaration's RHS.
+//  3. Only files go/build.Context.MatchFile selects for the CURRENT
+//     platform are scanned — a file gated out by a GOOS/GOARCH filename
+//     suffix or an explicit `//go:build` / `// +build` constraint that
+//     does not match this host is skipped exactly as `go build` would skip
+//     it. (This does not evaluate custom `-tags`-gated constraints beyond
+//     go/build's default context — none of internal/adapter's build tags
+//     are custom today; only OS/arch selection is exercised in practice.)
+func emittedByAnAdapterPackage(t *testing.T, tool string) (bool, string) {
+	t.Helper()
+	ident := modelsToolConstant(t, tool)
+	if ident == "" {
+		return false, ""
+	}
+	var hit string
+	buildCtx := build.Default
+	err := filepath.Walk("../adapter", func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if hit != "" || info.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		dir, name := filepath.Split(path)
+		if match, merr := buildCtx.MatchFile(dir, name); merr != nil || !match {
+			// Unreadable, or excluded by build constraints for this
+			// platform — `go build` would skip it too.
+			return nil
+		}
+		fset := token.NewFileSet()
+		f, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			return perr
+		}
+		if modelsConstUsedAsCodeExpression(f, ident) {
+			hit = filepath.ToSlash(path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking internal/adapter: %v", err)
+	}
+	return hit != "", hit
+}
+
+// modelsConstUsedAsCodeExpression reports whether `models.<ident>` appears
+// anywhere in file f as an expression sitting in one of the executable-code
+// sites validCodeSite recognizes.
+func modelsConstUsedAsCodeExpression(f *ast.File, ident string) bool {
+	v := &modelsConstUseVisitor{ident: ident}
+	ast.Walk(v, f)
+	return v.found
+}
+
+// modelsConstUseVisitor walks a file's AST maintaining a stack of enclosing
+// nodes, so it can classify whether a matching `models.<ident>` selector
+// sits in a valid executable-code site rather than, say, a comment (never
+// visited — comments are not AST expression nodes) or a dead declaration.
+//
+// It relies on go/ast's Walk contract: "if the result visitor w is not
+// nil, Walk visits each of the children of node with the visitor w,
+// followed by a call of w.Visit(nil)" — the nil call is what lets Visit
+// pop the stack on the way back out, giving a correct parent at every
+// point of the pre-order traversal.
+type modelsConstUseVisitor struct {
+	ident string
+	stack []ast.Node
+	found bool
+}
+
+func (v *modelsConstUseVisitor) Visit(n ast.Node) ast.Visitor {
+	if n == nil {
+		if len(v.stack) > 0 {
+			v.stack = v.stack[:len(v.stack)-1]
+		}
+		return nil
+	}
+	if !v.found && isModelsSelector(n, v.ident) && validCodeSite(v.stack, n) {
+		v.found = true
+	}
+	v.stack = append(v.stack, n)
+	return v
+}
+
+// isModelsSelector reports whether n is exactly the selector expression
+// `models.<ident>`.
+func isModelsSelector(n ast.Node, ident string) bool {
+	sel, ok := n.(*ast.SelectorExpr)
+	if !ok || sel.Sel == nil || sel.Sel.Name != ident {
+		return false
+	}
+	pkgIdent, ok := sel.X.(*ast.Ident)
+	return ok && pkgIdent.Name == "models"
+}
+
+// validCodeSite reports whether n's immediate enclosing node (the top of
+// stack) is one of the executable-code sites the finding requires: a
+// return statement, the RHS of an assignment or a non-blank var
+// declaration, a composite-literal element (keyed or not), or a
+// function-call argument.
+//
+// A `var _ = models.ToolX` dead anchor is explicitly excluded — even
+// though it is syntactically a ValueSpec whose Values contains n — by
+// checking that at least one of the ValueSpec's Names is not the blank
+// identifier.
+func validCodeSite(stack []ast.Node, n ast.Node) bool {
+	if len(stack) == 0 {
+		return false
+	}
+	switch p := stack[len(stack)-1].(type) {
+	case *ast.ReturnStmt:
+		return true
+	case *ast.AssignStmt:
+		for _, rhs := range p.Rhs {
+			if rhs == n {
+				return true
+			}
+		}
+	case *ast.ValueSpec:
+		allBlank := true
+		for _, name := range p.Names {
+			if name.Name != "_" {
+				allBlank = false
+				break
+			}
+		}
+		if allBlank {
+			// `var _ = models.ToolX` — a dead anchor, not an emission.
+			return false
+		}
+		for _, val := range p.Values {
+			if val == n {
+				return true
+			}
+		}
+	case *ast.KeyValueExpr:
+		return p.Value == n
+	case *ast.CompositeLit:
+		for _, elt := range p.Elts {
+			if elt == n {
+				return true
+			}
+		}
+	case *ast.CallExpr:
+		for _, arg := range p.Args {
+			if arg == n {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // transcriptReader mirrors the handoffsvc TranscriptReader seam locally so
@@ -346,6 +692,206 @@ func TestCrossOSRouteOnlyForPersistedKinds(t *testing.T) {
 			// persisted config write — cross-OS bridging is coherent.
 		default:
 			t.Errorf("adapter %q: Proxy.CrossOSBridge set on non-persisted RouteKind %q", c.Tool, c.Proxy.Kind)
+		}
+	}
+}
+
+// registryKeys reads the keys of internal/integration's package-level
+// `registry` map straight out of the source. There is no exported accessor
+// for them (For/Capabilities both hand back values), and the KEY is what
+// every caller looks a tool up by — so a test that only ever sees values
+// cannot notice a row filed under the wrong key.
+func registryKeys(t *testing.T) []string {
+	t.Helper()
+	keys, err := conformast.MapKeys(".", "registry")
+	if err != nil {
+		t.Fatalf("reading the registry map keys: %v", err)
+	}
+	if len(keys) < 20 {
+		t.Fatalf("only %d registry keys extracted — the registry shape probably changed", len(keys))
+	}
+	return keys
+}
+
+// TestRegistryRowToolMatchesItsKey closes the free-ride hole the codex
+// review found: TestRegistryCoversEveryRegisteredAdapter only asserts that
+// For(name) RESOLVES, so a row filed under "new-tool" but carrying
+// Tool: "codex" satisfies it — and then every capability keyed on
+// Capability.Tool (proxy route, handoff lane, launcher verb, and this file's
+// Vocabulary check) silently reads codex's answers for a different adapter.
+//
+// The key IS the identity: internal/integration.For, the doctor, the
+// dashboard matrix and sessions.tool all address a row by it.
+func TestRegistryRowToolMatchesItsKey(t *testing.T) {
+	for _, key := range registryKeys(t) {
+		c, ok := integration.For(key)
+		if !ok {
+			t.Errorf("registry key %q does not resolve through For", key)
+			continue
+		}
+		if c.Tool != key {
+			t.Errorf("registry row keyed %q carries Tool %q — the row would free-ride on "+
+				"%q's capabilities everywhere Capability.Tool is the lookup", key, c.Tool, c.Tool)
+		}
+	}
+}
+
+// toolSpecificTooltaxRows counts the rows internal/tooltax carries for a
+// SPECIFIC tool. It deliberately does not use tooltax.For, which folds in
+// the tool-less fallback rows that apply to every adapter — those say
+// nothing about whether THIS adapter's vocabulary was canonicalized.
+func toolSpecificTooltaxRows(tool string) int {
+	n := 0
+	for _, e := range tooltax.Table() {
+		if e.Tool == tool {
+			n++
+		}
+	}
+	return n
+}
+
+// TestVocabularyDeclaredForEveryAdapter is the WP-T3 taxonomy teeth
+// (docs/plans/tool-taxonomy-standardization-plan-2026-07-31.md §2 and §6):
+// every registry row must DECLARE whether its adapter's native tool names
+// live in the canonical taxonomy table, and the declaration is verified
+// against the real table — a new adapter that adds a registry row without
+// adding its vocabulary to internal/tooltax goes red here.
+//
+// The honesty rule is enforced in BOTH directions:
+//
+//   - a zero-value Vocabulary (neither InTaxonomy nor a Note) is undeclared
+//     and fails — the same "state your capability" pressure Binary /
+//     Handoff / Routability already apply;
+//   - InTaxonomy true with no TOOL-SPECIFIC tooltax rows is a fabricated
+//     capability (the tool-less fallback rows do not count);
+//   - InTaxonomy false REQUIRES a Note, and tooltax must genuinely carry no
+//     tool-specific rows for it (the five browser-chat `*-web` adapters,
+//     whose capture has no tool-call surface at all).
+func TestVocabularyDeclaredForEveryAdapter(t *testing.T) {
+	for _, c := range integration.Capabilities() {
+		rows := toolSpecificTooltaxRows(c.Tool)
+		v := c.Vocabulary
+		if !v.Declared() {
+			t.Errorf("adapter %q: Vocabulary is undeclared — set InTaxonomy true "+
+				"(and add its native tool names to internal/tooltax), or set a Note "+
+				"explaining the honest zero (tooltax currently has %d tool-specific rows for it)",
+				c.Tool, rows)
+			continue
+		}
+		if v.InTaxonomy && rows == 0 {
+			t.Errorf("adapter %q: Vocabulary.InTaxonomy is true but internal/tooltax "+
+				"carries no tool-specific rows for it — add the adapter's native tool "+
+				"names to tooltax's table, or declare the honest zero with a Note", c.Tool)
+		}
+		if !v.InTaxonomy {
+			if v.Note == "" {
+				t.Errorf("adapter %q: Vocabulary.InTaxonomy is false without a Note — "+
+					"an honest zero must say WHY the adapter has no native tool names", c.Tool)
+			}
+			if rows > 0 {
+				t.Errorf("adapter %q: Vocabulary declares an honest zero (%q) but "+
+					"internal/tooltax carries %d tool-specific rows for it — flip "+
+					"InTaxonomy to true", c.Tool, v.Note, rows)
+			}
+		}
+	}
+}
+
+// honestZeroPackages maps a registry tool that declares
+// Vocabulary{InTaxonomy: false} onto the adapter package that captures it.
+// It is the evidence base for TestHonestZeroVocabularyHasNoClassifier: an
+// honest zero is a claim about the adapter's CODE ("this capture has no
+// native tool names"), so the test checks the code.
+//
+// All five browser-chat rows share one package — internal/adapter/
+// browserchat, where the site is the data discriminator, not a separate
+// parser per tool.
+var honestZeroPackages = map[string]string{
+	"chatgpt-web":    "../adapter/browserchat",
+	"claude-web":     "../adapter/browserchat",
+	"perplexity-web": "../adapter/browserchat",
+	"gemini-web":     "../adapter/browserchat",
+	"copilot-web":    "../adapter/browserchat",
+}
+
+// TestHonestZeroVocabularyHasNoClassifier gives the honest-zero branch
+// teeth. Before this, Vocabulary{Note: "..."} passed on any non-empty
+// string, so a NEW adapter shipping a real private action-type map could
+// declare "no native vocabulary" and skip the taxonomy entirely — the exact
+// bypass the codex review named.
+//
+// The claim is now checked against the source: the adapter's package must
+// contain NO name-based action classifier (no switch whose case bodies
+// return models.Action*, no package-level map whose values are
+// models.Action*), found by AST walk rather than by being told where to
+// look. An honest-zero row whose package is not in honestZeroPackages fails
+// with instructions, so the mapping cannot be skipped either.
+//
+// The detector is deliberately CONSERVATIVE: it reports ANY switch/map that
+// turns a string into a models.Action*, not only ones that switch on a tool
+// name — AST alone cannot tell a tool-name switch from, say, a
+// content-block-type switch. An honest-zero package that grows such a
+// switch will trip this, and that is the intended outcome: a human decides
+// whether the "no native vocabulary" claim still holds, rather than a
+// heuristic deciding it silently.
+func TestHonestZeroVocabularyHasNoClassifier(t *testing.T) {
+	for _, c := range integration.Capabilities() {
+		if c.Vocabulary.InTaxonomy {
+			continue
+		}
+		dir, mapped := honestZeroPackages[c.Tool]
+		if !mapped {
+			t.Errorf("adapter %q declares an honest-zero Vocabulary but has no entry in "+
+				"honestZeroPackages — add one pointing at its adapter package so the "+
+				"claim can be checked against the code", c.Tool)
+			continue
+		}
+		domains, err := conformast.ActionClassifierDomain(dir)
+		if err != nil {
+			t.Errorf("adapter %q: scanning %s for a classifier: %v", c.Tool, dir, err)
+			continue
+		}
+		for site, names := range domains {
+			t.Errorf("adapter %q declares an honest-zero Vocabulary (%q) but %s ships a "+
+				"name-based action classifier at %s with domain %q — the claim is false; "+
+				"add those names to internal/tooltax and set InTaxonomy true",
+				c.Tool, c.Vocabulary.Note, dir, site, names)
+		}
+	}
+}
+
+// TestVocabularyRowsResolveToRegisteredActionTypes pins that a declared
+// vocabulary is USABLE, not just present: every tool-specific tooltax row
+// must carry an action type the canonical registry knows. A typo'd action
+// type would otherwise sit in the table forever, silently rendering as a
+// gray meta chip (CategoryForActionType falls back to `meta` by design).
+//
+// tooltax.ActionUnknown is ALLOWED and deliberate: cursor's `await`,
+// copilot-cli's `report_intent` and kiro-cli's `introspect` are explicit
+// unknown rows — a tool we have seen and consciously chose not to bucket,
+// which is different information from "never seen".
+func TestVocabularyRowsResolveToRegisteredActionTypes(t *testing.T) {
+	registered := map[string]bool{}
+	for _, at := range tooltax.ActionTypes() {
+		registered[at] = true
+	}
+	for _, c := range integration.Capabilities() {
+		if !c.Vocabulary.InTaxonomy {
+			continue
+		}
+		for _, e := range tooltax.Table() {
+			if e.Tool != c.Tool {
+				continue
+			}
+			if !registered[e.ActionType] {
+				t.Errorf("adapter %q: tooltax row %q carries unregistered action type %q",
+					c.Tool, e.Native, e.ActionType)
+			}
+			if e.Category != tooltax.CategoryForActionType(e.ActionType) {
+				t.Errorf("adapter %q: tooltax row %q has category %q but action type %q "+
+					"is category %q", c.Tool, e.Native, e.Category, e.ActionType,
+					tooltax.CategoryForActionType(e.ActionType))
+			}
 		}
 	}
 }

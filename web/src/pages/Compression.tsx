@@ -107,6 +107,10 @@ export function CompressionPage() {
     () => deriveTotals(timeseries.data),
     [timeseries.data],
   );
+  // Kept undefined rather than defaulted, so the two tiles that show an
+  // estimated token count em-dash alongside the byte total they derive
+  // from instead of claiming a confident 0.
+  const tokensEst = totals.bytes === undefined ? undefined : totals.bytes / 4;
 
   return (
     <div className="space-y-6 p-6">
@@ -139,8 +143,8 @@ export function CompressionPage() {
             <>
               across {fmtInt(totals.events)} compression events ·{" "}
               {fmtBytes(totals.bytes)} trimmed from upstream payloads · ~
-              {fmtCompact(totals.bytes / 4)} tokens
-              {totals.evicted > 0 && (
+              {fmtCompact(tokensEst)} tokens
+              {(totals.evicted ?? 0) > 0 && (
                 <>
                   {" · "}
                   <Tooltip content={EVICTED_TOOLTIP}>
@@ -164,7 +168,7 @@ export function CompressionPage() {
           label="Tokens saved"
           icon={<DatabaseIcon />}
           loading={timeseries.loading}
-          value={fmtCompact(totals.bytes / 4)}
+          value={fmtCompact(tokensEst)}
           sub="≈ bytes ÷ 4 (Claude tokenizer)"
           spark={totals.sparkBytes}
           sparkColor="var(--tok-net)"
@@ -279,7 +283,7 @@ export function CompressionPage() {
       {/* Recent events table */}
       <ChartShell
         title="Recent compression events"
-        sub={`Latest events with per-row mechanism, savings, importance, message slot. ${events.data?.total ?? 0} total in window.`}
+        sub={`Latest events with per-row mechanism, savings, importance, message slot. ${fmtInt(events.data?.total)} total in window.`}
       >
         <ChartState
           loading={events.loading && !events.data}
@@ -369,16 +373,24 @@ export function CompressionPage() {
 
 // --------------------------------------------------------------- helpers
 
+// deriveTotals yields undefined — never 0 — for every metric when there
+// is no timeseries to total. StatCard's loading flag also goes false on
+// error, so an all-zero fallback stops pulsing and settles into a
+// confident "$0.00 saved across 0 events", which is a different claim
+// from "we don't know yet". The formatters in lib/format.ts are all
+// null-safe and render an em dash, so loading keeps the pulse and an
+// error settles to a STATIC em dash. Follow-up to e3847247, which fixed
+// the identical shape in Cost.tsx's summarize().
 function deriveTotals(ts?: CompressionTimeseries | null) {
   if (!ts) {
     return {
-      usd: 0,
-      bytes: 0,
-      evicted: 0,
-      events: 0,
-      days: 0,
+      usd: undefined,
+      bytes: undefined,
+      evicted: undefined,
+      events: undefined,
+      days: undefined,
       topMech: "",
-      topMechUSD: 0,
+      topMechUSD: undefined,
       sparkUsd: [] as number[],
       sparkBytes: [] as number[],
       sparkEvents: [] as number[],

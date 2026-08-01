@@ -38,6 +38,7 @@ the full two-plane explainer.
 
 - [Install](#install)
 - [Five-minute quickstart](#five-minute-quickstart)
+- [Zero-setup cost report: `observer usage`](#zero-setup-cost-report-observer-usage)
 - [Two planes, one binary](#two-planes-one-binary)
 - [Per-AI-client setup](#per-ai-client-setup)
 - [Architecture in detail](#architecture-in-detail)
@@ -103,6 +104,23 @@ the [main repo](https://github.com/superbasedapp/observer).
 
 ## Five-minute quickstart
 
+**No install at all, just a cost table:**
+
+```bash
+npx @superbased/observer            # a 30-day cost table, right now
+npx @superbased/observer usage      # the explicit, same-thing form
+```
+
+On a fresh machine with no SuperBased state yet, bare `npx
+@superbased/observer` scans each detected AI tool's own local session
+files into a throwaway temp database, prints one tool × model cost
+table, and deletes the database again — no daemon, no config written,
+no network call. See [Zero-setup cost report](#zero-setup-cost-report-observer-usage)
+below for what it does and doesn't do.
+
+**For the full local tool** — proxy-accurate tokens, live dashboard,
+conversation compression, cache tracking:
+
 ```bash
 # 1) Install.
 npm install -g @superbased/observer
@@ -142,6 +160,65 @@ tokens of schema per turn). Skip it for an MCP-free install.
 MCP and codex routing are explicit-only because both write per-client
 config files. Hooks self-heal on every `start`.
 
+
+## Zero-setup cost report: `observer usage`
+
+Before `observer start` and the daemon, there's a one-shot path for
+"how much have I spent so far": `observer usage` reads each detected
+AI tool's own local session files (JSONL / SQLite — the same files
+the watcher normally tails), rolls up the last 30 days into one
+tool × model cost table, and prints it. Everything it reads goes into
+a throwaway database in a temp directory (foreign-mount adapter
+mirrors — e.g. WSL reading a Windows-side tool store — land there too),
+deleted again when the command exits — it never creates or touches
+`~/.observer`, never writes any AI tool's config, and never opens a
+socket. Pricing is embedded in the binary (the same rate sheet the
+dashboard's Cost tab uses), so the whole run makes zero network calls.
+
+On a fresh machine with no SuperBased state yet — no
+`~/.observer/observer.db` and no `~/.observer/config.toml` — running
+bare `observer` with no arguments runs this same report instead of the
+usual welcome screen. Set `OBSERVER_ONESHOT=off` to always get the
+welcome screen instead; a default-config daemon can't run without
+first creating one of those two files, so there's no separate "is a
+daemon listening" check — no port probe, no network activity at all.
+Once either file exists on the machine, the fallthrough stops firing
+on its own and bare `observer` goes back to the welcome screen —
+`observer usage` stays available as an explicit command regardless.
+
+The report is honest about its own limits: reliability is **log
+tier** — parsed from each tool's own self-reported counts, not the
+wire-accurate numbers the proxy captures — and every dollar figure is
+labeled `estimated list price, not invoiced`. When it's ready for
+more, `observer start` is the next step: it keeps the proxy, the
+watcher, and the dashboard running so cost, cache, and compression
+numbers stay current instead of being recomputed from scratch on
+every invocation.
+
+Flags: `--since` (`7d`/`30d`/`90d`/`all`/an RFC3339 timestamp, default
+`30d`), `--group-by` (`tool-model`/`tool`/`model`/`day`), `--tool`,
+`--budget` (wall-clock cap on the scan only, default `30s`, `0` =
+unlimited — on expiry the table still prints with a `partial:`
+footer), `--json`, and `--keep-db <path>` to keep the scratch database
+instead of deleting it. See `observer usage --help` for the full
+reference.
+
+## A wordmarked one-line status: `observer statusline`
+
+For an always-on glance instead of an on-demand report, `observer
+statusline` prints exactly one line — a short `▞ superbased` wordmark plus
+(when the data is available that invocation) the current session's
+cost, today's total observed spend, and the active model name — sized
+for a terminal prompt (Claude Code's `statusLine` contract) or any host
+tool that execs a command and reads its stdout. It's fail-open by
+design: with no daemon running it degrades to the wordmark alone (and
+makes no network call of any kind to find that out), and with a daemon
+running the only network-shaped call it makes is a bounded loopback
+request to that same-machine daemon. Every dollar figure is an
+estimated list-price total, not an invoiced amount. Registration is
+opt-in (`observer init --statusline`) — never automatic. See
+[`docs/observer-statusline.md`](https://github.com/superbasedapp/observer/blob/main/docs/observer-statusline.md)
+for the full reference.
 
 ## Two planes, one binary
 

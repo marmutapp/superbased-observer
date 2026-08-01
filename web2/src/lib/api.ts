@@ -45,6 +45,46 @@ function withDaysTool(days?: number, tool?: string): string {
 
 // --- wire types ------------------------------------------------------------
 
+// OrgAnnouncement is the plan §1 banner shape, identical on every rail.
+// `source` is asserted by the SERVER (always "org" here) — the composer
+// never sends it, because provenance is not the caller's to claim.
+export interface OrgAnnouncement {
+  id: string;
+  severity: "info" | "notice" | "critical";
+  title: string;
+  body: string;
+  url?: string;
+  expires_at: string;
+  source: "release" | "org";
+}
+
+// OrgAnnouncementDraft is what the composer POSTs: the §1 fields minus
+// `source`.
+export type OrgAnnouncementDraft = Omit<OrgAnnouncement, "source">;
+
+// OrgAnnouncementCurrent is GET /api/org/announcement — what the fleet
+// is being served right now. `published: false` is the never-published
+// empty state (a 200, not an error); `retracted: true` means the newest
+// version is the empty document, i.e. nodes are showing nothing.
+export interface OrgAnnouncementCurrent {
+  published: boolean;
+  version: number;
+  retracted: boolean;
+  announcements: OrgAnnouncement[];
+}
+
+// OrgAnnouncementPublishResult is the signed document the server stored.
+// Body/hash/signature are surfaced for transparency, not for the UI to
+// verify — verification happens on the agent against its pinned key.
+export interface OrgAnnouncementPublishResult {
+  version: number;
+  body: string;
+  body_hash: string;
+  signature: string;
+  public_key: string;
+}
+
+
 export interface CostPoint {
   date: string;
   cost_usd: number;
@@ -287,6 +327,13 @@ export interface SeatStats {
   active: number;
   inactive: number;
   utilization: number;
+  /** Configured plan price. Absent when the server was not told the price —
+   *  which is NOT the same as the seats being free, so it must not render 0. */
+  per_seat_price_usd?: number;
+  /** total × per_seat_price_usd. A point-in-time MONTHLY SUBSCRIPTION — never
+   *  add it to VendorTelemetry.cost_usd, which is additive per-day metered
+   *  overage. Keeping the two apart is the cross-vendor unit trap. */
+  monthly_usd?: number;
 }
 export interface VendorTelemetry {
   vendor: string;
@@ -911,6 +958,35 @@ export interface MembersResult {
   members: Member[];
 }
 
+// MintedEnrolmentToken is the mint response. token is shown ONCE — the server
+// stores only its argon2id hash. minted_this_month / monthly_cap are present
+// only for a delegated (member) mint; an admin mint is uncapped.
+export interface MintedEnrolmentToken {
+  token: string;
+  token_id: string;
+  user_id: string;
+  user_email?: string;
+  expires_at: string;
+  minted_this_month?: number;
+  monthly_cap?: number;
+}
+
+// EnrolmentTokenRow mirrors orgserver.enrolmentTokenDTO. No token material —
+// only the non-secret token_id, the owner, the inviter, and lifecycle state.
+export interface EnrolmentTokenRow {
+  token_id: string;
+  user_email: string;
+  minted_by_email?: string;
+  created_at: string;
+  expires_at: string;
+  used_at?: string;
+  redeemed: boolean;
+  expired: boolean;
+}
+export interface EnrolmentTokensResult {
+  tokens: EnrolmentTokenRow[];
+}
+
 // --- guard wire types (mirror rollup.Guard* — guard spec §14.3 / §14.5) -----
 
 export interface GuardTrendPoint {
@@ -1139,12 +1215,20 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ team_id: teamId, user_id: userId, role }),
     }),
-  mintEnrolmentToken: (userId: string, ttlDays?: number) =>
-    request<{ token: string; token_id: string; user_id: string; expires_at: string }>(
-      "/api/org/enrolment-tokens",
-      { method: "POST", body: JSON.stringify({ user_id: userId, ttl_days: ttlDays }) },
-    ),
+  // Mint an enrolment token. Address the target by user_id OR by email —
+  // exactly one; email is what an inviting MEMBER knows (the member list is
+  // an admin-only read). Both resolve to an EXISTING active member: minting
+  // never provisions an account.
+  mintEnrolmentToken: (target: { userId?: string; email?: string }, ttlDays?: number) =>
+    request<MintedEnrolmentToken>("/api/org/enrolment-tokens", {
+      method: "POST",
+      body: JSON.stringify({ user_id: target.userId, email: target.email, ttl_days: ttlDays }),
+    }),
   listOrgMembers: () => request<MembersResult>("/api/org/members"),
+  // Admin-only rail: outstanding + redeemed enrolment tokens, with the
+  // inviter (minted_by_email) and redemption state — the invite→enrolment
+  // conversion view. Carries no token material (only the non-secret id).
+  listEnrolmentTokens: () => request<EnrolmentTokensResult>("/api/org/enrolment-tokens"),
 
   // Guard rollups + policy authoring (guard spec §14.3 / §14.5).
   guardOverview: (days?: number) =>
@@ -1168,5 +1252,26 @@ export const api = {
     request<GuardPolicyPublishResult>("/api/org/guard/policy/publish", {
       method: "POST",
       body: JSON.stringify({ bundle_toml: bundleToml, description }),
+    }),
+
+  // Org announcements (rail R3 of
+  // docs/plans/dashboard-announcements-banner-plan-2026-07-31.md §4).
+  // Publishing is an AUDITED admin mutation behind the same SAML admin
+  // gate as enrolment-token minting; the agent-facing fetch route is a
+  // different endpoint entirely (/api/agent/announcement, bearer-only)
+  // and is never called from this dashboard.
+  orgAnnouncement: () => request<OrgAnnouncementCurrent>("/api/org/announcement"),
+  orgAnnouncementPublish: (a: OrgAnnouncementDraft) =>
+    request<OrgAnnouncementPublishResult>("/api/org/announcement", {
+      method: "POST",
+      body: JSON.stringify({ announcement: a }),
+    }),
+  // Retraction is its OWN named intent, never "publish an empty
+  // announcement": the server refuses an empty request precisely so a
+  // dropped payload can never be read as "clear the fleet's banner".
+  orgAnnouncementRetract: () =>
+    request<OrgAnnouncementPublishResult>("/api/org/announcement", {
+      method: "POST",
+      body: JSON.stringify({ retract: true }),
     }),
 };

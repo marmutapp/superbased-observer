@@ -77,8 +77,12 @@ export function Sidebar({
   open?: boolean;
   onClose?: () => void;
 } = {}) {
-  // Live-capture refresh: 5s on the status snapshot keeps the
-  // sidebar's nav counts current as fresh actions land.
+  // Live-capture refresh: 5s on the status snapshot, so the sidebar's nav
+  // counts follow fresh activity within seconds. Note the 5s is the POLL
+  // cadence, not the freshness guarantee — the daemon memoizes /api/status
+  // for ~15s because it is an unfiltered scan of every table, so on a large
+  // database a count can lag reality by up to ~20s. Fine for badges; do not
+  // build anything that needs to-the-second accuracy on these numbers.
   const status = useApi<StatusSnapshot>("/api/status", undefined, [], { refreshMs: 5000 });
   const setupClaude = useApi<SetupClaude>("/api/setup/claude");
   // Watcher health (P1.7): behind/orphan/misroute counts only — a
@@ -366,9 +370,17 @@ function Foot({
   const proxyOn =
     setup != null &&
     (setup.status === "oauth_ready" || setup.status === "api_key_ready");
-  // Watcher-lag signal (P1.7): files the watcher is behind on risk
-  // dropped capture; misroute/orphan cursors mean rows silently not
-  // landing. Surface a warn line the moment either is non-zero.
+  // Watcher-lag signal (P1.7): transcripts the watcher is behind on
+  // risk dropped capture; misroute/orphan cursors mean rows silently
+  // not landing. Surface a warn line the moment either is non-zero.
+  //
+  // Both counts arrive already filtered by cursor semantics: rows
+  // whose saved cursor is a SQLite watermark, whose store is
+  // encrypted, or which never emit actions by design are excluded
+  // server-side (they're still listed in `files` with a cursor_kind +
+  // excluded_reason). Without that filter these numbers were
+  // dominated by files the recovery flow can never close, so the warn
+  // line could never go away — see help "glossary.watcher_lag".
   const lagging = (watcher?.behind_count ?? 0) > 0;
   const misrouted = (watcher?.suspected_misrouted_count ?? 0) > 0;
   return (
@@ -399,11 +411,12 @@ function Foot({
           maxWidth={320}
           content={
             (lagging
-              ? `Watcher is behind on ${watcher!.behind_count} file(s) (${fmtBytes(watcher!.behind_total_bytes)} unread) — recent activity may not be captured yet. A rescan (Settings → Backfill) catches up if it persists. `
+              ? `Watcher is behind on ${watcher!.behind_count} append-only transcript(s) (${fmtBytes(watcher!.behind_total_bytes)} unread) — recent activity may not be captured yet. A rescan (Settings → Backfill) catches up if it persists. `
               : "") +
             (misrouted
-              ? `${watcher!.suspected_misrouted_count} session file(s) look misrouted (cursor at EOF, zero rows emitted).`
-              : "")
+              ? `${watcher!.suspected_misrouted_count} transcript(s) look misrouted (cursor at EOF, zero rows emitted). `
+              : "") +
+            "Files whose cursor is a SQLite watermark, whose store is encrypted, or that only ever carry tokens are excluded from both counts — that comparison can't close, so counting it would pin this warning on forever."
           }
         >
           {/* tabIndex={0} makes the warning keyboard-focusable so the Tooltip

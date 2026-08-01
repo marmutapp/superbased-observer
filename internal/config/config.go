@@ -2263,6 +2263,25 @@ type DashboardConfig struct {
 	// path). Validated as host:port with a numeric port at load; the
 	// remote-bind policy is enforced separately at bind time.
 	Addr string `toml:"addr"`
+	// OrgAnnouncements gates rail R3 of the announcements plan (§4):
+	// whether the banner shows announcements published by the org this
+	// node is enrolled with. Default TRUE — enrolment already implies
+	// consent to org communication, so silently swallowing the admin's
+	// message would be the dishonest default; and on a solo install the
+	// switch is inert (there is no org cache to read).
+	//
+	// This is the node operator's OWN opt-out and it lives only here:
+	// the org admin has no remote toggle for it, the same posture as
+	// [org_client.share].full_content. Turning it off never affects
+	// push, enrolment, or the release rail — the dashboard simply stops
+	// reading the cached document.
+	//
+	// Default() seeds it true so the loader's partial-merge keeps it
+	// true for an existing config that has a [dashboard] section with
+	// only `addr` in it (the CacheTrack partial-merge rule) — without
+	// that seed, adding the key would have silently disabled the rail
+	// for every install that had ever set a dashboard address.
+	OrgAnnouncements bool `toml:"org_announcements"`
 }
 
 // CompressionConfig groups all four compression layers' toggles.
@@ -2800,6 +2819,14 @@ func Default() Config {
 				AllowNonLoopback: false,
 				ContentCapture:   ContentCaptureFull,
 			},
+		},
+		// Dashboard: the org-announcements rail (announcements plan §4)
+		// is default-ON. Seeded here so the partial-merge rule holds —
+		// an existing config with only [dashboard].addr set must keep
+		// the rail on, not inherit a zero-value false. Addr stays empty
+		// (the built-in 127.0.0.1:8081 default resolves in cmd).
+		Dashboard: DashboardConfig{
+			OrgAnnouncements: true,
 		},
 		// CacheTrack is default-ON per spec §11: local, passive,
 		// network-free, hashes/counts/enums only. An install with

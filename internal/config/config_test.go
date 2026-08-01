@@ -1119,3 +1119,41 @@ func TestValidateAcceptsDisabledAlertsWithBadRule(t *testing.T) {
 		t.Fatalf("disabled alerts should not validate rules: %v", err)
 	}
 }
+
+// TestDashboardOrgAnnouncementsDefaults pins the rail-R3 opt-out
+// (docs/plans/dashboard-announcements-banner-plan-2026-07-31.md §4):
+// default-ON, explicitly overridable to false, and — the leg that
+// actually bites — a PARTIAL [dashboard] section that sets only `addr`
+// must NOT silently disable the rail (the cachetrack partial-merge
+// bug class: every install that had ever set a dashboard address would
+// have lost org announcements the day the key was added).
+func TestDashboardOrgAnnouncementsDefaults(t *testing.T) {
+	t.Parallel()
+	if !Default().Dashboard.OrgAnnouncements {
+		t.Error("[dashboard].org_announcements must default to true")
+	}
+
+	write := func(t *testing.T, body string) Config {
+		t.Helper()
+		cfgPath := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(cfgPath, []byte(body), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		cfg, err := Load(LoadOptions{GlobalPath: cfgPath})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		return cfg
+	}
+
+	if cfg := write(t, "[observer]\ndb_path = \"/tmp/x.db\"\n"); !cfg.Dashboard.OrgAnnouncements {
+		t.Error("no [dashboard] section should keep the rail on")
+	}
+	if cfg := write(t, "[dashboard]\naddr = \"127.0.0.1:8099\"\n"); !cfg.Dashboard.OrgAnnouncements {
+		t.Error("a partial [dashboard] section (addr only) silently disabled the org rail")
+	}
+	cfg := write(t, "[dashboard]\norg_announcements = false\n")
+	if cfg.Dashboard.OrgAnnouncements {
+		t.Error("org_announcements = false must override the default")
+	}
+}

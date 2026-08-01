@@ -27,6 +27,13 @@ type toolProbe struct {
 	// Partial: some but not all managed entries are registered
 	// (hooks only — a subset of events point at the observer).
 	Partial bool `json:"partial,omitempty"`
+	// ViaPlugin: the integration is wired through the AI tool's OWN
+	// plugin surface (the SuperBased Observer Claude Code plugin), not
+	// through a config file `observer init` wrote. This is a THIRD state,
+	// distinct both from unregistered and from init-registered: the
+	// wiring is live, so Registered is true, but re-running init would
+	// deliberately write nothing.
+	ViaPlugin bool `json:"via_plugin,omitempty"`
 	// Detail is a one-line human explanation (counts, conflict text,
 	// or the setup status word).
 	Detail string `json:"detail,omitempty"`
@@ -169,9 +176,25 @@ func (s *Server) hookProbe(tool string) *toolProbe {
 	if err != nil {
 		return &toolProbe{Detail: "probe failed: " + err.Error()}
 	}
-	res := reg.Register(tool)
+	return hookProbeFromResult(reg.Register(tool))
+}
+
+// hookProbeFromResult is the pure result→status mapping, split out so
+// the states can be exercised without a registry and a real home dir.
+func hookProbeFromResult(res hook.RegistrationResult) *toolProbe {
 	if res.Error != nil {
 		return &toolProbe{Detail: res.Error.Error()}
+	}
+	// The registrar declined to write because the tool's own plugin
+	// already declares these hooks. That is WIRED, not unregistered —
+	// falling through would render "registered=false / would register 0
+	// events", telling the user to fix something already working.
+	if res.Skipped {
+		return &toolProbe{
+			Registered: true,
+			ViaPlugin:  true,
+			Detail:     "wired via the Claude Code plugin — " + res.SkipReason,
+		}
 	}
 	p := &toolProbe{
 		Registered: len(res.AlreadySet) > 0 && len(res.HooksAdded) == 0,
@@ -200,9 +223,24 @@ func (s *Server) mcpProbe(tool string) *toolProbe {
 	if err != nil {
 		return &toolProbe{Detail: "probe failed: " + err.Error()}
 	}
-	res := reg.Register(tool)
+	return mcpProbeFromResult(reg.Register(tool))
+}
+
+// mcpProbeFromResult is the pure result→status mapping, split out for
+// the same reason as hookProbeFromResult.
+func mcpProbeFromResult(res mcp.RegistrationResult) *toolProbe {
 	if res.Error != nil {
 		return &toolProbe{Detail: res.Error.Error()}
+	}
+	// Same third state as hookProbeFromResult: the plugin's own .mcp.json
+	// already declares this server, so the registrar wrote nothing on
+	// purpose. Rendering "not registered" here would be false.
+	if res.Skipped {
+		return &toolProbe{
+			Registered: true,
+			ViaPlugin:  true,
+			Detail:     "wired via the Claude Code plugin — " + res.SkipReason,
+		}
 	}
 	p := &toolProbe{Registered: res.AlreadySet}
 	if res.AlreadySet {

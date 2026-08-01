@@ -1,8 +1,9 @@
 package models
 
 import (
-	"strings"
 	"time"
+
+	"github.com/marmutapp/superbased-observer/internal/tooltax"
 )
 
 // IsMCPToolName reports whether a raw tool name is an MCP tool call in the
@@ -13,8 +14,14 @@ import (
 // `use_mcp_tool` — map those names explicitly rather than through this
 // predicate. Keeping the "what is an MCP tool name" test in one place
 // keeps the detection consistent across adapters.
+//
+// Thin wrapper: internal/tooltax.MCPIdentity is the SINGLE Go owner of
+// the `mcp__<server>__<tool>` parse (taxonomy plan §1). tooltax imports
+// nothing project-internal, so this dependency direction is acyclic by
+// construction. Behaviour is unchanged — MCPIdentity's ok result is
+// exactly the `mcp__` prefix test this function has always been.
 func IsMCPToolName(name string) bool {
-	return strings.HasPrefix(name, "mcp__")
+	return tooltax.IsMCPToolName(name)
 }
 
 // Tool identifiers. These are the stable string values stored in the `tool`
@@ -370,18 +377,72 @@ const (
 	// / TaskOutput / TaskStop — administrative tools the agent uses to
 	// track its own work plan. Distinct from spawn_subagent (Agent) and
 	// from task_complete (legacy).
-	ActionTodoUpdate   = "todo_update"
+	ActionTodoUpdate = "todo_update"
+	// ActionTaskComplete is an EVIDENCE-GROUNDED turn terminus: a row an
+	// adapter emits because the source stream said the turn ended, not
+	// because the assistant happened to speak. The contract is narrow on
+	// purpose — a row may only carry this type when the harness itself
+	// supplies the terminal signal:
+	//
+	//   - a stop/finish reason on the message (openclaw
+	//     `message.assistant.stop`, gated on StopReason=="stop"; kilo-code-cli
+	//     `assistant.stop`; opencode `complete:` rows),
+	//   - a dedicated terminal event in the wire format (codex's
+	//     `event_msg`/`task_complete`),
+	//   - a turn-terminal HOOK firing (claude-code's Stop hook,
+	//     cmd/observer/hook.go::buildClaudeStopEvent), or
+	//   - a native completion tool the model called on purpose (cline
+	//     `attempt_completion`, cline-cli `submit_and_exit`).
+	//
+	// It is NOT the label for the assistant merely producing text — use
+	// ActionAssistantMessage for that. See its doc comment for the
+	// exemplar pattern the whole family converges on.
 	ActionTaskComplete = "task_complete"
 	ActionAskUser      = "ask_user"
 	ActionUserPrompt   = "user_prompt"
 	// ActionAssistantMessage is the model's natural-language response text
-	// (an assistant message / agent reply). Historically adapters recorded
-	// this as ActionTaskComplete with RawToolName "<tool>.assistant_text",
-	// which is the wrong semantic label (the assistant talking is not a task
-	// completion). New/swept adapters use this dedicated type; the dashboard
-	// assistant-text surface keys off the RawToolName "<tool>.assistant_text"
-	// suffix (not the ActionType), so the relabel is display-safe. Reasoning
-	// rows reuse "<tool>.reasoning"; this is for the spoken response.
+	// (an assistant message / agent reply), recorded PER MESSAGE — one row
+	// per text block / text part / prose chunk, mid-turn rows included.
+	// Adapters emit it with RawToolName "<tool>.assistant_text".
+	//
+	// The exemplar is openclaw (internal/adapter/openclaw/adapter.go): each
+	// text part of an assistant message becomes an `openclaw.assistant_text`
+	// assistant_message row, AND a separate, stop-reason-gated
+	// `message.assistant.stop` row carries ActionTaskComplete. Two raw
+	// names, two action types, one unambiguous meaning each — per-message
+	// text and turn terminus are different facts and get different rows.
+	// claude-code is the same shape across two producers: the JSONL walker
+	// emits the per-block assistant_message rows, its Stop hook emits the
+	// task_complete one.
+	//
+	// Historically most adapters recorded assistant text as
+	// ActionTaskComplete, which conflated the two facts (an assistant
+	// narrating mid-turn is not a task completion — 85% of claude-code and
+	// codex turns carry more than one such row). WP-T6/B2 swept the
+	// remaining emit sites and migration 078 repairs the rows already on
+	// disk, EXCEPT the claude-code Stop-hook rows, which are genuinely
+	// terminal and keep task_complete.
+	//
+	// The dashboard assistant-text surface keys off the RawToolName
+	// "<tool>.assistant_text" suffix (not the ActionType), and both types
+	// sit in tooltax CategoryMeta, so the relabel is display- and
+	// aggregate-safe. This type is for the spoken response only —
+	// chain-of-thought must not be folded into it.
+	//
+	// Reasoning is NOT an action and has no action type (WP-T6/B3,
+	// resolved 2026-07-31). A model thinking is not something it DID: the
+	// chain-of-thought rides the successor event's PrecedingReasoning
+	// column and never becomes a row of its own. The reference shape is
+	// grok (internal/adapter/grok/adapter.go): capture the thinking into
+	// pending state, flush it onto the next assistant-message / tool-call
+	// event, scrub at flush, discard at the user-turn boundary. The
+	// CONSUMPTION semantics are deliberately per-adapter — consumed-once
+	// (grok/crush/hermes/cline-cli/antigravity), fan-out
+	// (cline/cowork/codex-per-turn), shared-preamble (openclaw) — each
+	// documented at its own emit site, because they track how the source
+	// format scopes a preamble. An opaque placeholder (codex's
+	// "(encrypted reasoning, N bytes)") is not content and is threaded
+	// nowhere: it simply vanishes.
 	ActionAssistantMessage = "assistant_message"
 	// ActionTurnAborted is a turn that was interrupted before completion
 	// (user pressed esc, cancelled the agent, etc.). Distinct from
@@ -564,7 +625,64 @@ const (
 	// is scrubbed into RawToolInput; typed fields land on
 	// ActionMetadata.RateLimit*.
 	ActionRateLimit = "rate_limit"
-	ActionUnknown   = "unknown"
+
+	// The agent-orchestration + harness family, added by the tool-taxonomy
+	// plan (docs/plans/tool-taxonomy-standardization-plan-2026-07-31.md
+	// §1/§6 WP-T4). They close the measured `unknown` gap that migration
+	// 024's comment deferred as "a separate taxonomy decision": the codex
+	// wait/wait_agent/spawn_agent/send_message/write_stdin family and the
+	// claude-code ToolSearch/Monitor/SendMessage/Skill/ScheduleWakeup/
+	// StructuredOutput family. internal/tooltax re-declares these VALUES
+	// (it may not import this package); migration 077 backfills the
+	// historical rows.
+
+	// ActionSubagentWait is a blocking wait on one or more already-spawned
+	// sub-agents (codex `wait` / `wait_agent`). Distinct from
+	// ActionSpawnSubagent (the launch) and from ActionSubagentStart /
+	// ActionSubagentStop (the child's own lifecycle bracket) — this row is
+	// the PARENT blocking on a child.
+	ActionSubagentWait = "subagent_wait"
+	// ActionAgentMessage is an inter-agent message: work or instructions
+	// handed to an EXISTING agent thread rather than to a new one (codex
+	// `send_message` / `followup_task`, claude-code `SendMessage`).
+	ActionAgentMessage = "agent_message"
+	// ActionAgentControl is an orchestration verb that neither spawns,
+	// waits, nor messages — enumerating, inspecting or interrupting the
+	// agent/thread pool (codex `list_agents` / `interrupt_agent` /
+	// `read_thread` / `list_threads` / `read_thread_terminal`,
+	// claude-code `Monitor`).
+	ActionAgentControl = "agent_control"
+	// ActionSkillInvoke is a skill / packaged-instruction-set invocation
+	// (claude-code `Skill`). It is countable separately from MCP tool use
+	// on purpose; note the cowork adapter deliberately folds its own
+	// `Skill` into ActionMCPCall, which stays a cowork-specific semantic
+	// remap rather than being flattened here.
+	ActionSkillInvoke = "skill_invoke"
+	// ActionSchedule is a scheduling primitive: register / inspect /
+	// cancel a future or recurring agent run (claude-code
+	// `ScheduleWakeup` / `CronCreate` / `CronDelete` / `CronList`). The
+	// droid adapter maps its own Cron*/Automation* family to
+	// ActionConfigChange instead ("the closest honest bucket",
+	// droid/records.go) — a recorded divergence, not an oversight.
+	ActionSchedule = "schedule"
+	// ActionToolSearch is the deferred-tool loader: the agent searching
+	// the tool REGISTRY for a tool to load (claude-code `ToolSearch`). It
+	// is a search over the harness, not over the project, which is why it
+	// is not ActionSearchText / ActionSearchFiles.
+	ActionToolSearch = "tool_search"
+	// ActionStdinWrite writes to the stdin of a live agent / exec session
+	// (codex `write_stdin`). It is the channel into an ALREADY-RUNNING
+	// thread, not a fresh shell invocation, so it is not ActionRunCommand.
+	ActionStdinWrite = "stdin_write"
+	// ActionHarnessCall is the honest bucket for host-harness builtins
+	// that are neither file, command, search, web, agent, skill nor MCP
+	// work — claude-code `StructuredOutput` / `SendUserFile` / `Artifact`
+	// / `Workflow`, codex `imagegen`, copilot-cli `report_intent`, the
+	// `<tool>.step_finish` turn markers. It exists so these stop being
+	// indistinguishable from genuinely unmapped tools in ActionUnknown.
+	ActionHarnessCall = "harness_call"
+
+	ActionUnknown = "unknown"
 )
 
 // Freshness classifications for file and command accesses. See spec §7.
@@ -969,6 +1087,42 @@ type ToolEvent struct {
 	// ToolEvent → Action conversion in store.Ingest. Nil when the
 	// adapter has no metadata to record. See [ActionMetadata].
 	Metadata *ActionMetadata
+	// OutcomePending marks a tool call whose in-window outcome was
+	// never observed: the parse window ended before the tool_result
+	// record, so Success=true here is optimistic, not measured.
+	// Failure-context bookkeeping must wait for the matching
+	// [ActionOutcomeUpdate] — recording it at insert time would file
+	// an unobserved success, wrongly marking prior failures of the
+	// same command eventually_succeeded. The action row itself still
+	// inserts normally.
+	OutcomePending bool
+}
+
+// ActionOutcomeUpdate carries the late-arriving outcome of an already-
+// persisted action: a tool_result parsed in a LATER watcher tick than the
+// tool_use that created the row. Keyed by the action's
+// (SourceFile, SourceEventID) uniqueness pair. Applied via
+// Store.UpdateActionOutcome, whose merge rules hold: success is
+// authoritative, error_message only written when non-empty, duration
+// only backfills a zero, output length-merges.
+//
+// It deliberately carries no tool name / target: cross-tick the parser
+// has already forgotten them (the tool_use lives in the previous parse
+// window). The FTS index call tolerates the empty strings.
+type ActionOutcomeUpdate struct {
+	SourceFile    string
+	SourceEventID string
+	// SuccessKnown gates the Success field. False (the zero value, so
+	// the safe default for a parser that forgets to set it) means the
+	// result record reported no verdict and the persisted success
+	// column must be left exactly as it is — writing an invented
+	// success would flip a row an earlier telemetry record already
+	// marked failed. True means Success is authoritative.
+	SuccessKnown bool
+	Success      bool
+	ErrorMessage string
+	ToolOutput   string
+	DurationMs   int64
 }
 
 // TokenEvent is the adapter → storage transport type for per-turn token

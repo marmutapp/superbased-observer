@@ -119,9 +119,17 @@ func TestParseSessionFile_DebugLogMainJSONL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseSessionFile: %v", err)
 	}
-	// 4: user_prompt + todo_update + copilot.reasoning + assistant_message.
-	if len(res.ToolEvents) != 4 {
-		t.Fatalf("ToolEvents: got %d want 4", len(res.ToolEvents))
+	// 3: user_prompt + todo_update + assistant_message. B3
+	// (2026-07-31): attrs.reasoning no longer mints a standalone
+	// `copilot.reasoning` row — it rides the assistant_message's
+	// PrecedingReasoning (asserted below).
+	if len(res.ToolEvents) != 3 {
+		t.Fatalf("ToolEvents: got %d want 3", len(res.ToolEvents))
+	}
+	for _, ev := range res.ToolEvents {
+		if strings.Contains(strings.ToLower(ev.RawToolName), "reasoning") {
+			t.Fatalf("reasoning-named action row emitted: raw=%q %#v", ev.RawToolName, ev)
+		}
 	}
 	if len(res.TokenEvents) != 1 {
 		t.Fatalf("TokenEvents: got %d want 1", len(res.TokenEvents))
@@ -158,19 +166,20 @@ func TestParseSessionFile_DebugLogMainJSONL(t *testing.T) {
 	if res.ToolEvents[1].ToolOutput != "No todo list found." {
 		t.Fatalf("tool event output mismatch: %#v", res.ToolEvents[1])
 	}
-	// [2] = standalone reasoning row (from attrs.reasoning), [3] = the
-	// assistant_message response.
-	if res.ToolEvents[2].RawToolName != "copilot.reasoning" {
-		t.Fatalf("reasoning row mismatch: %#v", res.ToolEvents[2])
+	// [2] = the assistant_message response, carrying attrs.reasoning as
+	// PrecedingReasoning (B3: reasoning is never an action row).
+	if res.ToolEvents[2].ActionType != models.ActionAssistantMessage {
+		t.Fatalf("assistant message mismatch: %#v", res.ToolEvents[2])
 	}
-	if res.ToolEvents[3].ActionType != models.ActionAssistantMessage {
-		t.Fatalf("assistant message mismatch: %#v", res.ToolEvents[3])
+	if res.ToolEvents[2].MessageID != "assistant:user-1" {
+		t.Fatalf("assistant message_id mismatch: %#v", res.ToolEvents[2])
 	}
-	if res.ToolEvents[3].MessageID != "assistant:user-1" {
-		t.Fatalf("assistant message_id mismatch: %#v", res.ToolEvents[3])
+	if !strings.Contains(res.ToolEvents[2].ToolOutput, "How can I help") {
+		t.Fatalf("assistant output mismatch: %#v", res.ToolEvents[2])
 	}
-	if !strings.Contains(res.ToolEvents[3].ToolOutput, "How can I help") {
-		t.Fatalf("assistant output mismatch: %#v", res.ToolEvents[3])
+	if res.ToolEvents[2].PrecedingReasoning != "Responding to greetings" {
+		t.Fatalf("assistant PrecedingReasoning = %q, want the threaded attrs.reasoning",
+			res.ToolEvents[2].PrecedingReasoning)
 	}
 
 	if res.TokenEvents[0].Model != "oswe-vscode-prime" {
@@ -211,5 +220,49 @@ func TestParseSessionFile_MalformedLineSkipped(t *testing.T) {
 	}
 	if len(res.Warnings) != 1 {
 		t.Fatalf("Warnings: got %d want 1", len(res.Warnings))
+	}
+}
+
+// TestParseSessionFile_ReasoningNeverMintsAnAction is the B3 regression
+// pin for the CLI-debug-log path: `agent_response.attrs.reasoning`
+// produces NO action row of its own, only the sibling assistant_message
+// row's PrecedingReasoning — and a reasoning-only agent_response (no
+// response text) produces nothing at all, since there is no successor
+// event to carry it.
+func TestParseSessionFile_ReasoningNeverMintsAnAction(t *testing.T) {
+	lines := []string{
+		`{"v":1,"ts":1776928112439,"dur":0,"sid":"sess-b3","type":"session_start","name":"session_start","spanId":"session-start","status":"ok","attrs":{"copilotVersion":"0.45.0"}}`,
+		`{"ts":1776928112440,"dur":0,"sid":"sess-b3","type":"user_message","name":"user_message","spanId":"user-1","status":"ok","attrs":{"content":"do the thing"}}`,
+		// Reasoning-only agent_response — nothing to carry it.
+		`{"ts":1776928154900,"dur":0,"sid":"sess-b3","type":"agent_response","name":"agent_response","spanId":"agent-0","parentSpanId":"user-1","status":"ok","attrs":{"reasoning":"LONELY_REASONING"}}`,
+		// Reasoning + response text — the assistant row carries it.
+		`{"ts":1776928154966,"dur":0,"sid":"sess-b3","type":"agent_response","name":"agent_response","spanId":"agent-1","parentSpanId":"user-1","status":"ok","attrs":{"response":"[{\"role\":\"assistant\",\"parts\":[{\"type\":\"text\",\"content\":\"Done.\"}]}]","reasoning":"THREADED_REASONING"}}`,
+	}
+	path := writeFixture(t, lines)
+
+	res, err := New().ParseSessionFile(context.Background(), path, 0)
+	if err != nil {
+		t.Fatalf("ParseSessionFile: %v", err)
+	}
+	var assistantRows int
+	for _, ev := range res.ToolEvents {
+		if strings.Contains(strings.ToLower(ev.RawToolName), "reasoning") {
+			t.Fatalf("reasoning-named action row emitted: raw=%q %#v", ev.RawToolName, ev)
+		}
+		if ev.Target == "LONELY_REASONING" || ev.ToolOutput == "LONELY_REASONING" ||
+			ev.Target == "THREADED_REASONING" || ev.ToolOutput == "THREADED_REASONING" {
+			t.Fatalf("reasoning body surfaced as action content: %#v", ev)
+		}
+		if ev.ActionType != models.ActionAssistantMessage {
+			continue
+		}
+		assistantRows++
+		if ev.PrecedingReasoning != "THREADED_REASONING" {
+			t.Errorf("assistant PrecedingReasoning = %q, want THREADED_REASONING", ev.PrecedingReasoning)
+		}
+	}
+	if assistantRows != 1 {
+		t.Fatalf("assistant_message rows = %d, want 1 (the reasoning-only response emits nothing): %#v",
+			assistantRows, res.ToolEvents)
 	}
 }

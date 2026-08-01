@@ -9,21 +9,52 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![Platforms: Linux • macOS • Windows](https://img.shields.io/badge/platforms-linux%20%7C%20macos%20%7C%20windows-blue.svg)](#install)
 [![Go 1.22+](https://img.shields.io/badge/go-1.22%2B-blue.svg)](https://go.dev/)
+[![⭐ Star this repo](https://img.shields.io/badge/⭐-Star_this_repo-yellow.svg)](https://github.com/superbasedapp/observer)
+
+If SuperBased catches something useful in your next bill, a star helps
+other people looking for the same thing find it.
 
 <p align="center">
   <img src="docs/assets/infographics/one-local-path.png" alt="One local path for AI coding activity" width="780">
 </p>
 
+## Try it in one command
+
+```bash
+npx @superbased/observer
+```
+
+On a fresh machine — no `~/.observer/observer.db`, no
+`~/.observer/config.toml` — this scans every AI coding tool's own
+local session files into a throwaway temp database, prints one cost
+table grouped by tool and model, and deletes the database again before
+it exits. It's local-only: zero network calls, and nothing is written
+outside that temp directory (foreign-mount adapter mirrors — e.g. WSL
+reading a Windows-side tool store — are redirected there too; pricing
+is embedded in the binary, not fetched at runtime).
+
+Already have SuperBased set up (or want the explicit form)? Run
+`observer usage`. Bare `observer` only runs the one-shot on a machine
+with no local SuperBased state at all — otherwise it prints the usual
+welcome screen (`OBSERVER_ONESHOT=off` to always get the welcome
+screen). This is the zero-config sibling of `observer cost`: `usage`
+rolls up whatever session files it finds into a throwaway DB; `cost`
+queries the DB you've actually been capturing into with `observer
+scan` / `observer start` — including any proxy-accurate turns. Full
+reference: [`docs/one-shot-usage-report.md`](docs/one-shot-usage-report.md).
+
 ---
 
 ## Table of contents
 
+- [Try it in one command](#try-it-in-one-command)
 - [What it is in 30 seconds](#what-it-is-in-30-seconds)
 - [Install](#install)
 - [First-run walkthrough](#first-run-walkthrough)
 - [Dashboard tour](#dashboard-tour)
 - [Terminals — launch, join, and track your AI CLIs](#terminals--launch-join-and-track-your-ai-clis)
 - [MCP server — 25 cross-tool intelligence calls](#mcp-server--25-cross-tool-intelligence-calls)
+- [Integrations — the stable contract to build against](#integrations--the-stable-contract-to-build-against)
 - [API proxy — accurate token capture + compression](#api-proxy--accurate-token-capture--compression)
 - [Architecture](#architecture)
 - [Teams & Org Visibility](#teams--org-visibility)
@@ -706,6 +737,89 @@ compaction is visible from Cline.
 
 ---
 
+## Integrations — the stable contract to build against
+
+The MCP server is the **supported integration surface** for
+third-party tooling — the one place observer publishes a stability
+promise you can build against: three published tiers
+(**stable** / **conditional** / **experimental**), a tier for every
+one of the 25 tools, and five server-level invariants (a single
+pretty-JSON `text` block per call, in-band `isError`, silent limit
+clamping, alphabetical `tools/list`, and the pinned server name
+`observer`).
+
+**The contract:** [`docs/mcp-contract.md`](docs/mcp-contract.md) —
+what each tier promises under semver, and what is explicitly *out*
+of contract (the dashboard HTTP API and the SQLite schema are both
+internal and unversioned; integrate over MCP instead).
+
+**Machine-readable, diffable in CI:**
+
+```bash
+observer contract --json   # {"contract_version":1,"mcp":{…},"adapters":[…]}
+```
+
+The tiers come from one Go table shared by the doc and the emitter,
+and conformance tests fail the build if a stable tool is renamed or
+if a newly registered tool ships unlisted — so the contract can't
+silently drift from the binary.
+
+### Wiring the MCP server by hand
+
+`observer init --claude-code` (or `--cursor` / `--codex`, or bare
+`observer init`) writes the entry for you. For a client observer
+doesn't know about, register it yourself — it's a plain stdio
+subprocess with no network port:
+
+```json
+{
+  "mcpServers": {
+    "observer": {
+      "command": "/absolute/path/to/observer",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+Then call it like any MCP server:
+
+```jsonc
+// tools/call
+{ "name": "get_cost_summary", "arguments": { "group_by": "model", "days": 7 } }
+```
+
+The server reads `~/.observer/config.toml` unless you pass
+`--config <path>`. Its lifecycle matches the AI tool that spawned it.
+
+### Community integrations
+
+None listed yet — this list is PR-curated and starts empty rather
+than seeded with aspirational entries.
+
+To add yours, open a PR appending one row to the table below.
+Criteria:
+
+- **Verifiable artifact.** A public repo, package, or extension
+  anyone can install and run. Not a blog post, not a screenshot, not
+  a waitlist.
+- **Actually uses the contract.** It talks to the MCP server (or
+  consumes `observer contract --json`). An integration built on the
+  dashboard HTTP API or by reading `observer.db` directly can't be
+  listed — those surfaces are internal and will break you.
+- **Honesty rules apply**, the same ones this repo holds itself to:
+  claims in your description must be things a reader can check.
+  No unmeasured savings percentages, no capability the artifact
+  doesn't have today, and "planned" is not "does".
+- **One row, plain description.** Name, link, one sentence on what
+  it does. Maintenance status is welcome; marketing copy isn't.
+
+| Integration | What it does | Maintainer |
+|---|---|---|
+| _(none yet — [open a PR](CONTRIBUTING.md))_ | | |
+
+---
+
 ## API proxy — accurate tokens, compression, stash
 
 The proxy is the home of three features that only exist when your AI
@@ -977,11 +1091,13 @@ lint-gated policy editor, budget guardrails, evidence downloads) — see the
 - **[Operator guide](https://superbased.app/docs/guides/security-guard)** —
   concepts, modes, the observe→enforce path, Teams policy merge, and the
   honest "what guard does NOT do" list.
-- **Rule catalog, policy authoring, compliance mapping** — every built-in
-  rule ID, the TOML matcher vocabulary with a worked 7-recipe cookbook, and
-  the SOC 2 CC-series + NIST 800-53 AU-2/AU-3/AU-9/AC-6 evidence-pack
-  mapping ship as `docs/guard-rules.md`, `docs/guard-policy-authoring.md`,
-  and `docs/guard-compliance.md` for anyone building from source.
+- **Rule catalog, policy authoring, enforce runbook, compliance mapping** —
+  every built-in rule ID, the TOML matcher vocabulary with a worked
+  7-recipe cookbook, the observe→enforce rollout runbook, and the SOC 2
+  CC-series + NIST 800-53 AU-2/AU-3/AU-9/AC-6 evidence-pack mapping ship
+  as `docs/guard-rules.md`, `docs/guard-policy-authoring.md`,
+  `docs/guard-enforce-runbook.md`, and `docs/guard-compliance.md` for
+  anyone building from source.
 
 ---
 
@@ -989,6 +1105,8 @@ lint-gated policy editor, budget guardrails, evidence downloads) — see the
 
 | Command | Purpose |
 |---|---|
+| `observer usage [--since 30d] [--json]` | Zero-config one-shot: scans every detected tool's own session files into a throwaway temp DB, prints a tool × model cost table, deletes the DB. No daemon, no config read by default, no network. Bare `observer` runs this too, on a machine with no local SuperBased state (`OBSERVER_ONESHOT=off` to disable). See [`docs/one-shot-usage-report.md`](docs/one-shot-usage-report.md). |
+| `observer statusline` | One-line cost status for your terminal prompt (or a compatible editor status bar): wordmarked, fail-open, zero network calls beyond your own local daemon. Opt-in registration via `observer init --statusline`. See [`docs/observer-statusline.md`](docs/observer-statusline.md). |
 | `observer init [--all]` | Register hooks + MCP server + durable proxy routes with every detected AI tool (each side defaults on; `--skip-hooks` / `--skip-mcp` / `--skip-proxy-route` opt out). Zero flags on a terminal → an interactive checklist: preview + consent per write, MCP never pre-selected. Any flag keeps batch mode. |
 | `observer uninstall [--all] [--purge]` | Reverse of `init`. Refuses to touch drifted configs unless `--force`. `--purge` also deletes `~/.observer/`. |
 | `observer scan [--force]` | One-time backfill — parse all known session files into the DB. `--force` re-walks from offset 0. |
@@ -1000,7 +1118,7 @@ lint-gated policy editor, budget guardrails, evidence downloads) — see the
 | `observer config set <key> <value> [--project <root>]` | Dotted-key config setter through the shared validated write path; `--project` writes the repo-level override file. |
 | `observer proxy start` | Run only the API reverse proxy. |
 | `observer dashboard [--port N]` | Embedded dashboard + `/api/*` JSON on http://localhost:N (default 8081). |
-| `observer cost [--days N] [--group-by …]` | Token + USD rollup from the CLI. |
+| `observer cost [--days N] [--group-by …]` | Token + USD rollup from the CLI, against the DB you've been capturing into with `observer scan` / `observer start` (includes proxy-accurate turns) — the persistent sibling of `observer usage`'s throwaway one-shot. |
 | `observer discover` | Stale re-reads + redundant-commands report. |
 | `observer patterns` | Derive hot files, co-changes, common commands, edit→test pairs. |
 | `observer learn` | Derive correction rules from failure→recovery pairs. |
@@ -1012,6 +1130,8 @@ lint-gated policy editor, budget guardrails, evidence downloads) — see the
 | `observer advise` | Prescriptive cost/quality suggestions (the Suggestions tab, in the CLI). |
 | `observer cache-health` | Prompt-cache engine health: grading gate, read:write consistency, cause concentration. |
 | `observer doctor` | Health checks: DB integrity, hook checksums, MCP drift, pid bridge, proxy routing gaps. |
+| `observer contract [--json]` | The published stability contract: every MCP tool with its tier (stable / conditional / experimental) plus each adapter's public capability row. `--json` emits the `contract_version`-stamped artifact an integrator pins. Prose: [`docs/mcp-contract.md`](docs/mcp-contract.md). |
+| `observer adapters [--json]` | The full adapter capability matrix (proxy / surface / hook / MCP / native / token / handoff / attach / resume), generated from the capability registry. |
 | `observer prune` | Run retention now. |
 | `observer db stats\|vacuum\|backup` | Storage manager: per-table size breakdown (index + FTS5 shadow bytes folded in), reclaim free pages with bytes-freed report, online snapshot via `VACUUM INTO` (safe while the daemon runs; refuses overwrite). |
 | `observer db import <path> [--dry-run]` | Merge another `observer.db` (a stranded install from another OS / home dir) into this node's. Idempotent single-transaction merge; `--dry-run` rolls the same transaction back for exact counts. Migrates the source first — point it at a copy. |

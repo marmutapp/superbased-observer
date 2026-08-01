@@ -54,6 +54,17 @@
 //     writing `baseUrl` overrides into `~/.cline/data/settings/providers.json`,
 //     which carries OAuth tokens. Deferred to v2.
 //
+// Reasoning emission (B3, 2026-07-31): an Anthropic-shaped `thinking`
+// content block mints NO action row (it briefly minted a
+// `clinecli.reasoning` task_complete row). Its body is threaded onto the
+// next event as PrecedingReasoning under grok-style semantics —
+// consumed-once, last-wins, discarded at a role='user' turn boundary,
+// session-scoped by construction. "Next event" is in CONTENT-BLOCK
+// order, so for the live thinking → text → tool_use shape the
+// assistant-text row is the carrier; a thinking block followed directly
+// by tool_use puts it on the first tool call. The 200-char preview cap
+// + scrubbing happen at the flush site. See reasoningThread in parse.go.
+//
 // First-class sub-agent model — `sessions.parent_session_id` /
 // `parent_agent_id` / `agent_id` / `is_subagent` columns surface
 // directly onto ActionMetadata + the existing dashboard's parent-

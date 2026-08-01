@@ -292,6 +292,68 @@ It prints a compound `<token_id>.<secret>` string. Hand it to the developer
 over a secure channel — it is single-use and expires per
 `enrolment.default_token_lifetime_days`.
 
+### Member invites (optional, default OFF)
+
+By default only org admins can mint enrolment tokens. That makes adding the
+second and third developer an admin round-trip. Set:
+
+```toml
+[server]
+member_invites = true            # default false
+member_invite_monthly_cap = 10   # default 10; per member, per UTC month
+```
+
+and any **active** org member may mint a token too — from the org dashboard's
+Invite page, or straight from their own node dashboard (Settings → Enrolment →
+"Invite a teammate", which calls `POST /api/agent/invite-token` over the
+enrolment credential their agent already holds).
+
+What a member **can** do with this on:
+
+- mint a one-time enrolment token for someone who is **already** an active
+  member of the org, addressed by email;
+- up to `member_invite_monthly_cap` times per calendar month (UTC);
+- with a token lifetime of **1–90 days** (`ttl_days`). Omit it for
+  `enrolment.default_token_lifetime_days`; anything outside 1–90 — including an
+  explicit `0` — is a 400. The web2 form offers 1–30, so an admin who needs a
+  longer window has headroom via the API without touching server config.
+  Longer than 90 days is a standing credential, not an invite.
+
+What a member **cannot** do, with the flag on or off:
+
+- **create an account.** An invite is a token handoff. An email that is not a
+  provisioned member is a 404 — SCIM (or `observer-org users create`) remains
+  the only way in. There is deliberately no email self-signup in v1; that is
+  an identity-model change needing its own review.
+- read the member list, the tokens list, or any other admin surface. Those
+  stay admin-only; a member sees only the token they just minted.
+- exceed the cap, or mint without it being recorded.
+- **sweep the org's address book.** The mint answers 404 for an address that
+  is not an active member and 201 for one that is, which would otherwise make
+  it a membership oracle. Failed lookups are metered: **20 per inviter per
+  rolling hour**, after which every invite from that inviter is a 429 — hit or
+  miss — until the window rolls. Successful invites never consume it, so a
+  real inviter will not meet it.
+
+**Handing the token over.** Whatever the Invite page shows you is a live
+credential: treat it like a password. The enrol link is deliberately rendered
+as *text you copy*, not a link you click — the token is inside the URL, and
+link previewers, mail scanners, and outbound proxies fetch URLs they see,
+which spends a single-use invite. Prefer the `observer enroll <org-url>
+<token>` snippet, and send it the way you would send a password.
+
+Every mint — admin or member, dashboard or agent — writes an `invite_minted`
+row to `audit_log` naming the inviter, the invited user, the token id, and the
+surface used, and stamps `enrolment_tokens.minted_by`. The admin Invite page's
+"Enrolment tokens" table reads both, so you can see who invited whom and
+whether the invite was redeemed.
+
+**Before you enable it:** an enrolment token grants enrolment authority for the
+*target* user, so a member who mints for a teammate could also redeem it
+themselves and push activity attributed to that teammate. Admin-only minting
+bounds that to trusted operators; `member_invites` widens it to every member.
+That is why it is default-off, capped, and audited — decide it deliberately.
+
 ---
 
 ## 9. Enrol a developer agent

@@ -198,6 +198,15 @@ type Capability struct {
 	// TestAuthEnvImpliesAttachable pins that only an attachable row carries keys
 	// (a bare-only tool has no attach socket to forward across).
 	AuthEnv []string
+	// Vocabulary declares whether this adapter's NATIVE TOOL NAMES live in
+	// the canonical cross-adapter taxonomy table (internal/tooltax) — the
+	// WP-T3 teeth of the tool-taxonomy plan. A zero value is "not declared"
+	// and fails registry_coverage_test.go's
+	// TestVocabularyDeclaredForEveryAdapter, so a NEW adapter cannot ship a
+	// private action-type map that drifts from the table. InTaxonomy false
+	// is legal ONLY with a Note explaining the honest zero (the five
+	// browser-chat `*-web` rows capture chat turns, not tool calls).
+	Vocabulary Vocabulary
 }
 
 // registry is the capability table, keyed by the adapter's canonical tool
@@ -212,6 +221,7 @@ var registry = map[string]Capability{
 	// Full-capability flagships: proxy + hook + MCP + all native rails.
 	"claude-code": {
 		Tool:        "claude-code",
+		Vocabulary:  Vocabulary{InTaxonomy: true},
 		Proxy:       &ProxyRoute{Kind: RouteEnvSettings, EnvVar: "ANTHROPIC_BASE_URL", Suffix: "", Launcher: "observer claude", CrossOSBridge: true},
 		Routability: RouteStatusRoutableNow,
 		Hook:        HookSpec{Mechanism: HookClaudeSettings, CrossOSBridge: true, AutoWired: true},
@@ -260,6 +270,7 @@ var registry = map[string]Capability{
 	},
 	"codex": {
 		Tool:        "codex",
+		Vocabulary:  Vocabulary{InTaxonomy: true},
 		Proxy:       &ProxyRoute{Kind: RouteConfigFile, EnvVar: "", Launcher: "observer codex", Note: "codex routes through ~/.codex/config.toml openai_base_url (not an env var)", CrossOSBridge: true},
 		Routability: RouteStatusRoutableNow,
 		Hook:        HookSpec{Mechanism: HookCodexConfig, AutoWired: true},
@@ -306,6 +317,7 @@ var registry = map[string]Capability{
 	// gpt-5.4-nano turn through the proxy (api_turns grew).
 	"opencode": {
 		Tool:        "opencode",
+		Vocabulary:  Vocabulary{InTaxonomy: true},
 		Proxy:       &ProxyRoute{Kind: RouteLauncher, EnvVar: "OPENAI_BASE_URL", Suffix: "/v1", Launcher: "observer opencode"},
 		Routability: RouteStatusRoutableNow,
 		Hook:        HookSpec{Mechanism: HookNone},
@@ -333,9 +345,13 @@ var registry = map[string]Capability{
 		// installer on linux/darwin. Its own bin dir (.opencode/bin) is a
 		// per-tool extra on both OSes.
 		Binary: &BinaryResolveSpec{
+			// npm JS bin: Windows install lays down a `.cmd` shim (+
+			// .ps1/POSIX-shell forms), never an `.exe` — see the
+			// command-code row's Binary comment for the long-form
+			// rationale.
 			Names: BinaryNames{
 				Unix:    []string{"opencode"},
-				Windows: []string{"opencode.exe", "opencode.cmd", "opencode"},
+				Windows: []string{"opencode.cmd", "opencode"},
 			},
 			ProbeDirs: []ProbeDir{
 				{OS: ProbeUnix, Rel: ".opencode/bin"},
@@ -352,7 +368,8 @@ var registry = map[string]Capability{
 	// IDE/extension adapters that talk only to their own backend → no proxy
 	// route (Proxy=nil is DATA, not a missing feature). Hooks/MCP per tool.
 	"cursor": {
-		Tool: "cursor",
+		Tool:       "cursor",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// Surface-split (2026-06-26): the NATIVE Cursor backend has no base-URL
 		// knob (exempt), but Cursor's custom "OpenAI Base URL" / BYOK model
 		// setting MAY route through observer — unconfirmed on a live install,
@@ -423,7 +440,8 @@ var registry = map[string]Capability{
 		},
 	},
 	"cline": {
-		Tool: "cline",
+		Tool:       "cline",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// VS Code extension → backend. The "OpenAI Compatible" Base URL surface
 		// is routable, but it is a MANUAL-PASTE route, not an auto-writer:
 		// live-grounded 2026-06-27, Cline stores its provider/base-URL config
@@ -450,7 +468,8 @@ var registry = map[string]Capability{
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectMCP}},
 	},
 	"copilot": {
-		Tool: "copilot",
+		Tool:       "copilot",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// VS Code extension → GitHub-hosted backend (native traffic exempt),
 		// but VS Code's custom-endpoint / BYOK model support MAY route — probe
 		// before flipping. Native hosted + inline completions stay exempt.
@@ -466,7 +485,8 @@ var registry = map[string]Capability{
 		Handoff: HandoffCapability{Transcript: TranscriptPartial, Inject: []InjectKind{InjectFile}, Note: "patch-log replay reader not built"},
 	},
 	"copilot-cli": {
-		Tool: "copilot-cli",
+		Tool:       "copilot-cli",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// BYOK path: COPILOT_PROVIDER_BASE_URL/_TYPE/_API_KEY + COPILOT_MODEL →
 		// OpenAI-compatible endpoint (GitHub Docs); native GitHub-hosted
 		// routing stays exempt.
@@ -512,9 +532,13 @@ var registry = map[string]Capability{
 		// "copilot"; npm @github/copilot (any OS) + the cask/script/winget
 		// channels (docs.github.com copilot-cli install).
 		Binary: &BinaryResolveSpec{
+			// npm JS bin: Windows install lays down a `.cmd` shim (+
+			// .ps1/POSIX-shell forms), never an `.exe` — see the
+			// command-code row's Binary comment for the long-form
+			// rationale.
 			Names: BinaryNames{
 				Unix:    []string{"copilot"},
-				Windows: []string{"copilot.exe", "copilot.cmd", "copilot"},
+				Windows: []string{"copilot.cmd", "copilot"},
 			},
 			Installs: []InstallHint{
 				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "@github/copilot"}, Display: "npm install -g @github/copilot"},
@@ -527,7 +551,8 @@ var registry = map[string]Capability{
 		},
 	},
 	"kilo-code": {
-		Tool: "kilo-code",
+		Tool:       "kilo-code",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// Legacy IDE extension (wraps cline). Same "OpenAI Compatible" Base URL
 		// surface as cline VS Code, and the same MANUAL-PASTE reality: the
 		// base URL lives in live VS Code globalState (state.vscdb), not a
@@ -546,7 +571,8 @@ var registry = map[string]Capability{
 		Handoff: HandoffCapability{},
 	},
 	"kilo-code-cli": {
-		Tool: "kilo-code-cli",
+		Tool:       "kilo-code-cli",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// Native-exempt per the live 2026-06-26 finding: @kilocode/cli has no
 		// base-URL env handling and talks to the api.kilo.ai gateway directly
 		// (docs/kilo-code-adapter.md). A grounded negative, not "permanently
@@ -580,9 +606,13 @@ var registry = map[string]Capability{
 		// (kilo.ai/docs/cli). Windows shim grounded at
 		// %APPDATA%\npm\kilo.cmd (docs/kilo-code-adapter.md).
 		Binary: &BinaryResolveSpec{
+			// npm JS bin: Windows install lays down a `.cmd` shim (+
+			// .ps1/POSIX-shell forms), never an `.exe` — see the
+			// command-code row's Binary comment for the long-form
+			// rationale.
 			Names: BinaryNames{
 				Unix:    []string{"kilo"},
-				Windows: []string{"kilo.exe", "kilo.cmd", "kilo"},
+				Windows: []string{"kilo.cmd", "kilo"},
 			},
 			Installs: []InstallHint{
 				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "@kilocode/cli"}, Display: "npm install -g @kilocode/cli"},
@@ -595,7 +625,8 @@ var registry = map[string]Capability{
 
 	// CLI adapters captured via watcher/SQLite (+ opt-in receivers).
 	"cline-cli": {
-		Tool: "cline-cli",
+		Tool:       "cline-cli",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// ROUTABLE via the openai-compatible provider's persisted baseUrl —
 		// VERIFIED LIVE 2026-06-27. The NATIVE `openai` provider hardcodes
 		// api.openai.com and ignores OPENAI_BASE_URL (confirmed: `-P openai -k …`
@@ -611,9 +642,16 @@ var registry = map[string]Capability{
 		Proxy:       &ProxyRoute{Kind: RouteProviderJSON, EnvVar: "", Suffix: "/v1", Launcher: "observer cline-cli", Note: "routes via the openai-compatible provider's settings.baseUrl in ~/.cline/data/settings/providers.json; launcher writes baseUrl, never a key"},
 		Routability: RouteStatusRoutableNow,
 		Hook:        HookSpec{Mechanism: HookClineCLIJSONL, AutoWired: false}, // receiver exists (clinecli/hook.go); the live hooks.jsonl is lifecycle-only (no token payload) → stays a tailer, not auto-wired.
-		// MCP: NO cline_mcp_settings.json on the live install (the audit's
-		// assumption was wrong); the settings dir holds only providers.json +
-		// cli-notices.json. No grounded MCP target.
+		// MCP: nil here means "no WRITER", not "not capable" — re-grounded
+		// 2026-08-01 against cline 3.0.48. There is still NO
+		// cline_mcp_settings.json on the live install (the settings dir holds
+		// only providers.json + cli-notices.json), but Cline CLI IS
+		// MCP-capable via a command: `cline mcp install|add <name>
+		// [targetArgs...] --transport stdio --yes`. MCPTarget cannot express
+		// that today — every MCPFormat names a FILE and PathHint assumes one —
+		// so wiring it needs a command-mediated MCPFormat plus a writer in
+		// internal/mcp, not a row edit. Left nil deliberately rather than
+		// fabricating a target we cannot write (docs/clinecli-adapter.md).
 		MCP:       nil,
 		Native:    NativeRails{},
 		TokenTier: TokenTier{Best: "sqlite"}, // sessions.db + per-session messages.json; full.
@@ -633,9 +671,13 @@ var registry = map[string]Capability{
 		// Binary resolution + grounded install. Unix launcher resolves
 		// "cline"; npm-distributed `cline` 3.x (docs/clinecli-adapter.md).
 		Binary: &BinaryResolveSpec{
+			// npm JS bin: Windows install lays down a `.cmd` shim (+
+			// .ps1/POSIX-shell forms), never an `.exe` — see the
+			// command-code row's Binary comment for the long-form
+			// rationale.
 			Names: BinaryNames{
 				Unix:    []string{"cline"},
-				Windows: []string{"cline.exe", "cline.cmd", "cline"},
+				Windows: []string{"cline.cmd", "cline"},
 			},
 			Installs: []InstallHint{
 				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "cline"}, Display: "npm install -g cline"},
@@ -643,7 +685,8 @@ var registry = map[string]Capability{
 		},
 	},
 	"hermes": {
-		Tool: "hermes",
+		Tool:       "hermes",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// Proxy BLOCKED at the proxy-upstream layer, not a writer gap (live-
 		// grounded 2026-06-26). Hermes' only base-URL knob is model.base_url
 		// in ~/.hermes/config.yaml, live-set to https://openrouter.ai/api/v1
@@ -747,7 +790,8 @@ var registry = map[string]Capability{
 		},
 	},
 	"cowork": {
-		Tool: "cowork",
+		Tool:       "cowork",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// The LOCAL-observer path is native-exempt: the microVM sandbox can't
 		// reach 127.0.0.1:8820, app JS is ACL-locked, and the only base-URL
 		// levers are machine-wide (docs/cowork-adapter.md). A third-party
@@ -765,7 +809,8 @@ var registry = map[string]Capability{
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile}},
 	},
 	"gemini-cli": {
-		Tool: "gemini-cli",
+		Tool:       "gemini-cli",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// Phase E SHIPPED + LIVE-VERIFIED 2026-06-27: the proxy bridges Google
 		// generateContent (providerForPath → ProviderGoogle, the
 		// generativelanguage upstream, parseGeminiResponse/parseGeminiStream
@@ -803,9 +848,13 @@ var registry = map[string]Capability{
 		// Binary resolution + grounded install. Unix launcher resolves
 		// "gemini"; npm @google/gemini-cli (any OS).
 		Binary: &BinaryResolveSpec{
+			// npm JS bin: Windows install lays down a `.cmd` shim (+
+			// .ps1/POSIX-shell forms), never an `.exe` — see the
+			// command-code row's Binary comment for the long-form
+			// rationale.
 			Names: BinaryNames{
 				Unix:    []string{"gemini"},
-				Windows: []string{"gemini.exe", "gemini.cmd", "gemini"},
+				Windows: []string{"gemini.cmd", "gemini"},
 			},
 			Installs: []InstallHint{
 				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "@google/gemini-cli"}, Display: "npm install -g @google/gemini-cli"},
@@ -813,7 +862,8 @@ var registry = map[string]Capability{
 		},
 	},
 	"openclaw": {
-		Tool: "openclaw",
+		Tool:       "openclaw",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// Live-grounded 2026-06-26 (this WSL install): OpenClaw's bundled
 		// `openai` plugin reads OPENAI_BASE_URL / OPENAI_API_BASE
 		// (plugin-runtime-deps/.../extensions/openai), and the operator's
@@ -856,7 +906,7 @@ var registry = map[string]Capability{
 		Hook:        HookSpec{Mechanism: HookNone},
 		MCP:         nil,
 		Native:      NativeRails{},
-		TokenTier:   TokenTier{Best: "trajectory"}, // *.trajectory.jsonl model.completed lastCallUsage (accurate per-call); the runs.sqlite task path genuinely has no token columns.
+		TokenTier:   TokenTier{Best: "transcript"}, // <id>.jsonl message.usage covers EVERY call (accurate; re-grounded 2026-07-31 — byte-identical to the trajectory's lastCallUsage where they overlap); *.trajectory.jsonl model.completed is a one-row-per-run SUBSET that only fills gateway-injected usage-zero turns. The runs.sqlite task path genuinely has no token columns.
 		// P0.1 FULL: agents/main/sessions/<sid>.jsonl message records
 		// (content present despite gateway-zeroed tokens; reader = P2
 		// tranche).
@@ -881,9 +931,13 @@ var registry = map[string]Capability{
 		// npm is an alternate (needs `openclaw onboard --install-daemon`
 		// after, so script leads).
 		Binary: &BinaryResolveSpec{
+			// npm JS bin: Windows install lays down a `.cmd` shim (+
+			// .ps1/POSIX-shell forms), never an `.exe` — see the
+			// command-code row's Binary comment for the long-form
+			// rationale.
 			Names: BinaryNames{
 				Unix:    []string{"openclaw"},
-				Windows: []string{"openclaw.exe", "openclaw.cmd", "openclaw"},
+				Windows: []string{"openclaw.cmd", "openclaw"},
 			},
 			Installs: []InstallHint{
 				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://openclaw.ai/install.sh | bash"}, Display: "curl -fsSL https://openclaw.ai/install.sh | bash"},
@@ -893,7 +947,8 @@ var registry = map[string]Capability{
 		},
 	},
 	"pi": {
-		Tool: "pi",
+		Tool:       "pi",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// ROUTABLE via a custom provider in ~/.pi/agent/models.json — VERIFIED
 		// LIVE 2026-06-27. pi's BUILT-IN providers ignore OPENAI_BASE_URL
 		// (a dead-port base URL still reached api.openai.com; both env and the
@@ -939,9 +994,13 @@ var registry = map[string]Capability{
 		// "pi"; npm @earendil-works/pi-coding-agent (earendil-works/pi,
 		// pi.dev — NOT Inflection) + the official install script.
 		Binary: &BinaryResolveSpec{
+			// npm JS bin: Windows install lays down a `.cmd` shim (+
+			// .ps1/POSIX-shell forms), never an `.exe` — see the
+			// command-code row's Binary comment for the long-form
+			// rationale.
 			Names: BinaryNames{
 				Unix:    []string{"pi"},
-				Windows: []string{"pi.exe", "pi.cmd", "pi"},
+				Windows: []string{"pi.cmd", "pi"},
 			},
 			Installs: []InstallHint{
 				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "--ignore-scripts", "@earendil-works/pi-coding-agent"}, Display: "npm install -g --ignore-scripts @earendil-works/pi-coding-agent"},
@@ -951,7 +1010,8 @@ var registry = map[string]Capability{
 		},
 	},
 	"antigravity": {
-		Tool: "antigravity",
+		Tool:       "antigravity",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// No base-URL / custom-provider knob found (decrypt-gated, own
 		// backend). A grounded negative — reclassify if Google documents a
 		// gateway knob.
@@ -966,7 +1026,8 @@ var registry = map[string]Capability{
 		Handoff: HandoffCapability{Transcript: TranscriptPartial, Inject: []InjectKind{InjectFile}, Note: "desktop .pb decrypt-gated"},
 	},
 	"antigravity-cli": {
-		Tool: "antigravity-cli",
+		Tool:       "antigravity-cli",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// agy CLI itself is non-proxied (runs locally).
 		Proxy:       nil,
 		Routability: RouteStatusNativeExempt,
@@ -1006,7 +1067,8 @@ var registry = map[string]Capability{
 		},
 	},
 	"qwen-code": {
-		Tool: "qwen-code",
+		Tool:       "qwen-code",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// Live-captured 2026-07-09 (WSL + Windows): CC-shaped JSONL under
 		// ~/.qwen/projects/<slug>/chats/.
 		//
@@ -1079,9 +1141,13 @@ var registry = map[string]Capability{
 		// "qwen"; npm @qwen-code/qwen-code@latest (any OS) + the standalone
 		// install script + brew (QwenLM/qwen-code + official docs).
 		Binary: &BinaryResolveSpec{
+			// npm JS bin: Windows install lays down a `.cmd` shim (+
+			// .ps1/POSIX-shell forms), never an `.exe` — see the
+			// command-code row's Binary comment for the long-form
+			// rationale.
 			Names: BinaryNames{
 				Unix:    []string{"qwen"},
-				Windows: []string{"qwen.exe", "qwen.cmd", "qwen"},
+				Windows: []string{"qwen.cmd", "qwen"},
 			},
 			Installs: []InstallHint{
 				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "@qwen-code/qwen-code@latest"}, Display: "npm install -g @qwen-code/qwen-code@latest"},
@@ -1092,7 +1158,8 @@ var registry = map[string]Capability{
 		},
 	},
 	"kiro-cli": {
-		Tool: "kiro-cli",
+		Tool:       "kiro-cli",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// SigV4-signed AWS endpoints (CodeWhisperer lineage); no base-URL /
 		// BYOK surface exists on a live install — grounded negative.
 		Proxy:       nil,
@@ -1144,7 +1211,8 @@ var registry = map[string]Capability{
 		},
 	},
 	"grok": {
-		Tool: "grok",
+		Tool:       "grok",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// LIVE-VERIFIED 2026-07-09: grok's CLI chat proxy base URL is
 		// overridable via the GROK_CLI_CHAT_PROXY_BASE_URL env var (the env
 		// form of the `grok agent --cli-chat-proxy-base-url` flag; the
@@ -1199,9 +1267,13 @@ var registry = map[string]Capability{
 		// "grok"; npm @xai-official/grok (any OS) + the official install
 		// script (docs.x.ai/build/overview).
 		Binary: &BinaryResolveSpec{
+			// npm JS bin: Windows install lays down a `.cmd` shim (+
+			// .ps1/POSIX-shell forms), never an `.exe` — see the
+			// command-code row's Binary comment for the long-form
+			// rationale.
 			Names: BinaryNames{
 				Unix:    []string{"grok"},
-				Windows: []string{"grok.exe", "grok.cmd", "grok"},
+				Windows: []string{"grok.cmd", "grok"},
 			},
 			Installs: []InstallHint{
 				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "@xai-official/grok"}, Display: "npm install -g @xai-official/grok"},
@@ -1212,7 +1284,8 @@ var registry = map[string]Capability{
 		},
 	},
 	"kimi-code": {
-		Tool: "kimi-code",
+		Tool:       "kimi-code",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// Live wire traces show an openai-compat endpoint (provider:openai,
 		// gpt-4o) configured in ~/.kimi-code/config.toml — a NEVER-READ file
 		// (plaintext API key). The [providers.openai] block carries an
@@ -1286,7 +1359,8 @@ var registry = map[string]Capability{
 		Binary: &BinaryResolveSpec{Names: BinaryNames{Unix: []string{"kimi"}}},
 	},
 	"crush": {
-		Tool: "crush",
+		Tool:       "crush",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// Crush providers support custom base_url incl. an `anthropic` type —
 		// a real proxy lane. The provider config lives in crush.json alongside
 		// literal API keys (never-read/never-write file); providers.openai
@@ -1335,7 +1409,8 @@ var registry = map[string]Capability{
 		},
 	},
 	"devin": {
-		Tool: "devin",
+		Tool:       "devin",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// No base-URL override exists — the CLI talks to Cognition's own
 		// Windsurf backend (only an HTTP-proxy setting). No observer-routed
 		// turn is possible today.
@@ -1345,8 +1420,11 @@ var registry = map[string]Capability{
 		// UNWIRED in the shipped CLI (live 3000.1.27) — honest none until a
 		// firing hook is grounded.
 		Hook: HookSpec{Mechanism: HookNone},
-		// MCP client only (reads .devin/ config); no grounded format for
-		// registering observer's server — no writer.
+		// MCP client only (reads .devin/ config). The registration format IS
+		// now grounded (`.devin-plugin/plugin.json` + root `mcp_config.json`,
+		// coverage wave A 2026-07-31 — see plugins/devin/); distribution is
+		// the plugins channel, and no `observer init` writer is built, so the
+		// capability stays nil.
 		MCP:    nil,
 		Native: NativeRails{},
 		// Per-message metadata.metrics in sessions.db (input/output/cache
@@ -1385,7 +1463,8 @@ var registry = map[string]Capability{
 		},
 	},
 	"qoder": {
-		Tool: "qoder",
+		Tool:       "qoder",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// Hardcoded api.qoder.com, PAT auth, NO base-URL knob — token
 		// capture is proxy-tier or nothing, and there is no proxy lane.
 		Proxy:       nil,
@@ -1393,8 +1472,12 @@ var registry = map[string]Capability{
 		// `qodercli hooks` manage-command exists (CC lineage) but no firing
 		// hook envelope has been grounded — honest none.
 		Hook: HookSpec{Mechanism: HookNone},
-		// MCP client exists (`qodercli mcp`, --mcp-config) — a future
-		// additive-registration candidate, ungrounded; no writer.
+		// MCP client exists (`qodercli mcp`, --mcp-config). The bundling
+		// format IS now grounded (`.qoder-plugin/plugin.json` + dotted
+		// `.mcp.json`, validated by `qodercli plugins validate` — coverage
+		// wave A 2026-07-31, see plugins/qoder/); distribution is the plugins
+		// channel, and no `observer init` writer is built, so the capability
+		// stays nil.
 		MCP:    nil,
 		Native: NativeRails{},
 		// Local stores carry NEITHER model (empty string) NOR tokens
@@ -1425,9 +1508,13 @@ var registry = map[string]Capability{
 		// @qoder-ai/qodercli (any OS) + the official install script
 		// (qoder.com/cli + npm).
 		Binary: &BinaryResolveSpec{
+			// npm JS bin: Windows install lays down a `.cmd` shim (+
+			// .ps1/POSIX-shell forms), never an `.exe` — see the
+			// command-code row's Binary comment for the long-form
+			// rationale.
 			Names: BinaryNames{
 				Unix:    []string{"qodercli"},
-				Windows: []string{"qodercli.exe", "qodercli.cmd", "qodercli"},
+				Windows: []string{"qodercli.cmd", "qodercli"},
 			},
 			Installs: []InstallHint{
 				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "@qoder-ai/qodercli"}, Display: "npm install -g @qoder-ai/qodercli"},
@@ -1437,7 +1524,8 @@ var registry = map[string]Capability{
 		},
 	},
 	"aider": {
-		Tool: "aider",
+		Tool:       "aider",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// Aider honors OPENAI_API_BASE (LiteLLM-shaped) — a real base-URL
 		// surface, LIVE-GROUNDED 2026-07-09: a probe with
 		// OPENAI_API_BASE=http://127.0.0.1:8820/v1 (aider --message …
@@ -1470,7 +1558,8 @@ var registry = map[string]Capability{
 		},
 	},
 	"goose": {
-		Tool: "goose",
+		Tool:       "goose",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// Goose reads OPENAI_HOST (NOT OPENAI_BASE_URL; host ROOT — goose
 		// appends /v1) plus per-provider host settings in config.yaml — a
 		// real override surface, LIVE-GROUNDED 2026-07-09: a probe on the
@@ -1548,7 +1637,8 @@ var registry = map[string]Capability{
 	// Phase 2. See docs/plans/browser-extension-and-m365-copilot-proposal-
 	// 2026-07-10.md + internal/adapter/browserchat.
 	"chatgpt-web": {
-		Tool: "chatgpt-web",
+		Tool:       "chatgpt-web",
+		Vocabulary: Vocabulary{Note: "no native tool vocabulary: the MV3 browser-capture lane records ChatGPT prompt/answer turns from the chat UI, never tool calls, so tooltax carries no rows for it"},
 		// The real browser makes the real request; observer only OBSERVES a
 		// captured turn relayed by the extension. There is no base-URL knob
 		// to route (routing would re-originate TLS and risk flagging the
@@ -1580,6 +1670,7 @@ var registry = map[string]Capability{
 	// tokenizer family) in internal/adapter/browserchat.siteRules.
 	"claude-web": {
 		Tool:        "claude-web",
+		Vocabulary:  Vocabulary{Note: "no native tool vocabulary: browser-captured Claude.ai chat turns only (no tool-call surface in the DOM/WS capture)"},
 		Proxy:       nil,
 		Routability: RouteStatusNativeExempt,
 		Hook:        HookSpec{Mechanism: HookBrowserExtension, AutoWired: true},
@@ -1592,6 +1683,7 @@ var registry = map[string]Capability{
 	// Comet automation WebSocket).
 	"perplexity-web": {
 		Tool:        "perplexity-web",
+		Vocabulary:  Vocabulary{Note: "no native tool vocabulary: browser-captured Perplexity chat turns only"},
 		Proxy:       nil,
 		Routability: RouteStatusNativeExempt,
 		Hook:        HookSpec{Mechanism: HookBrowserExtension, AutoWired: true},
@@ -1605,6 +1697,7 @@ var registry = map[string]Capability{
 	// says so plainly so the honesty is visible in the doctor.
 	"gemini-web": {
 		Tool:        "gemini-web",
+		Vocabulary:  Vocabulary{Note: "no native tool vocabulary: browser-captured Gemini chat turns only (BatchExecute best-effort)"},
 		Proxy:       nil,
 		Routability: RouteStatusNativeExempt,
 		Hook:        HookSpec{Mechanism: HookBrowserExtension, AutoWired: true},
@@ -1619,6 +1712,7 @@ var registry = map[string]Capability{
 	// browser rail).
 	"copilot-web": {
 		Tool:        "copilot-web",
+		Vocabulary:  Vocabulary{Note: "no native tool vocabulary: browser-captured consumer-Copilot chat turns only (WebSocket capture, cf_clearance-gated)"},
 		Proxy:       nil,
 		Routability: RouteStatusNativeExempt,
 		Hook:        HookSpec{Mechanism: HookBrowserExtension, AutoWired: true},
@@ -1630,7 +1724,8 @@ var registry = map[string]Capability{
 	// Factory AI's "droid" CLI (docs/plans/factory-droid-adapter-plan-2026-07-29.md).
 	// Phase-0 research only — no adapter package yet (Phase A wiring row).
 	"droid": {
-		Tool: "droid",
+		Tool:       "droid",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// No live-verified route today; BYOK custom models call the
 		// underlying provider directly (the only near-routable_now
 		// candidate) but that's unverified — no live turn through :8820.
@@ -1640,11 +1735,10 @@ var registry = map[string]Capability{
 		Hook: HookSpec{Mechanism: HookNone},
 		// ~/.factory/mcp.json reuses claude-code/cursor's {"mcpServers":{}}
 		// shape (format confirmed live via a zero-cost `droid mcp add`/
-		// `remove` probe), but MCP must be nil here: no writer exists yet
-		// (TestMCPTargets requires nil for every tool without a grounded
-		// implemented writer) — the format finding is preserved in the
-		// plan doc for the Phase-B/C adapter build.
-		MCP:    nil,
+		// `remove` probe). A writer now exists (internal/mcp/register.go's
+		// generic registerJSONMCP, via the internal/mcp/locate row) so this
+		// is Implemented — parking §3.4.
+		MCP:    &MCPTarget{Format: MCPServersJSON, PathHint: ".factory/mcp.json", Implemented: true},
 		Native: NativeRails{},
 		// Sidecar <uuid>.settings.json carries session-level cumulative
 		// tokens only — no per-message token field in the JSONL itself.
@@ -1717,7 +1811,8 @@ var registry = map[string]Capability{
 	// the eventual implementation is expected to retag internal/adapter/codex
 	// (antigravity/antigravity-cli pattern), not a fresh package.
 	"open-interpreter": {
-		Tool: "open-interpreter",
+		Tool:       "open-interpreter",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// config schema present (base_url/wire_api strings confirmed in
 		// the binary) but not live-verified on this fork.
 		Proxy:       nil,
@@ -1784,7 +1879,8 @@ var registry = map[string]Capability{
 	// commandcode.ai's npm CLI (docs/plans/commandcode-adapter-plan-2026-07-29.md).
 	// Phase-0 research only — no adapter package yet (Phase A wiring row).
 	"command-code": {
-		Tool: "command-code",
+		Tool:       "command-code",
+		Vocabulary: Vocabulary{InTaxonomy: true},
 		// COMMANDCODE_API_URL / COMMAND_CODE_API_KEY / COMMANDCODE_API_ENV
 		// point at Command Code's OWN closed gateway (not a BYOK
 		// Anthropic/OpenAI-shaped endpoint) — a knob exists but it isn't
@@ -1793,9 +1889,13 @@ var registry = map[string]Capability{
 		Routability: RouteStatusAfterBridge,
 		// No hook mechanism grounded.
 		Hook: HookSpec{Mechanism: HookNone},
-		// A real `commandcode mcp` subcommand exists but its config file
-		// location was not investigated — MCP stays nil for v1.
-		MCP:    nil,
+		// ~/.commandcode/mcp.json reuses claude-code/cursor/droid's
+		// {"mcpServers":{}} shape, grounded 2026-07-29 from the npm
+		// package's cli.mjs getUserMcpConfigPath + bundled reference/mcp.md.
+		// A writer already exists (internal/mcp/register.go's generic
+		// registerJSONMCP, via the internal/mcp/locate row) so this is
+		// Implemented, not a new writer.
+		MCP:    &MCPTarget{Format: MCPServersJSON, PathHint: ".commandcode/mcp.json", Implemented: true},
 		Native: NativeRails{},
 		// Per-assistant-message usage envelope (inputTokens/outputTokens/
 		// cacheReadTokens/cacheWriteTokens/costUsd); inputTokens almost

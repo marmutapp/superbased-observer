@@ -435,6 +435,14 @@ func (c *Client) PushLoop(ctx context.Context) error {
 		if _, perr := c.FetchRoutingPolicy(ctx); perr != nil && !errors.Is(perr, ErrNotEnrolled) {
 			c.logger.Warn("org routing policy fetch failed", "err", perr)
 		}
+		// Rail R3 of the dashboard-announcements plan (§4) rides the
+		// SAME cycle for the same reason: no new timer, no new host, no
+		// new connection — and a fetch failure never affects push
+		// health (P1), it just leaves the banner at its last verified
+		// version.
+		if _, aerr := c.FetchOrgAnnouncement(ctx); aerr != nil && !errors.Is(aerr, ErrNotEnrolled) {
+			c.logger.Warn("org announcement fetch failed", "err", aerr)
+		}
 		return err
 	})
 }

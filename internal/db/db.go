@@ -76,6 +76,12 @@ type Options struct {
 // via Options.IntegrityCheck and costs a full-file checksum — see that field
 // for why the default is off and where the probe actually lives.
 //
+// Under `go test`, Open REFUSES a path inside the operator's real ~/.observer
+// directory and returns [ErrRealDBInTest] before creating a file or running a
+// migration. See [AllowRealDBInTestEnv] for the deliberate escape hatch and
+// testguard.go for the incident that motivated it. Production behaviour is
+// unchanged.
+//
 // Concurrency note: every transaction acquires the SQLite write lock
 // upfront via _txlock=immediate. The default BEGIN DEFERRED behavior
 // would take a read lock at BeginTx and try to upgrade to a write lock
@@ -90,6 +96,12 @@ type Options struct {
 func Open(ctx context.Context, opts Options) (*sql.DB, error) {
 	if opts.Path == "" {
 		return nil, errors.New("db.Open: Path is required")
+	}
+	// Live-DB test isolation gate (incident "task #17", 2026-07-30). Inert in
+	// production — see GuardLiveDB. This must stay ABOVE sql.Open: the whole
+	// point is that no file is created and no migration runs.
+	if err := GuardLiveDB(opts.Path); err != nil {
+		return nil, err
 	}
 	busy := opts.BusyTimeout
 	if busy <= 0 {
@@ -268,6 +280,14 @@ func integrityCheck(ctx context.Context, db *sql.DB) error {
 // not just K+1, so a botched migration script can't leave the schema
 // in a half-state.
 func runMigrations(ctx context.Context, db *sql.DB) error {
+	// Live-DB test isolation gate, handle form (incident "task #17"). Open is
+	// not the only route here: a caller can build a raw database/sql handle
+	// and call this runner directly (migrations_test.go does exactly that), so
+	// the DAMAGE site guards itself independently of the path seam. Inert in
+	// production — see GuardLiveDBHandle.
+	if err := GuardLiveDBHandle(ctx, db); err != nil {
+		return err
+	}
 	entries, err := readMigrationEntries()
 	if err != nil {
 		return err

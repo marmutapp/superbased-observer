@@ -15,6 +15,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/marmutapp/superbased-observer/internal/adapter"
+	"github.com/marmutapp/superbased-observer/internal/adapter/mirrorbase"
 	"github.com/marmutapp/superbased-observer/internal/contentcap"
 	"github.com/marmutapp/superbased-observer/internal/git"
 	"github.com/marmutapp/superbased-observer/internal/models"
@@ -183,9 +184,10 @@ type toolResult struct {
 
 // loadMessageEvents reads every message whose updated_at exceeds
 // fromOffset, pairs tool_call parts with their tool_result siblings, and
-// emits one ToolEvent per user-prompt / assistant-text / reasoning /
-// tool-call part. tool_result parts are consumed into the pairing map and
-// never emitted on their own.
+// emits one ToolEvent per user-prompt / assistant-text / tool-call part.
+// tool_result parts are consumed into the pairing map and never emitted
+// on their own; `reasoning` parts never mint a row of their own either —
+// they ride the next event as PrecedingReasoning (see threadState).
 func (a *Adapter) loadMessageEvents(ctx context.Context, db *sql.DB, sourceFile, projectRoot string, fromOffset int64) ([]models.ToolEvent, error) {
 	if !tableExists(ctx, db, "messages") {
 		return nil, nil
@@ -218,14 +220,64 @@ func (a *Adapter) loadMessageEvents(ctx context.Context, db *sql.DB, sourceFile,
 	results := collectToolResults(msgs)
 
 	var out []models.ToolEvent
+	var pending threadState
 	for _, m := range msgs {
 		var parts []crushPart
 		if err := json.Unmarshal([]byte(m.Parts), &parts); err != nil {
 			continue // malformed parts blob — skip, don't fail the batch
 		}
-		out = append(out, a.eventsForMessage(sourceFile, projectRoot, m, parts, results)...)
+		out = append(out, a.eventsForMessage(sourceFile, projectRoot, m, parts, results, &pending)...)
 	}
 	return out, nil
+}
+
+// threadState carries the reasoning text a `reasoning` part produced
+// until the next assistant-text / tool-call event consumes it.
+//
+// Semantics (grok-style, adopted by B3 — see the package doc):
+//
+//   - CONSUMED-ONCE: the first successor event to carry it clears it, so
+//     one block of thinking is never stamped onto a whole session.
+//
+//   - LAST-WINS: a second `reasoning` part before any successor replaces
+//     the first (Crush emits interleaved reasoning/tool_call parts, and
+//     the nearest thinking is the one that introduced the call).
+//
+//   - TURN-BOUNDARY DISCARD: a user prompt clears it — reasoning never
+//     crosses into the next user turn.
+//
+//   - SESSION-SCOPED: one crush.db holds every session of a project and
+//     the message scan orders by created_at across all of them, so two
+//     sessions can interleave. Reasoning never crosses a session id.
+//
+// The state lives for one ParseSessionFile call and spans messages,
+// because Crush's reasoning part and the tool_call it introduces can
+// land on different `messages` rows.
+type threadState struct {
+	sessionID string
+	text      string
+}
+
+// set records a reasoning body for a session (last-wins).
+func (t *threadState) set(sessionID, body string) {
+	t.sessionID, t.text = sessionID, body
+}
+
+// clear drops any pending reasoning (turn boundary).
+func (t *threadState) clear() { t.sessionID, t.text = "", "" }
+
+// take returns the pending reasoning and consumes it, or "" when the
+// pending reasoning belongs to a different session. Scrubbing + capping
+// happen HERE (at flush), not at capture, so the 200-char preview
+// convention the retired `crush.reasoning` row used is preserved
+// byte-for-byte on the successor's PrecedingReasoning.
+func (t *threadState) take(a *Adapter, sessionID string) string {
+	if t.text == "" || t.sessionID != sessionID {
+		return ""
+	}
+	out := a.scrub(truncate(t.text, 200))
+	t.clear()
+	return out
 }
 
 // collectToolResults walks every role="tool" message's tool_result parts
@@ -258,7 +310,9 @@ func collectToolResults(msgs []messageRow) map[string]toolResult {
 }
 
 // eventsForMessage converts one message's parts into ToolEvents.
-func (a *Adapter) eventsForMessage(sourceFile, projectRoot string, m messageRow, parts []crushPart, results map[string]toolResult) []models.ToolEvent {
+// `pending` carries reasoning across parts AND across messages; see
+// threadState for the consumption semantics.
+func (a *Adapter) eventsForMessage(sourceFile, projectRoot string, m messageRow, parts []crushPart, results map[string]toolResult, pending *threadState) []models.ToolEvent {
 	var out []models.ToolEvent
 	when := secondsToTime(m.CreatedAt)
 	for i, p := range parts {
@@ -273,30 +327,37 @@ func (a *Adapter) eventsForMessage(sourceFile, projectRoot string, m messageRow,
 				continue
 			}
 			if strings.EqualFold(m.Role, "user") {
-				out = append(out, a.userPromptEvent(sourceFile, projectRoot, m, i, body))
+				out = append(out, a.userPromptEvent(sourceFile, projectRoot, m, i, body, pending))
 			} else if strings.EqualFold(m.Role, "assistant") {
-				out = append(out, a.assistantTextEvent(sourceFile, projectRoot, m, i, body))
+				out = append(out, a.assistantTextEvent(sourceFile, projectRoot, m, i, body, pending))
 			}
 		case "reasoning":
+			// B3: a reasoning part mints NO action row of its own. Its
+			// body is held and threaded onto the next assistant-text /
+			// tool-call event as PrecedingReasoning.
 			var d crushReasoningData
 			if err := json.Unmarshal(p.Data, &d); err != nil {
 				continue
 			}
-			if ev, ok := a.reasoningEvent(sourceFile, projectRoot, m, i, d); ok {
-				out = append(out, ev)
+			if body := strings.TrimSpace(d.Thinking); body != "" {
+				pending.set(m.SessionID, body)
 			}
 		case "tool_call":
 			var d crushToolCallData
 			if err := json.Unmarshal(p.Data, &d); err != nil {
 				continue
 			}
-			out = append(out, a.toolCallEvent(sourceFile, projectRoot, m, when, d, results))
+			out = append(out, a.toolCallEvent(sourceFile, projectRoot, m, when, d, results, pending))
 		}
 	}
 	return out
 }
 
-func (a *Adapter) userPromptEvent(sourceFile, projectRoot string, m messageRow, idx int, body string) models.ToolEvent {
+// userPromptEvent emits the operator's prompt. A user turn is a reasoning
+// boundary: any thinking still pending from the previous turn is dropped
+// rather than stamped onto the new turn's rows.
+func (a *Adapter) userPromptEvent(sourceFile, projectRoot string, m messageRow, idx int, body string, pending *threadState) models.ToolEvent {
+	pending.clear()
 	preview := a.scrub(truncate(body, 500))
 	return models.ToolEvent{
 		SourceFile:    sourceFile,
@@ -313,7 +374,7 @@ func (a *Adapter) userPromptEvent(sourceFile, projectRoot string, m messageRow, 
 	}
 }
 
-func (a *Adapter) assistantTextEvent(sourceFile, projectRoot string, m messageRow, idx int, body string) models.ToolEvent {
+func (a *Adapter) assistantTextEvent(sourceFile, projectRoot string, m messageRow, idx int, body string, pending *threadState) models.ToolEvent {
 	preview := a.scrub(truncate(body, 200))
 	output := a.scrub(contentcap.Cap(body, contentcap.DefaultMaxBytes))
 	return models.ToolEvent{
@@ -324,54 +385,24 @@ func (a *Adapter) assistantTextEvent(sourceFile, projectRoot string, m messageRo
 		Timestamp:     secondsToTime(m.CreatedAt),
 		Model:         m.Model,
 		Tool:          models.ToolCrush,
-		ActionType:    models.ActionTaskComplete,
-		Target:        preview,
-		Success:       true,
-		RawToolName:   "crush.assistant_text",
-		ToolOutput:    output,
-		MessageID:     m.ID,
-	}
-}
-
-// reasoningEvent surfaces a Crush reasoning part as a ToolEvent. Crush
-// stores no reasoning TOKEN count (its token bundle is session-cumulative
-// prompt/completion only), so the reasoning is carried as text —
-// mirroring the opencode adapter's reasoning convention.
-func (a *Adapter) reasoningEvent(sourceFile, projectRoot string, m messageRow, idx int, d crushReasoningData) (models.ToolEvent, bool) {
-	body := strings.TrimSpace(d.Thinking)
-	if body == "" {
-		return models.ToolEvent{}, false
-	}
-	when := secondsToTime(d.StartedAt)
-	if when.IsZero() {
-		when = secondsToTime(m.CreatedAt)
-	}
-	var durationMs int64
-	if d.StartedAt > 0 && d.FinishedAt > d.StartedAt {
-		durationMs = (d.FinishedAt - d.StartedAt) * 1000
-	}
-	preview := a.scrub(truncate(body, 200))
-	output := a.scrub(contentcap.Cap(body, contentcap.DefaultMaxBytes))
-	return models.ToolEvent{
-		SourceFile:         sourceFile,
-		SourceEventID:      fmt.Sprintf("reasoning:%s:%d", m.ID, idx),
-		SessionID:          m.SessionID,
-		ProjectRoot:        projectRoot,
-		Timestamp:          when,
-		Model:              m.Model,
-		Tool:               models.ToolCrush,
-		ActionType:         models.ActionTaskComplete,
+		// One row per text part of a message — per-message assistant
+		// text, not a turn terminus.
+		ActionType:         models.ActionAssistantMessage,
 		Target:             preview,
 		Success:            true,
-		DurationMs:         durationMs,
-		PrecedingReasoning: preview,
-		RawToolName:        "crush.reasoning",
+		PrecedingReasoning: pending.take(a, m.SessionID),
+		RawToolName:        "crush.assistant_text",
 		ToolOutput:         output,
 		MessageID:          m.ID,
-	}, true
+	}
 }
 
-func (a *Adapter) toolCallEvent(sourceFile, projectRoot string, m messageRow, when time.Time, d crushToolCallData, results map[string]toolResult) models.ToolEvent {
+// Crush stores no reasoning TOKEN count (its token bundle is
+// session-cumulative prompt/completion only), so a `reasoning` part is
+// pure text. Pre-B3 it minted its own ActionTaskComplete row
+// (`crush.reasoning`) — a phantom action for something the model never
+// did. It is now threaded onto the successor event instead (threadState).
+func (a *Adapter) toolCallEvent(sourceFile, projectRoot string, m messageRow, when time.Time, d crushToolCallData, results map[string]toolResult, pending *threadState) models.ToolEvent {
 	actionType, target := mapTool(d.Name, []byte(d.Input))
 
 	success := true
@@ -392,21 +423,22 @@ func (a *Adapter) toolCallEvent(sourceFile, projectRoot string, m messageRow, wh
 		sourceID = "tool:" + m.ID + ":" + d.Name
 	}
 	return models.ToolEvent{
-		SourceFile:    sourceFile,
-		SourceEventID: sourceID,
-		SessionID:     m.SessionID,
-		ProjectRoot:   projectRoot,
-		Timestamp:     when,
-		Model:         m.Model,
-		Tool:          models.ToolCrush,
-		ActionType:    actionType,
-		Target:        truncate(target, 200),
-		Success:       success,
-		ErrorMessage:  a.scrub(truncate(errMsg, 500)),
-		RawToolName:   d.Name,
-		RawToolInput:  rawInput,
-		ToolOutput:    output,
-		MessageID:     m.ID,
+		SourceFile:         sourceFile,
+		SourceEventID:      sourceID,
+		SessionID:          m.SessionID,
+		ProjectRoot:        projectRoot,
+		Timestamp:          when,
+		Model:              m.Model,
+		Tool:               models.ToolCrush,
+		ActionType:         actionType,
+		Target:             truncate(target, 200),
+		Success:            success,
+		ErrorMessage:       a.scrub(truncate(errMsg, 500)),
+		PrecedingReasoning: pending.take(a, m.SessionID),
+		RawToolName:        d.Name,
+		RawToolInput:       rawInput,
+		ToolOutput:         output,
+		MessageID:          m.ID,
 	}
 }
 
@@ -623,12 +655,12 @@ func stageMirrorIfForeign(srcDB string) (string, error) {
 	if !isForeignMountPath(srcDB) {
 		return srcDB, nil
 	}
-	cache, err := os.UserCacheDir()
-	if err != nil || cache == "" {
-		cache = os.TempDir()
+	base, err := mirrorbase.Base()
+	if err != nil || base == "" {
+		base = filepath.Join(os.TempDir(), "superbased-observer")
 	}
 	sum := sha256.Sum256([]byte(srcDB))
-	mirrorDir := filepath.Join(cache, "superbased-observer", "crush-mirror", hex.EncodeToString(sum[:8]))
+	mirrorDir := filepath.Join(base, "crush-mirror", hex.EncodeToString(sum[:8]))
 	if err := os.MkdirAll(mirrorDir, 0o700); err != nil {
 		return "", fmt.Errorf("mkdir mirror: %w", err)
 	}

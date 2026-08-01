@@ -106,6 +106,12 @@ type DoctorOptions struct {
 // Run executes every check and returns the aggregated report. It never
 // returns an error — every failure is captured as a StatusFail check.
 func Run(ctx context.Context, opts DoctorOptions) Report {
+	// homeOverride is the caller's RAW HomeDir, kept before the real-$HOME
+	// default below: non-empty means "this doctor run is sandboxed", which
+	// switches OFF cross-OS auto-detection in the checks that would otherwise
+	// read a foreign-OS home (see crossmount.AutoDetectSuppressed, incident
+	// 2026-07-31). "" on every production run.
+	homeOverride := opts.HomeDir
 	if opts.HomeDir == "" {
 		if home, err := os.UserHomeDir(); err == nil {
 			opts.HomeDir = home
@@ -120,6 +126,7 @@ func Run(ctx context.Context, opts DoctorOptions) Report {
 	r.add(checkHookChecksums(opts.HomeDir))
 	r.add(checkHookCommandsBinary(opts.HomeDir, opts.BinaryPath))
 	r.add(checkMCPRegistrations(opts.HomeDir, opts.BinaryPath))
+	r.add(checkClaudeCodePlugin(opts.HomeDir, homeOverride))
 	r.add(checkPidBridge(ctx, opts.DB))
 	r.add(checkConcurrentDaemons(opts.Config))
 	r.add(checkCodexHookTrust(opts.HomeDir))

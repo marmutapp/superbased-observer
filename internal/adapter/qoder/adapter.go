@@ -186,7 +186,20 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 			break
 		}
 	}
+	st.flagPendingOutcomes(&res)
 	return res, nil
+}
+
+// flagPendingOutcomes marks every tool call still waiting for its result
+// at EOF. Its Success=true is a placeholder, so the store holds
+// failure-context bookkeeping for the row until the matching
+// ActionOutcomeUpdate reports the real outcome.
+func (st *parseState) flagPendingOutcomes(res *adapter.ParseResult) {
+	for _, idx := range st.pendingCall {
+		if idx < len(res.ToolEvents) {
+			res.ToolEvents[idx].OutcomePending = true
+		}
+	}
 }
 
 // parseState carries the per-call mutable bookkeeping shared across lines.
@@ -370,15 +383,41 @@ func (st *parseState) emitAssistant(rec *rawRecord, res *adapter.ParseResult) {
 
 // applyToolResult stamps success + scrubbed output onto the ToolEvent the
 // matching tool_use produced.
+//
+// When no pending call matches, the tool_use was emitted in an EARLIER
+// parse window and its row is already persisted (optimistically
+// successful): the outcome goes out as an ActionOutcomeUpdate keyed by
+// the same "tool:<ToolUseID>" SourceEventID the emit side built. Only a
+// non-empty ToolUseID qualifies — the empty-id fallback id embeds the
+// record uuid + position, which the result block doesn't carry.
 func (st *parseState) applyToolResult(block rawBlock, res *adapter.ParseResult) {
+	var scrubbed string
+	if out := toolResultText(block.Content); out != "" {
+		scrubbed = st.adapter.scrubber.String(contentcap.Cap(out, contentcap.DefaultMaxBytes))
+	}
 	idx, ok := st.pendingCall[block.ToolUseID]
 	if !ok || idx >= len(res.ToolEvents) {
+		if block.ToolUseID == "" {
+			return
+		}
+		// DurationMs stays 0 — the call lived in the prior window and
+		// UpdateActionOutcome no-ops a zero.
+		up := models.ActionOutcomeUpdate{
+			SourceFile:    st.path,
+			SourceEventID: "tool:" + block.ToolUseID,
+			SuccessKnown:  true, // is_error is always a verdict
+			Success:       !block.IsError,
+			ToolOutput:    scrubbed,
+		}
+		if block.IsError && scrubbed != "" {
+			up.ErrorMessage = truncate(scrubbed, 500)
+		}
+		res.OutcomeUpdates = append(res.OutcomeUpdates, up)
 		return
 	}
 	ev := &res.ToolEvents[idx]
 	ev.Success = !block.IsError
-	if out := toolResultText(block.Content); out != "" {
-		scrubbed := st.adapter.scrubber.String(contentcap.Cap(out, contentcap.DefaultMaxBytes))
+	if scrubbed != "" {
 		ev.ToolOutput = scrubbed
 		if block.IsError {
 			ev.ErrorMessage = truncate(scrubbed, 500)

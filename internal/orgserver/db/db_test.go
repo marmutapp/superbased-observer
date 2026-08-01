@@ -26,18 +26,19 @@ func TestOpenAppliesMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Version: %v", err)
 	}
-	if v != 21 {
-		t.Fatalf("version = %d, want 21", v)
+	if v != 24 {
+		t.Fatalf("version = %d, want 24", v)
 	}
 
 	want := []string{
 		"actions", "api_turns", "audit_log", "budgets", "cc_analytics_daily",
 		"codex_analytics_daily", "copilot_analytics_daily", "digest_state", "enrolment_tokens",
-		"guard_events", "issued_bearers", "m365_copilot_analytics_daily",
+		"guard_events", "invite_attempts", "issued_bearers", "m365_copilot_analytics_daily",
 		"m365_copilot_content", "obs_admission_events", "obs_admission_policy_versions",
 		"obs_alert_events", "obs_alert_rules",
 		"obs_content", "obs_enduser_spend", "obs_eval_items", "obs_eval_summaries", "obs_span_events", "obs_spans",
-		"obs_summaries", "obs_traces", "org", "org_members", "org_policy_bundles",
+		"obs_summaries", "obs_traces", "org", "org_announcement_audit", "org_announcements",
+		"org_members", "org_policy_bundles",
 		"org_project_team", "org_routing_policies", "org_team_members",
 		"org_teams", "otel_content", "revoked_bearers", "routing_policy_audit",
 		"routing_policy_keys", "routing_summaries", "sessions", "token_usage",
@@ -138,7 +139,7 @@ func TestReopenIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != 21 {
-		t.Errorf("version after reopen = %d, want 21", v)
+	if v != 24 {
+		t.Errorf("version after reopen = %d, want 24", v)
 	}
 }

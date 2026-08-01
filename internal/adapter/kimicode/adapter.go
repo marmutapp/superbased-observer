@@ -167,7 +167,20 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 			break
 		}
 	}
+	st.flagPendingOutcomes(&res)
 	return res, nil
+}
+
+// flagPendingOutcomes marks every tool call still waiting for its result
+// at EOF. Its Success=true is a placeholder, so the store holds
+// failure-context bookkeeping for the row until the matching
+// ActionOutcomeUpdate reports the real outcome.
+func (st *parseState) flagPendingOutcomes(res *adapter.ParseResult) {
+	for _, idx := range st.pendingCall {
+		if idx < len(res.ToolEvents) {
+			res.ToolEvents[idx].OutcomePending = true
+		}
+	}
 }
 
 // parseState carries the per-call mutable bookkeeping the line handler
@@ -331,13 +344,44 @@ func (st *parseState) emitToolCall(ev *loopEvent, ts int64, res *adapter.ParseRe
 
 // applyToolResult stamps success + scrubbed output onto the ToolEvent the
 // matching tool.call produced.
+//
+// When no pending call matches, the tool.call was emitted in an EARLIER
+// parse window and its row is already persisted (optimistically
+// successful): the outcome goes out as an ActionOutcomeUpdate keyed by
+// the same "tool:<id>" SourceEventID emitToolCall built.
+//
+// Key caveat: the emit side keys on ToolCallID||UUID, the result side on
+// ToolCallID||ParentUUID. They agree whenever ToolCallID is present; the
+// ParentUUID fallback is the same call-UUID guess the in-window match
+// already relies on, so cross-tick is exactly as accurate as in-window,
+// no more.
 func (st *parseState) applyToolResult(ev *loopEvent, res *adapter.ParseResult) {
 	id := firstNonEmpty(ev.ToolCallID, ev.ParentUUID)
+	output, success, errMsg := resultOutcome(ev.Result)
 	idx, ok := st.pendingCall[id]
 	if !ok || idx >= len(res.ToolEvents) {
+		if id == "" {
+			return
+		}
+		// DurationMs stays 0 — the call lived in the prior window and
+		// UpdateActionOutcome no-ops a zero.
+		up := models.ActionOutcomeUpdate{
+			SourceFile:    st.path,
+			SourceEventID: "tool:" + id,
+			// resultOutcome always returns a verdict: a tool.result
+			// with neither error nor isError IS the success signal.
+			SuccessKnown: true,
+			Success:      success,
+		}
+		if output != "" {
+			up.ToolOutput = st.adapter.scrubber.String(contentcap.Cap(output, contentcap.DefaultMaxBytes))
+		}
+		if !success && errMsg != "" {
+			up.ErrorMessage = truncate(st.adapter.scrubber.String(errMsg), 500)
+		}
+		res.OutcomeUpdates = append(res.OutcomeUpdates, up)
 		return
 	}
-	output, success, errMsg := resultOutcome(ev.Result)
 	te := &res.ToolEvents[idx]
 	te.Success = success
 	if output != "" {

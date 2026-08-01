@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 )
 
@@ -104,4 +106,82 @@ func VerifyPolicyBundle(b PolicyBundle) (ed25519.PublicKey, error) {
 func PublicKeyPinHash(pub ed25519.PublicKey) string {
 	sum := sha256.Sum256(pub)
 	return hex.EncodeToString(sum[:])
+}
+
+// Org-announcement signing (rail R3 of
+// docs/plans/dashboard-announcements-banner-plan-2026-07-31.md §4).
+// Same discipline as the policy bundle above and for the same reasons:
+// the signature covers a DOMAIN-SEPARATED, VERSION-BOUND message, never
+// the bare body bytes. Client and server derive it through this one
+// helper.
+
+// announcementSigningDomain domain-separates announcement signatures
+// from every other Ed25519 use in the protocol — and specifically from
+// the routing-policy rail, which is signed by the SAME org key
+// (orgserver/routingpolicy.SigningKey). Without the tag, a captured
+// routing-policy document could be presented as an announcement (its
+// signature is over the bare body there), so this constant is what
+// makes one signing identity safe across two rails.
+const announcementSigningDomain = "superbased-org-announcement"
+
+// AnnouncementSigningMessage returns the canonical bytes signed over an
+// org announcement document: SHA-256 over
+//
+//	domain || 0x00 || decimal(version) || 0x00 || body
+//
+// The NUL separators make the encoding unambiguous (the version is
+// decimal digits, so no body can shift the boundary), and binding the
+// version means a captured signature for version N can never be
+// replayed as version N+1 — which is the whole attack the agent's
+// monotonic-version short-circuit would otherwise hand an eavesdropper:
+// bump the version on any captured signed document and the node caches
+// it, freezing (or clearing) the fleet's banner.
+//
+// The rail is UNRELEASED, which is why this could be fixed in place
+// rather than carried as a compat wart the way the routing rail's
+// body-only signature is (docs/security.md open ledger).
+func AnnouncementSigningMessage(version int64, body string) []byte {
+	h := sha256.New()
+	h.Write([]byte(announcementSigningDomain))
+	h.Write([]byte{0})
+	h.Write([]byte(strconv.FormatInt(version, 10)))
+	h.Write([]byte{0})
+	h.Write([]byte(body))
+	return h.Sum(nil)
+}
+
+// DecodeCapped decodes exactly ONE JSON value from r into v under a hard
+// byte cap, refusing both anything past that value and a document that
+// reaches the cap.
+//
+// It exists because `json.NewDecoder(io.LimitReader(body, cap)).Decode`
+// — the shape both org-announcement endpoints used — enforces neither
+// property it looks like it enforces:
+//
+//   - Trailing bytes: Decode stops at the end of the first JSON value,
+//     so a document followed by a second document, or by megabytes of
+//     padding, decodes "successfully". Here the token stream must end
+//     at EOF. Trailing whitespace is fine (json.Encoder writes a
+//     newline); anything else is an error.
+//   - Cap exhaustion: io.LimitReader simply stops producing bytes,
+//     which a decoder can read as a clean end of input. Here the budget
+//     is cap+1 bytes and exhausting it is an explicit error, so the cap
+//     is a document cap and not merely a read cap.
+func DecodeCapped(r io.Reader, maxBytes int64, v any) error {
+	if maxBytes <= 0 {
+		return fmt.Errorf("orgcontract.DecodeCapped: cap must be positive, got %d", maxBytes)
+	}
+	limited := &io.LimitedReader{R: r, N: maxBytes + 1}
+	dec := json.NewDecoder(limited)
+	err := dec.Decode(v)
+	if limited.N <= 0 {
+		return fmt.Errorf("orgcontract.DecodeCapped: document exceeds the %d-byte cap", maxBytes)
+	}
+	if err != nil {
+		return fmt.Errorf("orgcontract.DecodeCapped: %w", err)
+	}
+	if _, terr := dec.Token(); !errors.Is(terr, io.EOF) {
+		return fmt.Errorf("orgcontract.DecodeCapped: trailing bytes after the document")
+	}
+	return nil
 }

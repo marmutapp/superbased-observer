@@ -196,6 +196,18 @@ func CheckAdapter(tool string, cfg config.Config) (Check, bool) {
 	// WARN would be alarm fatigue, not signal.
 	note(StatusOK, "token/cost: "+tokenTierSummary(ic.TokenTier))
 
+	// Native tool VOCABULARY coverage (WP-T7, registry-sourced): whether
+	// the canonical taxonomy (internal/tooltax) carries this adapter's
+	// native tool names, so its raw tool calls resolve to a canonical
+	// action type instead of falling into `unknown`. An honest-zero row
+	// prints its registry Note VERBATIM — the Note is the grounded reason
+	// (e.g. a browser-capture lane that records chat turns, never tool
+	// calls), and paraphrasing it would re-introduce exactly the
+	// heuristic-lie class WP-T3 removed. Stays StatusOK either way: a
+	// capture with no tool vocabulary is the honest ceiling of that
+	// source, not user-fixable misconfiguration.
+	note(StatusOK, "vocabulary: "+vocabularySummary(ic.Vocabulary))
+
 	// Session attach/resume (registry-sourced, session-attach design §2.3).
 	// Informational: whether the tool can hand its PTY to the daemon for
 	// dashboard jump-in (`observer <sub> --attach`) and how a closed session
@@ -292,6 +304,34 @@ func tokenTierSummary(t integration.TokenTier) string {
 		return "best tier=" + best + " (no known gap)"
 	}
 	return "best tier=" + best + " — known gap: " + t.Gap
+}
+
+// vocabularySummary renders an adapter's native tool VOCABULARY coverage
+// (the registry ledger) for the doctor.
+//
+// Three shapes, dispatched on the declared capability (never tool name):
+//
+//   - InTaxonomy — states the coverage plainly; any Note is a
+//     partial-coverage caveat and is appended VERBATIM.
+//   - honest zero (InTaxonomy false, Note set) — prints the Note VERBATIM.
+//     The Note is the grounded reason this capture has no tool vocabulary;
+//     summarizing it here would put a rendering-layer guess in front of the
+//     registry's evidence.
+//   - undeclared (the zero value) — says exactly that. registry_coverage_
+//     test.go rejects this state, so it should be unreachable in a shipped
+//     build; rendering still refuses to invent a claim for it.
+func vocabularySummary(v integration.Vocabulary) string {
+	if v.InTaxonomy {
+		s := "in taxonomy (native tool names classified via internal/tooltax)"
+		if v.Note != "" {
+			s += " — " + v.Note
+		}
+		return s
+	}
+	if v.Note != "" {
+		return v.Note
+	}
+	return "not declared in the integration registry"
 }
 
 // attachResumeSummary renders an adapter's session attach/resume capability

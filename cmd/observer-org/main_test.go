@@ -64,9 +64,19 @@ func TestMigrateAndDumpConfig(t *testing.T) {
 	// 017_obs_enduser_spend (per-end-user cross-instance spend rollup),
 	// 018_m365_copilot_analytics_daily (native-console instance #4 / World 1 —
 	// the Microsoft 365 Copilot org connector; server-only, no agent pair),
-	// 019_obs_admission (T6 admission org-wire tier), and 020_obs_eval_items
-	// (T7 per-item eval tier).
-	if !strings.Contains(out, "schema version = 21") {
+	// 019_obs_admission (T6 admission org-wire tier), 020_obs_eval_items
+	// (T7 per-item eval tier), 021_digest_state (the scheduled report
+	// digest), 022_org_announcements (the announcements banner rail), and
+	// 023_invite_attribution (enrolment_tokens.minted_by for the Teams
+	// bottom-up invite loop — server-only, no agent pair), and
+	// 024_invite_attempts (the failed-resolution budget that bounds the
+	// invite email oracle — server-only, no agent pair).
+	//
+	// NOTE: this assertion had drifted (it still expected 21 while 021 and
+	// 022 had landed), so the pin was silently failing before the invite arc
+	// touched it. Bump it with every new server migration — that is the whole
+	// point of the check.
+	if !strings.Contains(out, "schema version = 24") {
 		t.Errorf("migrate output = %q", out)
 	}
 

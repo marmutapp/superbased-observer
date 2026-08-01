@@ -26,6 +26,37 @@ export function isRemoteView(): boolean {
   return !isLoopbackHost(window.location.hostname);
 }
 
+// --- Session classification (tags / favorites / notes) remote gate ---
+//
+// POST /api/session/<id>/tags and POST /api/sessions/tags/manage are registered
+// Execute-class (internal/intelligence/dashboard/dashboard.go "/tags" +
+// "/api/sessions/tags/manage"). On a paired REMOTE device the fetch layer sends
+// X-Remote-CSRF, which only ever proves View; Execute additionally requires a
+// single-use X-Remote-Execute capability whose binding is (device session,
+// METHOD + " " + PATH) — see remoteController.Principal.
+//
+// No such capability is obtainable for these routes. The only mint in the
+// product is MintTerminalControl(deviceHash, terminalHandle) behind the
+// owner-LOCAL /api/remote/approve-execute route: it is bound to a terminal
+// handle and consumed by the PTY writer websocket, so it can never satisfy a
+// "POST /api/session/<id>/tags" action binding. The generic MintExecute has no
+// HTTP surface at all (CLI verb only). A remote classification mutation is
+// therefore a guaranteed 403, exactly like the owner-local workspace-layout
+// save that WorkspaceGrid already declines to attempt.
+//
+// So the affordances are disabled up front with copy naming the exact missing
+// dependency (the house honest-disabled-control rule), while every READ-ONLY
+// classification surface — pills, the tag rollup, tag/favorite filters — stays
+// fully functional remotely.
+export function canClassifySessions(): boolean {
+  return !isRemoteView();
+}
+
+// CLASSIFY_REMOTE_BLOCKED_MSG is the tooltip/title shown on every disabled
+// classification affordance on a paired remote device.
+export const CLASSIFY_REMOTE_BLOCKED_MSG =
+  "Tagging from a paired device needs a remote-execute approval, and the only approval SuperBased mints is scoped to one terminal — tags, favorites and notes are read-only here. Use the owner's local dashboard to classify sessions.";
+
 const REMOTE_CSRF_KEY = "sb_remote_csrf";
 
 export function getRemoteCSRF(): string {

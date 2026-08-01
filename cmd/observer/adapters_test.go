@@ -40,6 +40,8 @@ func TestRenderAdapterMatrixCoversEveryAdapter(t *testing.T) {
 		"HANDOFF",                      // handoff column header
 		"full+seeded",                  // full transcript + seeded launcher (claude-code/codex)
 		"full+doc-assisted",            // hermes DocAssisted launch
+		"VOCAB",                        // native-tool-vocabulary column header
+		"internal/tooltax",             // VOCAB legend names the taxonomy package
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("matrix missing expected cell %q", want)
@@ -142,6 +144,86 @@ func TestHandoffCell(t *testing.T) {
 		if got := handoffCell(tc.in); got != tc.want {
 			t.Errorf("%s: handoffCell() = %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+// TestVocabCell pins the VOCAB cell rendering (WP-T7): the taxonomy-covered
+// row reads "yes"; every other shape reads the honest-zero dash the rest of
+// the table uses. An honest-zero row's grounded Note is NOT squeezed into
+// the grid cell — `observer doctor <tool>` is where it prints verbatim.
+func TestVocabCell(t *testing.T) {
+	cases := []struct {
+		name string
+		in   integration.Vocabulary
+		want string
+	}{
+		{"in taxonomy", integration.Vocabulary{InTaxonomy: true}, "yes"},
+		{"in taxonomy with caveat", integration.Vocabulary{InTaxonomy: true, Note: "partial"}, "yes"},
+		{"honest zero with note", integration.Vocabulary{Note: "no native tool vocabulary: chat turns only"}, "—"},
+		{"undeclared zero value", integration.Vocabulary{}, "—"},
+	}
+	for _, tc := range cases {
+		if got := vocabCell(tc.in); got != tc.want {
+			t.Errorf("%s: vocabCell() = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestRenderAdapterMatrixVocabColumn pins that the VOCAB column lands in the
+// header right after TOKEN and that each row's VOCAB cell is rendered at
+// that column position. Driven by synthetic rows so it never depends on the
+// registry's row set (which other work-packages add to).
+func TestRenderAdapterMatrixVocabColumn(t *testing.T) {
+	caps := []integration.Capability{
+		{Tool: "vocab-yes-fixture", Vocabulary: integration.Vocabulary{InTaxonomy: true}},
+		{Tool: "vocab-zero-fixture", Vocabulary: integration.Vocabulary{Note: "no native tool vocabulary: chat turns only"}},
+	}
+	var buf bytes.Buffer
+	renderAdapterMatrix(&buf, caps)
+	lines := strings.Split(buf.String(), "\n")
+	if len(lines) == 0 {
+		t.Fatal("no output")
+	}
+	header := strings.Fields(lines[0])
+	vocabIdx, tokenIdx := -1, -1
+	for i, h := range header {
+		switch h {
+		case "VOCAB":
+			vocabIdx = i
+		case "TOKEN":
+			tokenIdx = i
+		}
+	}
+	if vocabIdx < 0 || tokenIdx < 0 {
+		t.Fatalf("header missing TOKEN/VOCAB: %v", header)
+	}
+	if vocabIdx != tokenIdx+1 {
+		t.Errorf("VOCAB at index %d, want directly after TOKEN (%d): %v", vocabIdx, tokenIdx, header)
+	}
+
+	want := map[string]string{"vocab-yes-fixture": "yes", "vocab-zero-fixture": "—"}
+	seen := 0
+	for _, line := range lines[1:] {
+		f := strings.Fields(line)
+		if len(f) <= vocabIdx {
+			continue
+		}
+		w, ok := want[f[0]]
+		if !ok {
+			continue
+		}
+		seen++
+		if f[vocabIdx] != w {
+			t.Errorf("%s: VOCAB cell = %q, want %q (line: %q)", f[0], f[vocabIdx], w, line)
+		}
+	}
+	if seen != len(want) {
+		t.Errorf("matched %d fixture rows, want %d", seen, len(want))
+	}
+
+	// The honest-zero row's grounded Note never leaks into the grid.
+	if strings.Contains(buf.String(), "chat turns only") {
+		t.Error("honest-zero Note should not be rendered in the matrix cell")
 	}
 }
 

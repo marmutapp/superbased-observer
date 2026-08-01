@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/marmutapp/superbased-observer/internal/models"
 )
 
 // buildFixtureDB loads the live testdata/hermes/sessions.sql + messages.sql
@@ -100,11 +103,13 @@ func TestScanStateDB_LiveCorpus(t *testing.T) {
 }
 
 // TestBuildEvents_ReasoningAndStopReason pins the two trace-coverage
-// additions for Hermes: a standalone hermes.reasoning row from the
-// messages.reasoning / reasoning_content columns (the live corpus rows
-// 2/4/6/8 carry chain-of-thought), and Metadata.StopReason stamped on
-// the assistant_response row from messages.finish_reason. hookCheck is
-// nil so every session runs the SQLite emission path.
+// behaviours for Hermes against the live corpus: the messages.reasoning
+// / reasoning_content chain-of-thought (rows 2/4/6/8) is THREADED onto
+// the successor event's PrecedingReasoning and mints NO action row of
+// its own (B3, 2026-07-31 — it used to emit a phantom
+// `hermes.reasoning` task_complete row), and Metadata.StopReason is
+// stamped on the assistant_response row from messages.finish_reason.
+// hookCheck is nil so every session runs the SQLite emission path.
 func TestBuildEvents_ReasoningAndStopReason(t *testing.T) {
 	t.Parallel()
 	dbPath := buildFixtureDB(t)
@@ -114,30 +119,107 @@ func TestBuildEvents_ReasoningAndStopReason(t *testing.T) {
 	}
 	toolEvents, _, _ := buildEvents(context.Background(), sessions, messages, dbPath, nil, nil)
 
-	var reasoningRows, stopRows int
+	var stopRows int
 	var sawGreeting bool
 	for _, ev := range toolEvents {
-		switch ev.RawToolName {
-		case "hermes.reasoning":
-			reasoningRows++
-			if strings.Contains(ev.ToolOutput, "simple greeting") {
-				sawGreeting = true
-			}
-		case "hermes.assistant_response":
+		if strings.Contains(strings.ToLower(ev.RawToolName), "reasoning") {
+			t.Errorf("reasoning-named action row emitted (B3: reasoning is never an action): raw=%q %+v", ev.RawToolName, ev)
+		}
+		if strings.Contains(ev.PrecedingReasoning, "simple greeting") {
+			sawGreeting = true
+		}
+		if ev.RawToolName == "hermes.assistant_response" {
 			if ev.Metadata != nil && strings.TrimSpace(ev.Metadata.StopReason) != "" {
 				stopRows++
 			}
 		}
 	}
-	if reasoningRows == 0 {
-		t.Errorf("no hermes.reasoning rows emitted; want >= 1 (live corpus rows 2/4/6/8 carry reasoning)")
-	}
 	if !sawGreeting {
-		t.Errorf("hermes.reasoning row body missing expected 'simple greeting' text")
+		t.Errorf("no event carried the message-2 chain-of-thought ('simple greeting') in PrecedingReasoning")
 	}
 	if stopRows == 0 {
 		t.Errorf("no hermes.assistant_response carried Metadata.StopReason; want >= 1 (finish_reason='stop')")
 	}
+}
+
+// TestBuildEvents_ReasoningThreadingContract is the B3 regression pin
+// for the threading semantics themselves, driven off hand-built rows so
+// each rule gets its own unambiguous case. buildEvents is the real
+// producer; nothing here re-implements it.
+func TestBuildEvents_ReasoningThreadingContract(t *testing.T) {
+	t.Parallel()
+	sessions := map[string]sessionRow{
+		"s1": {ID: "s1", Model: "openai/gpt-4o-mini", CWD: "/tmp/hermes-b3"},
+		"s2": {ID: "s2", Model: "openai/gpt-4o-mini", CWD: "/tmp/hermes-b3"},
+	}
+	call := func(id, name, args string) string {
+		return `[{"id":"` + id + `","function":{"name":"` + name + `","arguments":` + strconv.Quote(args) + `}}]`
+	}
+	twoCalls := `[{"id":"c2a","function":{"name":"read_file","arguments":"{\"path\":\"/a\"}"}},` +
+		`{"id":"c2b","function":{"name":"read_file","arguments":"{\"path\":\"/b\"}"}}]`
+	str := func(s string) sql.NullString { return sql.NullString{String: s, Valid: s != ""} }
+
+	messages := []messageRow{
+		// 1: user turn — starts clean.
+		{ID: 1, SessionID: "s1", Role: "user", Content: str("do the thing"), Timestamp: 1700000000},
+		// 2: reasoning + TWO tool calls → only the first call takes it.
+		{ID: 2, SessionID: "s1", Role: "assistant", ReasoningContent: str("THINK_ONE"), ToolCalls: str(twoCalls), Timestamp: 1700000001},
+		// 3: reasoning, no calls, no content → stays pending.
+		{ID: 3, SessionID: "s1", Role: "assistant", ReasoningContent: str("STALE_ACROSS_TURN"), Timestamp: 1700000002},
+		// 4: user turn → discards it.
+		{ID: 4, SessionID: "s1", Role: "user", Content: str("next thing"), Timestamp: 1700000003},
+		// 5: bare tool call → nothing pending.
+		{ID: 5, SessionID: "s1", Role: "assistant", ToolCalls: str(call("c5", "read_file", `{"path":"/c"}`)), Timestamp: 1700000004},
+		// 6: reasoning only (last-wins target), then 7 replaces it.
+		{ID: 6, SessionID: "s1", Role: "assistant", ReasoningContent: str("FIRST"), Timestamp: 1700000005},
+		{ID: 7, SessionID: "s1", Role: "assistant", ReasoningContent: str("SECOND"), Content: str("here you go"), Timestamp: 1700000006},
+		// 8: reasoning in s1 must never reach s2's row.
+		{ID: 8, SessionID: "s1", Role: "assistant", ReasoningContent: str("CROSS_SESSION"), Timestamp: 1700000007},
+		{ID: 9, SessionID: "s2", Role: "assistant", ToolCalls: str(call("c9", "read_file", `{"path":"/d"}`)), Timestamp: 1700000008},
+	}
+
+	toolEvents, _, warnings := buildEvents(context.Background(), sessions, messages, "/tmp/state.db", nil, nil)
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %v, want none", warnings)
+	}
+
+	byID := map[string]models.ToolEvent{}
+	for _, ev := range toolEvents {
+		if strings.Contains(strings.ToLower(ev.RawToolName), "reasoning") {
+			t.Fatalf("reasoning-named action row emitted: raw=%q %+v", ev.RawToolName, ev)
+		}
+		for _, body := range []string{"THINK_ONE", "STALE_ACROSS_TURN", "FIRST", "SECOND", "CROSS_SESSION"} {
+			if ev.Target == body || ev.ToolOutput == body {
+				t.Fatalf("reasoning body %q surfaced as action content: %+v", body, ev)
+			}
+		}
+		byID[ev.SourceEventID] = ev
+	}
+
+	cases := []struct{ id, want, why string }{
+		{"m2:c2a", "THINK_ONE", "the message's reasoning rides its first tool call"},
+		{"m2:c2b", "", "consumed-once: the sibling call already took it"},
+		{"m5:c5", "", "turn-boundary discard: a user prompt intervened"},
+		{"m7:asst", "SECOND", "last-wins: message 7's reasoning replaces message 6's"},
+		{"m9:c9", "", "session-scoped: s1 reasoning never reaches an s2 row"},
+	}
+	for _, c := range cases {
+		ev, ok := byID[c.id]
+		if !ok {
+			t.Fatalf("missing event %q; got %v", c.id, keysOf(byID))
+		}
+		if ev.PrecedingReasoning != c.want {
+			t.Errorf("%s PrecedingReasoning = %q, want %q (%s)", c.id, ev.PrecedingReasoning, c.want, c.why)
+		}
+	}
+}
+
+func keysOf(m map[string]models.ToolEvent) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 // TestScanStateDB_OffsetAdvance verifies the watermark semantics: a

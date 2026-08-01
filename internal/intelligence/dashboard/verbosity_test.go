@@ -41,7 +41,7 @@ func seedVerbositySession(t *testing.T, database *sql.DB, sessionID string, with
 		return sql.NullInt64{Int64: n, Valid: true}
 	}
 	body := "Here is the fix.\n```go\nfunc main() {}\n```\nDone.\n```\nlog output\n```"
-	ins("e1", models.ActionTaskComplete, "claudecode.assistant_text", "preview", body, sql.NullInt64{})
+	ins("e1", models.ActionAssistantMessage, "claudecode.assistant_text", "preview", body, sql.NullInt64{})
 	ins("e2", models.ActionWriteFile, "Write", "internal/x.go", "", cb(1000))
 	ins("e3", models.ActionRunCommand, "Bash", "go test ./...", "", cb(50))
 }

@@ -206,26 +206,17 @@ func (a *Adapter) parseLine(sourceFile string, line rawLine, lineNum int, state 
 			return
 		}
 		spanID := firstNonEmpty(line.SpanID, fmt.Sprintf("complete:L%d", lineNum))
-		// Emit the reasoning as a standalone, visible row (was only threaded
-		// into PrecedingReasoning) so the chain-of-thought is in the timeline.
-		if reasoning != "" {
-			res.ToolEvents = append(res.ToolEvents, models.ToolEvent{
-				SourceFile:         sourceFile,
-				SourceEventID:      spanID + ":reasoning",
-				SessionID:          state.SessionID,
-				MessageID:          assistantMessageID(line),
-				ProjectRoot:        state.ProjectRoot,
-				Timestamp:          ts,
-				Model:              state.Model,
-				Tool:               models.ToolCopilot,
-				ActionType:         models.ActionTaskComplete,
-				Target:             truncate(reasoning, 200),
-				Success:            true,
-				PrecedingReasoning: truncate(reasoning, 200),
-				RawToolName:        "copilot.reasoning",
-				ToolOutput:         a.scrubber.String(reasoning),
-			})
-		}
+		// B3 (2026-07-31): the reasoning mints NO row of its own — it
+		// briefly emitted a standalone `copilot.reasoning`
+		// task_complete, a phantom action for something the model never
+		// did. `attrs.reasoning` is a SIBLING FIELD of the agent_response
+		// it belongs to, so the threading is direct and unconditional
+		// (no pending state, no consumption ordering): the
+		// agent_response row below carries it in PrecedingReasoning,
+		// capped at the same 200 chars the retired row's Target used.
+		// A reasoning-only agent_response (no response text) therefore
+		// produces nothing — there is no successor to carry it.
+		//
 		// Assistant message row (only when there is actual response text).
 		if output != "" {
 			res.ToolEvents = append(res.ToolEvents, models.ToolEvent{

@@ -3,14 +3,19 @@ package dashboard
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/marmutapp/superbased-observer/internal/claudeplugin"
 	"github.com/marmutapp/superbased-observer/internal/db"
+	"github.com/marmutapp/superbased-observer/internal/hook"
+	"github.com/marmutapp/superbased-observer/internal/mcp"
 	"github.com/marmutapp/superbased-observer/internal/models"
 	"github.com/marmutapp/superbased-observer/internal/store"
 )
@@ -140,4 +145,137 @@ func TestToolsStatusMatrix(t *testing.T) {
 	if rr.Code != http.StatusMethodNotAllowed {
 		t.Errorf("POST: got %d want 405", rr.Code)
 	}
+}
+
+// TestProbeFromResultReportsPluginWiring is codex finding M4: a
+// registrar result whose Skipped flag is set means the tool is wired
+// through its OWN plugin surface. Connected Tools must render that as a
+// THIRD state — wired, but not by anything `observer init` wrote —
+// rather than as "registered=false / would register 0 events" (hooks) or
+// "not registered" (MCP).
+func TestProbeFromResultReportsPluginWiring(t *testing.T) {
+	// The expected reason is NOT hand-typed — it is exactly what the
+	// PRODUCTION detector (internal/claudeplugin) emits, built by feeding a
+	// real settings.json through claudeplugin.DetectInClaudeDir the same
+	// way internal/hook/register.go and internal/mcp/register.go do before
+	// stuffing the result into RegistrationResult.SkipReason. This closes
+	// the codex finding: a hand-typed constant only pins the literal
+	// "wired via the Claude Code plugin — " PREFIX the dashboard code
+	// writes, so a bug that dropped, truncated, or otherwise corrupted the
+	// propagation of res.SkipReason into Detail would still satisfy a
+	// prefix-only check. Asserting the FULL detail against the reason the
+	// live API actually computes makes that corruption visible.
+	claudeDir := t.TempDir()
+	settingsPath := filepath.Join(claudeDir, "settings.json")
+	settingsBody := fmt.Sprintf(`{"enabledPlugins": {%q: true}}`, claudeplugin.EnabledKey)
+	if err := os.WriteFile(settingsPath, []byte(settingsBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	detection := claudeplugin.DetectInClaudeDir(claudeDir)
+	if !detection.Active {
+		t.Fatalf("fixture setup: expected claudeplugin.DetectInClaudeDir to report Active for the settings.json we just wrote")
+	}
+	reason := detection.Reason()
+	if reason == "" {
+		t.Fatal("fixture setup: Detection.Reason() returned empty for an Active detection")
+	}
+	wantWiredDetail := "wired via the Claude Code plugin — " + reason
+
+	t.Run("hooks", func(t *testing.T) {
+		cases := []struct {
+			name           string
+			res            hook.RegistrationResult
+			wantRegistered bool
+			wantViaPlugin  bool
+			wantDetail     string
+		}{
+			{
+				name:           "skipped — wired via the plugin",
+				res:            hook.RegistrationResult{Skipped: true, SkipReason: reason},
+				wantRegistered: true,
+				wantViaPlugin:  true,
+				wantDetail:     wantWiredDetail,
+			},
+			{
+				name:           "all events already registered by init",
+				res:            hook.RegistrationResult{AlreadySet: []string{"Stop", "PreToolUse"}},
+				wantRegistered: true,
+				wantDetail:     "2 events registered",
+			},
+			{
+				name:       "nothing registered",
+				res:        hook.RegistrationResult{HooksAdded: []string{"Stop"}},
+				wantDetail: "would register 1 events",
+			},
+			{
+				name:       "partial",
+				res:        hook.RegistrationResult{AlreadySet: []string{"Stop"}, HooksAdded: []string{"PreToolUse"}},
+				wantDetail: "1 registered, 1 missing",
+			},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				p := hookProbeFromResult(c.res)
+				if p.Registered != c.wantRegistered {
+					t.Errorf("Registered = %v, want %v", p.Registered, c.wantRegistered)
+				}
+				if p.ViaPlugin != c.wantViaPlugin {
+					t.Errorf("ViaPlugin = %v, want %v", p.ViaPlugin, c.wantViaPlugin)
+				}
+				if !strings.Contains(p.Detail, c.wantDetail) {
+					t.Errorf("Detail = %q, want it to contain %q", p.Detail, c.wantDetail)
+				}
+				// A skipped result must never read as "would register".
+				if c.res.Skipped && strings.Contains(p.Detail, "would register") {
+					t.Errorf("Detail = %q claims a pending registration for a plugin-wired tool", p.Detail)
+				}
+			})
+		}
+	})
+
+	t.Run("mcp", func(t *testing.T) {
+		cases := []struct {
+			name           string
+			res            mcp.RegistrationResult
+			wantRegistered bool
+			wantViaPlugin  bool
+			wantDetail     string
+		}{
+			{
+				name:           "skipped — wired via the plugin",
+				res:            mcp.RegistrationResult{Skipped: true, SkipReason: reason},
+				wantRegistered: true,
+				wantViaPlugin:  true,
+				wantDetail:     wantWiredDetail,
+			},
+			{
+				name:           "already set by init",
+				res:            mcp.RegistrationResult{AlreadySet: true},
+				wantRegistered: true,
+				wantDetail:     "observer MCP server registered",
+			},
+			{
+				name:       "absent",
+				res:        mcp.RegistrationResult{},
+				wantDetail: "not registered",
+			},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				p := mcpProbeFromResult(c.res)
+				if p.Registered != c.wantRegistered {
+					t.Errorf("Registered = %v, want %v", p.Registered, c.wantRegistered)
+				}
+				if p.ViaPlugin != c.wantViaPlugin {
+					t.Errorf("ViaPlugin = %v, want %v", p.ViaPlugin, c.wantViaPlugin)
+				}
+				if !strings.Contains(p.Detail, c.wantDetail) {
+					t.Errorf("Detail = %q, want it to contain %q", p.Detail, c.wantDetail)
+				}
+				if c.res.Skipped && strings.Contains(p.Detail, "not registered") {
+					t.Errorf("Detail = %q says not registered for a plugin-wired tool", p.Detail)
+				}
+			})
+		}
+	})
 }

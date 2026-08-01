@@ -164,13 +164,15 @@ func TestBuildEvent_BeforeSubmitPrompt(t *testing.T) {
 	}
 }
 
-// TestBuildEvent_AfterAgentThought pins the v1.6.18 capture of
-// finalized assistant thinking blocks. The event delivers the full
-// thinking text + duration_ms once per thought (not per-token-delta
-// per the v1.4.45 docstring's now-obsolete claim — verified against
-// captured live payloads). The emitted row mirrors the
-// cursor.assistant_text shape used by BuildTranscriptToolEvents so a
-// hook-sourced session looks identical to a transcript-walked one.
+// TestBuildEvent_AfterAgentThought pins the B3-converged behaviour of
+// the v1.6.18 finalized-thinking capture. UPDATED 2026-07-31: the event
+// used to mint a `cursor.thinking` task_complete row carrying the
+// thought in its own Target/PrecedingReasoning/ToolOutput. It now mints
+// NO row at all — the scrubbed 200-char preview is stashed and threaded
+// onto the next recordable event of the conversation instead (see
+// pending.go). The old assertions on the minted row are replaced by
+// assertions on the absence of the row plus the arrival of the text on
+// the successor; the preview cap is unchanged.
 func TestBuildEvent_AfterAgentThought(t *testing.T) {
 	body := []byte(`{
 		"hook_event_name": "afterAgentThought",
@@ -182,26 +184,107 @@ func TestBuildEvent_AfterAgentThought(t *testing.T) {
 		"duration_ms": 9468
 	}`)
 	ev, ok, err := BuildEvent(EventAfterAgentThought, body, nil)
+	if err != nil {
+		t.Fatalf("BuildEvent: %v", err)
+	}
+	if ok {
+		t.Fatalf("afterAgentThought must mint NO row; got %+v", ev)
+	}
+
+	// The thought reaches the timeline on the NEXT recordable event.
+	next := []byte(`{
+		"hook_event_name": "beforeShellExecution",
+		"conversation_id": "32c83fe8-3763-4f29-b127-a0968203db01",
+		"generation_id": "5ac8a876-8e4e-428d-8189-21d5a3ee129c",
+		"workspace_roots": ["/c:/programsx/marmutmain"],
+		"command": "go test ./..."
+	}`)
+	shell, ok, err := BuildEvent(EventBeforeShellCommand, next, nil)
 	if err != nil || !ok {
-		t.Fatalf("BuildEvent: %v ok=%v", err, ok)
+		t.Fatalf("BuildEvent(shell): %v ok=%v", err, ok)
 	}
-	if ev.ActionType != models.ActionTaskComplete {
-		t.Errorf("action: %s want task_complete", ev.ActionType)
+	if !strings.Contains(shell.PrecedingReasoning, "wants to know my specific model name") {
+		t.Errorf("successor preceding reasoning = %q, want the stashed thought", shell.PrecedingReasoning)
 	}
-	if ev.RawToolName != "cursor.thinking" {
-		t.Errorf("raw tool name: %s", ev.RawToolName)
+}
+
+// TestAfterAgentThought_ConsumedOnceAndDiscardedOnUserTurn pins the
+// three semantics the stash carries (pending.go): consumed-once (the
+// second successor gets nothing), last-wins (a second thought before
+// any successor replaces the first), and turn-boundary discard (a new
+// user prompt drops an unclaimed thought).
+func TestAfterAgentThought_ConsumedOnceAndDiscardedOnUserTurn(t *testing.T) {
+	thought := func(conv, gen, text string) {
+		t.Helper()
+		body := []byte(`{"hook_event_name":"afterAgentThought","conversation_id":"` + conv +
+			`","generation_id":"` + gen + `","workspace_roots":["/repo"],"text":"` + text + `"}`)
+		if _, ok, err := BuildEvent(EventAfterAgentThought, body, nil); err != nil || ok {
+			t.Fatalf("thought: err=%v ok=%v (want no row)", err, ok)
+		}
 	}
-	if ev.DurationMs != 9468 {
-		t.Errorf("duration_ms: %d want 9468", ev.DurationMs)
+	shell := func(conv, gen, cmd string) models.ToolEvent {
+		t.Helper()
+		body := []byte(`{"hook_event_name":"beforeShellExecution","conversation_id":"` + conv +
+			`","generation_id":"` + gen + `","workspace_roots":["/repo"],"command":"` + cmd + `"}`)
+		ev, ok, err := BuildEvent(EventBeforeShellCommand, body, nil)
+		if err != nil || !ok {
+			t.Fatalf("shell: err=%v ok=%v", err, ok)
+		}
+		return ev
 	}
-	if !strings.Contains(ev.PrecedingReasoning, "wants to know my specific model name") {
-		t.Errorf("preceding reasoning: %q", ev.PrecedingReasoning)
+
+	// last-wins: two thoughts, no successor between them.
+	thought("conv-a", "g1", "first thought")
+	thought("conv-a", "g1", "second thought")
+	first := shell("conv-a", "g1", "ls")
+	if first.PrecedingReasoning != "second thought" {
+		t.Errorf("last-wins: preceding reasoning = %q, want %q", first.PrecedingReasoning, "second thought")
 	}
-	if !strings.Contains(ev.ToolOutput, "wants to know my specific model name") {
-		t.Errorf("tool output: %q", ev.ToolOutput)
+	// consumed-once: the next successor of the same conversation gets none.
+	second := shell("conv-a", "g2", "pwd")
+	if second.PrecedingReasoning != "" {
+		t.Errorf("consumed-once: second successor carried %q", second.PrecedingReasoning)
 	}
-	if ev.SessionID != "32c83fe8-3763-4f29-b127-a0968203db01" {
-		t.Errorf("session id: %s", ev.SessionID)
+
+	// turn boundary: a user prompt discards an unclaimed thought.
+	thought("conv-b", "g1", "stale thought")
+	promptBody := []byte(`{"hook_event_name":"beforeSubmitPrompt","conversation_id":"conv-b",` +
+		`"generation_id":"g1","workspace_roots":["/repo"],"prompt":"do the thing"}`)
+	if _, ok, err := BuildEvent(EventBeforeSubmitPrompt, promptBody, nil); err != nil || !ok {
+		t.Fatalf("prompt: err=%v ok=%v", err, ok)
+	}
+	after := shell("conv-b", "g2", "ls")
+	if after.PrecedingReasoning != "" {
+		t.Errorf("user-turn discard: successor carried %q", after.PrecedingReasoning)
+	}
+}
+
+// TestAfterAgentThought_LifecycleEventsDoNotConsume pins the consumer
+// TABLE: a lifecycle marker firing between the thought and the model's
+// real next act must neither claim the reasoning nor destroy it.
+func TestAfterAgentThought_LifecycleEventsDoNotConsume(t *testing.T) {
+	body := []byte(`{"hook_event_name":"afterAgentThought","conversation_id":"conv-c",` +
+		`"generation_id":"g1","workspace_roots":["/repo"],"text":"planning the edit"}`)
+	if _, ok, _ := BuildEvent(EventAfterAgentThought, body, nil); ok {
+		t.Fatal("thought minted a row")
+	}
+	compact := []byte(`{"hook_event_name":"preCompact","conversation_id":"conv-c",` +
+		`"generation_id":"g1","workspace_roots":["/repo"],"trigger":"auto"}`)
+	ev, ok, err := BuildEvent(EventPreCompact, compact, nil)
+	if err != nil || !ok {
+		t.Fatalf("preCompact: err=%v ok=%v", err, ok)
+	}
+	if ev.PrecedingReasoning != "" {
+		t.Errorf("preCompact consumed the thought: %q", ev.PrecedingReasoning)
+	}
+	edit := []byte(`{"hook_event_name":"afterFileEdit","conversation_id":"conv-c",` +
+		`"generation_id":"g2","workspace_roots":["/repo"],"file_path":"/repo/main.go"}`)
+	got, ok, err := BuildEvent(EventAfterFileEdit, edit, nil)
+	if err != nil || !ok {
+		t.Fatalf("afterFileEdit: err=%v ok=%v", err, ok)
+	}
+	if got.PrecedingReasoning != "planning the edit" {
+		t.Errorf("real successor preceding reasoning = %q", got.PrecedingReasoning)
 	}
 }
 

@@ -189,7 +189,7 @@ function EnrolmentSection() {
     }
     setBusy(true);
     try {
-      const res = await api.mintEnrolmentToken(userId.trim());
+      const res = await api.mintEnrolmentToken({ userId: userId.trim() });
       setToken(res.token);
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : String(e));

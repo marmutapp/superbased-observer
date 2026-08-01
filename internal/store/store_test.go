@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -1132,6 +1134,151 @@ func TestUpdateActionOutcome_PreservesPriorErrorAndDuration(t *testing.T) {
 	}
 	if dur != 1500 {
 		t.Errorf("duration_ms = %d (want 1500 preserved; 250 would be a regression)", dur)
+	}
+}
+
+// TestIngestAppliesOutcomeUpdates pins the cross-tick seam: a
+// tool_result parsed in a LATER watcher tick than its tool_use arrives
+// as IngestOptions.OutcomeUpdates and flips the already-persisted row.
+// The action upsert cannot express this — ON CONFLICT never touches
+// success / error_message — so without the seam the outcome is lost.
+func TestIngestAppliesOutcomeUpdates(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Tick 1: the tool_use lands, optimistically successful.
+	events := []models.ToolEvent{{
+		SourceFile: "/t/ou.jsonl", SourceEventID: "toolu_ou1",
+		SessionID: "s_ou", ProjectRoot: "/tmp/p_ou", Timestamp: now,
+		Tool: models.ToolClaudeCode, ActionType: models.ActionRunCommand,
+		Target: "go test ./...", RawToolName: "Bash", Success: true,
+	}}
+	if _, err := s.Ingest(ctx, events, nil, IngestOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Tick 2: no events at all, only the late outcome.
+	if _, err := s.Ingest(ctx, nil, nil, IngestOptions{
+		OutcomeUpdates: []models.ActionOutcomeUpdate{{
+			SourceFile: "/t/ou.jsonl", SourceEventID: "toolu_ou1",
+			SuccessKnown: true, Success: false, ErrorMessage: "exit 1: FAIL ./internal/store",
+			ToolOutput: "--- FAIL: TestFoo\nexit status 1",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var success int
+	var errMsg, out string
+	if err := s.db.QueryRowContext(
+		ctx,
+		`SELECT success, error_message, COALESCE(raw_tool_output, '')
+		   FROM actions WHERE source_event_id = 'toolu_ou1'`,
+	).Scan(&success, &errMsg, &out); err != nil {
+		t.Fatal(err)
+	}
+	if success != 0 {
+		t.Errorf("success = %d, want 0 (late tool_result is authoritative)", success)
+	}
+	if errMsg != "exit 1: FAIL ./internal/store" {
+		t.Errorf("error_message = %q", errMsg)
+	}
+	if !strings.Contains(out, "--- FAIL: TestFoo") {
+		t.Errorf("raw_tool_output = %q, want the late result body", out)
+	}
+}
+
+// TestIngestOutcomeUpdateNoMatchTolerated pins the tolerance rule: an
+// update whose key matches no row (unknown id, or a row pruned by
+// retention) is neither an error nor allowed to disturb the other
+// updates in the same Ingest call.
+func TestIngestOutcomeUpdateNoMatchTolerated(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	events := []models.ToolEvent{{
+		SourceFile: "/t/ou2.jsonl", SourceEventID: "toolu_ou2",
+		SessionID: "s_ou2", ProjectRoot: "/tmp/p_ou2", Timestamp: now,
+		Tool: models.ToolClaudeCode, ActionType: models.ActionRunCommand,
+		Target: "ls", RawToolName: "Bash", Success: true,
+	}}
+	if _, err := s.Ingest(ctx, events, nil, IngestOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.Ingest(ctx, nil, nil, IngestOptions{
+		OutcomeUpdates: []models.ActionOutcomeUpdate{
+			{SourceFile: "/t/ou2.jsonl", SourceEventID: "toolu_missing", SuccessKnown: true, Success: false, ErrorMessage: "ghost"},
+			{SourceFile: "", SourceEventID: "", SuccessKnown: true, Success: false, ErrorMessage: "empty key"},
+			{SourceFile: "/t/ou2.jsonl", SourceEventID: "toolu_ou2", SuccessKnown: true, Success: false, ErrorMessage: "real failure"},
+		},
+	}); err != nil {
+		t.Fatalf("no-match update must not fail Ingest: %v", err)
+	}
+
+	var rows int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM actions`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Errorf("actions rows = %d, want 1 (a no-match update must not insert)", rows)
+	}
+	var success int
+	var errMsg string
+	if err := s.db.QueryRowContext(
+		ctx,
+		`SELECT success, error_message FROM actions WHERE source_event_id = 'toolu_ou2'`,
+	).Scan(&success, &errMsg); err != nil {
+		t.Fatal(err)
+	}
+	if success != 0 || errMsg != "real failure" {
+		t.Errorf("sibling update dropped: success=%d error_message=%q", success, errMsg)
+	}
+}
+
+// TestIngestOutcomeUpdateIndexesViaOptsIndexer pins the reason
+// updateActionOutcome takes the indexer as a PARAMETER: the watcher's
+// Store has no WithIndexer binding — its indexer arrives per-call in
+// IngestOptions. Reading s.indexer here instead would silently skip
+// FTS for every cross-tick tool output on the watcher path.
+func TestIngestOutcomeUpdateIndexesViaOptsIndexer(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// No WithIndexer binding on the Store — exactly the watcher shape.
+	idx := indexing.New(s.db, 0)
+
+	events := []models.ToolEvent{{
+		SourceFile: "/t/ou3.jsonl", SourceEventID: "toolu_ou3",
+		SessionID: "s_ou3", ProjectRoot: "/tmp/p_ou3", Timestamp: now,
+		Tool: models.ToolClaudeCode, ActionType: models.ActionRunCommand,
+		Target: "rg zathras", RawToolName: "Bash", Success: true,
+	}}
+	if _, err := s.Ingest(ctx, events, nil, IngestOptions{Indexer: idx}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Ingest(ctx, nil, nil, IngestOptions{
+		Indexer: idx,
+		OutcomeUpdates: []models.ActionOutcomeUpdate{{
+			SourceFile: "/t/ou3.jsonl", SourceEventID: "toolu_ou3",
+			SuccessKnown: true, Success: true, ToolOutput: "matched zathras in cmd/observer/main.go",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, err := idx.Search(ctx, "zathras", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("FTS hits = %d, want 1 (cross-tick output must reach action_excerpts): %+v", len(hits), hits)
 	}
 }
 
@@ -4305,5 +4452,678 @@ func TestCountUniqueCompressions_RequiresSessionID(t *testing.T) {
 	s, _ := newTestStore(t)
 	if _, err := s.CountUniqueCompressions(context.Background(), ""); err == nil {
 		t.Errorf("expected error for empty sessionID")
+	}
+}
+
+// TestIngestOutcomeUpdateErrorFailsTick pins the retry contract (F1).
+// The tool_result record is the ONLY carrier of the outcome, and the
+// watcher advances its parse cursor past it the moment Ingest returns
+// nil — so an update that errored must fail the whole tick, exactly as
+// an InsertActions error would, and let the watcher re-run the window.
+// (Re-processing is idempotent: upserts plus idempotent updates.)
+func TestIngestOutcomeUpdateErrorFailsTick(t *testing.T) {
+	t.Parallel()
+	s, database := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if _, err := s.Ingest(ctx, []models.ToolEvent{{
+		SourceFile: "/t/ou_err.jsonl", SourceEventID: "toolu_err",
+		SessionID: "s_err", ProjectRoot: "/tmp/p_err", Timestamp: now,
+		Tool: models.ToolClaudeCode, ActionType: models.ActionRunCommand,
+		Target: "go build ./...", RawToolName: "Bash", Success: true,
+	}}, nil, IngestOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the transient DB fault class the retry exists for
+	// (SQLITE_BUSY against a concurrent hook process) with the bluntest
+	// reproducible stand-in: a closed handle. The events/tokens slices
+	// are empty so the update is the ONLY DB work this call attempts.
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.Ingest(ctx, nil, nil, IngestOptions{
+		OutcomeUpdates: []models.ActionOutcomeUpdate{{
+			SourceFile: "/t/ou_err.jsonl", SourceEventID: "toolu_err",
+			SuccessKnown: true, Success: false, ErrorMessage: "boom",
+		}},
+	})
+	if err == nil {
+		t.Fatal("Ingest returned nil after a failed outcome update — the watcher would advance the cursor past the only record carrying this outcome")
+	}
+	if !strings.Contains(err.Error(), "toolu_err") {
+		t.Errorf("error does not identify the failed update: %v", err)
+	}
+}
+
+// TestIngestOutcomeUpdateRecordsFailureContext pins F2(b): a command
+// whose failure is only known cross-tick still lands in failure_context.
+// Pre-fix, recordCommandOutcome ran exclusively at insert time — on an
+// outcome that had not been observed — so a cross-tick failure was
+// invisible to the "this command kept failing" surface.
+func TestIngestOutcomeUpdateRecordsFailureContext(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Tick 1: the call lands, outcome not yet observed.
+	if _, err := s.Ingest(ctx, []models.ToolEvent{{
+		SourceFile: "/t/fc1.jsonl", SourceEventID: "toolu_fc1",
+		SessionID: "s_fc1", ProjectRoot: "/tmp/p_fc1", Timestamp: now,
+		Tool: models.ToolClaudeCode, ActionType: models.ActionRunCommand,
+		Target: "go test ./internal/store", RawToolName: "Bash",
+		Success: true, OutcomePending: true,
+	}}, nil, IngestOptions{RecordFailures: true}); err != nil {
+		t.Fatal(err)
+	}
+	var rows int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM failure_context`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("failure_context rows after the optimistic tick = %d, want 0", rows)
+	}
+
+	// Tick 2: the real (failed) outcome arrives.
+	if _, err := s.Ingest(ctx, nil, nil, IngestOptions{
+		RecordFailures: true,
+		OutcomeUpdates: []models.ActionOutcomeUpdate{{
+			SourceFile: "/t/fc1.jsonl", SourceEventID: "toolu_fc1",
+			SuccessKnown: true, Success: false,
+			ErrorMessage: "exit status 1: FAIL github.com/x/store",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var errMsg string
+	var retry int
+	if err := s.db.QueryRowContext(
+		ctx,
+		`SELECT error_message, retry_count FROM failure_context`,
+	).Scan(&errMsg, &retry); err != nil {
+		t.Fatalf("cross-tick failure never reached failure_context: %v", err)
+	}
+	if !strings.Contains(errMsg, "FAIL github.com/x/store") {
+		t.Errorf("failure_context.error_message = %q", errMsg)
+	}
+	if retry != 0 {
+		t.Errorf("retry_count = %d, want 0 (first failure of this command)", retry)
+	}
+}
+
+// TestOutcomePendingDefersFailureContextBookkeeping pins F2(a) and the
+// second half of F2(b) together. An optimistic tick-1 insert must NOT
+// mark a prior failure of the same command eventually_succeeded — that
+// success was never observed — and the real success arriving at tick 2
+// must.
+func TestOutcomePendingDefersFailureContextBookkeeping(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const cmd = "go test ./internal/watcher"
+
+	// Tick 0: an observed failure of the command.
+	if _, err := s.Ingest(ctx, []models.ToolEvent{{
+		SourceFile: "/t/fc2.jsonl", SourceEventID: "toolu_fc2a",
+		SessionID: "s_fc2", ProjectRoot: "/tmp/p_fc2", Timestamp: now,
+		Tool: models.ToolClaudeCode, ActionType: models.ActionRunCommand,
+		Target: cmd, RawToolName: "Bash",
+		Success: false, ErrorMessage: "exit status 1",
+	}}, nil, IngestOptions{RecordFailures: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	succeeded := func() int {
+		t.Helper()
+		var v int
+		if err := s.db.QueryRowContext(
+			ctx, `SELECT eventually_succeeded FROM failure_context`,
+		).Scan(&v); err != nil {
+			t.Fatalf("prior failure row missing: %v", err)
+		}
+		return v
+	}
+	if got := succeeded(); got != 0 {
+		t.Fatalf("eventually_succeeded = %d right after the failure, want 0", got)
+	}
+
+	// Tick 1: the retry's tool_use lands, outcome NOT yet observed.
+	if _, err := s.Ingest(ctx, []models.ToolEvent{{
+		SourceFile: "/t/fc2.jsonl", SourceEventID: "toolu_fc2b",
+		SessionID: "s_fc2", ProjectRoot: "/tmp/p_fc2", Timestamp: now.Add(time.Second),
+		Tool: models.ToolClaudeCode, ActionType: models.ActionRunCommand,
+		Target: cmd, RawToolName: "Bash",
+		Success: true, OutcomePending: true,
+	}}, nil, IngestOptions{RecordFailures: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got := succeeded(); got != 0 {
+		t.Errorf("eventually_succeeded = %d after an UNOBSERVED optimistic insert, want 0", got)
+	}
+
+	// Tick 2: the retry really did succeed.
+	if _, err := s.Ingest(ctx, nil, nil, IngestOptions{
+		RecordFailures: true,
+		OutcomeUpdates: []models.ActionOutcomeUpdate{{
+			SourceFile: "/t/fc2.jsonl", SourceEventID: "toolu_fc2b",
+			SuccessKnown: true, Success: true, ToolOutput: "ok",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := succeeded(); got != 1 {
+		t.Errorf("eventually_succeeded = %d after the observed success, want 1", got)
+	}
+}
+
+// TestIngestOutcomeUpdateWithoutVerdictLeavesSuccess pins F3 through the
+// SQL. qwen-code's functionResponse records carry no status: in-window
+// that leaves Success untouched, and cross-tick it must do the same. A
+// row an earlier ui_telemetry tool_call event marked failed must not be
+// silently repaired by a status-less result — output still merges.
+func TestIngestOutcomeUpdateWithoutVerdictLeavesSuccess(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if _, err := s.Ingest(ctx, []models.ToolEvent{{
+		SourceFile: "/t/nv.jsonl", SourceEventID: "tool:call_nv",
+		SessionID: "s_nv", ProjectRoot: "/tmp/p_nv", Timestamp: now,
+		Tool: models.ToolQwenCode, ActionType: models.ActionRunCommand,
+		Target: "go test ./...", RawToolName: "run_shell_command",
+		Success: false, ErrorMessage: "telemetry: status=error",
+	}}, nil, IngestOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.Ingest(ctx, nil, nil, IngestOptions{
+		OutcomeUpdates: []models.ActionOutcomeUpdate{{
+			SourceFile: "/t/nv.jsonl", SourceEventID: "tool:call_nv",
+			SuccessKnown: false, Success: true, // Success must be ignored
+			ToolOutput: "--- FAIL: TestFoo",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var success int
+	var errMsg, out string
+	if err := s.db.QueryRowContext(
+		ctx,
+		`SELECT success, error_message, COALESCE(raw_tool_output, '')
+		   FROM actions WHERE source_event_id = 'tool:call_nv'`,
+	).Scan(&success, &errMsg, &out); err != nil {
+		t.Fatal(err)
+	}
+	if success != 0 {
+		t.Errorf("success = %d, want 0 (a verdict-less result must not flip it)", success)
+	}
+	if errMsg != "telemetry: status=error" {
+		t.Errorf("error_message = %q, want the earlier verdict preserved", errMsg)
+	}
+	if out != "--- FAIL: TestFoo" {
+		t.Errorf("raw_tool_output = %q, want the result body merged anyway", out)
+	}
+}
+
+// TestInsertActionsSuccessSelfHealsOneWay pins F4's asymmetric conflict
+// rule. A force rescan (offset 0) pairs a tool_use with its tool_result
+// in ONE window and re-emits the CORRECTED event; with success frozen on
+// conflict, a row left optimistically successful by an interrupted
+// cross-tick parse could never be repaired. The reverse must stay
+// frozen — every tool_use re-emits success=1 by construction, so 0 → 1
+// would let an ordinary re-scan un-fix a corrected failure.
+func TestInsertActionsSuccessSelfHealsOneWay(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	optimistic := models.ToolEvent{
+		SourceFile: "/t/heal.jsonl", SourceEventID: "toolu_heal",
+		SessionID: "s_heal", ProjectRoot: "/tmp/p_heal", Timestamp: now,
+		Tool: models.ToolClaudeCode, ActionType: models.ActionRunCommand,
+		Target: "go test ./...", RawToolName: "Bash", Success: true,
+	}
+	corrected := optimistic
+	corrected.Success = false
+	corrected.ErrorMessage = "exit status 1: FAIL"
+
+	read := func() (int, string) {
+		t.Helper()
+		var success int
+		var errMsg string
+		if err := s.db.QueryRowContext(
+			ctx,
+			`SELECT success, COALESCE(error_message, '') FROM actions
+			  WHERE source_event_id = 'toolu_heal'`,
+		).Scan(&success, &errMsg); err != nil {
+			t.Fatal(err)
+		}
+		return success, errMsg
+	}
+
+	// The damaged state a cross-tick parse could leave behind.
+	if _, err := s.Ingest(ctx, []models.ToolEvent{optimistic}, nil, IngestOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := read(); got != 1 {
+		t.Fatalf("seeded success = %d, want 1", got)
+	}
+
+	// Force rescan re-emits the corrected event: 1 → 0 must heal.
+	if _, err := s.Ingest(ctx, []models.ToolEvent{corrected}, nil, IngestOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	success, errMsg := read()
+	if success != 0 {
+		t.Errorf("success = %d after re-emitting the corrected event, want 0 (row cannot self-heal)", success)
+	}
+	if errMsg != "exit status 1: FAIL" {
+		t.Errorf("error_message = %q, want it to ride along on the heal", errMsg)
+	}
+
+	// Another ordinary re-scan re-emits the optimistic event: 0 → 1
+	// must NOT happen.
+	if _, err := s.Ingest(ctx, []models.ToolEvent{optimistic}, nil, IngestOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	success, errMsg = read()
+	if success != 0 {
+		t.Errorf("success = %d — an optimistic re-emit un-fixed a corrected failure", success)
+	}
+	if errMsg != "exit status 1: FAIL" {
+		t.Errorf("error_message = %q, want it preserved", errMsg)
+	}
+}
+
+// TestIngestOutcomeUpdateSkipsFTSWhenOutputRejected pins F5: the FTS
+// excerpt must follow the SAME acceptance rule as the column's SQL
+// length-merge. A shorter duplicate payload is rejected by the UPDATE,
+// so indexing it would leave action_excerpts describing a body
+// raw_tool_output does not hold.
+func TestIngestOutcomeUpdateSkipsFTSWhenOutputRejected(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	idx := indexing.New(s.db, 0)
+
+	if _, err := s.Ingest(ctx, []models.ToolEvent{{
+		SourceFile: "/t/fts.jsonl", SourceEventID: "toolu_fts",
+		SessionID: "s_fts", ProjectRoot: "/tmp/p_fts", Timestamp: now,
+		Tool: models.ToolClaudeCode, ActionType: models.ActionRunCommand,
+		Target: "rg needle", RawToolName: "Bash", Success: true,
+	}}, nil, IngestOptions{Indexer: idx}); err != nil {
+		t.Fatal(err)
+	}
+
+	const long = "zathras found the long buffer with all of the detail"
+	const short = "zathras narnia"
+	if _, err := s.Ingest(ctx, nil, nil, IngestOptions{
+		Indexer: idx,
+		OutcomeUpdates: []models.ActionOutcomeUpdate{{
+			SourceFile: "/t/fts.jsonl", SourceEventID: "toolu_fts",
+			SuccessKnown: true, Success: true, ToolOutput: long,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A second, SHORTER payload for the same row: the column rule
+	// rejects it, so the index must ignore it too.
+	if _, err := s.Ingest(ctx, nil, nil, IngestOptions{
+		Indexer: idx,
+		OutcomeUpdates: []models.ActionOutcomeUpdate{{
+			SourceFile: "/t/fts.jsonl", SourceEventID: "toolu_fts",
+			SuccessKnown: true, Success: true, ToolOutput: short,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stored string
+	if err := s.db.QueryRowContext(
+		ctx,
+		`SELECT COALESCE(raw_tool_output, '') FROM actions WHERE source_event_id = 'toolu_fts'`,
+	).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != long {
+		t.Fatalf("raw_tool_output = %q, want the longer body preserved", stored)
+	}
+	// "narnia" appears only in the rejected payload.
+	hits, err := idx.Search(ctx, "narnia", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Errorf("rejected payload was indexed: %d hits — excerpt now disagrees with raw_tool_output", len(hits))
+	}
+	hits, err = idx.Search(ctx, "zathras", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("accepted payload hits = %d, want 1", len(hits))
+	}
+	if !strings.Contains(hits[0].Excerpt, "long buffer") {
+		t.Errorf("excerpt = %q, want the accepted (longer) body", hits[0].Excerpt)
+	}
+}
+
+// TestIngestOutcomeUpdateErrorStillCompletesBatch pins WHERE the
+// outcome-update failure is reported (R2-1). By the time the updates
+// run, the batch's actions are already inserted; returning before the
+// later stages would cost them their guard evaluation and cache
+// observations, and the retry can't make that up — re-inserted
+// duplicates keep ID == 0 and the guard stage skips them. So every
+// stage must still run, and the error surfaces last.
+//
+// session lineage is the observable stage here: it sits after the old
+// return point and needs no fake collaborator.
+func TestIngestOutcomeUpdateErrorStillCompletesBatch(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if _, err := s.Ingest(ctx, []models.ToolEvent{{
+		SourceFile: "/t/late.jsonl", SourceEventID: "toolu_late",
+		SessionID: "s_late", ProjectRoot: "/tmp/p_late", Timestamp: now,
+		Tool: models.ToolClaudeCode, ActionType: models.ActionRunCommand,
+		Target: "go build ./...", RawToolName: "Bash", Success: true,
+	}}, nil, IngestOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fail ONLY the outcome update — everything else in the batch must
+	// keep working, which a closed handle could not express.
+	if _, err := s.db.ExecContext(
+		ctx,
+		`CREATE TRIGGER fail_outcome_update BEFORE UPDATE ON actions
+		 WHEN NEW.error_message = 'BOOM'
+		 BEGIN SELECT RAISE(ABORT, 'synthetic outcome-update fault'); END`,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.Ingest(ctx, nil, nil, IngestOptions{
+		OutcomeUpdates: []models.ActionOutcomeUpdate{{
+			SourceFile: "/t/late.jsonl", SourceEventID: "toolu_late",
+			SuccessKnown: true, Success: false, ErrorMessage: "BOOM",
+		}},
+		SessionLineages: []models.SessionLineage{{
+			SessionID: "s_late", ThreadSource: "subagent",
+		}},
+	})
+	if err == nil {
+		t.Fatal("Ingest returned nil despite a failed outcome update")
+	}
+
+	var threadSource sql.NullString
+	if qerr := s.db.QueryRowContext(
+		ctx, `SELECT thread_source FROM sessions WHERE id = 's_late'`,
+	).Scan(&threadSource); qerr != nil {
+		t.Fatal(qerr)
+	}
+	if threadSource.String != "subagent" {
+		t.Errorf("thread_source = %q — a failed outcome update short-circuited the rest of the batch; the retry cannot make those stages up",
+			threadSource.String)
+	}
+}
+
+// TestIngestOutcomeUpdateFailureContextIdempotentOnReplay pins R2-2.
+// The update MATCHES on every replay (RowsAffected counts matched, not
+// changed), failure_context has no uniqueness on action_id, and the
+// failure branch is a plain INSERT — so a retried window (which an
+// outcome-update error now deliberately causes) or a duplicate result
+// record would file the same failure twice with an inflated
+// retry_count.
+func TestIngestOutcomeUpdateFailureContextIdempotentOnReplay(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if _, err := s.Ingest(ctx, []models.ToolEvent{{
+		SourceFile: "/t/idem.jsonl", SourceEventID: "toolu_idem",
+		SessionID: "s_idem", ProjectRoot: "/tmp/p_idem", Timestamp: now,
+		Tool: models.ToolClaudeCode, ActionType: models.ActionRunCommand,
+		Target: "go test ./...", RawToolName: "Bash",
+		Success: true, OutcomePending: true,
+	}}, nil, IngestOptions{RecordFailures: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	update := IngestOptions{
+		RecordFailures: true,
+		OutcomeUpdates: []models.ActionOutcomeUpdate{{
+			SourceFile: "/t/idem.jsonl", SourceEventID: "toolu_idem",
+			SuccessKnown: true, Success: false, ErrorMessage: "exit status 1: FAIL",
+		}},
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := s.Ingest(ctx, nil, nil, update); err != nil {
+			t.Fatalf("ingest %d: %v", i, err)
+		}
+	}
+
+	var rows, maxRetry int
+	if err := s.db.QueryRowContext(
+		ctx, `SELECT COUNT(*), COALESCE(MAX(retry_count), 0) FROM failure_context`,
+	).Scan(&rows, &maxRetry); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Errorf("failure_context rows = %d, want 1 (a replayed window must not re-file)", rows)
+	}
+	if maxRetry != 0 {
+		t.Errorf("retry_count = %d, want 0 (replay inflated the retry count)", maxRetry)
+	}
+}
+
+// TestInsertActionsProvisionalFalseDoesNotDowngrade pins R2-3. The
+// self-heal arm flips 1 → 0 on EVIDENCE, never on a bare success=0:
+// snapshot adapters re-emit stable ids carrying provisional falses
+// (antigravity's "no exit code yet", copilot's isComplete=false
+// task_complete row), and those never carry an error body. A measured
+// failure does — that is the discriminator, not the tool name.
+func TestInsertActionsProvisionalFalseDoesNotDowngrade(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	complete := models.ToolEvent{
+		SourceFile: "/t/prov.jsonl", SourceEventID: "ev_prov",
+		SessionID: "s_prov", ProjectRoot: "/tmp/p_prov", Timestamp: now,
+		Tool: models.ToolAntigravity, ActionType: models.ActionRunCommand,
+		Target: "npm run build", RawToolName: "run_command", Success: true,
+	}
+	// A stale/truncated snapshot re-parse: not-finished-yet, no error body.
+	provisional := complete
+	provisional.Success = false
+
+	if _, err := s.Ingest(ctx, []models.ToolEvent{complete}, nil, IngestOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Ingest(ctx, []models.ToolEvent{provisional}, nil, IngestOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	var success int
+	var errMsg string
+	if err := s.db.QueryRowContext(
+		ctx,
+		`SELECT success, COALESCE(error_message, '') FROM actions WHERE source_event_id = 'ev_prov'`,
+	).Scan(&success, &errMsg); err != nil {
+		t.Fatal(err)
+	}
+	if success != 1 {
+		t.Errorf("success = %d — a provisional false with no error body downgraded a completed success", success)
+	}
+	if errMsg != "" {
+		t.Errorf("error_message = %q, want empty", errMsg)
+	}
+}
+
+// TestIngestOutcomeUpdateFTSFollowsStoredBody pins R2-4: the FTS
+// excerpt tracks what the column ACTUALLY ended up holding, not a
+// predicted length comparison. The payload here carries an early
+// U+0000 — SQLite's LENGTH() stops there and rejects the merge, while
+// a Go-side rune count sees a long string and would have indexed it,
+// leaving action_excerpts describing a body raw_tool_output never took.
+func TestIngestOutcomeUpdateFTSFollowsStoredBody(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	idx := indexing.New(s.db, 0)
+
+	if _, err := s.Ingest(ctx, []models.ToolEvent{{
+		SourceFile: "/t/nul.jsonl", SourceEventID: "toolu_nul",
+		SessionID: "s_nul", ProjectRoot: "/tmp/p_nul", Timestamp: now,
+		Tool: models.ToolClaudeCode, ActionType: models.ActionRunCommand,
+		Target: "rg needle", RawToolName: "Bash", Success: true,
+	}}, nil, IngestOptions{Indexer: idx}); err != nil {
+		t.Fatal(err)
+	}
+
+	const stored = "zathras long detailed buffer of output"
+	// LENGTH() of this is 6 (it stops at the NUL) so the SQL merge
+	// rejects it, but it is 167 runes long to a Go-side counter.
+	rejected := "narnia\x00" + strings.Repeat("padding ", 20)
+
+	for _, out := range []string{stored, rejected} {
+		if _, err := s.Ingest(ctx, nil, nil, IngestOptions{
+			Indexer: idx,
+			OutcomeUpdates: []models.ActionOutcomeUpdate{{
+				SourceFile: "/t/nul.jsonl", SourceEventID: "toolu_nul",
+				SuccessKnown: true, Success: true, ToolOutput: out,
+			}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var got string
+	if err := s.db.QueryRowContext(
+		ctx,
+		`SELECT COALESCE(raw_tool_output, '') FROM actions WHERE source_event_id = 'toolu_nul'`,
+	).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != stored {
+		t.Fatalf("raw_tool_output = %q, want the first body (the NUL payload must be rejected by the length-merge)", got)
+	}
+	hits, err := idx.Search(ctx, "narnia", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Errorf("rejected NUL payload was indexed: %d hits — excerpt now disagrees with raw_tool_output", len(hits))
+	}
+	hits, err = idx.Search(ctx, "zathras", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("stored body hits = %d, want 1", len(hits))
+	}
+}
+
+// TestLoadActionTargets_MatchesBothAssistantTypes pins the WP-T6/B2
+// hard-break consumer. LoadActionTargets feeds the antigravity
+// plaintext-transcript augmentation's coverage set (see
+// antigravity.TargetCoverageReader); the B2a sweep re-typed the
+// assistant-text emit sites from task_complete to assistant_message,
+// so a query that matched task_complete only would return an EMPTY
+// assistant bucket for post-sweep rows and re-open the duplicate-
+// assistant-row bug this reader exists to close.
+//
+// The table covers the three real database states: pre-sweep history
+// (task_complete only), post-sweep (assistant_message only), and the
+// mid-upgrade mix — the state every existing install passes through
+// between the code sweep and migration 078.
+func TestLoadActionTargets_MatchesBothAssistantTypes(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	base := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+
+	ev := func(eid, actionType, target string, n int) models.ToolEvent {
+		return models.ToolEvent{
+			SourceFile: "/tmp/conv.pb", SourceEventID: eid,
+			SessionID: "ag-1", ProjectRoot: "/tmp/proj",
+			Timestamp:  base.Add(time.Duration(n) * time.Second),
+			Tool:       models.ToolAntigravity,
+			ActionType: actionType, Target: target, Success: true,
+			RawToolName: "structured.assistant_text",
+		}
+	}
+
+	cases := []struct {
+		name     string
+		events   []models.ToolEvent
+		wantUser []string
+		wantAsst []string
+	}{
+		{
+			name: "pre_sweep_task_complete_only",
+			events: []models.ToolEvent{
+				ev("e0", models.ActionUserPrompt, "Just say ok", 0),
+				ev("e1", models.ActionTaskComplete, "ok", 1),
+			},
+			wantUser: []string{"Just say ok"},
+			wantAsst: []string{"ok"},
+		},
+		{
+			name: "post_sweep_assistant_message_only",
+			events: []models.ToolEvent{
+				ev("e0", models.ActionUserPrompt, "Just say ok", 0),
+				ev("e1", models.ActionAssistantMessage, "ok", 1),
+			},
+			wantUser: []string{"Just say ok"},
+			wantAsst: []string{"ok"},
+		},
+		{
+			name: "mid_upgrade_mixed_history",
+			events: []models.ToolEvent{
+				ev("e0", models.ActionUserPrompt, "Just say ok", 0),
+				ev("e1", models.ActionTaskComplete, "ok", 1),
+				ev("e2", models.ActionAssistantMessage, "and then some", 2),
+				// Controls: neither type, and an empty target.
+				ev("e3", models.ActionReadFile, "/tmp/proj/main.go", 3),
+				ev("e4", models.ActionAssistantMessage, "", 4),
+			},
+			wantUser: []string{"Just say ok"},
+			wantAsst: []string{"and then some", "ok"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s, _ := newTestStore(t)
+			if _, err := s.Ingest(ctx, tc.events, nil, IngestOptions{}); err != nil {
+				t.Fatalf("Ingest: %v", err)
+			}
+			gotUser, gotAsst, err := s.LoadActionTargets(ctx, "/tmp/conv.pb")
+			if err != nil {
+				t.Fatalf("LoadActionTargets: %v", err)
+			}
+			sort.Strings(gotUser)
+			sort.Strings(gotAsst)
+			if !reflect.DeepEqual(gotUser, tc.wantUser) {
+				t.Errorf("userTargets = %q, want %q", gotUser, tc.wantUser)
+			}
+			if !reflect.DeepEqual(gotAsst, tc.wantAsst) {
+				t.Errorf("asstTargets = %q, want %q", gotAsst, tc.wantAsst)
+			}
+		})
 	}
 }

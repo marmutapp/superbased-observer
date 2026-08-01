@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"strings"
@@ -226,6 +227,35 @@ type ServerConfig struct {
 	// configuration mistake; it should never be enabled on a server
 	// reachable from the public internet.
 	DevAuth bool `toml:"dev_auth"`
+	// MemberInvites, when true, lets a NON-admin SAML member mint an
+	// enrolment token for an already-provisioned teammate (the Teams
+	// bottom-up invite loop, docs/plans/tier3-local-contract-and-teams-
+	// invite-plan-2026-07-31.md Arc 2). DEFAULT FALSE — delegation is an
+	// admin opt-in, never a silent change to the trust model.
+	//
+	// What it does NOT do: it is not an account-creation path. The target
+	// must already be an ACTIVE org member (SCIM-provisioned, or JIT-created
+	// by a prior SAML login); minting for an unknown email is a 404. v1
+	// deliberately has no email self-signup — that is an identity-model
+	// change needing its own review.
+	//
+	// Trust note (read before enabling): an enrolment token is a bearer
+	// handoff for the TARGET user's identity, so a member who mints for a
+	// teammate could also redeem that token themselves and push activity
+	// attributed to the teammate. Admin-only minting bounds that to trusted
+	// operators; enabling this widens it to every member. The mitigations
+	// shipped with the flag are: default-off, the per-member monthly cap
+	// below, an `invite_minted` audit_log row naming the inviter, and
+	// enrolment_tokens.minted_by so an admin can see who minted what and
+	// whether it was redeemed.
+	MemberInvites bool `toml:"member_invites"`
+	// MemberInviteMonthlyCap bounds how many enrolment tokens ONE actor may
+	// mint per UTC calendar month. It applies to every delegated mint —
+	// both the SAML member path and the bearer-authenticated agent path —
+	// so a leaked node bearer cannot become an unbounded token faucet.
+	// Admin mints are not capped (an admin can already mint from the CLI).
+	// Default 10; must be >= 1.
+	MemberInviteMonthlyCap int `toml:"member_invite_monthly_cap"`
 }
 
 // SAMLConfig configures the SAML 2.0 service-provider side. Cert/key are
@@ -296,6 +326,11 @@ func Default() Config {
 			DBPath:            "/var/lib/observer-org/server.db",
 			DataRetentionDays: 730,
 			LogLevel:          "info",
+			// Delegated invites are admin opt-in; the cap only bites once
+			// they are enabled, but it carries a default so an operator who
+			// flips member_invites alone still gets a bounded surface.
+			MemberInvites:          false,
+			MemberInviteMonthlyCap: 10,
 		},
 		SAML: SAMLConfig{
 			AttributeMapping: map[string]string{
@@ -427,6 +462,14 @@ func Validate(cfg Config) error {
 	if cfg.Server.DataRetentionDays < 0 {
 		return errors.New("orgserver/config: server.data_retention_days must be >= 0")
 	}
+	// The cap is validated unconditionally (not only when member_invites is
+	// on) so a typo is caught at boot rather than the first delegated mint.
+	// A zero/negative cap would silently mean "no member may ever invite",
+	// which is what member_invites = false already says — refuse the
+	// ambiguous spelling.
+	if cfg.Server.MemberInviteMonthlyCap < 1 {
+		return errors.New("orgserver/config: server.member_invite_monthly_cap must be >= 1 (set server.member_invites = false to disable delegated invites)")
+	}
 	if cfg.SAML.SPEntityID == "" {
 		return errors.New("orgserver/config: saml.sp_entity_id is required")
 	}
@@ -453,6 +496,23 @@ func Validate(cfg Config) error {
 	}
 	if err := cfg.Digest.Validate(); err != nil {
 		return fmt.Errorf("orgserver/config: %w", err)
+	}
+	// A negative plan price would not produce a negative bill — the telemetry
+	// rollup refuses to price seats at all below zero — so the visible effect
+	// is that seat cost silently vanishes from the dashboard. Fail fast with
+	// the reason instead. Zero is legal and means "price not supplied".
+	//
+	// NaN and Inf must be rejected explicitly: TOML accepts the literals `nan`
+	// and `inf` without error (verified against the decoder), and `< 0` catches
+	// neither — NaN compares false to everything, and +Inf is not negative. The
+	// consequences differ and both are bad: `nan` prices nothing (the rollup's
+	// `> 0` gate is false) so the subscription silently disappears, while `inf`
+	// prices seats at +Inf, which encoding/json refuses — and writeJSON has
+	// already sent 200 by then and discards the encode error, so the endpoint
+	// answers 200 with no valid body.
+	if price := cfg.CopilotAnalytics.PerSeatPriceUSD; price < 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+		return fmt.Errorf("orgserver/config: copilot_analytics.per_seat_price_usd %v must be a finite value >= 0 (0 means unpriced; seat cost is then omitted)",
+			price)
 	}
 	return nil
 }

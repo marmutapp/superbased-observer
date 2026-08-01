@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 func TestEnrolment_RoundTripAndDelete(t *testing.T) {
@@ -69,5 +70,54 @@ func TestWriteEnrolment_DefaultsEnrolledAt(t *testing.T) {
 	got, _ := s.LoadEnrolment(ctx)
 	if got == nil || got.EnrolledAt == "" {
 		t.Fatalf("EnrolledAt was not defaulted: %+v", got)
+	}
+}
+
+// TestDeleteEnrolment_ClearsOrgDistributionCaches is security finding 3
+// leg (a): unenrolment must not leave the departed org's signed
+// distribution state behind.
+//
+// Two distinct harms if it does, and they compound. The announcement
+// cache keeps rendering the old org's banner on a node that has left.
+// And both cached rows carry that org's TOFU-PINNED KEY, so the next
+// enrolment — into a different org, with a different key — is refused
+// by the node's own key-change guard: an operator action (leaving)
+// poisons the next one (joining).
+func TestDeleteEnrolment_ClearsOrgDistributionCaches(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+
+	if err := s.WriteEnrolment(ctx, Enrolment{
+		OrgID: "org-1", OrgName: "Acme", OrgServerURL: "https://org.example",
+		UserID: "u", UserEmail: "e@acme.example", BearerKeyID: "k",
+	}); err != nil {
+		t.Fatalf("WriteEnrolment: %v", err)
+	}
+	if err := s.UpsertOrgAnnouncement(ctx, OrgAnnouncementRow{
+		Version: 7, Body: `{"id":"x"}`, BodyHash: "h", Signature: "sig",
+		ServerPubkey: "old-org-key", ReceivedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("UpsertOrgAnnouncement: %v", err)
+	}
+	if err := s.UpsertOrgRoutingPolicy(ctx, OrgRoutingPolicyRow{
+		Version: 3, Body: "[routing]\n", BodyHash: "h", Signature: "sig",
+		ServerPubkey: "old-org-key", ReceivedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("UpsertOrgRoutingPolicy: %v", err)
+	}
+
+	if err := s.DeleteEnrolment(ctx); err != nil {
+		t.Fatalf("DeleteEnrolment: %v", err)
+	}
+
+	if row, ok, err := s.GetOrgAnnouncement(ctx); err != nil || ok {
+		t.Errorf("announcement cache survived unenrolment: %+v ok=%v err=%v", row, ok, err)
+	}
+	if row, ok, err := s.GetOrgRoutingPolicy(ctx); err != nil || ok {
+		t.Errorf("routing-policy cache survived unenrolment: %+v ok=%v err=%v", row, ok, err)
+	}
+	// Idempotent: a second unenrol on already-clean state is a no-op.
+	if err := s.DeleteEnrolment(ctx); err != nil {
+		t.Fatalf("DeleteEnrolment (idempotent): %v", err)
 	}
 }

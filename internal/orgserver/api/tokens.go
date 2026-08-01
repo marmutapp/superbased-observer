@@ -71,6 +71,35 @@ func decodeArgon2(encoded string) (mem, time32 uint32, threads uint8, salt, hash
 	return mem, time32, threads, salt, hash, nil
 }
 
+// newTokenMaterial generates one enrolment token's material: the compound
+// cleartext ("<token_id>.<secret>") handed to the invitee exactly once, the
+// non-secret token id used as the lookup key, and the argon2id hash stored at
+// rest.
+//
+// It is deliberately callable WITHOUT a transaction or a DB handle: argon2id
+// at the OWASP parameters costs ~60ms, and running it while holding SQLite's
+// write lock would turn the invite mint's serialization (see
+// store.mintInviteAtomically) into a throughput cliff. Callers generate the
+// material first and insert it inside the transaction.
+func newTokenMaterial() (cleartext, tokenID, hash string, err error) {
+	secret, err := newCleartextToken(32)
+	if err != nil {
+		return "", "", "", err
+	}
+	// Only the secret is hashed; the token_id is the (non-secret) lookup key.
+	hash, err = hashToken(secret)
+	if err != nil {
+		return "", "", "", err
+	}
+	tokenID, err = randID()
+	if err != nil {
+		return "", "", "", err
+	}
+	// The inviter hands the developer this single compound string; the server
+	// resolves the user from token_id at enrol, so no user_id is needed there.
+	return tokenID + "." + secret, tokenID, hash, nil
+}
+
 // newCleartextToken returns nBytes of crypto/rand as a base64url (no padding)
 // string — the cleartext enrolment token handed to an admin once.
 func newCleartextToken(nBytes int) (string, error) {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -172,8 +173,7 @@ func TestParseSessionFile_FullEmission(t *testing.T) {
 
 	want := map[string]string{
 		"crush.user_prompt":    models.ActionUserPrompt,
-		"crush.reasoning":      models.ActionTaskComplete,
-		"crush.assistant_text": models.ActionTaskComplete,
+		"crush.assistant_text": models.ActionAssistantMessage,
 		"write":                models.ActionWriteFile,
 		"bash":                 models.ActionRunCommand,
 	}
@@ -195,9 +195,13 @@ func TestParseSessionFile_FullEmission(t *testing.T) {
 	if b := byRaw["bash"]; b.Success || b.ErrorMessage == "" {
 		t.Errorf("bash event = %+v, want failure + error", b)
 	}
-	// reasoning carries the thinking preview.
-	if r := byRaw["crush.reasoning"]; r.PrecedingReasoning == "" {
-		t.Errorf("reasoning event missing PrecedingReasoning: %+v", r)
+	// B3: reasoning mints no row of its own — the thinking that
+	// introduced the `write` call rides that call's PrecedingReasoning.
+	if _, ok := byRaw["crush.reasoning"]; ok {
+		t.Errorf("crush.reasoning row emitted; reasoning must never be its own action (B3)")
+	}
+	if w := byRaw["write"]; w.PrecedingReasoning != "I should create the file first." {
+		t.Errorf("write PrecedingReasoning = %q, want the reasoning part's text", w.PrecedingReasoning)
 	}
 	// write target derived from input.file_path.
 	if w := byRaw["write"]; w.Target != "/proj/hello.txt" {
@@ -406,6 +410,88 @@ func TestMapTool(t *testing.T) {
 				t.Errorf("target = %q, want %q", gotTarget, c.wantTarget)
 			}
 		})
+	}
+}
+
+// b3Session exercises every reasoning-threading rule in one session.
+// The message ids sort in creation order, which is the order the parser
+// sees them (ORDER BY created_at, id).
+//
+//	b1 user      "first task"                 → clears pending
+//	b2 assistant reasoning THINK_ONE, bash A, bash B
+//	                                          → A carries THINK_ONE, B empty (consumed-once)
+//	b3 assistant reasoning STALE_ACROSS_TURN  → never consumed
+//	b4 user      "second task"                → discards STALE_ACROSS_TURN
+//	b5 assistant bash C                       → empty (turn-boundary discard)
+//	b6 assistant reasoning FIRST, reasoning SECOND, bash D
+//	                                          → D carries SECOND (last-wins)
+//	b7 assistant reasoning CROSS_SESSION (ses_b3)
+//	b8 assistant bash E in a DIFFERENT session → empty (session-scoped)
+func b3Session() []string {
+	return []string{
+		`INSERT INTO sessions(id,title,prompt_tokens,completion_tokens,cost,updated_at,created_at)
+		 VALUES ('ses_b3','B3',10,2,0.01,1783600100,1783600000)`,
+		`INSERT INTO messages(id,session_id,role,parts,model,provider,created_at,updated_at) VALUES
+		 ('b1','ses_b3','user','[{"type":"text","data":{"text":"first task"}}]','','',1783600001,1783600001),
+		 ('b2','ses_b3','assistant','[{"type":"reasoning","data":{"thinking":"THINK_ONE","started_at":1783600002,"finished_at":1783600003}},{"type":"tool_call","data":{"id":"call_a","name":"bash","input":"{\"command\":\"cmd_a\"}","finished":true}},{"type":"tool_call","data":{"id":"call_b","name":"bash","input":"{\"command\":\"cmd_b\"}","finished":true}}]','m','openai',1783600004,1783600004),
+		 ('b3','ses_b3','assistant','[{"type":"reasoning","data":{"thinking":"STALE_ACROSS_TURN","started_at":1783600005,"finished_at":1783600006}}]','m','openai',1783600007,1783600007),
+		 ('b4','ses_b3','user','[{"type":"text","data":{"text":"second task"}}]','','',1783600008,1783600008),
+		 ('b5','ses_b3','assistant','[{"type":"tool_call","data":{"id":"call_c","name":"bash","input":"{\"command\":\"cmd_c\"}","finished":true}}]','m','openai',1783600009,1783600009),
+		 ('b6','ses_b3','assistant','[{"type":"reasoning","data":{"thinking":"FIRST"}},{"type":"reasoning","data":{"thinking":"SECOND"}},{"type":"tool_call","data":{"id":"call_d","name":"bash","input":"{\"command\":\"cmd_d\"}","finished":true}}]','m','openai',1783600010,1783600010),
+		 ('b7','ses_b3','assistant','[{"type":"reasoning","data":{"thinking":"CROSS_SESSION"}}]','m','openai',1783600011,1783600011),
+		 ('b8','ses_other','assistant','[{"type":"tool_call","data":{"id":"call_e","name":"bash","input":"{\"command\":\"cmd_e\"}","finished":true}}]','m','openai',1783600012,1783600012)`,
+	}
+}
+
+// TestReasoningNeverMintsAnAction is the B3 regression pin: a Crush
+// `reasoning` part must produce NO action row (neither the retired
+// `crush.reasoning` raw name nor any other reasoning-shaped row) and its
+// text must instead ride the successor event's PrecedingReasoning under
+// the consumed-once / last-wins / turn-boundary-discard contract.
+func TestReasoningNeverMintsAnAction(t *testing.T) {
+	root, dbPath := dbPathUnder(t)
+	newCrushDB(t, dbPath, b3Session()...)
+	a := NewWithOptions(nil, []string{filepath.Join(root, ".crush")})
+
+	res, err := a.ParseSessionFile(context.Background(), dbPath, 0)
+	if err != nil {
+		t.Fatalf("ParseSessionFile: %v", err)
+	}
+
+	byCmd := map[string]models.ToolEvent{}
+	for _, ev := range res.ToolEvents {
+		if ev.RawToolName == "crush.reasoning" {
+			t.Fatalf("crush.reasoning row emitted: %+v", ev)
+		}
+		if strings.Contains(strings.ToLower(ev.RawToolName), "reasoning") ||
+			strings.Contains(strings.ToLower(ev.RawToolName), "thinking") {
+			t.Fatalf("reasoning-named action row emitted: raw=%q %+v", ev.RawToolName, ev)
+		}
+		// No row may carry the reasoning bodies as its own content.
+		for _, body := range []string{"THINK_ONE", "STALE_ACROSS_TURN", "FIRST", "SECOND", "CROSS_SESSION"} {
+			if ev.Target == body || ev.ToolOutput == body {
+				t.Fatalf("reasoning body %q surfaced as action content: %+v", body, ev)
+			}
+		}
+		if ev.RawToolName == "bash" {
+			byCmd[ev.Target] = ev
+		}
+	}
+	if len(byCmd) != 5 {
+		t.Fatalf("want 5 bash rows, got %d (%v)", len(byCmd), res.ToolEvents)
+	}
+
+	cases := []struct{ cmd, wantReasoning, why string }{
+		{"cmd_a", "THINK_ONE", "the reasoning that introduced it"},
+		{"cmd_b", "", "consumed-once: the sibling call already took it"},
+		{"cmd_c", "", "turn-boundary discard: a user prompt intervened"},
+		{"cmd_d", "SECOND", "last-wins: the newer reasoning part replaces the older"},
+		{"cmd_e", "", "session-scoped: pending reasoning never crosses into another session"},
+	}
+	for _, c := range cases {
+		if got := byCmd[c.cmd].PrecedingReasoning; got != c.wantReasoning {
+			t.Errorf("%s PrecedingReasoning = %q, want %q (%s)", c.cmd, got, c.wantReasoning, c.why)
+		}
 	}
 }
 

@@ -339,6 +339,18 @@ type SeatStats struct {
 	Active      float64 `json:"active"`
 	Inactive    float64 `json:"inactive"`
 	Utilization float64 `json:"utilization"`
+	// PerSeatPriceUSD is the configured plan price
+	// ([copilot_analytics].per_seat_price_usd) and MonthlyUSD is Total ×
+	// that price. Both omitted when the price is unconfigured — a seat
+	// count priced at $0 would read as "seats are free", which is a
+	// stronger claim than "we were not told the price".
+	//
+	// MonthlyUSD is a MONTHLY SUBSCRIPTION and is deliberately NOT part of
+	// VendorTelemetry.CostUSD, which carries the additive per-day metered
+	// overage. Summing a point-in-time subscription with per-day spend is
+	// the cross-vendor unit trap this rollup exists to avoid.
+	PerSeatPriceUSD float64 `json:"per_seat_price_usd,omitempty"`
+	MonthlyUSD      float64 `json:"monthly_usd,omitempty"`
 }
 
 // TeamRollup is a team list item for GET /api/org/teams. Spark is the trailing

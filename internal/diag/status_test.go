@@ -201,6 +201,59 @@ func TestFormatStatus_RendersAllFields(t *testing.T) {
 	}
 }
 
+// TestFormatStatus_QueryErrorsWarning pins the CLI-visible half of the
+// completeness signal: FormatStatus must stay silent on a healthy
+// snapshot (QueryErrors == 0, including the legitimately-empty-DB case)
+// and must surface an unmistakable warning the moment any lookup failed,
+// so a reader of `observer status` can't mistake a degraded, partially
+// fabricated read for a clean one.
+func TestFormatStatus_QueryErrorsWarning(t *testing.T) {
+	base := StatusSnapshot{
+		DBPath:        "/tmp/x.db",
+		DBSizeBytes:   2048,
+		SchemaVersion: 1,
+		Counts:        SnapshotCounts{Projects: 2, Sessions: 5, Actions: 100},
+	}
+
+	cases := []struct {
+		name        string
+		queryErrors int
+		wantWarn    bool
+		wantSubstr  string
+	}{
+		{name: "zero query errors on empty DB stays silent", queryErrors: 0, wantWarn: false},
+		{name: "zero query errors on populated DB stays silent", queryErrors: 0, wantWarn: false},
+		{name: "one query error warns, singular", queryErrors: 1, wantWarn: true, wantSubstr: "1 query failed"},
+		{name: "many query errors warn, plural", queryErrors: 14, wantWarn: true, wantSubstr: "14 queries failed"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			snap := base
+			snap.QueryErrors = c.queryErrors
+			out := FormatStatus(snap)
+
+			gotWarn := strings.Contains(out, "WARNING")
+			if gotWarn != c.wantWarn {
+				t.Fatalf("FormatStatus with QueryErrors=%d: WARNING present = %v, want %v\noutput:\n%s",
+					c.queryErrors, gotWarn, c.wantWarn, out)
+			}
+			if c.wantWarn {
+				if !strings.Contains(out, c.wantSubstr) {
+					t.Errorf("output missing %q:\n%s", c.wantSubstr, out)
+				}
+				if !strings.Contains(out, "INCOMPLETE") {
+					t.Errorf("warning does not tell the reader the counts are INCOMPLETE:\n%s", out)
+				}
+			}
+			// The healthy path must be byte-for-byte what it always was —
+			// no noise added for QueryErrors == 0.
+			if !c.wantWarn && strings.Contains(out, "INCOMPLETE") {
+				t.Errorf("unexpected INCOMPLETE warning on a healthy snapshot:\n%s", out)
+			}
+		})
+	}
+}
+
 func TestHumanBytes(t *testing.T) {
 	cases := []struct {
 		in   int64
@@ -219,3 +272,118 @@ func TestHumanBytes(t *testing.T) {
 
 // dummy import keeper — bytes used in main file but not here
 var _ = bytes.Buffer{}
+
+// TestSnapshot_QueryErrors pins the completeness signal StatusSnapshot.
+// QueryErrors carries.
+//
+// Snapshot swallows every per-lookup failure into a zero value on purpose —
+// a partial schema must still yield whatever else is readable — but that
+// makes a broken read wire-indistinguishable from an empty database. The
+// dashboard's /api/status cache refuses to memoize a snapshot whose numbers
+// might be fabricated, so this counter has to be right in BOTH directions:
+// zero on a healthy database including a completely empty one (an empty table
+// is an ANSWER, not a failure), non-zero the moment lookups genuinely cannot
+// run.
+func TestSnapshot_QueryErrors(t *testing.T) {
+	t.Run("empty database is complete, not degraded", func(t *testing.T) {
+		dbPath := filepath.Join(t.TempDir(), "obs.db")
+		d, err := db.Open(context.Background(), db.Options{Path: dbPath})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer d.Close()
+
+		snap, err := Snapshot(context.Background(), d, dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Every count is legitimately zero here, and several lookups return
+		// sql.ErrNoRows (no advisor digest, no last action). None of that is a
+		// failure to read: a fresh install must never look degraded, or its
+		// snapshot would never be cacheable.
+		if snap.QueryErrors != 0 {
+			t.Errorf("QueryErrors = %d on a healthy empty DB, want 0", snap.QueryErrors)
+		}
+	})
+
+	t.Run("populated database is complete", func(t *testing.T) {
+		dbPath := filepath.Join(t.TempDir(), "obs.db")
+		d, err := db.Open(context.Background(), db.Options{Path: dbPath})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer d.Close()
+		st := store.New(d)
+		if _, err := st.Ingest(context.Background(), []models.ToolEvent{{
+			SourceFile: "f", SourceEventID: "e1", SessionID: "s1",
+			ProjectRoot: t.TempDir(), Timestamp: time.Now().UTC(),
+			Tool: models.ToolClaudeCode, ActionType: models.ActionReadFile,
+			Target: "a.go", Success: true,
+		}}, nil, store.IngestOptions{}); err != nil {
+			t.Fatal(err)
+		}
+
+		snap, err := Snapshot(context.Background(), d, dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if snap.QueryErrors != 0 {
+			t.Errorf("QueryErrors = %d on a healthy populated DB, want 0", snap.QueryErrors)
+		}
+		if snap.Counts.Actions != 1 {
+			t.Errorf("Counts.Actions = %d, want 1", snap.Counts.Actions)
+		}
+	})
+
+	t.Run("unreadable database is degraded, not empty", func(t *testing.T) {
+		dbPath := filepath.Join(t.TempDir(), "obs.db")
+		d, err := db.Open(context.Background(), db.Options{Path: dbPath})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Close the handle: every lookup now fails outright. This is the
+		// shape that matters — the snapshot still comes back "successfully",
+		// with all-zero counts that look exactly like a fresh install.
+		if err := d.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		snap, err := Snapshot(context.Background(), d, dbPath)
+		if err != nil {
+			t.Fatalf("Snapshot must stay tolerant and return what it has: %v", err)
+		}
+		if snap.Counts.Sessions != 0 || snap.Counts.Actions != 0 {
+			t.Fatalf("expected the all-zero fabricated counts: %+v", snap.Counts)
+		}
+		if snap.QueryErrors == 0 {
+			t.Fatal("QueryErrors = 0 on a database that answered nothing — a partial " +
+				"snapshot is indistinguishable from an empty one, which is exactly what " +
+				"this field exists to prevent")
+		}
+		// Sanity: the counter is a count, not a bool — every table lookup
+		// plus the aggregate queries should have registered.
+		if snap.QueryErrors < 12 {
+			t.Errorf("QueryErrors = %d, want >= 12 (11 table counts + the aggregates)", snap.QueryErrors)
+		}
+	})
+
+	t.Run("cancelled context is degraded", func(t *testing.T) {
+		dbPath := filepath.Join(t.TempDir(), "obs.db")
+		d, err := db.Open(context.Background(), db.Options{Path: dbPath})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer d.Close()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		snap, err := Snapshot(ctx, d, dbPath)
+		if err != nil {
+			t.Fatalf("Snapshot must stay tolerant: %v", err)
+		}
+		if snap.QueryErrors == 0 {
+			t.Error("QueryErrors = 0 for a scan under a cancelled context — the zeros " +
+				"it returned would be cached as fact")
+		}
+	})
+}

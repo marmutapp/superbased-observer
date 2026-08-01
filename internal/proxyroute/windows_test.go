@@ -40,6 +40,18 @@ func forceWindowsUser(t *testing.T, name string) {
 	t.Cleanup(func() { windowsUserName = prev })
 }
 
+// clearSandboxPin drops a registrar's caller-pinned-home marker so the
+// crossmount AUTO-DETECT branch of resolveWindowsHomeFor runs even though the
+// test sandboxed HomeDir. Legitimate only in tests that have already replaced
+// the crossmount seams (forceHomes + forceWindowsUser) with fakes — nothing
+// there can reach a real /mnt/c. Every OTHER caller, in particular every
+// out-of-package one, keeps the sandbox gate; see
+// crossmount.AutoDetectSuppressed (incident 2026-07-31).
+func clearSandboxPin(r *Registrar) *Registrar {
+	r.homeOverride = ""
+	return r
+}
+
 // newWindowsRegistrar builds a Registrar whose cross-OS writers target a
 // temp Windows-home override, so the tests never touch a real /mnt/c home
 // or depend on the ambient crossmount detection of the host they run on. The
@@ -47,10 +59,17 @@ func forceWindowsUser(t *testing.T, name string) {
 func newWindowsRegistrar(t *testing.T, port int) (*Registrar, string) {
 	t.Helper()
 	forceWSL(t, true)
-	winHome := t.TempDir()
+	nativeHome := t.TempDir()
+	// The Windows home must live UNDER the pinned HomeDir: once a caller
+	// sandboxes its home, an override outside it is refused (containment half
+	// of crossmount.AutoDetectSuppressed — the 2026-07-31 follow-up round).
+	winHome := filepath.Join(nativeHome, "mnt", "c", "Users", "tester")
+	if err := os.MkdirAll(winHome, 0o755); err != nil {
+		t.Fatalf("mkdir win home: %v", err)
+	}
 	r, err := NewRegistrar(RegisterOptions{
 		ProxyPort:         port,
-		HomeDir:           t.TempDir(), // distinct native home, unused by the windows writers
+		HomeDir:           nativeHome,
 		WindowsClaudeHome: winHome,
 		WindowsCodexHome:  winHome,
 	})
@@ -204,6 +223,7 @@ func TestRegisterClaudeCodeWindows_AmbiguousRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	r = clearSandboxPin(r) // crossmount fakes are installed; drive auto-detect
 	res := r.RegisterClaudeCodeWindows()
 	if res.Error == nil {
 		t.Fatal("expected an error refusing to auto-pick an ambiguous layout")
@@ -238,6 +258,7 @@ func TestRegisterClaudeCodeWindows_SingleUnownedMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	r = clearSandboxPin(r) // crossmount fakes are installed; drive auto-detect
 	res := r.RegisterClaudeCodeWindows()
 	if res.Error == nil {
 		t.Fatal("expected a refusal error for a single unowned home")
@@ -317,6 +338,7 @@ func TestWindowsRouteTargets_ExcludesAmbiguous(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	r = clearSandboxPin(r) // crossmount fakes are installed; drive auto-detect
 	got := r.WindowsRouteTargets()
 	if len(got) != 1 || got[0] != "codex-windows" {
 		t.Errorf("WindowsRouteTargets = %v, want [codex-windows] (ambiguous claude excluded)", got)
@@ -416,6 +438,7 @@ func TestWindowsRouteTargets_NoneWhenUnset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	r = clearSandboxPin(r) // crossmount fakes are installed; drive auto-detect
 	for _, tgt := range r.WindowsRouteTargets() {
 		if tgt != "claude-code-windows" && tgt != "codex-windows" {
 			t.Errorf("unexpected target %q", tgt)
@@ -448,6 +471,7 @@ func TestWindowsRouteCandidates_UnresolvedListed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	r = clearSandboxPin(r) // crossmount fakes are installed; drive auto-detect
 	cands := r.WindowsRouteCandidates()
 	if _, ok := cands["codex-windows"]; ok {
 		t.Errorf("codex resolved cleanly (owned) — must NOT appear in candidates: %v", cands)
@@ -481,6 +505,7 @@ func TestWindowsRouteCandidates_NoneWhenResolvedOrEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	r = clearSandboxPin(r) // crossmount fakes are installed; drive auto-detect
 	if cands := r.WindowsRouteCandidates(); cands != nil {
 		t.Errorf("resolved single owned home should yield nil candidates, got %v", cands)
 	}

@@ -22,6 +22,16 @@
 //     placeholder cwd. Differences: JOIN project.worktree as a cwd
 //     fallback past message.path.cwd; emit Tool = models.ToolKiloCodeCLI.
 //
+// Reasoning follows the OpenCode transposition exactly: `reasoning` parts
+// are never rows of their own; loadReasoningIndex assigns each one to the
+// successor part it precedes within the same message (consumed-once,
+// last-wins, message-partitioned) and the body lands on that row's
+// PrecedingReasoning, beating both the part `title` and the OpenRouter
+// reasoning-detail metadata. The legacy IDE half inherits the same
+// posture from internal/adapter/cline, whose thinking blocks thread
+// (fan-out) instead of minting rows. See
+// docs/plans/b3-reasoning-convergence-plan-2026-07-31.md §1.
+//
 // See docs/plans/kilocode-adapter-plan-2026-06-06.md for the Phase-0
 // research note (confirmed live capture from WSL + Windows 2026-06-06).
 package kilocode

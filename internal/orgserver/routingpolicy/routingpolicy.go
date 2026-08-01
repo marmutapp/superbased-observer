@@ -36,7 +36,7 @@ func Publish(ctx context.Context, db *sql.DB, body, actor string) (orgcontract.R
 	if err := toml.Unmarshal([]byte(body), &probe); err != nil {
 		return orgcontract.RoutingPolicyDoc{}, fmt.Errorf("routingpolicy.Publish: body is not valid TOML: %w", err)
 	}
-	priv, pub, err := signingKey(ctx, db)
+	priv, pub, err := SigningKey(ctx, db)
 	if err != nil {
 		return orgcontract.RoutingPolicyDoc{}, err
 	}
@@ -95,9 +95,19 @@ func Latest(ctx context.Context, db *sql.DB) (orgcontract.RoutingPolicyDoc, bool
 	return doc, true, nil
 }
 
-// signingKey loads (or generates, once) the server's Ed25519 policy
-// signing key.
-func signingKey(ctx context.Context, db *sql.DB) (ed25519.PrivateKey, ed25519.PublicKey, error) {
+// SigningKey loads (or generates, once) the server's Ed25519
+// distribution signing key.
+//
+// EXPORTED because it is the org server's ONE signing identity, not a
+// routing-specific one: every signed-distribution rail shares it so an
+// agent that has TOFU-pinned the key on one rail sees the same key on
+// the others. Second consumer: orgserver/organnounce (rail R3 of the
+// announcements plan). Keep it that way — a second key would mean a
+// second pin, a second rotation story, and a second way to get it
+// wrong. The row lives in routing_policy_keys (id=1) for continuity
+// with the deployments that already have one; the table name is
+// historical, its contents are org-wide.
+func SigningKey(ctx context.Context, db *sql.DB) (ed25519.PrivateKey, ed25519.PublicKey, error) {
 	var pubB64, privB64 string
 	err := db.QueryRowContext(ctx, `SELECT public_key, private_key FROM routing_policy_keys WHERE id = 1`).
 		Scan(&pubB64, &privB64)
@@ -131,19 +141,41 @@ func signingKey(ctx context.Context, db *sql.DB) (ed25519.PrivateKey, ed25519.Pu
 
 // Verify checks a policy doc's signature against a (pinned) public key.
 func Verify(doc orgcontract.RoutingPolicyDoc, pinnedPubB64 string) error {
+	return VerifySigned(doc.Body, doc.BodyHash, doc.Signature, pinnedPubB64)
+}
+
+// VerifySigned is the document-shape-independent core of Verify: hash
+// match first, then Ed25519 over the BODY BYTES against the PINNED key.
+//
+// SECURITY NOTE (docs/security.md open ledger, ROUTING-SIG-1): the
+// signature covers the body and NOTHING ELSE — not the version, not
+// which rail the document arrived on. A captured signed policy can
+// therefore be replayed at a different version number, and the org
+// server's ONE signing identity means a signature minted on another
+// body-signing rail would verify here too. This is a RELEASED wire
+// format (agents in the field verify exactly these bytes), so it is
+// recorded rather than changed in place; a fix is a versioned
+// migration, not an edit.
+//
+// A NEW rail must NOT reuse this. The org-announcement rail
+// (orgserver/organnounce, unreleased when it was hardened) signs
+// orgcontract.AnnouncementSigningMessage — domain tag + version + body
+// — precisely so neither replay works there, and it deliberately does
+// not call this function.
+func VerifySigned(body, bodyHash, signatureB64, pinnedPubB64 string) error {
 	pub, err := base64.StdEncoding.DecodeString(pinnedPubB64)
 	if err != nil || len(pub) != ed25519.PublicKeySize {
 		return fmt.Errorf("routingpolicy.Verify: bad public key")
 	}
-	sig, err := base64.StdEncoding.DecodeString(doc.Signature)
+	sig, err := base64.StdEncoding.DecodeString(signatureB64)
 	if err != nil {
 		return fmt.Errorf("routingpolicy.Verify: bad signature encoding")
 	}
-	sum := sha256.Sum256([]byte(doc.Body))
-	if hex.EncodeToString(sum[:]) != doc.BodyHash {
+	sum := sha256.Sum256([]byte(body))
+	if hex.EncodeToString(sum[:]) != bodyHash {
 		return fmt.Errorf("routingpolicy.Verify: body hash mismatch")
 	}
-	if !ed25519.Verify(ed25519.PublicKey(pub), []byte(doc.Body), sig) {
+	if !ed25519.Verify(ed25519.PublicKey(pub), []byte(body), sig) {
 		return fmt.Errorf("routingpolicy.Verify: signature invalid")
 	}
 	return nil

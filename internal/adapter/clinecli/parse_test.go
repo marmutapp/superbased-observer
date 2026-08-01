@@ -243,7 +243,69 @@ func TestExtractTarget(t *testing.T) {
 		{
 			tool:  "run_commands",
 			input: `{"commands":[{"command":"go build"},{"command":"go test"}]}`,
-			want:  "go build (+1 more)",
+			want:  "go build; go test",
+		},
+		{
+			// Live cline 3.x shape: commands is a list of PLAIN STRINGS,
+			// not objects (WP-T6 finding C1). Single command.
+			tool:  "run_commands",
+			input: `{"commands":["printf 'DONE' > /tmp/probe_out.txt"]}`,
+			want:  "printf 'DONE' > /tmp/probe_out.txt",
+		},
+		{
+			// Live cline 3.x shape, multiple plain-string commands —
+			// the exact payload captured in /tmp/wpt6/cline-findings.md.
+			// Every command is joined into the target (F4): a batch is a
+			// sequence of independent commands, and only the head was
+			// visible before.
+			tool: "run_commands",
+			input: `{"commands":["printf 'DONE' > /tmp/wpt6/cline/probe_out.txt",` +
+				`"echo probe-marker-cline",` +
+				`"printf '\n--- probe_out.txt ---\n'; cat /tmp/wpt6/cline/probe_out.txt"]}`,
+			want: "printf 'DONE' > /tmp/wpt6/cline/probe_out.txt; echo probe-marker-cline; " +
+				`printf '` + "\n" + `--- probe_out.txt ---` + "\n" + `'; cat /tmp/wpt6/cline/probe_out.txt`,
+		},
+		{
+			// F4 REGRESSION: a destructive TAIL command must appear in
+			// the target. Keeping only the head hid it from both the
+			// target-based guard policy (internal/policy's engine calls
+			// ParseCommand(ev.Target) and splits on ";") and from every
+			// target-based analytics surface.
+			tool:  "run_commands",
+			input: `{"commands":["go build ./...","rm -rf /home/u/proj/.git"]}`,
+			want:  "go build ./...; rm -rf /home/u/proj/.git",
+		},
+		{
+			// Legacy OBJECT-list batches join identically — the two
+			// wire shapes must not disagree about what a batch target
+			// looks like.
+			tool:  "run_commands",
+			input: `{"commands":[{"command":"go build"},{"command":"rm -rf ~/x"}]}`,
+			want:  "go build; rm -rf ~/x",
+		},
+		{
+			// Empty commands list: no target, no crash.
+			tool:  "run_commands",
+			input: `{"commands":[]}`,
+			want:  "",
+		},
+		{
+			// Mixed types in one list (defensive: shouldn't happen in
+			// practice, but the type-switch must not panic on an
+			// unexpected element type). Extraction is PER ELEMENT, so
+			// the string element still lands in the target and the one
+			// element we could not read is reported honestly as
+			// "(+1 more)" rather than silently dropped.
+			tool:  "run_commands",
+			input: `{"commands":[123,"echo hi"]}`,
+			want:  "echo hi (+1 more)",
+		},
+		{
+			// Nothing readable at all: the target says so rather than
+			// pretending the batch was empty.
+			tool:  "run_commands",
+			input: `{"commands":[123,456]}`,
+			want:  "(+2 more)",
 		},
 		{
 			tool:  "editor",
@@ -299,6 +361,28 @@ func TestExtractTarget(t *testing.T) {
 				t.Errorf("extractTarget(%q, %s) = %q; want %q", tc.tool, tc.input, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestJoinBatchCommands_CapsAtByteBudget pins the one bound on the
+// joined multi-command target: a pathological batch cannot put an
+// unbounded string in actions.target (the store does not truncate it),
+// and whatever the cap drops is reported, never silently lost.
+func TestJoinBatchCommands_CapsAtByteBudget(t *testing.T) {
+	t.Parallel()
+	big := strings.Repeat("x", 900)
+	got := joinBatchCommands([]string{big, big, big, big})
+	if len(got) > maxBatchCommandTargetBytes+len(" (+9 more)") {
+		t.Errorf("len(got) = %d; want <= cap %d plus the suffix", len(got), maxBatchCommandTargetBytes)
+	}
+	if !strings.HasSuffix(got, "(+2 more)") {
+		t.Errorf("got = %q; want the dropped-tail count reported as (+2 more)", got)
+	}
+	// A single oversized command is NOT capped: single-command batches
+	// never reach this helper (extractTarget returns them verbatim), and
+	// the first element is always rendered so the target is never empty.
+	if first := joinBatchCommands([]string{big + big + big, "echo hi"}); !strings.HasPrefix(first, "xxx") {
+		t.Errorf("oversized head dropped: %q", first[:min(40, len(first))])
 	}
 }
 
@@ -787,5 +871,122 @@ func TestNormalizeProjectRoot_CrossMount(t *testing.T) {
 	// native).
 	if got := normalizeProjectRoot(`C:\Users\dev\proj`); got == "" {
 		t.Error("normalizeProjectRoot dropped a non-empty Windows path")
+	}
+}
+
+// TestBuildEvents_ReasoningNeverMintsAnAction is the B3 regression pin.
+// A `thinking` content block must produce NO action row (it used to mint
+// a phantom `clinecli.reasoning` task_complete row) and its body must
+// ride the next event's PrecedingReasoning under the consumed-once /
+// last-wins / turn-boundary-discard contract.
+func TestBuildEvents_ReasoningNeverMintsAnAction(t *testing.T) {
+	t.Parallel()
+	s := sessionRow{
+		ID:           "b3-sid",
+		Source:       "cli",
+		Status:       "idle",
+		Model:        "deepseek/deepseek-v4-flash",
+		CWD:          "/home/dev/proj",
+		StartedAt:    "2026-06-05T23:21:51.000Z",
+		UpdatedAt:    "2026-06-05T23:28:30.000Z",
+		MessagesPath: sql.NullString{Valid: true, String: "/synth/b3.messages.json"},
+	}
+	s.Messages.Messages = []messageRecord{
+		{
+			ID: "u1", Role: "user", Ts: 1780701724628,
+			Content: []messageBlock{{Type: "text", Text: `<user_input mode="act">do the thing</user_input>`}},
+		},
+		{
+			ID: "a1", Role: "assistant", Ts: 1780701727101,
+			Content: []messageBlock{
+				{Type: "thinking", Thinking: "THINK_ONE"},
+				{Type: "tool_use", ID: "call_1", Name: "read_files", Input: json.RawMessage(`{"files":[{"path":"/a"}]}`)},
+				{Type: "tool_use", ID: "call_2", Name: "read_files", Input: json.RawMessage(`{"files":[{"path":"/b"}]}`)},
+			},
+		},
+		{
+			ID: "a2", Role: "assistant", Ts: 1780701728101,
+			Content: []messageBlock{{Type: "thinking", Thinking: "STALE_ACROSS_TURN"}},
+		},
+		{
+			ID: "u2", Role: "user", Ts: 1780701729101,
+			Content: []messageBlock{{Type: "text", Text: `<user_input mode="act">next thing</user_input>`}},
+		},
+		{
+			ID: "a3", Role: "assistant", Ts: 1780701730101,
+			Content: []messageBlock{
+				{Type: "tool_use", ID: "call_3", Name: "read_files", Input: json.RawMessage(`{"files":[{"path":"/c"}]}`)},
+			},
+		},
+		{
+			ID: "a4", Role: "assistant", Ts: 1780701731101,
+			Content: []messageBlock{
+				{Type: "thinking", Thinking: "FIRST"},
+				{Type: "thinking", Thinking: "SECOND"},
+				{Type: "tool_use", ID: "call_4", Name: "read_files", Input: json.RawMessage(`{"files":[{"path":"/d"}]}`)},
+			},
+		},
+	}
+
+	tools, _, _ := buildEvents(context.Background(), []sessionRow{s}, "/x/sessions.db", scrub.New(), nil)
+
+	byCall := map[string]models.ToolEvent{}
+	for _, ev := range tools {
+		if strings.Contains(strings.ToLower(ev.RawToolName), "reasoning") ||
+			strings.Contains(strings.ToLower(ev.RawToolName), "thinking") {
+			t.Fatalf("reasoning-named action row emitted: raw=%q %+v", ev.RawToolName, ev)
+		}
+		for _, body := range []string{"THINK_ONE", "STALE_ACROSS_TURN", "FIRST", "SECOND"} {
+			if ev.Target == body || ev.ToolOutput == body {
+				t.Fatalf("reasoning body %q surfaced as action content: %+v", body, ev)
+			}
+		}
+		if ev.RawToolName == "read_files" {
+			byCall[ev.SourceEventID] = ev
+		}
+	}
+
+	cases := []struct{ id, want, why string }{
+		{"ma1:tool_use:call_1", "THINK_ONE", "the thinking block that introduced it"},
+		{"ma1:tool_use:call_2", "", "consumed-once: the sibling call already took it"},
+		{"ma3:tool_use:call_3", "", "turn-boundary discard: a user prompt intervened"},
+		{"ma4:tool_use:call_4", "SECOND", "last-wins: the newer thinking block replaces the older"},
+	}
+	for _, c := range cases {
+		ev, ok := byCall[c.id]
+		if !ok {
+			t.Fatalf("missing tool_use event %q", c.id)
+		}
+		if ev.PrecedingReasoning != c.want {
+			t.Errorf("%s PrecedingReasoning = %q, want %q (%s)", c.id, ev.PrecedingReasoning, c.want, c.why)
+		}
+	}
+}
+
+// TestParseSessionFile_FixtureCorpus_ReasoningThreaded is the same B3
+// pin against the LIVE captured corpus, whose assistant messages carry
+// thinking → text → tool_use in that block order: the assistant-text row
+// is the first successor, so it (not the tool_use row) carries the
+// chain-of-thought.
+func TestParseSessionFile_FixtureCorpus_ReasoningThreaded(t *testing.T) {
+	t.Parallel()
+	dbPath := buildFixtureCLineDataDir(t)
+	a := New()
+	res, err := a.ParseSessionFile(context.Background(), dbPath, 0)
+	if err != nil {
+		t.Fatalf("ParseSessionFile: %v", err)
+	}
+	var threaded int
+	for _, ev := range res.ToolEvents {
+		if strings.Contains(strings.ToLower(ev.RawToolName), "reasoning") {
+			t.Fatalf("reasoning-named action row emitted: raw=%q %+v", ev.RawToolName, ev)
+		}
+		if ev.RawToolName == "clinecli.assistant_text" &&
+			strings.Contains(ev.PrecedingReasoning, "session protocol in the AGENTS.md") {
+			threaded++
+		}
+	}
+	if threaded == 0 {
+		t.Errorf("no assistant_text row carried the fixture's thinking block in PrecedingReasoning")
 	}
 }

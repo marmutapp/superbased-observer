@@ -627,9 +627,9 @@ export const HELP_REGISTRY: HelpEntry[] = [
     id: "chart.tools_breakdown",
     category: "chart",
     title: "Tools › Action-type mix chart",
-    oneLiner: "Horizontal stacked bar — one row per tool, segments coloured by action type (read_file / edit_file / run_command / search_text / …).",
-    detail: "For each tool in the window, shows what fraction of its actions were each type. Useful for spotting workflow asymmetries: cursor is typically edit-heavy, claude-code is typically a mix, codex is typically run-command-heavy. A tool with an unexpected mix (e.g. claude-code suddenly 90% search) usually means a session-design change.",
-    source: "/api/tools/breakdown?days=N",
+    oneLiner: "Horizontal stacked bar — one row per tool, segments coloured by CANONICAL ACTION CATEGORY (files / commands / search / web / agents / skills / MCP / user / meta / failures), plus a capture-depth row.",
+    detail: "For each tool in the window, shows what fraction of its actions fell in each canonical category. Every bar uses the same category order, so two adapters are directly comparable — which per-action-type bars never were. Useful for spotting workflow asymmetries: cursor is typically edit-heavy, claude-code is typically a mix, codex is typically run-command-heavy. The dot row underneath is the honesty row: a SOLID dot is a category observed in this window, a RING is a category this adapter's captured vocabulary covers but that didn't appear, and a FAINT dot is a category this adapter's capture cannot express at all. Capture depth varies wildly across adapters, so without that row a shallow-capture adapter reads as \"doesn't use tools\" when the truth is \"its logs never say\". Categories and capture depth both come from internal/tooltax, the one cross-adapter taxonomy owner.",
+    source: "/api/tools/breakdown?days=N (by_category / by_surface / coverage)",
   },
   {
     id: "chart.top_models",
@@ -1343,7 +1343,7 @@ export const HELP_REGISTRY: HelpEntry[] = [
     category: "glossary",
     title: "Action",
     oneLiner: "One normalised tool call recorded by an adapter.",
-    detail: "Action types are normalised across all adapters: read_file, write_file, edit_file, run_command, search_text, search_files, web_search, web_fetch, mcp_call, user_prompt, task_complete.",
+    detail: "Action types are normalised across all adapters: read_file, write_file, edit_file, run_command, search_text, search_files, web_search, web_fetch, mcp_call, user_prompt, assistant_message, task_complete.",
   },
   {
     id: "glossary.api_turn",
@@ -1815,7 +1815,7 @@ export const HELP_REGISTRY: HelpEntry[] = [
     category: "glossary",
     title: "Watcher lag warning (sidebar)",
     oneLiner: "The sidebar warns when the file watcher is behind on session files or a file looks misrouted — capture may be incomplete until it catches up.",
-    detail: "The observer's watcher tails each AI tool's session files and ingests new activity. Two health signals surface as a small warn line in the sidebar footer (polled every 60s from /api/health/watcher):\n\n• behind N files — a session file has grown past the watcher's saved read position. Usually transient (heavy write bursts); if it persists, recent activity isn't in the dashboard yet. Fix: a rescan from Settings → Backfill (or `observer scan --force --adapter <tool>`) replays the gap — ingestion is idempotent, so catching up never duplicates rows.\n• N misrouted — a file's cursor sits at end-of-file but zero rows were ever emitted from it (the pre-v1.4.51 misroute fingerprint). Worth a rescan or an `observer doctor` run.\n\nNo warn line = the watcher is current on every known file.",
+    detail: "The observer's watcher tails each AI tool's session files and ingests new activity. Two health signals surface as a small warn line in the sidebar footer (polled every 60s from /api/health/watcher):\n\n• behind N files — an append-only transcript has grown past the watcher's saved read position. Usually transient (heavy write bursts); if it persists, recent activity isn't in the dashboard yet. Fix: a rescan from Settings → Backfill (or `observer scan --force --adapter <tool>`) replays the gap — ingestion is idempotent, so catching up never duplicates rows.\n• N misrouted — a transcript's cursor sits at end-of-file but zero rows were ever emitted from it (the pre-v1.4.51 misroute fingerprint). Worth a rescan or an `observer doctor` run.\n\nBoth counts deliberately EXCLUDE files where the comparison wouldn't mean anything, so the warn line stays actionable instead of becoming permanent. Excluded files are still listed in the endpoint's `files` array with a `cursor_kind` and an `excluded_reason`:\n\n• watermark — SQLite-backed tools (hermes, goose, devin, cline-cli, opencode, crush, kilo-cli, kiro-cli, openclaw) save a row id or a timestamp in the cursor column, not a byte count. Comparing it to a file size is meaningless in both directions, so neither signal applies. The `.db-wal` / `.db-shm` sidecars are fsnotify triggers only and follow the same rule.\n• encrypted — Antigravity's `.pb` conversation store is OSCrypt-encrypted. Where the secret or cipher isn't available on this host, emitting zero rows is the designed outcome, not a misroute. Byte lag still counts for these.\n• no_actions — files read for tokens or state only, which never produce activity rows: grok's global `logs/unified.jsonl`, qoder run-log segments, copilot-cli `process-*.log`, openclaw trajectory traces, kiro-cli `.json` bundle state (its events land on the sibling `.jsonl`). Byte lag still counts for these too.\n\nThe endpoint returns at most the 50 worst rows; `total_files` and `files_truncated` say what was left out. The counts are always computed over every row.\n\nNo warn line = the watcher is current on every file where being behind would mean something.",
     related: ["tab.settings", "glossary.session"],
   },
   {

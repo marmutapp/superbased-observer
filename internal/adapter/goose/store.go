@@ -12,6 +12,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/marmutapp/superbased-observer/internal/adapter/mirrorbase"
 	"github.com/marmutapp/superbased-observer/internal/platform/crossmount"
 	"github.com/marmutapp/superbased-observer/internal/platform/sqlitedsn"
 )
@@ -101,12 +102,12 @@ func stageMirrorIfForeign(srcDB string) (string, error) {
 	if !isForeignMountPath(srcDB) {
 		return srcDB, nil
 	}
-	cache, err := os.UserCacheDir()
-	if err != nil || cache == "" {
-		cache = os.TempDir()
+	base, err := mirrorbase.Base()
+	if err != nil || base == "" {
+		base = filepath.Join(os.TempDir(), "superbased-observer")
 	}
 	sum := sha256.Sum256([]byte(srcDB))
-	mirrorDir := filepath.Join(cache, "superbased-observer", "goose-mirror", hex.EncodeToString(sum[:8]))
+	mirrorDir := filepath.Join(base, "goose-mirror", hex.EncodeToString(sum[:8]))
 	if err := os.MkdirAll(mirrorDir, 0o700); err != nil {
 		return "", fmt.Errorf("mkdir mirror: %w", err)
 	}

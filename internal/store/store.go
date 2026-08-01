@@ -338,10 +338,18 @@ func (s *Store) SessionHasSourceFileRows(ctx context.Context, sessionID, sourceF
 
 // LoadActionTargets returns the distinct Target column values already
 // persisted for sourceFile, split by ActionType into user_prompt
-// targets and task_complete targets. Used by the antigravity
+// targets and assistant targets. Used by the antigravity
 // adapter's plaintext-transcript augmentation path to dedup
 // synthesized entries against rows from prior parse cycles — see
 // antigravity.TargetCoverageReader for the bug it closes.
+//
+// The assistant bucket matches BOTH 'assistant_message' and
+// 'task_complete'. The WP-T6/B2 sweep re-typed the assistant-text emit
+// sites to assistant_message while genuinely-terminal rows keep
+// task_complete, and a database mid-upgrade (rows ingested before the
+// sweep, or before migration 078 ran) carries both spellings for the
+// same text. Matching one type only would return an empty coverage set
+// and reopen the duplicate-assistant-row bug this query closes.
 //
 // Empty Target rows are skipped on the SQL side (DISTINCT collapses
 // them but they'd be useless for text dedup anyway). Returning empty
@@ -352,7 +360,7 @@ func (s *Store) LoadActionTargets(ctx context.Context, sourceFile string) (userT
 		`SELECT DISTINCT action_type, target FROM actions
 		  WHERE source_file = ?
 		    AND target <> ''
-		    AND action_type IN ('user_prompt', 'task_complete')`,
+		    AND action_type IN ('user_prompt', 'task_complete', 'assistant_message')`,
 		sourceFile)
 	if err != nil {
 		return nil, nil, fmt.Errorf("store.LoadActionTargets: %w", err)
@@ -366,7 +374,7 @@ func (s *Store) LoadActionTargets(ctx context.Context, sourceFile string) (userT
 		switch actionType {
 		case "user_prompt":
 			userTargets = append(userTargets, target)
-		case "task_complete":
+		case "task_complete", "assistant_message":
 			asstTargets = append(asstTargets, target)
 		}
 	}
@@ -576,6 +584,49 @@ ON CONFLICT(source_file, source_event_id) DO UPDATE SET
 		THEN excluded.content_bytes
 		ELSE actions.content_bytes
 	END,
+	-- success self-heal, ASYMMETRIC 1 → 0 ONLY (outcome seam).
+	-- A tool_use and its tool_result are separate records: every call
+	-- inserts optimistically successful and is corrected when the
+	-- result is seen. When a parse window ends between the two, the
+	-- row can be left permanently wrong; a force rescan (offset 0)
+	-- pairs them in ONE window and re-emits the CORRECTED event, but
+	-- with success frozen on conflict that repair could never land.
+	--
+	-- The reverse direction must stay frozen: an optimistic re-emit
+	-- carries success=1 by construction, so allowing 0 → 1 would let
+	-- an ordinary re-scan un-fix a row a real failure had already
+	-- corrected. Same asymmetry as the action_type unknown → known
+	-- rule below — a re-emit may only ever ADD information.
+	--
+	-- The flip is gated on EVIDENCE, not on tool identity: a measured
+	-- failure carries its error text, while a PROVISIONAL false
+	-- carries none. Snapshot adapters re-emit stable ids with such
+	-- sentinels — antigravity's "no exit code yet" (success is derived
+	-- from an unsigned exit value) and copilot's isComplete=false
+	-- task_complete row — and a stale or truncated snapshot parse
+	-- landing after a complete one would otherwise downgrade a real
+	-- success. Requiring the error body makes that impossible without
+	-- naming a single adapter.
+	--
+	-- Accepted miss: a genuine failure whose result body is empty
+	-- won't self-heal on rescan. The cross-tick update path still
+	-- fixes it — ActionOutcomeUpdate.SuccessKnown carries the verdict
+	-- without needing a message.
+	success = CASE
+		WHEN actions.success = 1 AND excluded.success = 0
+		 AND excluded.error_message IS NOT NULL AND excluded.error_message != ''
+		THEN excluded.success
+		ELSE actions.success
+	END,
+	-- error_message rides along on that same flip (and only then), so
+	-- a healed row explains itself. Bound as a plain string by
+	-- InsertActions, hence the '' guard rather than IS NULL alone.
+	error_message = CASE
+		WHEN actions.success = 1 AND excluded.success = 0
+		 AND excluded.error_message IS NOT NULL AND excluded.error_message != ''
+		THEN excluded.error_message
+		ELSE actions.error_message
+	END,
 	-- action_type reclassification (rescan self-heal). An adapter
 	-- mapping fix (e.g. grok's search_replace -> edit_file, 2026-07-09)
 	-- lets a re-scan finally classify a tool the original emit stored
@@ -771,13 +822,42 @@ func (s *Store) UpdateActionOutcome(
 	durationMs int64,
 	toolOutput, toolName, target string,
 ) (int64, error) {
+	// successKnown=true: an after-event hook always reports a verdict,
+	// and this path is the authoritative one for it.
+	return s.updateActionOutcome(ctx, sourceFile, sourceEventID, true, success,
+		errorMessage, durationMs, toolOutput, toolName, target, s.indexer)
+}
+
+// updateActionOutcome is the implementation behind UpdateActionOutcome,
+// with the FTS5 indexer supplied by the caller instead of read off the
+// Store. The watcher's Store has no WithIndexer binding — its indexer
+// arrives per-call through IngestOptions — so the Ingest path must be
+// able to hand its own indexer in, or cross-tick tool output would
+// silently skip the action_excerpts index.
+//
+// idx may be nil: the outcome columns still update, only the FTS insert
+// is skipped.
+//
+// successKnown=false leaves the success column untouched — for a result
+// record that carried no verdict, where writing anything would be an
+// invention (see [models.ActionOutcomeUpdate.SuccessKnown]).
+func (s *Store) updateActionOutcome(
+	ctx context.Context,
+	sourceFile, sourceEventID string,
+	successKnown bool,
+	success bool,
+	errorMessage string,
+	durationMs int64,
+	toolOutput, toolName, target string,
+	idx *indexing.Indexer,
+) (int64, error) {
 	if sourceFile == "" || sourceEventID == "" {
 		return 0, errors.New("store.UpdateActionOutcome: sourceFile and sourceEventID are required")
 	}
 	res, err := s.db.ExecContext(
 		ctx,
 		`UPDATE actions SET
-			success = ?,
+			success = CASE WHEN ? THEN ? ELSE success END,
 			error_message = CASE WHEN ? <> '' THEN ? ELSE error_message END,
 			duration_ms = CASE
 				WHEN ? > 0 AND (duration_ms IS NULL OR duration_ms = 0)
@@ -800,7 +880,7 @@ func (s *Store) UpdateActionOutcome(
 				ELSE raw_tool_output
 			END
 		 WHERE source_file = ? AND source_event_id = ?`,
-		boolToInt(success),
+		boolToInt(successKnown), boolToInt(success),
 		errorMessage, errorMessage,
 		durationMs, durationMs,
 		toolOutput, toolOutput, toolOutput,
@@ -810,20 +890,36 @@ func (s *Store) UpdateActionOutcome(
 		return 0, fmt.Errorf("store.UpdateActionOutcome: %w", err)
 	}
 	n, _ := res.RowsAffected()
-	// FTS5 index the tool output if (a) we matched a row, (b) the
-	// caller provided non-empty output, and (c) an Indexer is bound.
-	// Look up the action.id first — the indexer is keyed by rowid,
-	// not by source_event_id. Failures here log but don't propagate;
-	// the action's outcome columns are already correctly updated.
-	if n > 0 && toolOutput != "" && s.indexer != nil {
-		var actionID int64
+	// FTS5 index the tool output only when the column NOW holds exactly
+	// this payload. Read the POST-update state and compare bytes: the
+	// UPDATE's length-merge may have rejected this body (a shorter
+	// duplicate), and indexing a rejected payload would leave
+	// action_excerpts describing something raw_tool_output doesn't
+	// hold. Asking the row what it ended up with — rather than
+	// predicting the merge from a pre-read length — closes two holes at
+	// once: a concurrent writer installing a longer body between the
+	// two statements, and SQLite's LENGTH() stopping at the first
+	// embedded U+0000 where a Go-side count would not. A later, longer
+	// write by another path re-indexes with its own body, exactly as
+	// the hook path already behaves.
+	//
+	// Index failures are swallowed: the outcome columns are the
+	// load-bearing write. (The indexer's own DELETE+INSERT is not
+	// atomic — a pre-existing property shared with the hook path, out
+	// of scope here.)
+	if n > 0 && toolOutput != "" && idx != nil {
+		var (
+			actionID  int64
+			isCurrent int
+		)
 		err := s.db.QueryRowContext(
 			ctx,
-			`SELECT id FROM actions WHERE source_file = ? AND source_event_id = ?`,
-			sourceFile, sourceEventID,
-		).Scan(&actionID)
-		if err == nil && actionID > 0 {
-			_ = s.indexer.Index(ctx, actionID, toolName, target, toolOutput, errorMessage)
+			`SELECT id, COALESCE(raw_tool_output, '') = ?
+			   FROM actions WHERE source_file = ? AND source_event_id = ?`,
+			toolOutput, sourceFile, sourceEventID,
+		).Scan(&actionID, &isCurrent)
+		if err == nil && actionID > 0 && isCurrent != 0 {
+			_ = idx.Index(ctx, actionID, toolName, target, toolOutput, errorMessage)
 		}
 	}
 	return n, nil
@@ -1306,6 +1402,15 @@ type IngestOptions struct {
 	// SetSessionLineage after the sessions are upserted. NODE-LOCAL —
 	// never on the org-push wire. Empty/nil is a clean no-op.
 	SessionLineages []models.SessionLineage
+	// OutcomeUpdates carries outcomes for actions inserted by an
+	// EARLIER Ingest call: a tool_result an adapter parsed in a later
+	// watcher tick than the tool_use that created the row (see
+	// adapter.ParseResult.OutcomeUpdates). Applied after the batch
+	// insert via UpdateActionOutcome's merge rules, using this options
+	// struct's Indexer for the FTS excerpt. An entry matching no row is
+	// silently tolerated, and a per-entry error is non-fatal — a late
+	// outcome must never fail an ingest.
+	OutcomeUpdates []models.ActionOutcomeUpdate
 }
 
 // fileActionTypes is the set of normalized actions whose target is a file
@@ -1377,6 +1482,13 @@ func (s *Store) Ingest(
 		batchIdx int
 	}
 	var pendingGuard []guardPending
+
+	// Batch indices of actions whose tool call has no observed outcome
+	// yet (models.ToolEvent.OutcomePending). Their success=true is an
+	// optimistic placeholder, so failure-context bookkeeping is held
+	// back until the matching ActionOutcomeUpdate arrives — see the
+	// RecordFailures loops below.
+	outcomePending := map[int]bool{}
 
 	for _, e := range events {
 		if e.SessionID == "" || e.ProjectRoot == "" {
@@ -1519,6 +1631,9 @@ func (s *Store) Ingest(
 		}
 
 		actions = append(actions, act)
+		if e.OutcomePending {
+			outcomePending[len(actions)-1] = true
+		}
 		if s.guard != nil {
 			pendingGuard = append(pendingGuard, guardPending{
 				batchIdx: len(actions) - 1,
@@ -1608,6 +1723,14 @@ func (s *Store) Ingest(
 			if a.ID == 0 || a.ActionType != models.ActionRunCommand {
 				continue
 			}
+			if outcomePending[i] {
+				// Outcome not observed yet. Filing it now would record
+				// an unobserved success and wrongly flip every prior
+				// failure of the same command to eventually_succeeded.
+				// The OutcomeUpdate loop below files it for real once
+				// the tool_result lands.
+				continue
+			}
 			if err := s.recordCommandOutcome(ctx, a); err != nil {
 				// failure_context is a supplementary index for the
 				// dashboard's "this command kept failing" view — not
@@ -1627,6 +1750,48 @@ func (s *Store) Ingest(
 	if opts.Indexer != nil {
 		if err := s.indexOutputs(ctx, events, actions, opts.Indexer); err != nil {
 			return result, err
+		}
+	}
+
+	// Cross-tick outcomes: a tool_result whose tool_use was inserted by
+	// an earlier Ingest call, which the action upsert can only partly
+	// express (its ON CONFLICT success rule is a one-way 1 → 0 repair
+	// and needs the corrected event re-emitted in one window). Applied
+	// AFTER the batch insert so an update targeting a row created in
+	// THIS same batch still lands. Tool name / target are empty by
+	// design — the adapter no longer knows them cross-tick — so the
+	// FTS excerpt indexes on output alone.
+	//
+	// Errors are COLLECTED, not swallowed: this record is the only
+	// carrier of the outcome, and the watcher advances its cursor past
+	// it as soon as Ingest returns nil. The realistic error class is
+	// transient (SQLITE_BUSY against a concurrent hook process), so
+	// failing the tick — exactly as an InsertActions error would — is
+	// what makes the watcher retry the window whole. Re-processing is
+	// idempotent (upserts plus idempotent updates). A zero-row update
+	// is NOT an error: the row may be unknown or pruned.
+	var updateErrs []error
+	for _, up := range opts.OutcomeUpdates {
+		if up.SourceFile == "" || up.SourceEventID == "" {
+			continue
+		}
+		n, err := s.updateActionOutcome(ctx, up.SourceFile, up.SourceEventID,
+			up.SuccessKnown, up.Success, up.ErrorMessage, up.DurationMs, up.ToolOutput, "", "",
+			opts.Indexer)
+		if err != nil {
+			updateErrs = append(updateErrs, fmt.Errorf("%s#%s: %w", up.SourceFile, up.SourceEventID, err))
+			continue
+		}
+		if n > 0 && opts.RecordFailures && up.SuccessKnown {
+			// The moment the outcome is actually known is the moment
+			// failure_context may be written — the insert-time call
+			// above deliberately skipped this row. Non-fatal, mirroring
+			// that call site.
+			if err := s.recordOutcomeUpdateFailureContext(ctx, up); err != nil {
+				fmt.Fprintf(os.Stderr,
+					"store.Ingest: outcome recordCommandOutcome non-fatal err for source_file=%s source_event_id=%s: %v\n",
+					up.SourceFile, up.SourceEventID, err)
+			}
 		}
 	}
 
@@ -1737,6 +1902,17 @@ func (s *Store) Ingest(
 				s.guard.MaybeAlert(verdicts[i])
 			}
 		}
+	}
+
+	// Outcome-update failures are reported LAST, after every other
+	// stage has run. Returning earlier would make a failed late outcome
+	// cost the batch its guard evaluation and cache observations too:
+	// the actions are already inserted by then, so the retry re-inserts
+	// them as duplicates with ID == 0 and the guard stage drops them
+	// (only genuinely-inserted rows evaluate). Retrying the updates
+	// alone is idempotent, so this is the cheapest honest failure.
+	if len(updateErrs) > 0 {
+		return result, fmt.Errorf("store.Ingest: outcome update: %w", errors.Join(updateErrs...))
 	}
 
 	return result, nil
@@ -1922,6 +2098,66 @@ func (s *Store) recordCommandOutcome(ctx context.Context, a *models.Action) erro
 		return fmt.Errorf("store.recordCommandOutcome: insert: %w", err)
 	}
 	return nil
+}
+
+// recordOutcomeUpdateFailureContext files failure_context for a
+// run_command row whose real outcome arrived cross-tick, after the
+// insert-time pass deliberately skipped it (models.ToolEvent.
+// OutcomePending). It reloads the identifying columns the bookkeeping
+// needs — the update carries only the key plus the outcome — and hands
+// recordCommandOutcome an Action bearing the NEW success/error, so a
+// failure files with the right retry_count and a success flips prior
+// failures of the same command at the moment it is actually observed.
+//
+// A non-run_command row, or a key that matches nothing, is a silent
+// no-op.
+//
+// Unlike the insert-time call site, this one needs its own replay
+// guard. There, a duplicate insert leaves Action.ID == 0 and the row is
+// skipped; here the update MATCHES on every replay (RowsAffected counts
+// matched rows, not changed ones), failure_context has no uniqueness on
+// action_id, and recordCommandOutcome's failure branch is a plain
+// INSERT — so a retried window (which an outcome-update error now
+// deliberately causes) or a duplicate result record would re-file the
+// same failure with an inflated retry_count. The success branch needs
+// no guard: its UPDATE is already scoped WHERE eventually_succeeded = 0.
+func (s *Store) recordOutcomeUpdateFailureContext(ctx context.Context, up models.ActionOutcomeUpdate) error {
+	var (
+		a  models.Action
+		ts string
+	)
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT id, session_id, project_id, timestamp, action_type, COALESCE(target, '')
+		   FROM actions WHERE source_file = ? AND source_event_id = ?`,
+		up.SourceFile, up.SourceEventID,
+	).Scan(&a.ID, &a.SessionID, &a.ProjectID, &ts, &a.ActionType, &a.Target)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("store.recordOutcomeUpdateFailureContext: load: %w", err)
+	}
+	if a.ActionType != models.ActionRunCommand {
+		return nil
+	}
+	if !up.Success {
+		var exists int
+		if err := s.db.QueryRowContext(
+			ctx,
+			`SELECT EXISTS(SELECT 1 FROM failure_context WHERE action_id = ?)`,
+			a.ID,
+		).Scan(&exists); err != nil {
+			return fmt.Errorf("store.recordOutcomeUpdateFailureContext: replay check: %w", err)
+		}
+		if exists != 0 {
+			return nil
+		}
+	}
+	a.Timestamp = parseStamp(ts)
+	a.Success = up.Success
+	a.ErrorMessage = up.ErrorMessage
+	return s.recordCommandOutcome(ctx, &a)
 }
 
 // insertSingleAction is the per-row path used for file-typed actions so the

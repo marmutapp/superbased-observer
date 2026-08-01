@@ -94,11 +94,24 @@ function NotConfigured() {
 function Configured({ vendors }: { vendors: VendorTelemetry[] }) {
   const totalUSD = vendors.reduce((a, v) => a + v.cost_usd, 0);
   const totalCredits = vendors.reduce((a, v) => a + (v.credits_cost ?? 0), 0);
+  // Seat subscriptions are summed SEPARATELY and never folded into totalUSD: a
+  // point-in-time monthly fee is not commensurable with additive per-day
+  // metered spend over the window, and adding them is the unit trap.
+  const totalSeatsUSD = vendors.reduce((a, v) => a + (v.seats?.monthly_usd ?? 0), 0);
   return (
     <div className="space-y-5">
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+      <div
+        className={`grid grid-cols-2 gap-3 ${totalSeatsUSD > 0 ? "sm:grid-cols-4" : "sm:grid-cols-3"}`}
+      >
         <StatCard label="Vendors reporting" value={num(vendors.length)} />
         <StatCard label="Cost (USD-metered)" value={usd(totalUSD)} accent />
+        {totalSeatsUSD > 0 ? (
+          <StatCard
+            label="Seat subscriptions"
+            value={`${usd(totalSeatsUSD)}/mo`}
+            sub="monthly fee — not added to metered cost"
+          />
+        ) : null}
         <StatCard
           label="Credits-metered"
           value={totalCredits > 0 ? `${compact(totalCredits)} cr` : "—"}
@@ -156,6 +169,18 @@ function VendorCard({ v }: { v: VendorTelemetry }) {
             sub={`${num(v.seats.active)} of ${num(v.seats.total)} seats active`}
           />
         ) : null}
+        {/* Gated on the PRICE being known, not on the amount being non-zero.
+            An org with a configured price and zero seats has monthly_usd
+            omitted by omitempty, and keying off the amount would hide the
+            tile and fall through to "no cost reported" — when in fact we know
+            the price and know the subscription is $0. */}
+        {v.seats?.per_seat_price_usd ? (
+          <Tile
+            label="Seat subscription"
+            value={`${usd(v.seats.monthly_usd ?? 0)}/mo`}
+            sub={`${num(v.seats.total)} seats × ${usd(v.seats.per_seat_price_usd)}`}
+          />
+        ) : null}
       </div>
 
       {v.engagement && v.engagement.length > 0 ? (
@@ -194,6 +219,10 @@ function costSub(v: VendorTelemetry): ReactNode {
   if (v.cost_unit === "mixed" && v.credits_cost) return `+ ${compact(v.credits_cost)} credits`;
   if (v.cost_unit === "usd") return "USD-metered";
   if (v.cost_unit === "credits") return "credits (not USD)";
+  // A vendor can have no METERED cost and still cost money: Copilot's seat
+  // subscription is shown in its own tile. Saying "no cost reported" there
+  // would be false — the honest statement is that nothing was metered.
+  if (v.seats?.per_seat_price_usd) return "no metered overage";
   return "no cost reported";
 }
 

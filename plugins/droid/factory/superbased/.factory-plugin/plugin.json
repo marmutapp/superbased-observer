@@ -1,0 +1,19 @@
+{
+  "name": "superbased",
+  "description": "Token, cost and cache observability for Droid. Wires the SuperBased Observer MCP server. Requires the `observer` binary already on your PATH (npm i -g @superbased/observer, or pipx install superbased-observer) — this plugin is wiring only and installs no binary.",
+  "version": "1.28.0",
+  "author": {
+    "name": "Santosh Kathira"
+  },
+  "homepage": "https://superbased.app/",
+  "repository": "https://github.com/superbasedapp/plugins",
+  "license": "Apache-2.0",
+  "keywords": [
+    "cost",
+    "cost-tracking",
+    "mcp",
+    "observability",
+    "tokens",
+    "usage"
+  ]
+}

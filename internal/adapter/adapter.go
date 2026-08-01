@@ -36,6 +36,168 @@ type Adapter interface {
 	ParseSessionFile(ctx context.Context, path string, fromOffset int64) (ParseResult, error)
 }
 
+// CursorKind classifies what an adapter's persisted parse cursor
+// (parse_cursors.byte_offset) actually MEANS for a given file, and
+// whether that file is expected to produce action rows at all.
+//
+// The zero value is CursorByteOffset, so an adapter that does not
+// implement CursorSemantics keeps the historical assumption — every
+// tracked file is an append-only text log tailed by byte offset —
+// unchanged.
+//
+// Consumers branch on the derived capability predicates
+// (LagMeaningful / ActionsExpected), never on the kind constant or on
+// a tool name (CLAUDE.md module rule #3).
+type CursorKind uint8
+
+const (
+	// CursorByteOffset is an append-only text file tailed by byte
+	// offset. `file_size - byte_offset` is a real ingest lag, and a
+	// cursor that reached EOF on a non-trivial file without emitting
+	// any action is the adapter-misroute fingerprint.
+	CursorByteOffset CursorKind = iota
+
+	// CursorWatermark is an opaque high-water mark — a SQLite row id,
+	// a Unix-millis `updated_at`, a `MAX(time_updated)` — that the
+	// adapter compares against store rows, not against bytes on disk.
+	// Comparing it to the file size is a category error in BOTH
+	// directions: a small row-id watermark makes a multi-megabyte
+	// store read "permanently behind", and a Unix-millis watermark
+	// dwarfs the file size and makes it read "permanently at EOF".
+	// Neither lag nor the zero-action fingerprint means anything here.
+	CursorWatermark
+
+	// CursorEncrypted is a file a current adapter recognises and
+	// tracks but cannot decode on this host by design (the Antigravity
+	// desktop OSCrypt `.pb` conversation store). Emitting zero actions
+	// is the EXPECTED outcome, not evidence of a misroute. Byte lag
+	// still means something: these adapters advance the cursor to the
+	// file size once a file is judged unrecoverable and hold it when a
+	// retry is still pending.
+	CursorEncrypted
+
+	// CursorNoActions is a file an adapter reads but which never
+	// produces action rows of its own — either because it carries only
+	// token / usage / correlation records, or because the events it
+	// contributes are attributed to a sibling file. Grok's global
+	// `logs/unified.jsonl` (per-request token splits keyed by `sid`),
+	// Qoder's `segments/*.jsonl` run logs, Copilot CLI's
+	// `logs/process-*.log`, OpenClaw's `<id>.trajectory.jsonl` and
+	// kiro-cli's flat `.json` state sidecar (whose events land under
+	// the canonical `.jsonl`) are all this shape — each verified
+	// against a live DB as having produced zero `actions` rows ever.
+	// Byte lag is real; the zero-action fingerprint is not.
+	//
+	// Declare this ONLY with that evidence in hand. Cursor's per-chat
+	// `store.db` LOOKS like a member (it stores the system prompt and
+	// prompt budget, not activity) but demonstrably emits action rows
+	// — 104 of them across 20 files on the measurement host — so
+	// declaring it here would have suppressed a real signal.
+	CursorNoActions
+)
+
+// String returns the stable machine-readable tag surfaced on the
+// watcher-health wire.
+func (k CursorKind) String() string {
+	switch k {
+	case CursorWatermark:
+		return "watermark"
+	case CursorEncrypted:
+		return "encrypted"
+	case CursorNoActions:
+		return "no_actions"
+	default:
+		return "byte_offset"
+	}
+}
+
+// LagMeaningful reports whether `file_size - byte_offset` is a real
+// ingest lag for this kind of cursor. False for watermark cursors,
+// whose value is not a byte count at all.
+//
+// An unrecognised kind degrades to the byte-offset answer: the safe
+// direction is to keep reporting a signal, never to invent a
+// suppression.
+func (k CursorKind) LagMeaningful() bool {
+	return k != CursorWatermark
+}
+
+// ActionsExpected reports whether a non-trivial file of this kind
+// SHOULD have produced at least one action row. False for undecodable
+// stores and for files that carry tokens or state only. Also false for
+// watermark cursors — not because such a store never holds actions
+// (cline-cli's sessions.db does), but because the fingerprint's
+// precondition, "the cursor reached EOF", cannot be established from a
+// value that is not a byte count.
+//
+// An unrecognised kind degrades to the byte-offset answer for the same
+// reason as LagMeaningful.
+func (k CursorKind) ActionsExpected() bool {
+	switch k {
+	case CursorWatermark, CursorEncrypted, CursorNoActions:
+		return false
+	default:
+		return true
+	}
+}
+
+// FileCursorSemantics is one adapter's declaration about one file.
+type FileCursorSemantics struct {
+	// Kind classifies the cursor. Zero value = CursorByteOffset.
+	Kind CursorKind
+	// Detail is a short operator-facing explanation of WHY, surfaced
+	// verbatim in the dashboard's watcher-health payload. Empty is
+	// allowed; consumers fall back to a generic phrasing.
+	Detail string
+}
+
+// CursorSemantics is an OPTIONAL interface an adapter implements when
+// the cursor it persists for at least one of its files is NOT a byte
+// offset into an append-only text file, or when a file it tracks is
+// not expected to yield actions.
+//
+// It is deliberately NOT part of Adapter: adding a method there would
+// force all ~29 adapters to change (CLAUDE.md module rule #6,
+// "additive, not invasive"). Adapters that do not implement it keep
+// byte-offset semantics for every file they claim.
+//
+// The method is per-PATH, not per-adapter, because several adapters
+// mix shapes — cline-cli tails `hooks.jsonl` by byte offset while
+// scanning `sessions.db` by a Unix-millis watermark, and kiro-cli
+// mixes flat file-size bundles with a SQLite watermark store.
+//
+// Implementations must be pure and cheap: no I/O, no locking. They
+// are called once per parse_cursors row on a dashboard request.
+type CursorSemantics interface {
+	// CursorSemanticsFor returns the semantics of path's cursor. It is
+	// only consulted for paths the same adapter's IsSessionFile
+	// accepts; a path the adapter does not recognise may return the
+	// zero value.
+	CursorSemanticsFor(path string) FileCursorSemantics
+}
+
+// ResolveCursorSemantics resolves the cursor semantics of path across
+// a set of adapters, using the SAME first-match rule as the
+// composed IsSessionFile predicate: the first adapter that claims the
+// path decides. When that adapter does not implement CursorSemantics,
+// the byte-offset default applies — which is exactly the behaviour
+// every adapter had before this interface existed.
+//
+// A path no adapter claims also resolves to the byte-offset default;
+// such rows are already tagged orphan_unmatched upstream.
+func ResolveCursorSemantics(adapters []Adapter, path string) FileCursorSemantics {
+	for _, a := range adapters {
+		if !a.IsSessionFile(path) {
+			continue
+		}
+		if cs, ok := a.(CursorSemantics); ok {
+			return cs.CursorSemanticsFor(path)
+		}
+		return FileCursorSemantics{}
+	}
+	return FileCursorSemantics{}
+}
+
 // ParseResult is the value returned by Adapter.ParseSessionFile.
 type ParseResult struct {
 	ToolEvents  []models.ToolEvent
@@ -67,6 +229,20 @@ type ParseResult struct {
 	// org-push wire. Additive: adapters that don't populate it leave it
 	// nil and every stop on the path silently no-ops.
 	SessionLineages []models.SessionLineage
+	// OutcomeUpdates carries outcomes for actions persisted by an
+	// EARLIER parse window. A tool_use and its tool_result are two
+	// separate records; a poll tick that ends between them persists
+	// the call optimistically successful, and the next window resumes
+	// past the tool_use with an empty correlation map — the result
+	// would otherwise be dropped, because the store's action upsert
+	// cannot flip success / error_message on conflict. An adapter that
+	// can reconstruct the row's (SourceFile, SourceEventID) key from
+	// the RESULT record alone emits the outcome here instead; the
+	// watcher plumbs it into store.IngestOptions, which applies it via
+	// Store.UpdateActionOutcome after the batch insert. Additive — nil
+	// is a clean no-op at every stop on the path, and an entry that
+	// matches no row is silently tolerated (unknown id, pruned row).
+	OutcomeUpdates []models.ActionOutcomeUpdate
 	// NewOffset is the byte offset to persist in parse_cursors. Subsequent
 	// calls with this value as fromOffset will resume from the next
 	// unparsed byte.

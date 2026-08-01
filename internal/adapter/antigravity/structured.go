@@ -86,6 +86,19 @@ type StructuredEnrichment struct {
 // ToolOutput. nil scrubber is treated as identity, but production
 // callers MUST pass a real scrubber (per CLAUDE.md adapter rules).
 //
+// Reasoning emission (B3, 2026-07-31): a step's `reasoningText`
+// (1.2.20.3) mints NO ToolEvent. It rides the next emitted event as
+// PrecedingReasoning (capped at the same 200 chars the retired
+// `structured.reasoning` row's Target used, scrubbed at the flush
+// site) under consumed-once / last-wins / turn-boundary-discard
+// semantics. Successor set: structured.file_view,
+// structured.assistant_text (which prefers it over its legacy
+// self-preview) and structured.final_summary. The artifact-edit row is
+// deliberately excluded — its PrecedingReasoning already carries the
+// pre-edit file body — as are the Tier-4 run_command rows, which are
+// joined by nearest-turn rather than sequential position. See the
+// per-step loop below.
+//
 // Step-type enum mapping (1.2.1) is not yet known beyond
 // 90 = EPHEMERAL_MESSAGE, so per-message wall-clock alignment for
 // markdown-derived rows + user-prompt extraction remain deferred —
@@ -411,6 +424,35 @@ func ParseStructuredTrajectory(buf []byte, conversationID, projectRoot, sourceFi
 	// lines up.
 	numSteps := len(steps)
 	if numSteps > 0 && len(rows) > 0 {
+		// B3 (2026-07-31): a step's `reasoningText` mints NO action row
+		// (it used to emit a phantom `structured.reasoning`
+		// task_complete). Its body is held here and threaded onto the
+		// next event this walk emits as PrecedingReasoning:
+		//
+		//   - CONSUMED-ONCE: the first successor takes it and clears it.
+		//   - LAST-WINS: a newer reasoningText replaces an unconsumed one.
+		//   - TURN-BOUNDARY DISCARD: a `structured.user_prompt` step
+		//     clears it — reasoning never crosses into the next turn.
+		//
+		// The successor set is deliberately narrow: file_view,
+		// assistant_text and final_summary. The artifact-edit row's
+		// PrecedingReasoning already means something else (the
+		// pre-edit file body from the diff) and is never clobbered;
+		// the Tier-4 run_command rows come from a separate,
+		// nearest-turn-joined loop with no sequential position in this
+		// stream. `structured.assistant_text` prefers real reasoning
+		// over its legacy self-preview when both are available.
+		// The whole walk is one conversation, so no session scoping is
+		// needed here (unlike the multi-session SQLite adapters).
+		pendingReasoning := ""
+		takeReasoning := func() string {
+			if pendingReasoning == "" {
+				return ""
+			}
+			out := truncate(scrubber.String(pendingReasoning), 200)
+			pendingReasoning = ""
+			return out
+		}
 		for i, s := range steps {
 			rawTurnIdx := (i * len(rows)) / numSteps
 			if rawTurnIdx >= len(rows) {
@@ -436,21 +478,32 @@ func ParseStructuredTrajectory(buf []byte, conversationID, projectRoot, sourceFi
 			}
 			msgID := sharedTurnMessageID(conversationID, rawTurnIdx)
 
+			// Modern reasoning (1.2.20.3) — sibling of assistantText on
+			// the same PLANNER_RESPONSE step, so it is captured BEFORE
+			// this step's own emissions: the thinking belongs to the
+			// step it was written on, not to the next one. B3: it is
+			// never an action row (see the pendingReasoning comment
+			// above).
+			if s.reasoningText != "" {
+				pendingReasoning = s.reasoningText
+			}
+
 			if s.fileURI != "" {
 				en.ToolEvents = append(en.ToolEvents, models.ToolEvent{
-					SourceFile:    sourceFile,
-					SourceEventID: "antigravity-struct-tool:" + conversationID + ":step:" + intStr(i),
-					SessionID:     conversationID,
-					ProjectRoot:   projectRoot,
-					Timestamp:     ts,
-					Tool:          models.ToolAntigravity,
-					Model:         en.Model,
-					ActionType:    models.ActionReadFile,
-					Target:        truncate(decodeFileURIToPath(s.fileURI), 200),
-					Success:       true,
-					DurationMs:    durationMs,
-					RawToolName:   "structured.file_view",
-					MessageID:     msgID,
+					SourceFile:         sourceFile,
+					SourceEventID:      "antigravity-struct-tool:" + conversationID + ":step:" + intStr(i),
+					SessionID:          conversationID,
+					ProjectRoot:        projectRoot,
+					Timestamp:          ts,
+					Tool:               models.ToolAntigravity,
+					Model:              en.Model,
+					ActionType:         models.ActionReadFile,
+					Target:             truncate(decodeFileURIToPath(s.fileURI), 200),
+					Success:            true,
+					DurationMs:         durationMs,
+					PrecedingReasoning: takeReasoning(),
+					RawToolName:        "structured.file_view",
+					MessageID:          msgID,
 				})
 			}
 
@@ -477,6 +530,9 @@ func ParseStructuredTrajectory(buf []byte, conversationID, projectRoot, sourceFi
 			}
 
 			if s.userPrompt != "" {
+				// Turn boundary — drop reasoning the previous turn left
+				// unconsumed rather than stamping it onto this turn.
+				pendingReasoning = ""
 				en.ToolEvents = append(en.ToolEvents, models.ToolEvent{
 					SourceFile:    sourceFile,
 					SourceEventID: "antigravity-struct-payload:" + conversationID + ":step:" + intStr(i) + ":user",
@@ -497,26 +553,31 @@ func ParseStructuredTrajectory(buf []byte, conversationID, projectRoot, sourceFi
 
 			if s.assistantText != "" {
 				en.ToolEvents = append(en.ToolEvents, models.ToolEvent{
-					SourceFile:         sourceFile,
-					SourceEventID:      "antigravity-struct-payload:" + conversationID + ":step:" + intStr(i) + ":assistant",
-					SessionID:          conversationID,
-					ProjectRoot:        projectRoot,
-					Timestamp:          ts,
-					Tool:               models.ToolAntigravity,
-					Model:              en.Model,
-					ActionType:         models.ActionTaskComplete,
+					SourceFile:    sourceFile,
+					SourceEventID: "antigravity-struct-payload:" + conversationID + ":step:" + intStr(i) + ":assistant",
+					SessionID:     conversationID,
+					ProjectRoot:   projectRoot,
+					Timestamp:     ts,
+					Tool:          models.ToolAntigravity,
+					Model:         en.Model,
+					// One row per synthesized step, many steps per turn —
+					// per-message assistant text. The turn-terminal row is
+					// `structured.final_summary` below, which keeps
+					// task_complete.
+					ActionType:         models.ActionAssistantMessage,
 					Target:             truncate(scrubber.String(s.assistantText), 200),
 					Success:            true,
 					DurationMs:         durationMs,
 					RawToolName:        "structured.assistant_text",
-					PrecedingReasoning: truncate(scrubber.String(s.assistantText), 200),
+					PrecedingReasoning: coalesce(takeReasoning(), truncate(scrubber.String(s.assistantText), 200)),
 					ToolOutput:         scrubber.String(truncate(s.assistantText, 4000)),
 					MessageID:          msgID,
 				})
 			}
 
 			// Legacy plan_step (1.2.93.x). Modern reasoning lives in
-			// `reasoningText` (1.2.20.3) — emitted in the block below.
+			// `reasoningText` (1.2.20.3) — captured (not emitted) in the
+			// block below.
 			if s.planStepDesc != "" || s.planAnalysis != "" {
 				body := s.planAnalysis
 				if body == "" {
@@ -541,29 +602,6 @@ func ParseStructuredTrajectory(buf []byte, conversationID, projectRoot, sourceFi
 				})
 			}
 
-			// Modern reasoning (1.2.20.3). Sibling of assistantText on
-			// the same PLANNER_RESPONSE step; surfaces the model's
-			// internal analysis blob that's otherwise invisible in
-			// markdown trajectory + the assistant-text emission.
-			if s.reasoningText != "" {
-				en.ToolEvents = append(en.ToolEvents, models.ToolEvent{
-					SourceFile:    sourceFile,
-					SourceEventID: "antigravity-struct-reasoning:" + conversationID + ":step:" + intStr(i),
-					SessionID:     conversationID,
-					ProjectRoot:   projectRoot,
-					Timestamp:     ts,
-					Tool:          models.ToolAntigravity,
-					Model:         en.Model,
-					ActionType:    models.ActionTaskComplete,
-					Target:        truncate(scrubber.String(s.reasoningText), 200),
-					Success:       true,
-					DurationMs:    durationMs,
-					RawToolName:   "structured.reasoning",
-					ToolOutput:    scrubber.String(truncate(s.reasoningText, 4000)),
-					MessageID:     msgID,
-				})
-			}
-
 			if s.finalSummary != "" {
 				// Prefer the title from 1.2.30.4 when present (modern
 				// schema); fall back to the truncated body if not.
@@ -572,21 +610,22 @@ func ParseStructuredTrajectory(buf []byte, conversationID, projectRoot, sourceFi
 					target = s.finalSummary
 				}
 				en.ToolEvents = append(en.ToolEvents, models.ToolEvent{
-					SourceFile:    sourceFile,
-					SourceEventID: "antigravity-struct-final:" + conversationID + ":step:" + intStr(i),
-					SessionID:     conversationID,
-					ProjectRoot:   projectRoot,
-					Timestamp:     ts,
-					Tool:          models.ToolAntigravity,
-					Model:         en.Model,
-					ActionType:    models.ActionTaskComplete,
-					Target:        truncate(scrubber.String(target), 200),
-					Success:       true,
-					DurationMs:    durationMs,
-					RawToolName:   "structured.final_summary",
-					RawToolInput:  scrubber.String(truncate(decodeFileURIToPath(s.finalSummaryURI), 200)),
-					ToolOutput:    scrubber.String(truncate(s.finalSummary, 4000)),
-					MessageID:     msgID,
+					SourceFile:         sourceFile,
+					SourceEventID:      "antigravity-struct-final:" + conversationID + ":step:" + intStr(i),
+					SessionID:          conversationID,
+					ProjectRoot:        projectRoot,
+					Timestamp:          ts,
+					Tool:               models.ToolAntigravity,
+					Model:              en.Model,
+					ActionType:         models.ActionTaskComplete,
+					Target:             truncate(scrubber.String(target), 200),
+					Success:            true,
+					DurationMs:         durationMs,
+					PrecedingReasoning: takeReasoning(),
+					RawToolName:        "structured.final_summary",
+					RawToolInput:       scrubber.String(truncate(decodeFileURIToPath(s.finalSummaryURI), 200)),
+					ToolOutput:         scrubber.String(truncate(s.finalSummary, 4000)),
+					MessageID:          msgID,
 				})
 			}
 		}
@@ -782,7 +821,10 @@ type stepData struct {
 	// Claude sessions populate it less often. Verified 2026-05-13
 	// against 4 user sessions: counts 5 / 1 / 5 / 4 per session for
 	// Gemini-Pro-high / Sonnet-4-6 / Gemini-Pro-low / Gemini-Flash
-	// respectively. Surfaces as `structured.reasoning` ToolEvents.
+	// respectively. Surfaces as the successor event's
+	// PrecedingReasoning — never as an action row of its own (B3,
+	// 2026-07-31; it used to emit `structured.reasoning` task_complete
+	// rows).
 	reasoningText string
 	// 1.2.94.x — Tier 6 final-summary content (enum 1.2.1 = 82).
 	// DEPRECATED 2026-05-13: see planStepDesc note above. Modern

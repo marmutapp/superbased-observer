@@ -64,8 +64,11 @@ import (
 //     duration_ms per thought/response), not per-token deltas. The
 //     overhead concern was wrong for current Cursor.
 //
-// So afterAgentThought now emits a cursor.thinking row carrying the
-// finalized thinking-text + duration_ms; afterAgentResponse emits a
+// So afterAgentThought is now CAPTURED (it was skipped entirely
+// pre-v1.6.18) — though as of the 2026-07-31 B3 convergence it mints no
+// row of its own: its finalized thinking-text is stashed and threaded
+// onto the next recordable event's PrecedingReasoning (see pending.go
+// and the EventAfterAgentThought case below). afterAgentResponse emits a
 // cursor.assistant_response row carrying the final assistant prose. Per-
 // turn token counts are still sourced from the `stop` event (single
 // source of truth — afterAgentResponse's input_tokens/output_tokens
@@ -381,29 +384,37 @@ func BuildEvent(eventName string, body []byte, sc *scrub.Scrubber) (models.ToolE
 	case EventAfterAgentThought:
 		// Finalized assistant thinking block. text is the full prose
 		// (no per-token deltas — Cursor 3.4+ emits one event per
-		// finalized thought, not one per fragment). duration_ms is
-		// the rendered "Thought for Ns" timer Cursor's UI surfaces.
-		// Drop empty-text events (rare but observed in capture
-		// dumps) — they're metadata-only and carry nothing the
-		// dashboard can render.
+		// finalized thought, not one per fragment).
+		//
+		// REASONING SEMANTICS (B3 convergence, 2026-07-31): this event
+		// mints NO row. A thought is not an action; the row it used to
+		// emit was a phantom that polluted every action aggregate and
+		// carried the text nowhere but its own self-preview (see
+		// docs/plans/b3-reasoning-convergence-plan-2026-07-31.md §1).
+		// Instead the scrubbed 200-char preview — byte-for-byte the
+		// string that used to land in that row's preceding_reasoning
+		// column, cap unchanged — is stashed for the conversation and
+		// threaded onto the NEXT recordable event of that conversation
+		// (see pending.go for the consumed-once / last-wins / user-turn
+		// -discard semantics and why cursor needs an on-disk carrier).
+		// duration_ms is dropped with the row: it described the thought,
+		// and no successor row can honestly claim it.
+		//
+		// Empty-text events (rare but observed in capture dumps) carry
+		// nothing to stash.
 		text := strings.TrimSpace(raw.Text)
 		if text == "" {
 			return models.ToolEvent{}, false, nil
 		}
-		ev.ActionType = models.ActionTaskComplete
-		ev.RawToolName = "cursor.thinking"
-		ev.DurationMs = raw.DurationMs
 		preview := text
 		if sc != nil {
 			preview = sc.String(preview)
 		}
-		body := preview
 		if len(preview) > 200 {
 			preview = preview[:200]
 		}
-		ev.Target = preview
-		ev.PrecedingReasoning = preview
-		ev.ToolOutput = contentcap.Cap(body, contentcap.DefaultMaxBytes)
+		stashReasoning(raw.ConversationID, preview)
+		return models.ToolEvent{}, false, nil
 	case EventAfterAgentResponse:
 		// Finalized assistant response prose. Mirrors the transcript
 		// walker's cursor.assistant_text emit so a session ingested
@@ -436,7 +447,41 @@ func BuildEvent(eventName string, body []byte, sc *scrub.Scrubber) (models.ToolE
 		ev.RawToolInput = string(body)
 	}
 
+	// Thread the pending thought (see pending.go) onto this row. The
+	// consumer set is a TABLE, not a name ladder: only the events that
+	// are genuinely the model's next act can claim a thought. A
+	// lifecycle marker (sessionEnd, preCompact, subagentStop) that
+	// happened to fire next must not eat it — it would both mis-attribute
+	// the reasoning and rob the real successor.
+	if reasoningConsumers[eventName] {
+		if pending := takeReasoning(raw.ConversationID, ev.SourceEventID); pending != "" {
+			// A real thought beats the self-preview afterAgentResponse
+			// otherwise writes here (a row echoing its own body into its
+			// reasoning column tells a reader nothing).
+			ev.PrecedingReasoning = pending
+		}
+	}
+	if eventName == EventBeforeSubmitPrompt {
+		// A new user turn ends the previous one — an unclaimed thought
+		// from it must not leak forward (grok's emitUserPrompt discard).
+		clearReasoning(raw.ConversationID)
+	}
+
 	return ev, true, nil
+}
+
+// reasoningConsumers is the set of hook events that may claim a pending
+// afterAgentThought as their PrecedingReasoning: the model's own next
+// act — a tool call it decided on, or the prose it produced. Lifecycle
+// and bookkeeping events (sessionStart/End, preCompact, subagent*,
+// postToolUseFailure) are deliberately absent; see BuildEvent.
+var reasoningConsumers = map[string]bool{
+	EventBeforeShellCommand: true,
+	EventBeforeMCPExecution: true,
+	EventBeforeReadFile:     true,
+	EventAfterFileEdit:      true,
+	EventPreToolUse:         true,
+	EventAfterAgentResponse: true,
 }
 
 // OutcomeUpdate is the paired-after-event enrichment payload for the

@@ -114,7 +114,13 @@
   --tool-copilot-web: #bb62cb;
   --tool-other: #64748b;
 
-  /* Action-type category colors */
+  /* Action-type category colors. One var per canonical category in
+     internal/tooltax (mirrored into web/src/lib/actiontax.gen.json) —
+     adding a category there needs a var here in BOTH themes, or
+     actions.ts falls the new category back to the meta gray.
+     --act-skill (skill/command invocation) is the taxonomy-plan
+     addition: orange, the one warm hue left between --act-mcp amber
+     and --act-fail red. */
   --act-file: #60a5fa;
   --act-cmd: #34d399;
   --act-search: #a855f7;
@@ -122,6 +128,7 @@
   --act-meta: #94a3b8;
   --act-fail: #f87171;
   --act-agent: #ec4899;
+  --act-skill: #fb923c;
   --act-mcp: #fbbf24;
   --act-user: #c084fc;
 
@@ -252,6 +259,7 @@
   --act-meta: #64748b;
   --act-fail: #e53e3e;
   --act-agent: #db2777;
+  --act-skill: #ea580c;
   --act-mcp: #d97706;
   --act-user: #9333ea;
 

@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -227,5 +228,66 @@ func TestOpenInterpreterIncrementalParseRetagsResumedChunk(t *testing.T) {
 		if e.Tool != models.ToolOpenInterpreter {
 			t.Errorf("resumed TokenEvents[%d].Tool = %q, want %q", i, e.Tool, models.ToolOpenInterpreter)
 		}
+	}
+}
+
+// TestOpenInterpreterReasoningNeverMintsAnAction pins that the B3 fix
+// covers the RETAG too: `NewOpenInterpreter` shares this package's
+// single response_item parser (the §2.1 boundary seam), so one emit-site
+// change has to hold for both tool identities. Encrypted-only reasoning
+// (the dominant live shape) produces nothing; readable summary text is
+// threaded onto the turn's next tool row instead of minting one.
+func TestOpenInterpreterReasoningNeverMintsAnAction(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rollout-2026-07-18T10-00-00-oi-thread.jsonl")
+	body := strings.Join([]string{
+		`{"timestamp":"2026-07-18T10:00:00.000Z","type":"session_meta","payload":{"id":"oi-thread","cwd":"/tmp","model":"gpt-5.6-sol"}}`,
+		`{"timestamp":"2026-07-18T10:00:00.500Z","type":"turn_context","payload":{"turn_id":"turn-oi","model":"gpt-5.6-sol","cwd":"/tmp"}}`,
+		`{"timestamp":"2026-07-18T10:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-oi"}}`,
+		// Encrypted-only reasoning: the 100% live shape. Emits nothing.
+		`{"timestamp":"2026-07-18T10:00:02.000Z","type":"response_item","payload":{"type":"reasoning","summary":[],"encrypted_content":"abcdefghijklmnopqrstuvwxyz0123456789ABCDEF"}}`,
+		// Readable summary: threaded, still no row of its own.
+		`{"timestamp":"2026-07-18T10:00:03.000Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"I should list the directory."}],"encrypted_content":"opaque..."}}`,
+		`{"timestamp":"2026-07-18T10:00:04.000Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_OI","turn_id":"turn-oi","command":["bash","-lc","ls"],"cwd":"/tmp","aggregated_output":"ok","exit_code":0,"duration":{"secs":1,"nanos":0},"status":"completed"}}`,
+		``,
+	}, "\n")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	a := NewOpenInterpreterWithOptions(nil, dir)
+	res, err := a.ParseSessionFile(context.Background(), path, 0)
+	if err != nil {
+		t.Fatalf("ParseSessionFile: %v", err)
+	}
+
+	var exec *models.ToolEvent
+	for i := range res.ToolEvents {
+		ev := &res.ToolEvents[i]
+		if ev.Tool != models.ToolOpenInterpreter {
+			t.Errorf("ToolEvents[%d].Tool = %q, want %q", i, ev.Tool, models.ToolOpenInterpreter)
+		}
+		if strings.Contains(strings.ToLower(ev.RawToolName), "reasoning") {
+			t.Fatalf("reasoning-named action row emitted on the retag: raw=%q %+v", ev.RawToolName, *ev)
+		}
+		if strings.Contains(ev.Target, "encrypted reasoning") || ev.Target == "(reasoning)" {
+			t.Fatalf("placeholder reasoning surfaced as an action target: %+v", *ev)
+		}
+		if strings.Contains(ev.PrecedingReasoning, "encrypted reasoning") {
+			t.Fatalf("placeholder reasoning threaded into PrecedingReasoning: %+v", *ev)
+		}
+		if ev.RawToolName == "exec_command_end" {
+			exec = ev
+		}
+	}
+	if len(res.ToolEvents) != 1 {
+		t.Fatalf("tool events: %d want 1 (exec_command_end only): %+v", len(res.ToolEvents), res.ToolEvents)
+	}
+	if exec == nil {
+		t.Fatal("missing exec_command_end row")
+	}
+	if !strings.Contains(exec.PrecedingReasoning, "list the directory") {
+		t.Errorf("exec_command_end PrecedingReasoning = %q, want the threaded summary text", exec.PrecedingReasoning)
 	}
 }

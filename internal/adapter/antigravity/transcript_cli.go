@@ -36,13 +36,51 @@ import (
 //	SYSTEM/CONVERSATION_HISTORY    — system event, no content,
 //	                                 ignored
 //
-// v1 (this ship) extracts USER_INPUT + PLANNER_RESPONSE only — the
+// This parser extracts USER_INPUT + PLANNER_RESPONSE text only — the
 // two text-bearing turn types observer's session view actually
-// renders. Tool calls are deferred; the bridge's structured payload
-// already covers them on the happy path, and parsing the
-// tool_calls / per-type content shape is a bigger surface than
-// what's needed to close the immediate "assistant responses are
-// missing from the dashboard" gap.
+// renders. `ToolCalls` is decoded but deliberately NOT promoted into
+// action rows. That deferral is now GROUNDED rather than assumed;
+// TestSynthesizeTranscriptEvents_ToolCallsAreNotPromoted and
+// TestTranscriptToolTargetsCannotDedupAgainstStructured pin it.
+//
+// Measured 2026-08-01 against the live corpus + the desktop sidecar
+// for conversation b070924e (~/.gemini/antigravity/brain/…/overview.txt):
+//
+//   - The invocation and the result are DIFFERENT entries. tool_calls
+//     rides a PLANNER_RESPONSE at step N; the typed result entry
+//     (MODEL/VIEW_FILE, …) lands at step N+1. A single tool_calls
+//     ARRAY fans out: step 17 carries 2 calls → results at steps 18
+//     and 19; step 21 carries 3 → steps 22, 23, 24. So neither the
+//     step index nor a fixed offset is a usable join key.
+//   - The structured/bridge path keys its rows on the RESULT step
+//     ("antigravity-struct-tool:<conv>:step:<N+1>"). For b070924e all
+//     14 structured tool rows are the same invocations this file's
+//     tool_calls describe — a naive promotion double-counts 1:1.
+//   - The two namespaces differ, so the (source_file,
+//     source_event_id) UNIQUE constraint cannot suppress the overlap
+//     — the same gap TargetCoverageReader exists to close for text.
+//   - Target-keyed dedup does not transfer. structured.file_view
+//     stores decodeFileURIToPath's output ("home/marmutapp/x.go" —
+//     file:/// strips the leading slash), while tool_calls carries a
+//     JSON-quoted absolute path ("\"/home/marmutapp/x.go\""). The
+//     TargetCoverageReader docstring's "byte-exact, no normalisation
+//     needed" premise holds for free text ONLY.
+//   - The overlap is not layout-specific, so a CLI-only gate is not a
+//     safe shortcut. antigravity-cli has no structured.* tool rows
+//     TODAY, but that is a corpus property, not an invariant: the
+//     structured/bridge machinery demonstrably runs on CLI
+//     conversations (47 token_usage rows across 16 antigravity-cli
+//     `.pb` source files), and log_scan.go exists precisely to map CLI
+//     conversation UUIDs onto the agy host that serves the cascade
+//     trajectory. A CLI conversation can therefore start producing
+//     structured tool rows at any time.
+//
+// Promoting tool calls therefore needs a THIRD coverage bucket on
+// TargetCoverageReader.LoadActionTargets (whose SQL filters to
+// user_prompt/task_complete/assistant_message today) plus an explicit
+// normalisation contract for tool targets. Both live outside this
+// package (internal/store + cmd/observer), so the promotion is
+// blocked here by design rather than by effort.
 type cliTranscriptEntry struct {
 	StepIndex int             `json:"step_index"`
 	Source    string          `json:"source"`
@@ -207,7 +245,15 @@ func synthesizeTranscriptEvents(
 		switch ev.ActionType {
 		case models.ActionUserPrompt:
 			coveredUser[ev.Target] = true
-		case models.ActionTaskComplete:
+		case models.ActionAssistantMessage, models.ActionTaskComplete:
+			// BOTH types, deliberately. The structured/markdown parsers
+			// now emit assistant text as assistant_message (WP-T6 B2a),
+			// while genuinely-terminal rows (structured.final_summary,
+			// markdown.planner_response) stay task_complete — and a
+			// mid-upgrade database carries BOTH spellings for the same
+			// text until migration 078 lands. Matching only one of them
+			// would silently reopen the duplicate-assistant-row bug this
+			// coverage set exists to close.
 			coveredAssistant[ev.Target] = true
 		}
 	}
@@ -261,12 +307,14 @@ func synthesizeTranscriptEvents(
 				ProjectRoot:   projectRoot,
 				Timestamp:     ts.UTC(),
 				Tool:          models.ToolAntigravity,
-				ActionType:    models.ActionTaskComplete,
-				Target:        target,
-				Success:       true,
-				RawToolName:   "transcript.assistant_text",
-				RawToolInput:  scrubber.String(e.Content),
-				MessageID:     eid,
+				// One row per MODEL/PLANNER_RESPONSE step, many steps per
+				// turn — per-message assistant text, not a turn terminus.
+				ActionType:   models.ActionAssistantMessage,
+				Target:       target,
+				Success:      true,
+				RawToolName:  "transcript.assistant_text",
+				RawToolInput: scrubber.String(e.Content),
+				MessageID:    eid,
 			})
 		}
 	}

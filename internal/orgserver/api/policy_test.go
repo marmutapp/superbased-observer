@@ -157,8 +157,7 @@ func TestEnroll_DeliversPolicyKey(t *testing.T) {
 	h.SetOrgPolicyPublicKey(wantKey)
 
 	mintRec := httptest.NewRecorder()
-	h.MintEnrolmentToken(mintRec, httptest.NewRequest(http.MethodPost, "/api/org/enrolment-tokens",
-		bytes.NewReader([]byte(`{"user_id":"user-1"}`))))
+	h.MintEnrolmentToken(mintRec, mintRequest(auth.InviteRoleAdmin, "admin-1", `{"user_id":"user-1"}`))
 	if mintRec.Code != http.StatusCreated {
 		t.Fatalf("mint: code=%d body=%s", mintRec.Code, mintRec.Body.String())
 	}

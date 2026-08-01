@@ -327,8 +327,13 @@ func mintTokenViaDevAuth(ctx context.Context, base, userID string, ttlDays int, 
 			resp.StatusCode, string(rbody))
 	}
 
-	// 2. mint the token.
-	mintBody := fmt.Sprintf(`{"user_id":%q,"ttl_days":%d}`, userID, ttlDays)
+	// 2. mint the token. ttl_days is omitted when non-positive so the
+	// server default applies; the server rejects out-of-range values
+	// (bounds 1..90) rather than falling through.
+	mintBody := fmt.Sprintf(`{"user_id":%q}`, userID)
+	if ttlDays > 0 {
+		mintBody = fmt.Sprintf(`{"user_id":%q,"ttl_days":%d}`, userID, ttlDays)
+	}
 	mintReq, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/org/enrolment-tokens", strings.NewReader(mintBody))
 	if err != nil {
 		return "", err

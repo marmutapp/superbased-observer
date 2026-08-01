@@ -19,6 +19,7 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/db"
 	"github.com/marmutapp/superbased-observer/internal/models"
 	"github.com/marmutapp/superbased-observer/internal/store"
+	"github.com/marmutapp/superbased-observer/internal/tooltax"
 )
 
 func newTestServer(t *testing.T) (*Server, string) {
@@ -845,6 +846,64 @@ func TestAPIToolsBreakdown(t *testing.T) {
 	}
 	if int(bt["edit_file"].(float64)) != 1 {
 		t.Errorf("claude-code edit_file: %v want 1", bt["edit_file"])
+	}
+
+	// WP-T5 additive dimensions. by_type above is the pre-WP-T5 contract
+	// and must keep working untouched; these are the like-to-like ones.
+	cats, _ := got["categories"].([]any)
+	if len(cats) != len(tooltax.Categories()) {
+		t.Errorf("categories: got %d entries want %d", len(cats), len(tooltax.Categories()))
+	} else if cats[0] != tooltax.Categories()[0] {
+		t.Errorf("categories order: got %v want tooltax display order", cats)
+	}
+	surfaces, _ := got["surfaces"].([]any)
+	if len(surfaces) != len(tooltax.Surfaces())+1 {
+		t.Errorf("surfaces: got %v want the canonical surfaces + %q", surfaces, SurfaceUnresolved)
+	}
+
+	// jsonInt reads a numeric member without asserting on a possibly
+	// absent key — a wrong taxonomy answer must fail as a diff, not as a
+	// nil-interface panic that hides the rest of the assertions.
+	jsonInt := func(m map[string]any, key string) int {
+		v, ok := m[key].(float64)
+		if !ok {
+			return -1
+		}
+		return int(v)
+	}
+	byCat, _ := first["by_category"].(map[string]any)
+	// 2 read + 1 edit are all category "file".
+	if len(byCat) != 1 || jsonInt(byCat, tooltax.CategoryFile) != 3 {
+		t.Errorf("claude-code by_category: %v want {file: 3}", byCat)
+	}
+	// These fixtures carry no raw_tool_name, so the surface is honestly
+	// unresolved rather than guessed to be a builtin.
+	bySurface, _ := first["by_surface"].(map[string]any)
+	if len(bySurface) != 1 || jsonInt(bySurface, SurfaceUnresolved) != 3 {
+		t.Errorf("claude-code by_surface: %v want {%s: 3}", bySurface, SurfaceUnresolved)
+	}
+	cov, _ := first["coverage"].(map[string]any)
+	if jsonInt(cov, "observed_categories") != 1 {
+		t.Errorf("coverage.observed_categories: %v want 1", cov["observed_categories"])
+	}
+	if jsonInt(cov, "canonical_categories") != len(tooltax.Categories()) {
+		t.Errorf("coverage.canonical_categories: %v want %d",
+			cov["canonical_categories"], len(tooltax.Categories()))
+	}
+	if cov["vocabulary_declared"] != true {
+		t.Errorf("coverage.vocabulary_declared: %v want true", cov["vocabulary_declared"])
+	}
+	if jsonInt(cov, "expressible_categories") != tooltax.CoverageDepth("claude-code") {
+		t.Errorf("coverage.expressible_categories: %v want %d",
+			cov["expressible_categories"], tooltax.CoverageDepth("claude-code"))
+	}
+	// observed(1) is the file category, which claude-code declares, so
+	// nothing here is beyond the vocabulary. The key must still be
+	// present: it is what stops a client formatting observed and
+	// expressible as one ratio (see TestCoverageObservedMayExceedDeclared
+	// for the case where observed legitimately exceeds expressible).
+	if jsonInt(cov, "observed_beyond_declared") != 0 {
+		t.Errorf("coverage.observed_beyond_declared: %v want 0", cov["observed_beyond_declared"])
 	}
 }
 

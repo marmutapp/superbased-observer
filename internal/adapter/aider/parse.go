@@ -225,11 +225,14 @@ func (p *parser) flushAssistant() {
 		Timestamp:     p.sess.start,
 		Tool:          models.ToolAider,
 		Model:         p.sess.model,
-		ActionType:    models.ActionTaskComplete,
-		Target:        preview,
-		Success:       true,
-		RawToolName:   "aider.assistant_text",
-		ToolOutput:    output,
+		// flushAssistant fires at seven distinct prose boundaries, not
+		// only at end-of-turn, so every row here is per-message
+		// assistant text rather than a turn terminus.
+		ActionType:  models.ActionAssistantMessage,
+		Target:      preview,
+		Success:     true,
+		RawToolName: "aider.assistant_text",
+		ToolOutput:  output,
 	})
 }
 

@@ -8,6 +8,7 @@ export { Pill } from "./Pill";
 export { ToolBadge, ToolDot, ToolGlyphFrame } from "./ToolBadge";
 export { ReliabilityPill } from "./ReliabilityPill";
 export { SegmentedControl, type Segment } from "./SegmentedControl";
+export { TabStrip, type TabDef } from "./Tabs";
 export { SlideOver } from "./SlideOver";
 export { TruncatedPath } from "./TruncatedPath";
 export { Toggle } from "./Toggle";

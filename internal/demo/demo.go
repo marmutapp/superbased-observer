@@ -82,6 +82,13 @@ func Events(ctx context.Context, now time.Time) ([]models.ToolEvent, []models.To
 		// runs without a cachetrack engine, so feeding them would be a
 		// silent no-op anyway — the Cache tab keeps its honest empty
 		// state in demo mode.
+		//
+		// OutcomeUpdates are deliberately dropped too: they are keyed
+		// by (source_file, source_event_id), and the loop above rewrote
+		// every event's SourceFile to the virtual demo scheme. An
+		// update would key against the real staging path and match no
+		// row. Demo parses each fixture whole in one window anyway, so
+		// no outcome is cross-tick here.
 	}
 	if len(events) == 0 {
 		return nil, nil, fmt.Errorf("demo.Events: embedded fixtures produced zero events")

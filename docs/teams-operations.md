@@ -330,3 +330,145 @@ only if you want a hard age cap on message content.
 > capture AND content sharing (`full_content` / `admin_managed`). Viewing them is
 > an audited, deeper disclosure (`view_session_messages` audit_log rows). There
 > is no remote toggle to force content collection on.
+
+## 7. Org announcements
+
+A one-way, admin-authored banner distributed to every enrolled node's
+dashboard — the fleet-wide "blast" rail (there are two other, release-coupled
+rails for solo installs; see `docs/plans/dashboard-announcements-banner-plan-2026-07-31.md`
+for the full three-rail design).
+
+### Publishing
+
+From web2's **Announcements** page (nav → Announcements; requires an org admin
+session per `[dashboard].admin_emails`), fill in title (≤ 120 characters),
+body (≤ 280 characters, plain text — no HTML/Markdown), a severity, and an
+expiry, then **Publish (audited)**:
+
+- **Severity** is one of `info` (neutral, the default — "here's something we
+  changed"), `notice` (accent — something to act on eventually, e.g. a
+  deprecation), or `critical` (red — **reserved for security advisories**;
+  overusing it is how a banner surface stops being trusted).
+- **Expiry is required.** The banner self-retires at that instant; there is no
+  open-ended announcement. Pick weeks-to-months out, not "forever".
+- **Id** is auto-derived (date-prefixed slug) and must be unique — reusing an
+  id for different content means anyone who already dismissed the old one
+  never sees the new one.
+
+### Retraction
+
+There's no delete. **Retracting** publishes a new, empty, signed, version-
+bumped document; every enrolled node clears its cached banner on its next
+poll. This is deliberate — a delete would be invisible to the node's
+monotonic-version short-circuit, which is what keeps the poll cheap.
+
+### Trust model
+
+An org announcement is signed (Ed25519) and distributed the same way a
+routing-policy bundle is: the agent TOFU-pins your org's signing key the
+first time it fetches *either* rail, and refuses a different key afterward —
+on both rails, in both directions. Practically, this means your org has
+**exactly one distribution signing identity**, shared across routing
+policy and announcements, and a node that has ever trusted your org will
+never silently accept a document signed by a different key. If a node
+reports a pin/key-change refusal, that's the correct fail-closed behavior
+(it usually means the server's signing key was rotated or the node was
+pointed at a different org) — it is not something to work around by
+re-pinning casually.
+
+### Node-side opt-out
+
+`[dashboard].org_announcements` defaults to `true` — enrollment already
+implies consent to org communication, so default-on is the honest choice.
+Set it to `false` in the node's own `config.toml` to silence fleet banners
+locally; there is no server-side way to force them back on.
+
+### Propagation and observability
+
+The fetch rides the node's existing push/poll cycle (no new timer, no new
+connection) — expect roughly the same **~15-minute** propagation as a
+routing-policy change. Unenrolling a node clears its cached announcement.
+
+Be plain with operators about what this rail reveals: the server sees each
+poll like it sees the push — that an enrolled node checked in, and when.
+That's inherent to any fetch and isn't something a node-side switch can
+remove (short of disabling `[org_client]` entirely). There is, deliberately,
+no read receipt in the other direction — whether a banner was shown or
+dismissed on a given node is never reported back to the server.
+
+---
+
+## 8. Member invites
+
+`[server].member_invites` (default **false**) delegates enrolment-token minting
+from admins to any active org member — the lever that turns one adopting
+developer into a team without an admin round-trip. With it on, a member mints
+from web2's Invite page or straight from their own node dashboard (Settings →
+Enrolment → "Invite a teammate", which rides the enrolment credential their
+agent already holds via `POST /api/agent/invite-token`); `[server].member_invite_monthly_cap`
+(default 10) bounds each member to that many mints per UTC calendar month, on
+both surfaces, with no admin exemption on the agent path. It is **not** an
+account-creation path: the invited email must already be an active member
+(SCIM, or `observer-org users create`) or the mint is a 404, and there is no
+email self-signup. Operationally, the two things to watch are the `invite_minted`
+rows in `audit_log` (inviter, invited user, token id, surface — written for
+admin mints too) and the Invite page's "Enrolment tokens" table, which joins
+`enrolment_tokens.minted_by` to redemption state and is therefore your
+invite→enrolment conversion view; both live entirely in the org DB and add
+nothing to the agent→server wire. Weigh the trade before enabling: an enrolment
+token grants enrolment authority for the *target* identity, so delegating mints
+widens who could, in principle, redeem a token they minted for someone else —
+which is exactly why the flag is default-off, capped, and audited.
+
+### 8.1 Bounds enforced on every mint
+
+| Bound | Value | Behaviour past it |
+| --- | --- | --- |
+| Monthly mints per member | `member_invite_monthly_cap` (default 10) | 429 `invite_cap_reached`; resets at the UTC month boundary |
+| Failed target lookups per inviter | 20 per rolling hour | 429 `invite_attempts_exceeded` for **every** invite from that inviter — hit or miss — until the window rolls |
+| Token lifetime (`ttl_days`) | 1–90 days | 400; omit the field for `enrolment.default_token_lifetime_days`. An explicit `0` is a 400, not "use the default" |
+
+The monthly cap is counted and the token inserted inside **one**
+`BEGIN IMMEDIATE` transaction, so concurrent requests queue rather than each
+reading the same pre-mint count — N simultaneous mints against a cap of C
+leave exactly C tokens.
+
+The failed-lookup budget exists because the mint necessarily answers 404 for a
+non-member and 201 for a member, i.e. it can confirm whether an address is an
+active member of your org. The statuses are kept (a member who typo'd an
+address deserves to be told); what is bounded is the RATE. Only failures are
+charged, so a legitimate inviter never meets it. Attempts are stored in the
+node-local `invite_attempts` table (a user id and a timestamp — never the
+probed address, which would build the very list the budget bounds) and pruned
+inside the mint transaction.
+
+Deactivation revokes authority immediately for admins as well as members: the
+admin check requires the session user's `org_members` row to be `active = 1`,
+so a SCIM-deprovisioned admin holding a still-valid SAML cookie loses the mint,
+the tokens list, and every other admin surface — not just the ability to log in
+again.
+
+The `invite_minted` audit row's `source_ip` is the **transport peer address**.
+`X-Forwarded-For` is deliberately ignored: it is a header any client can set
+and this server has no trusted-proxy allow-list to tell a real hop from a
+forged one, so honouring it would let an inviter write an arbitrary address
+into your audit trail. If you terminate TLS at a reverse proxy, expect the
+proxy's address in these rows.
+
+### 8.2 Known limitation — deleting a target frees a cap slot
+
+`enrolment_tokens.user_id` is a foreign key with `ON DELETE CASCADE`, so
+deleting an org member (SCIM `DELETE /Users/{id}`, or `observer-org users
+delete`) removes every enrolment token minted *for* them — including tokens
+that count against the inviter's monthly cap. A member who can get targets
+deleted could therefore recover cap slots.
+
+This is **documented, not fixed**: it needs a co-operating actor with member
+lifecycle authority (an admin or the SCIM credential), and anyone with that
+authority can already mint tokens directly, so the cap is not the binding
+control against them. Closing it properly means keeping a mint LEDGER
+independent of token rows rather than counting the tokens themselves — a
+schema change we would rather make deliberately than reflexively. Inviter
+attribution is unaffected: `minted_by` is intentionally not a foreign key, so
+deleting the *inviter* leaves their tokens attributed (the tokens list falls
+back to the raw user id).

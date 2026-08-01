@@ -64,6 +64,7 @@ func newInitCmd() *cobra.Command {
 		flagCursor           bool
 		flagCline            bool
 		flagHermes           bool
+		flagStatusline       bool
 		flagUninstall        bool
 		flagAll              bool
 		flagDryRun           bool
@@ -248,6 +249,25 @@ func newInitCmd() *cobra.Command {
 					return err
 				}
 			}
+			// Statusline registration (docs/plans/observer-statusline-plan-2026-07-30.md
+			// §5.1): strictly opt-in via --statusline — never implied by --all,
+			// never touched by `observer start`. Only fires when claude-code
+			// resolves into the SAME selected/detected set the rest of init
+			// already computed (reusing initSelectedTools, the one place that
+			// selection logic lives) so `--codex --statusline` alone (claude-code
+			// neither requested nor detected) is correctly a no-op.
+			if flagStatusline {
+				selected := initSelectedTools(binary, resolvedConfig, flagAll, flagClaudeCode, flagCodex, flagCursor, flagCline)
+				if err := runStatuslineInit(out, hook.Options{
+					BinaryPath:        binary,
+					ConfigPath:        resolvedConfig,
+					DryRun:            flagDryRun,
+					Force:             flagForce,
+					WindowsClaudeHome: flagWinClaudeHome,
+				}, selected, flagUninstall); err != nil {
+					return err
+				}
+			}
 			// Elevated-ETW-capturer setup surface (process-obs plan §W4).
 			// Writes nothing — it probes for the Scheduled Task and, when
 			// absent, emits the one elevated command observer is structurally
@@ -265,7 +285,8 @@ func newInitCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&flagCursor, "cursor", false, "Register hooks + MCP for Cursor")
 	cmd.Flags().BoolVar(&flagCline, "cline", false, "Register for Cline / Roo Code (no hooks; captured via file watcher)")
 	cmd.Flags().BoolVar(&flagHermes, "hermes", false, "Register Python plugin + MCP entry for Nous Research's Hermes Agent (~/.hermes/plugins/superbased-observer/ + ~/.hermes/config.yaml)")
-	cmd.Flags().BoolVar(&flagUninstall, "uninstall", false, "Uninstall instead of install — currently only honoured for --hermes")
+	cmd.Flags().BoolVar(&flagStatusline, "statusline", false, "Register the observer statusline (writes Claude Code settings.json's top-level \"statusLine\" key to run `observer statusline`) — a one-line cost/session status; opt-in only, never implied by --all and never registered by `observer start`")
+	cmd.Flags().BoolVar(&flagUninstall, "uninstall", false, "Uninstall instead of install — honoured for --hermes and --statusline")
 	cmd.Flags().BoolVar(&flagAll, "all", false, "Select every detected tool")
 	cmd.Flags().BoolVar(&flagDryRun, "dry-run", false, "Print intended changes without writing any files")
 	cmd.Flags().BoolVar(&flagForce, "force", false, "Overwrite existing non-observer hook / MCP entries")
@@ -444,6 +465,79 @@ func runHermesInit(out io.Writer, opts hook.HermesOptions, skipHooks, skipMCP, u
 		}
 		fmt.Fprintf(out, "hermes: %s mcp entry to %s\n", verb, path)
 	}
+	return nil
+}
+
+// runStatuslineInit installs (or uninstalls when uninstall=true) the
+// Claude Code statusline registration (docs/plans/observer-statusline-plan-2026-07-30.md
+// §5.1). It is called ONLY when --statusline is explicitly passed —
+// never implied by --all, never invoked from `observer start`.
+//
+// v1 scope is the native-OS Claude Code case only: a statusLine
+// command runs on every render tick, and bridging that through
+// `wsl.exe -d <distro> -- ...` (the pattern registerClaudeCodeWindows
+// uses for discrete hook events) risks the command's own latency
+// budget for a cadence this frequent, so a cross-OS-only detection
+// (claude-code present solely on the Windows side of a WSL daemon)
+// prints an honest WARN and returns rather than attempting a bridge.
+//
+// selected is the already-resolved tool selection (initSelectedTools)
+// so this reuses the SAME "selected/detected" semantics as the rest
+// of init, rather than re-deriving detection independently.
+func runStatuslineInit(out io.Writer, opts hook.Options, selected []string, uninstall bool) error {
+	native := contains(selected, "claude-code")
+	windowsOnly := !native && contains(selected, "claude-code-windows")
+	if windowsOnly {
+		fmt.Fprintln(out, "statusline: claude-code was detected only on the Windows side of a cross-OS WSL setup — v1 scope is native-OS only, skipping (see docs/observer-statusline.md). Run `observer init --statusline` from the OS where Claude Code itself runs.")
+		return nil
+	}
+	if !native {
+		fmt.Fprintln(out, "statusline: claude-code not selected/detected — nothing to register (pass --claude-code, or --all, or run this on a host with ~/.claude)")
+		return nil
+	}
+
+	reg, err := hook.NewRegistry(opts)
+	if err != nil {
+		return err
+	}
+
+	if uninstall {
+		res := reg.UnregisterClaudeCodeStatusline()
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.Skipped {
+			if len(res.HooksKept) > 0 {
+				fmt.Fprintf(out, "statusline: %s has a non-observer \"statusLine\" entry — left untouched\n", res.ConfigPath)
+			} else {
+				fmt.Fprintf(out, "statusline: nothing to remove in %s\n", res.ConfigPath)
+			}
+			return nil
+		}
+		verb := "removed"
+		if opts.DryRun {
+			verb = "would remove"
+		}
+		fmt.Fprintf(out, "statusline: %s \"statusLine\" key from %s\n", verb, res.ConfigPath)
+		return nil
+	}
+
+	res := reg.RegisterClaudeCodeStatusline()
+	if res.Error != nil {
+		return res.Error
+	}
+	if len(res.AlreadySet) > 0 {
+		fmt.Fprintf(out, "statusline: already set in %s\n", res.ConfigPath)
+		return nil
+	}
+	verb := "registered"
+	if opts.DryRun {
+		verb = "would register"
+	}
+	fmt.Fprintf(out, "statusline: %s claude-code \"statusLine\" -> %s statusline (in %s)\n", verb, opts.BinaryPath, res.ConfigPath)
+	// §4.2: the disclaimer is said ONCE, here, at registration time —
+	// never per-render (a one-line statusline has no room for it).
+	fmt.Fprintln(out, "statusline: dollar figures it prints are an estimated list price, not invoiced — see `observer statusline --help`")
 	return nil
 }
 
@@ -717,6 +811,11 @@ func printHookResult(out io.Writer, tool string, res hook.RegistrationResult, dr
 		fmt.Fprintf(out, "%-12s hook ✗ %v\n", tool, res.Error)
 		return
 	}
+	if res.Skipped {
+		printWiringSkip(out, tool, "hook", res.SkipReason, res.SkipAdvice)
+		return
+	}
+	printProbeWarning(out, tool, "hook", res.ProbeWarning)
 	verb := "registered"
 	if dryRun {
 		verb = "would register"
@@ -735,6 +834,11 @@ func printMCPResult(out io.Writer, tool string, res mcp.RegistrationResult, dryR
 		fmt.Fprintf(out, "%-12s mcp  ✗ %v\n", tool, res.Error)
 		return
 	}
+	if res.Skipped {
+		printWiringSkip(out, tool, "mcp ", res.SkipReason, res.SkipAdvice)
+		return
+	}
+	printProbeWarning(out, tool, "mcp ", res.ProbeWarning)
 	verb := "registered"
 	if dryRun {
 		verb = "would register"
@@ -746,6 +850,37 @@ func printMCPResult(out io.Writer, tool string, res mcp.RegistrationResult, dryR
 	if res.Added {
 		fmt.Fprintf(out, "%-12s mcp  %s in %s\n", tool, verb, res.ConfigPath)
 	}
+}
+
+// printWiringSkip renders a registrar's deliberate no-write. Capability-shaped
+// — any registrar that sets RegistrationResult.Skipped renders here; the
+// reason AND the follow-up advice are the registrar's, not this printer's.
+//
+// advice == "" keeps the historical plugin wording (the tool already carries
+// observer's wiring through its own packaging surface, so --force is the
+// escape hatch). A registrar whose skip has different semantics — the
+// cross-OS sandbox gate, where --force deliberately does NOT apply — supplies
+// its own advice instead of being misdescribed by this printer.
+func printWiringSkip(out io.Writer, tool, kind, reason, advice string) {
+	if reason == "" {
+		reason = "this tool already carries observer's wiring"
+	}
+	if advice == "" {
+		advice = "nothing written; the plugin already provides it. " +
+			"Re-run with --force to register anyway (both fire, doubling every event)."
+	}
+	fmt.Fprintf(out, "%-12s %s skipped — %s\n", tool, kind, reason)
+	fmt.Fprintf(out, "%-12s %s   %s\n", "", kind, advice)
+}
+
+// printProbeWarning renders a registrar's NON-FATAL probe failure: it
+// registered, but could not first rule out an in-tool plugin providing
+// the same wiring. Silent on every conclusive path.
+func printProbeWarning(out io.Writer, tool, kind, warning string) {
+	if warning == "" {
+		return
+	}
+	fmt.Fprintf(out, "%-12s %s ! %s\n", tool, kind, warning)
 }
 
 // printProxyRoutingHint reminds the user that hook + MCP installation
@@ -784,6 +919,13 @@ func printProxyRouteResult(out io.Writer, tool string, res proxyroute.Registrati
 	verb := "registered"
 	if dryRun {
 		verb = "would register"
+	}
+	if res.SkipReason != "" {
+		// A deliberate, benign no-write that is NOT "tool not installed"
+		// (today: the cross-OS sandbox gate). Surfaced rather than silently
+		// swallowed with the other ConfigMissing skips.
+		fmt.Fprintf(out, "%-12s route skipped — %s\n", tool, res.SkipReason)
+		return
 	}
 	if res.AlreadySet {
 		fmt.Fprintf(out, "%-12s route already set in %s → %s\n", tool, res.ConfigPath, res.BaseURL)
@@ -1559,12 +1701,20 @@ func resolveTools(all, cc, codex, cursor, cline bool, installed []string, crossO
 			requested[t] = true
 		}
 	}
+	// supported is the vocabulary resolveTools understands for a no-flag
+	// (auto-detected) selection. A tool with a registry MCP/Hook capability
+	// but no dedicated init flag (opencode, cline, droid) still needs an
+	// entry here or it is silently dropped even though mcpSupported/
+	// hookSupported would say yes — hermes is the deliberate exception,
+	// wired through its own --hermes path instead.
 	supported := map[string]bool{
 		"claude-code": true, "claude-code-windows": true,
 		"cursor": true, "cursor-windows": true,
 		"codex": true, "codex-windows": true,
 		"opencode": true,
 		"cline":    true, "cline-windows": true,
+		"droid":        true,
+		"command-code": true,
 	}
 	var out []string
 	for t := range requested {

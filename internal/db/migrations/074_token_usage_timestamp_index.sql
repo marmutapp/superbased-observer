@@ -1,0 +1,19 @@
+-- 074_token_usage_timestamp_index.sql — timestamp index for token_usage
+-- (adversarial-review finding F6, HIGH).
+--
+-- GET /api/statusline's "today" leg (internal/intelligence/dashboard/
+-- statusline.go::statuslineQueryRows) filters token_usage on
+-- `timestamp >= ?` to bound the query to the current UTC calendar day.
+-- api_turns already carries idx_api_turns_timestamp (001_initial.sql), but
+-- no pre-existing token_usage index leads with `timestamp` — the two
+-- composite indexes added since (012_message_id.sql's
+-- idx_token_usage_session_message, 070_token_usage_tool_session_message_idx
+-- .sql's idx_token_usage_tool_session_message) both lead with a different
+-- column, so neither can be used to seek into a time range. Without this
+-- index the today-leg SCANs the entire token_usage table on every render —
+-- and a statusline can fire on every terminal render tick (up to every
+-- keystroke), against a table that grows unbounded over the life of the
+-- install (multi-GB on a long-lived node).
+--
+-- Node-local only: no wire-shape change, no server-side migration pair.
+CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp);

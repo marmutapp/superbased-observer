@@ -211,6 +211,11 @@ func buildEvents(
 			continue
 		}
 		pendingByCallID := map[string]int{}
+		// B3: a `thinking` block mints no action row — its body is held
+		// here and threaded onto the next event this session emits as
+		// PrecedingReasoning. Session-scoped by construction (declared
+		// inside the per-session loop). See reasoningThread.
+		var pending reasoningThread
 		for mi := range s.Messages.Messages {
 			m := &s.Messages.Messages[mi]
 			ts := unixMilliToTime(m.Ts)
@@ -225,7 +230,7 @@ func buildEvents(
 				// or paired tool_result blocks. We handle both —
 				// text blocks become ActionUserPrompt rows; tool_result
 				// blocks lookup-and-fill the matching tool_use row.
-				userMsgEvents := walkUserMessage(s, m, msgPath, projectRoot, ts, sc, pendingByCallID, toolEvents, meta)
+				userMsgEvents := walkUserMessage(s, m, msgPath, projectRoot, ts, sc, pendingByCallID, toolEvents, meta, &pending)
 				toolEvents = userMsgEvents
 			case "assistant":
 				// Per-message TokenEvent from metrics (Phase 0
@@ -233,7 +238,7 @@ func buildEvents(
 				if m.Metrics != nil {
 					tokenEvents = append(tokenEvents, perMessageTokenEvent(s, m, msgPath, projectRoot, ts))
 				}
-				asstEvents, asstWarnings := walkAssistantMessage(s, m, msgPath, projectRoot, ts, sc, pendingByCallID, len(toolEvents), meta)
+				asstEvents, asstWarnings := walkAssistantMessage(s, m, msgPath, projectRoot, ts, sc, pendingByCallID, len(toolEvents), meta, &pending)
 				toolEvents = append(toolEvents, asstEvents...)
 				warnings = append(warnings, asstWarnings...)
 			default:
@@ -404,7 +409,11 @@ func walkUserMessage(
 	pendingByCallID map[string]int,
 	toolEvents []models.ToolEvent,
 	meta *models.ActionMetadata,
+	pending *reasoningThread,
 ) []models.ToolEvent {
+	// A user turn is a reasoning boundary: thinking the previous turn
+	// left unconsumed is dropped, never stamped onto the new turn.
+	pending.clear()
 	for bi, b := range m.Content {
 		switch b.Type {
 		case "text":
@@ -434,9 +443,8 @@ func walkUserMessage(
 // walkAssistantMessage handles role='assistant' content blocks.
 // Text blocks emit ActionTaskComplete ("assistant_text") rows; tool_use
 // blocks emit ToolEvents with normalized ActionType + extracted target;
-// thinking blocks are skipped (Anthropic-extended-thinking trace —
-// observability-only; the dashboard surfaces them via the parent
-// message's PrecedingReasoning when needed).
+// thinking blocks emit NOTHING (B3) — their body is held in `pending`
+// and threaded onto the next event as PrecedingReasoning.
 //
 // `firstIdx` is the index into the OUTER toolEvents slice where this
 // message's first event will land. Used to populate pendingByCallID
@@ -453,6 +461,7 @@ func walkAssistantMessage(
 	pendingByCallID map[string]int,
 	firstIdx int,
 	meta *models.ActionMetadata,
+	pending *reasoningThread,
 ) (events []models.ToolEvent, warnings []string) {
 	for bi, b := range m.Content {
 		switch b.Type {
@@ -461,15 +470,19 @@ func walkAssistantMessage(
 			if body == "" {
 				continue
 			}
-			events = append(events, assistantTextEvent(s, m, msgPath, projectRoot, ts, bi, body, sc, meta))
-		case "thinking":
-			body := strings.TrimSpace(b.Thinking)
-			if body == "" {
-				continue
+			evt := assistantTextEvent(s, m, msgPath, projectRoot, ts, bi, body, sc, meta)
+			if r := pending.take(sc); r != "" {
+				evt.PrecedingReasoning = r
 			}
-			events = append(events, reasoningEvent(s, m, msgPath, projectRoot, ts, bi, body, sc, meta))
+			events = append(events, evt)
+		case "thinking":
+			// B3: no row. The chain-of-thought rides the next event.
+			if body := strings.TrimSpace(b.Thinking); body != "" {
+				pending.set(body)
+			}
 		case "tool_use":
 			evt := toolUseEvent(s, m, msgPath, projectRoot, ts, b, sc, meta)
+			evt.PrecedingReasoning = pending.take(sc)
 			pendingByCallID[b.ID] = firstIdx + len(events)
 			events = append(events, evt)
 		case "":
@@ -620,43 +633,42 @@ func assistantTextEvent(
 	}
 }
 
-// reasoningEvent shapes a `thinking` block into a standalone, visible
-// reasoning row (was dropped as "observability-only") so the model's
-// chain-of-thought is in the timeline, matching the cross-adapter
-// convention (cline/gemini/cowork/openclaw/…).
-func reasoningEvent(
-	s *sessionRow,
-	m *messageRecord,
-	msgPath, projectRoot string,
-	ts time.Time,
-	blockIdx int,
-	thinking string,
-	sc *scrub.Scrubber,
-	meta *models.ActionMetadata,
-) models.ToolEvent {
-	preview := truncate(sc.String(thinking), 200)
-	hash := shortHash(thinking)
-	model := s.Model
-	if m.ModelInfo != nil && m.ModelInfo.ID != "" {
-		model = m.ModelInfo.ID
+// reasoningThread holds a `thinking` block's body until the next event
+// consumes it as PrecedingReasoning. Pre-B3 a thinking block minted its
+// own ActionTaskComplete row (`clinecli.reasoning`) — a phantom action
+// for something the model never did.
+//
+// Semantics (grok-style default adopted by B3):
+//
+//   - CONSUMED-ONCE: the first successor event (the next assistant-text
+//     or tool_use row, in content-block order) takes it and clears it.
+//   - LAST-WINS: an unconsumed body is replaced by a newer thinking
+//     block — the nearest thinking introduced the call.
+//   - TURN-BOUNDARY DISCARD: a role='user' message clears it.
+//
+// Scope is one session: the state is declared inside buildEvents'
+// per-session loop, so it can never leak across sessions.
+type reasoningThread struct {
+	text string
+}
+
+// set records a thinking body (last-wins).
+func (t *reasoningThread) set(body string) { t.text = body }
+
+// clear drops any pending reasoning (turn boundary).
+func (t *reasoningThread) clear() { t.text = "" }
+
+// take consumes the pending reasoning, or returns "" when none is
+// pending. Scrubbing + the 200-char cap happen HERE (at flush) so the
+// preview convention the retired `clinecli.reasoning` row carried is
+// preserved unchanged.
+func (t *reasoningThread) take(sc *scrub.Scrubber) string {
+	if t.text == "" {
+		return ""
 	}
-	return models.ToolEvent{
-		SourceFile:         msgPath,
-		SourceEventID:      "m" + m.ID + ":reasoning:" + fmt.Sprintf("%d", blockIdx) + ":" + hash,
-		SessionID:          s.ID,
-		ProjectRoot:        projectRoot,
-		Timestamp:          ts,
-		Model:              model,
-		Tool:               models.ToolClineCLI,
-		ActionType:         models.ActionTaskComplete,
-		Target:             preview,
-		Success:            true,
-		PrecedingReasoning: preview,
-		RawToolName:        "clinecli.reasoning",
-		ToolOutput:         sc.String(contentcap.Cap(thinking, contentcap.DefaultMaxBytes)),
-		MessageID:          "asst:" + m.ID,
-		Metadata:           meta,
-	}
+	out := truncate(sc.String(t.text), 200)
+	t.clear()
+	return out
 }
 
 // toolUseEvent emits one ToolEvent per tool_use block. ActionType
@@ -700,10 +712,44 @@ func toolUseEvent(
 	}
 }
 
+// batchCommandSeparator joins the elements of a `run_commands` batch
+// into one target string. ";" is chosen deliberately over "&&": a batch
+// is a LIST of independent commands (cline does not condition item N+1
+// on item N's exit status), and internal/policy's shell parser treats
+// ";" as its unit separator (shellparse.go's lexer emits ";" as an
+// operator and ParseCommand returns one Command per unit), so the guard
+// engine — which parses actions straight off Event.Target
+// (policy/engine.go: `ctx.Cmds = ParseCommand(ev.Target, ev.Dialect)`)
+// — evaluates EVERY command in the batch, not just the head.
+const batchCommandSeparator = "; "
+
+// maxBatchCommandTargetBytes caps the joined multi-command target. It is
+// deliberately generous (a whole realistic batch fits) because the point
+// of joining is that a destructive tail command stays visible; the cap
+// only exists so a pathological batch cannot put an unbounded string in
+// actions.target, which the store does not truncate. Single-command
+// batches bypass this entirely and stay byte-identical to the old path.
+const maxBatchCommandTargetBytes = 2000
+
 // extractTarget pulls the user-visible target string out of a
 // tool_use's input args. Per-tool: read_files / run_commands /
-// apply_patch all carry batched inputs (the plural names!) so we
-// summarise the first item + count.
+// apply_patch all carry batched inputs (the plural names!).
+//
+// read_files / apply_patch summarise as first item + count — they name
+// PATHS, and the per-path detail is carried by the file-action rows and
+// raw_tool_input. run_commands is different and joins every command
+// (WP-T6 finding F4): the target is the only place a batch's commands
+// reach the target-based guard policy and the target-based analytics
+// surfaces, and keeping just the head silently hid, e.g., a destructive
+// second command. The complete, unsummarised args always remain in
+// RawToolInput (see toolUseEvent's RawToolInput) — the join makes the
+// batch legible in `target`, it is not the record of truth.
+//
+// NOT per-command ToolEvents: one tool_use is one row (its dedup key is
+// SourceEventID = the block index within the message), so fanning a
+// batch out into N rows would change row cardinality and mint N synthetic
+// dedup keys per block — a re-parse hazard and an action-count skew for
+// every downstream aggregate. Rejected deliberately.
 func extractTarget(toolName string, rawInput json.RawMessage, sc *scrub.Scrubber) string {
 	if len(rawInput) == 0 {
 		return ""
@@ -720,78 +766,126 @@ func extractTarget(toolName string, rawInput json.RawMessage, sc *scrub.Scrubber
 		}
 		return ""
 	}
-	pickList := func(key, itemKey string) (first string, count int) {
+	// pickList returns one extracted string PER element of a batched
+	// list arg, in wire order, plus the element count. An element the
+	// extractor cannot read yields "" and keeps its slot, so the count
+	// never lies about how big the batch was.
+	//
+	// The element type is what decides the shape (WP-T6 finding C1):
+	// live cline 3.x sends plain strings, legacy captures send objects.
+	// Dispatching per element rather than off the list head is a strict
+	// generalization — homogeneous lists (every real capture) behave
+	// identically, and a mixed list now yields the items it can read
+	// instead of nothing at all.
+	pickList := func(key, itemKey string) (items []string, count int) {
 		raw, ok := m[key]
 		if !ok {
-			return "", 0
+			return nil, 0
 		}
 		list, ok := raw.([]any)
 		if !ok {
-			return "", 0
+			return nil, 0
 		}
 		count = len(list)
 		if count == 0 {
-			return "", 0
+			return nil, 0
 		}
-		head, ok := list[0].(map[string]any)
-		if !ok {
-			return "", count
+		items = make([]string, 0, count)
+		for _, el := range list {
+			switch v := el.(type) {
+			case string:
+				// Live cline 3.x shape: a plain list of strings, e.g.
+				// {"commands":["printf ...","echo ..."]}.
+				items = append(items, v)
+			case map[string]any:
+				// Legacy/older shape: a list of objects, e.g.
+				// {"files":[{"path":"...","start_line":1,"end_line":200}]}.
+				s, _ := v[itemKey].(string)
+				items = append(items, s)
+			default:
+				items = append(items, "")
+			}
 		}
-		if s, ok := head[itemKey].(string); ok {
-			return s, count
+		return items, count
+	}
+	// first returns the head extraction of a pickList result, tolerating
+	// an empty slice.
+	first := func(items []string) string {
+		if len(items) == 0 {
+			return ""
 		}
-		return "", count
+		return items[0]
 	}
 
 	switch toolName {
 	case "read_files":
-		first, n := pickList("files", "path")
+		items, n := pickList("files", "path")
 		if n == 0 {
 			return ""
 		}
 		if n == 1 {
-			return first
+			return first(items)
 		}
-		return fmt.Sprintf("%s (+%d more)", first, n-1)
+		return fmt.Sprintf("%s (+%d more)", first(items), n-1)
 	case "run_commands":
-		first, n := pickList("commands", "command")
+		items, n := pickList("commands", "command")
 		if n == 0 {
 			return ""
 		}
 		if n == 1 {
-			return sc.String(first)
+			return sc.String(first(items))
 		}
-		return sc.String(fmt.Sprintf("%s (+%d more)", first, n-1))
+		return sc.String(joinBatchCommands(items))
 	case "apply_patch":
-		first, n := pickList("patches", "path")
+		items, n := pickList("patches", "path")
 		if n == 0 {
 			// apply_patch with single {path, old_string, new_string}
 			return pick("path", "file_path")
 		}
 		if n == 1 {
-			return first
+			return first(items)
 		}
-		return fmt.Sprintf("%s (+%d more)", first, n-1)
-	case "editor":
-		return pick("path", "file_path")
-	case "search_codebase":
-		return pick("pattern", "query", "regex")
-	case "fetch_web_content":
-		return pick("url")
-	case "ask_question":
-		return sc.String(pick("question"))
-	case "spawn_agent":
-		return sc.String(pick("task", "prompt"))
-	case "submit_and_exit":
-		return sc.String(pick("summary", "result"))
-	case "team_send_message", "team_broadcast":
-		return pick("to", "team_name", "recipient")
-	case "team_spawn_teammate":
-		return pick("name", "agent_id")
-	case "team_run_task", "team_task":
-		return pick("task_id", "title")
+		return fmt.Sprintf("%s (+%d more)", first(items), n-1)
+	}
+	if v, ok := pickSimpleToolTarget(toolName, pick, sc); ok {
+		return v
 	}
 	return ""
+}
+
+// pickSimpleToolTarget extracts the target string for tool_use blocks
+// whose args carry a single scalar target field, as opposed to
+// read_files / run_commands / apply_patch's batched-list args (handled
+// directly in extractTarget, since those three share the pickList
+// batch-summarisation shape and run_commands additionally carries the
+// ';'-joined multi-command contract in joinBatchCommands). `pick` is
+// extractTarget's own field-lookup closure, threaded through so both
+// functions read from the same decoded args map.
+//
+// Reports ok=false for a toolName this helper doesn't recognise, so the
+// caller falls through to its own "" default.
+func pickSimpleToolTarget(toolName string, pick func(keys ...string) string, sc *scrub.Scrubber) (target string, ok bool) {
+	switch toolName {
+	case "editor":
+		return pick("path", "file_path"), true
+	case "search_codebase":
+		return pick("pattern", "query", "regex"), true
+	case "fetch_web_content":
+		return pick("url"), true
+	case "ask_question":
+		return sc.String(pick("question")), true
+	case "spawn_agent":
+		return sc.String(pick("task", "prompt")), true
+	case "submit_and_exit":
+		return sc.String(pick("summary", "result")), true
+	case "team_send_message", "team_broadcast":
+		return pick("to", "team_name", "recipient"), true
+	case "team_spawn_teammate":
+		return pick("name", "agent_id"), true
+	case "team_run_task", "team_task":
+		return pick("task_id", "title"), true
+	}
+	return "", false
 }
 
 // --- helpers ---------------------------------------------------------
@@ -808,6 +902,46 @@ func firstNonEmpty(ss ...string) string {
 		}
 	}
 	return ""
+}
+
+// joinBatchCommands renders a multi-command `run_commands` batch into
+// one target string: every command the extractor could read, joined by
+// batchCommandSeparator, capped at maxBatchCommandTargetBytes.
+//
+// Anything not rendered — an element whose shape the extractor could not
+// read, or a tail dropped by the byte cap — is reported as
+// " (+N more)", so the target never claims the batch was smaller than it
+// was. RawToolInput still carries the complete args either way.
+func joinBatchCommands(items []string) string {
+	var b strings.Builder
+	rendered := 0
+	for _, cmd := range items {
+		if cmd == "" {
+			continue
+		}
+		add := len(cmd)
+		if b.Len() > 0 {
+			add += len(batchCommandSeparator)
+		}
+		if b.Len()+add > maxBatchCommandTargetBytes && b.Len() > 0 {
+			break
+		}
+		if b.Len() > 0 {
+			b.WriteString(batchCommandSeparator)
+		}
+		b.WriteString(cmd)
+		rendered++
+	}
+	out := b.String()
+	missing := len(items) - rendered
+	if missing <= 0 {
+		return out
+	}
+	suffix := fmt.Sprintf("(+%d more)", missing)
+	if out == "" {
+		return suffix
+	}
+	return out + " " + suffix
 }
 
 func truncate(s string, n int) string {

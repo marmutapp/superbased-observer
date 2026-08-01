@@ -162,6 +162,50 @@ func resolveWindowsHome(override, subdir string) (dir string, refuse []string) {
 	return "", homes
 }
 
+// resolveWindowsHomeFor is the Registrar-scoped resolveWindowsHome: it applies
+// the SANDBOX GATE before any crossmount walk, then delegates.
+//
+// The gate (crossmount.AutoDetectSuppressed, incident 2026-07-31): a caller
+// that pinned RegisterOptions.HomeDir and did NOT name this target's Windows
+// home gets NO auto-detection — it resolves to "not detected" (dir "", no
+// refusal candidates) so the cross-OS writers skip instead of silently
+// resolving the REAL /mnt/c/Users/<u>/.claude. Production never pins HomeDir,
+// so every real `observer init` run takes the delegate path unchanged.
+//
+// EVERY caller of resolveWindowsHome inside this Registrar must go through
+// here — that is what makes the hazard structural rather than per-call
+// discipline.
+func (r *Registrar) resolveWindowsHomeFor(override, subdir string) (dir string, refuse []string) {
+	if crossmount.AutoDetectSuppressed(r.homeOverride, override) {
+		return "", nil
+	}
+	return resolveWindowsHome(override, subdir)
+}
+
+// sandboxRouteSkip fills a benign, explicit skip result for a cross-OS route
+// write the sandbox gate suppressed: the caller pinned HomeDir and either
+// named no Windows-side home, or named one OUTSIDE that sandbox. optionName is
+// the RegisterOptions field that unlocks the target; its value must resolve
+// INSIDE the pinned home.
+func (r *Registrar) sandboxRouteSkip(tool, subdir, optionName, override string) RegistrationResult {
+	reason := fmt.Sprintf(
+		"HomeDir was pinned by the caller but no %s was given — cross-OS %s/ resolution is suppressed (incident 2026-07-31); set %s to a home UNDER the pinned HomeDir to wire this target",
+		optionName, subdir, optionName,
+	)
+	if override != "" {
+		reason = fmt.Sprintf(
+			"%s (%s) resolves OUTSIDE the pinned HomeDir (%s) — cross-OS %s/ resolution is suppressed (incident 2026-07-31)",
+			optionName, override, r.homeOverride, subdir,
+		)
+	}
+	return RegistrationResult{
+		Tool:          tool,
+		DryRun:        r.opts.DryRun,
+		ConfigMissing: true,
+		SkipReason:    reason,
+	}
+}
+
 // windowsRouteRefusalError builds the honest refusal error for a cross-OS route
 // write that could not resolve a single OWNED Windows home. It distinguishes
 // two shapes so the message is precise rather than falsely implying plurality:
@@ -211,7 +255,10 @@ func (r *Registrar) RegisterClaudeCodeWindows() RegistrationResult {
 		// over.
 		return RegistrationResult{Tool: "claude-code-windows", DryRun: r.opts.DryRun, ConfigMissing: true}
 	}
-	dir, refuse := resolveWindowsHome(r.opts.WindowsClaudeHome, ".claude")
+	if crossmount.AutoDetectSuppressed(r.homeOverride, r.opts.WindowsClaudeHome) {
+		return r.sandboxRouteSkip("claude-code-windows", ".claude", "WindowsClaudeHome", r.opts.WindowsClaudeHome)
+	}
+	dir, refuse := r.resolveWindowsHomeFor(r.opts.WindowsClaudeHome, ".claude")
 	if len(refuse) > 0 {
 		return RegistrationResult{
 			Tool:   "claude-code-windows",
@@ -243,7 +290,10 @@ func (r *Registrar) RegisterCodexWindows() RegistrationResult {
 		// F4: benign skip off WSL (see RegisterClaudeCodeWindows).
 		return RegistrationResult{Tool: "codex-windows", DryRun: r.opts.DryRun, ConfigMissing: true}
 	}
-	dir, refuse := resolveWindowsHome(r.opts.WindowsCodexHome, ".codex")
+	if crossmount.AutoDetectSuppressed(r.homeOverride, r.opts.WindowsCodexHome) {
+		return r.sandboxRouteSkip("codex-windows", ".codex", "WindowsCodexHome", r.opts.WindowsCodexHome)
+	}
+	dir, refuse := r.resolveWindowsHomeFor(r.opts.WindowsCodexHome, ".codex")
 	if len(refuse) > 0 {
 		return RegistrationResult{
 			Tool:   "codex-windows",
@@ -279,10 +329,10 @@ func (r *Registrar) WindowsRouteTargets() []string {
 		return nil
 	}
 	var out []string
-	if dir, _ := resolveWindowsHome(r.opts.WindowsClaudeHome, ".claude"); dir != "" {
+	if dir, _ := r.resolveWindowsHomeFor(r.opts.WindowsClaudeHome, ".claude"); dir != "" {
 		out = append(out, "claude-code-windows")
 	}
-	if dir, _ := resolveWindowsHome(r.opts.WindowsCodexHome, ".codex"); dir != "" {
+	if dir, _ := r.resolveWindowsHomeFor(r.opts.WindowsCodexHome, ".codex"); dir != "" {
 		out = append(out, "codex-windows")
 	}
 	return out
@@ -308,7 +358,7 @@ func (r *Registrar) WindowsRouteCandidates() map[string][]string {
 	}
 	out := map[string][]string{}
 	add := func(label, subdir, override string) {
-		dir, refuse := resolveWindowsHome(override, subdir)
+		dir, refuse := r.resolveWindowsHomeFor(override, subdir)
 		if dir != "" || len(refuse) == 0 {
 			return // resolved cleanly, or nothing detected — no disambiguation needed
 		}

@@ -22,6 +22,7 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/models"
 	"github.com/marmutapp/superbased-observer/internal/platform/crossmount"
 	"github.com/marmutapp/superbased-observer/internal/scrub"
+	"github.com/marmutapp/superbased-observer/internal/tooltax"
 )
 
 // Adapter parses OpenAI Codex CLI rollout JSONL files under
@@ -142,69 +143,22 @@ func (a *Adapter) IsSessionFile(path string) bool {
 }
 
 // actionMap translates Codex tool names to the normalized taxonomy.
-// Synonyms and search/list tool names added per audit C2 — Codex
-// historically captured only the five core tools and silently routed
-// everything else through ActionUnknown.
-var actionMap = map[string]string{
-	// Core tools
-	"shell":       models.ActionRunCommand,
-	"apply_patch": models.ActionEditFile,
-	"file_read":   models.ActionReadFile,
-	"file_write":  models.ActionWriteFile,
-	"web_search":  models.ActionWebSearch,
-	// Synonyms observed in newer Codex builds and IDE extensions
-	"exec":           models.ActionRunCommand,
-	"execute":        models.ActionRunCommand,
-	"command":        models.ActionRunCommand,
-	"read_file":      models.ActionReadFile,
-	"open_file":      models.ActionReadFile,
-	"write_file":     models.ActionWriteFile,
-	"create_file":    models.ActionWriteFile,
-	"edit_file":      models.ActionEditFile,
-	"patch":          models.ActionEditFile,
-	"replace":        models.ActionEditFile,
-	"search":         models.ActionSearchText,
-	"grep":           models.ActionSearchText,
-	"find_text":      models.ActionSearchText,
-	"find_in_files":  models.ActionSearchText,
-	"file_search":    models.ActionSearchFiles,
-	"find":           models.ActionSearchFiles,
-	"glob":           models.ActionSearchFiles,
-	"list_files":     models.ActionSearchFiles,
-	"list_directory": models.ActionSearchFiles,
-	"web_fetch":      models.ActionWebFetch,
-	"fetch_url":      models.ActionWebFetch,
-	// Function-call names emitted via response_item.payload.type=function_call
-	// in current Codex Desktop builds. shell_command is the by-far dominant
-	// one (~95% of function_calls in real sessions); update_plan is Codex's
-	// structured todo planner; list_mcp_resources / list_mcp_resource_templates
-	// are MCP discovery calls; view_image is image-file reading.
-	"shell_command":                models.ActionRunCommand,
-	"update_plan":                  models.ActionTodoUpdate,
-	"list_mcp_resources":           models.ActionMCPCall,
-	"list_mcp_resource_templates":  models.ActionMCPCall,
-	"search_past_outputs":          models.ActionMCPCall,
-	"get_session_summary":          models.ActionMCPCall,
-	"get_project_patterns":         models.ActionMCPCall,
-	"get_last_test_result":         models.ActionMCPCall,
-	"get_session_recovery_context": models.ActionMCPCall,
-	"get_cost_summary":             models.ActionMCPCall,
-	"check_command_freshness":      models.ActionMCPCall,
-	"get_failure_context":          models.ActionMCPCall,
-	"load_workspace_dependencies":  models.ActionMCPCall,
-	"view_image":                   models.ActionReadFile,
-	// exec_command is the modern Codex Desktop (>=v0.130) shell tool
-	// name — distinct from the older "shell" / "shell_command". Without
-	// this mapping these rows land as ActionUnknown; live maintainer DB
-	// shows 260 such rows (Issue #6 cross-adapter sweep).
-	"exec_command": models.ActionRunCommand,
-	// PowerShell / pwsh / cmd.exe surface when Codex on Windows
-	// invokes its shell tool with a windows-shell payload. The tool
-	// name in the function_call envelope is the literal interpreter.
-	"powershell": models.ActionRunCommand,
-	"pwsh":       models.ActionRunCommand,
-	"cmd.exe":    models.ActionRunCommand,
-}
+// It is READ OUT of internal/tooltax, the one owner of the
+// cross-adapter tool vocabulary (WP-T3 of
+// docs/plans/tool-taxonomy-standardization-plan-2026-07-31.md). The
+// hand-maintained literal that used to live here — core tools,
+// newer-build synonyms (audit C2), the function_call names of current
+// Codex Desktop builds, exec_command (>=v0.130) and the Windows
+// interpreter names — is now the codex rows of tooltax's ordered
+// canonical table. Add new native tool names THERE, not here.
+//
+// tooltax.For returns LITERAL rows only, so the `mcp__*` glob is not
+// in this map; codex never relied on it (it allow-lists MCP names).
+//
+// TestActionMapPreservesPreTooltaxFixture pins every pre-conversion
+// pair as still present and unchanged; TestActionMapTooltaxAdditions
+// pins the intended additions so an unreviewed one is loud.
+var actionMap = tooltax.For(models.ToolCodex)
 
 // rawLine is the top-level envelope; payload is decoded per type.
 type rawLine struct {
@@ -432,12 +386,16 @@ type webSearchEnd struct {
 // responseItemReasoning is response_item.payload when payload.type ==
 // "reasoning". The `summary` array MAY contain text segments
 // {type:"summary_text"|"text", text:"..."} in future Codex builds; the
-// `encrypted_content` field is opaque and not extractable. Adapter
-// extracts whatever readable text is present and threads it through
-// the turn's agentMessages cache for downstream PrecedingReasoning,
-// AND emits a standalone ToolEvent so reasoning is visible in the
-// action stream (zero-text encrypted-only items appear as opaque
-// placeholders with a byte-size proxy).
+// `encrypted_content` field is opaque and not extractable.
+//
+// B3 (2026-07-31): reasoning mints NO action row. Readable summary text
+// is threaded through the turn's agentMessages cache so the next
+// tool_call / agent_message carries it as PrecedingReasoning; an
+// encrypted-only item (the overwhelming majority — 15,040 of the 15,369
+// historical rows were the `(encrypted reasoning, N bytes)` placeholder)
+// contributes NOTHING and simply vanishes. EncryptedContent is retained
+// as a decode target so the field is documented against the wire shape
+// and a future readable-content build has somewhere to land.
 type responseItemReasoning struct {
 	Summary          []reasoningSummaryPart `json:"summary"`
 	EncryptedContent string                 `json:"encrypted_content"`
@@ -649,8 +607,25 @@ type patchApplyEnd struct {
 	Stderr  string                      `json:"stderr"`
 	Success bool                        `json:"success"`
 	Changes map[string]patchApplyChange `json:"changes"`
+
+	// ChangesRaw is the verbatim `changes` object, filled by
+	// patchChangesRaw at the call site rather than decoded here — a
+	// second field can't share the `changes` tag. The typed map above
+	// drives Target and ContentBytes; the raw bytes are what
+	// RawToolInput stores, so re-marshaling can't silently drop a
+	// field this struct doesn't name.
+	ChangesRaw json.RawMessage `json:"-"`
 }
 
+// patchApplyChange is one entry of patch_apply_end.changes. The producer
+// uses a different payload per change type: `add` and `delete` carry the
+// whole file in `content`, while `update` carries `unified_diff` (plus a
+// `move_path` that is null outside a rename) and no `content` at all.
+//
+// `unified_diff` and `move_path` are deliberately NOT decoded. Nothing in
+// Tier 1 reads them: RawToolInput stores the producer's verbatim bytes
+// (see RenderPatchChangesInput), and the authored-byte count must not
+// include the diff — see authoredBytesFromPatchChanges for why.
 type patchApplyChange struct {
 	Type    string `json:"type"`
 	Content string `json:"content"`
@@ -900,6 +875,14 @@ func (a *Adapter) parseSessionFile(ctx context.Context, path string, fromOffset 
 	// turn picks it up as PrecedingReasoning. Keyed by turn_id; entries
 	// stay around for the whole parse since one turn's preamble is
 	// only valid for that turn's tool events.
+	//
+	// This is ALSO the sole destination of response_item.reasoning
+	// summary text (B3, 2026-07-31): reasoning is never its own action
+	// row, it only enriches the turn's successor events here. Semantics
+	// are per-turn FAN-OUT + concatenate (every tool event of the turn
+	// carries the same accumulated preamble) — deliberately unlike the
+	// consumed-once grok default, because Codex's turn boundary
+	// (turn_id) is explicit in the log and already scopes it.
 	agentMessages := map[string]string{}
 	// seenSystemPrompts dedups ActionSystemPrompt emissions across the
 	// parse. Keyed by content hash (shortHash of the prompt body).
@@ -1592,6 +1575,7 @@ func (a *Adapter) parseSessionFile(ctx context.Context, path string, fromOffset 
 				if err := json.Unmarshal(line.Payload, &pa); err != nil {
 					continue
 				}
+				pa.ChangesRaw = patchChangesRaw(line.Payload)
 				if pa.TurnID != "" {
 					applyContext(sessionContext{TurnID: pa.TurnID})
 				}
@@ -1944,24 +1928,24 @@ func (a *Adapter) parseSessionFile(ctx context.Context, path string, fromOffset 
 				// response_item.reasoning currently carries only opaque
 				// `encrypted_content` plus an empty `summary` array in
 				// every Codex Desktop build inspected (838 reasoning
-				// items, 0% non-empty summary as of 2026-05). Future
-				// builds may populate summary[*].text — when they do,
-				// thread the concatenated text into the per-turn
-				// agentMessages cache so the next tool_call inherits
-				// it as PrecedingReasoning, mirroring agent_message
-				// semantics.
+				// items, 0% non-empty summary as of 2026-05).
 				//
-				// v1.4.53: ALSO emit a standalone ToolEvent so the
-				// reasoning is visible in the action stream rather
-				// than only feeding PrecedingReasoning downstream.
-				// Empty-summary items still emit a row with an opaque
-				// placeholder + encrypted byte count so the operator
-				// can see that reasoning happened at this position
-				// even when the content is unrecoverable.
+				// B3 (2026-07-31): reasoning is NEVER its own action
+				// row. v1.4.53 minted one — including an opaque
+				// "(encrypted reasoning, N bytes)" placeholder for the
+				// unreadable majority — and that produced 15,369
+				// phantom task_complete rows, 15,040 of them content-
+				// free. The ONLY thing that happens here is the
+				// pre-existing threading: readable summary text is
+				// concatenated into the per-turn agentMessages cache so
+				// the next tool_call / agent_message of the same turn
+				// carries it as PrecedingReasoning (see the
+				// agentMessages declaration). An item with no readable
+				// summary contributes nothing at all — a placeholder is
+				// never threaded and never stored.
 				var rr responseItemReasoning
 				if err := json.Unmarshal(line.Payload, &rr); err == nil {
-					text := reasoningSummaryText(rr.Summary)
-					if text != "" {
+					if text := reasoningSummaryText(rr.Summary); text != "" {
 						turnID := assistantTurnID("")
 						if turnID != "" {
 							existing := agentMessages[turnID]
@@ -1972,17 +1956,6 @@ func (a *Adapter) parseSessionFile(ctx context.Context, path string, fromOffset 
 							}
 						}
 					}
-					projectRoot := a.resolveProjectRoot(ctxState.Cwd, rootCache)
-					evt := a.buildCodexReasoningEvent(path, ctxState, projectRoot, ts, rr, text, lineNum)
-					if evt.Model == "" {
-						if turnID := assistantTurnID(""); turnID != "" {
-							evt.Model = modelForTurn(turnID)
-							if evt.Model == "" {
-								pendingToolModels[turnID] = append(pendingToolModels[turnID], len(res.ToolEvents))
-							}
-						}
-					}
-					res.ToolEvents = append(res.ToolEvents, withEffort(evt))
 				}
 			case "message":
 				// response_item.payload.type=message — role discriminates.
@@ -2235,11 +2208,22 @@ func (a *Adapter) parseSessionFile(ctx context.Context, path string, fromOffset 
 }
 
 // buildCustomToolCallEvent emits the assistant-side row for a
-// response_item/custom_tool_call. In current Codex Desktop builds the
-// only `name` is "apply_patch", but we route through actionMap so a
-// future custom-tool name lands as ActionUnknown without crashing. The
-// patch text is parsed for the first changed file path so the row's
-// Target is meaningful even without the matching patch_apply_end.
+// response_item/custom_tool_call.
+//
+// Two shapes reach here. The legacy one names the tool directly
+// ("apply_patch") and puts the raw patch text in `input`. The modern
+// one (and the Open Interpreter rebadge) names EVERY call "exec" and
+// puts a JavaScript program in `input` that dispatches to the real
+// tool — see unifiedexec.go for the measured vocabulary. Both are
+// resolved to a native tool name first, then routed through actionMap
+// (the tooltax-sourced table) exactly like every other codex path, so
+// an unseen name lands as ActionUnknown instead of being absorbed into
+// run_command, and the emit site never contradicts the taxonomy table.
+//
+// The patch text — inline for the legacy shape, decoded out of the JS
+// program for the modern one — is parsed for the first changed file
+// path so the row's Target is meaningful even without the matching
+// patch_apply_end.
 func (a *Adapter) buildCustomToolCallEvent(
 	sourceFile, callID string,
 	sess sessionContext,
@@ -2248,16 +2232,38 @@ func (a *Adapter) buildCustomToolCallEvent(
 	rc responseItemCustomToolCall,
 	preceding string,
 ) models.ToolEvent {
-	actionType, ok := actionMap[rc.Name]
+	name, target, patchText, provablyNoCall := a.resolveCustomToolCall(rc)
+
+	actionType, ok := actionMap[name]
 	if !ok {
 		actionType = models.ActionUnknown
 	}
-	target := ""
-	if rc.Name == "apply_patch" {
-		target = applyPatchTarget(rc.Input)
-		if target != "" && projectRoot != "" {
-			target = git.RelativePath(projectRoot, target)
+	// Residual class 1: an `exec` program PROVABLY dispatching to no
+	// tools.* call at all (3 of 7,087 live rows, all harness
+	// introspection over the injected ALL_TOOLS array). It ran no
+	// command, so it keeps neither the dispatcher's run_command row
+	// nor a fabricated target.
+	//
+	// FAIL CLOSED. The downgrade needs the parser's PROOF, not merely
+	// its silence — a program the scanner could not resolve
+	// (`tools["exec_command"](…)`, a call inside a template literal,
+	// tomorrow's syntax) may well have run a real command, and typing
+	// that harness_call would drop it out of run_command analytics AND
+	// out of target-based safety classification. Unresolved therefore
+	// keeps the taxonomy's own conservative `exec` row (run_command)
+	// with an empty Target — the pre-fix behaviour, which under-informs
+	// rather than mis-asserts. See unifiedexec.go RESIDUAL CLASS 1.
+	if rc.Name == unifiedExecToolName && name == unifiedExecToolName && provablyNoCall {
+		actionType = models.ActionHarnessCall
+		target = ""
+	}
+	if patchText != "" {
+		if p := applyPatchTarget(patchText); p != "" {
+			target = p
 		}
+	}
+	if target != "" && (actionType == models.ActionEditFile) && projectRoot != "" {
+		target = git.RelativePath(projectRoot, target)
 	}
 	return models.ToolEvent{
 		SourceFile:         sourceFile,
@@ -2272,17 +2278,76 @@ func (a *Adapter) buildCustomToolCallEvent(
 		Target:             truncate(target, 200),
 		Success:            true,
 		PrecedingReasoning: truncate(preceding, 500),
-		RawToolName:        rc.Name,
+		RawToolName:        name,
 		RawToolInput:       a.scrubber.String(rc.Input),
-		ContentBytes:       authoredBytes(actionType, []byte(rc.Input)),
+		ContentBytes:       customToolCallAuthoredBytes(actionType, rc, target, patchText),
 		MessageID:          sess.TurnID,
 	}
 }
 
+// resolveCustomToolCall turns a custom_tool_call payload into (native
+// tool name, target, patch text, provably-no-call). The legacy shape is
+// already named; the modern unified-exec shape is resolved by parsing
+// its JavaScript program (unifiedexec.go). Returning the dispatcher
+// name "exec" unchanged is how the caller recognises an unresolved
+// program; the fourth result separates the two reasons a program can be
+// unresolved — PROVED tool-free (the residual class) versus merely
+// beyond the scanner's syntax (fall back to the taxonomy's exec row).
+func (a *Adapter) resolveCustomToolCall(
+	rc responseItemCustomToolCall,
+) (name, target, patchText string, provablyNoCall bool) {
+	if rc.Name != unifiedExecToolName {
+		if rc.Name == "apply_patch" {
+			return rc.Name, "", rc.Input, false
+		}
+		return rc.Name, "", "", false
+	}
+	call := parseUnifiedExec(rc.Input)
+	if call.Name == "" {
+		return rc.Name, "", "", call.NoToolCall
+	}
+	// The command / written chars / plan explanation are agent-authored
+	// free text that can carry credentials, exactly like the
+	// exec_command_end path's command string — scrub before it becomes
+	// a queryable column.
+	return call.Name, a.scrubber.String(call.Target), call.PatchText, false
+}
+
+// customToolCallAuthoredBytes counts what the AGENT authored in a
+// custom_tool_call. The legacy shape can be measured straight off the
+// payload, but a unified-exec payload is a JavaScript program: passing
+// it to authoredBytes would either fail to parse (edit rows silently
+// scoring 0) or count the whole wrapper as if it were the command.
+// Measure the resolved inner argument instead — the command string for
+// a shell run, the added patch lines for an edit, nothing for plan
+// updates and stdin writes, which author no content.
+func customToolCallAuthoredBytes(actionType string, rc responseItemCustomToolCall, target, patchText string) int64 {
+	if rc.Name != unifiedExecToolName {
+		return authoredBytes(actionType, []byte(rc.Input))
+	}
+	switch actionType {
+	case models.ActionRunCommand:
+		return int64(len(target))
+	case models.ActionWriteFile, models.ActionEditFile:
+		return authoredBytesFromPatch(patchText)
+	default:
+		return 0
+	}
+}
+
 // buildPatchApplyStandaloneEvent emits a row when patch_apply_end lands
-// without a matching pending custom_tool_call (mid-session resume,
-// truncated rollout). Carries the structured `changes` summary as the
-// authoritative source.
+// without a matching pending custom_tool_call. Carries the structured
+// `changes` summary as the authoritative source.
+//
+// This is the DOMINANT path on current builds, not the rare recovery
+// case its name suggests. Codex now invokes apply_patch from inside an
+// `exec` custom_tool_call (`tools.apply_patch(patch)` in the sandbox
+// script), and the executor stamps patch_apply_end with its own
+// `exec-<uuid>` id — a different namespace from the response_item's
+// `call_<hash>`, so pending[pa.CallID] cannot match by construction.
+// Measured over a 393-rollout corpus: 2,059 exec-uuid vs 416 call_hash.
+// There is no id join to repair, which is why the row's RawToolInput is
+// reconstructed from `changes` here instead.
 func (a *Adapter) buildPatchApplyStandaloneEvent(
 	sourceFile string,
 	sess sessionContext,
@@ -2309,6 +2374,7 @@ func (a *Adapter) buildPatchApplyStandaloneEvent(
 		ErrorMessage:       errorIfFailed(pa.Success, output),
 		PrecedingReasoning: truncate(preceding, 500),
 		RawToolName:        "patch_apply_end",
+		RawToolInput:       RenderPatchChangesInput(a.scrubber, pa.ChangesRaw),
 		ToolOutput:         a.scrubber.String(output),
 		ContentBytes:       authoredBytesFromPatchChanges(pa.Changes),
 		MessageID:          firstNonEmpty(pa.TurnID, sess.TurnID),
@@ -2332,6 +2398,44 @@ func mergePatchApplyIntoPending(row *models.ToolEvent, a *Adapter, pa patchApply
 	if t := patchApplyTargetFromChanges(pa.Changes, projectRoot); t != "" {
 		row.Target = truncate(t, 200)
 	}
+	// The pending row already holds the model's own `*** Begin Patch`
+	// text, which is a richer input than the post-execution summary —
+	// only fill from `changes` when there is nothing to preserve.
+	if row.RawToolInput == "" {
+		row.RawToolInput = RenderPatchChangesInput(a.scrubber, pa.ChangesRaw)
+	}
+}
+
+// patchChangesRaw returns the verbatim `changes` object of a
+// patch_apply_end payload, or nil when the payload does not parse.
+func patchChangesRaw(payload []byte) json.RawMessage {
+	var probe struct {
+		Changes json.RawMessage `json:"changes"`
+	}
+	if err := json.Unmarshal(payload, &probe); err != nil {
+		return nil
+	}
+	return probe.Changes
+}
+
+// RenderPatchChangesInput renders a patch_apply_end `changes` object for
+// storage in raw_tool_input, scrubbed. Absent, JSON null and the empty
+// object all render "" — a patch_apply_end that recorded no changes has
+// no input to store, and "{}" is a value the producer never wrote.
+//
+// This is the ONE owner of that rendering. The live parse path and
+// `observer backfill --codex-tool-input` both call it, so a row captured
+// live and the same row recovered from disk are byte-identical.
+func RenderPatchChangesInput(sc *scrub.Scrubber, raw json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" || trimmed == "{}" {
+		return ""
+	}
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &probe); err != nil || len(probe) == 0 {
+		return ""
+	}
+	return sc.RawJSON(raw)
 }
 
 // dynamicToolCallBody concatenates text content_items into a single
@@ -2897,15 +3001,19 @@ func (a *Adapter) buildAgentMessageEvent(sourceFile string, sess sessionContext,
 	turnID := sess.TurnID
 	preview := truncate(a.scrubber.String(message), 200)
 	return models.ToolEvent{
-		SourceFile:         sourceFile,
-		SourceEventID:      fmt.Sprintf("agent:%s:L%d:%s", filepath.Base(sourceFile), lineNum, shortHash(message)),
-		SessionID:          sess.SessionID,
-		ProjectRoot:        projectRoot,
-		Timestamp:          ts,
-		GitBranch:          sess.GitBranch,
-		Model:              sess.Model,
-		Tool:               models.ToolCodex,
-		ActionType:         models.ActionTaskComplete,
+		SourceFile:    sourceFile,
+		SourceEventID: fmt.Sprintf("agent:%s:L%d:%s", filepath.Base(sourceFile), lineNum, shortHash(message)),
+		SessionID:     sess.SessionID,
+		ProjectRoot:   projectRoot,
+		Timestamp:     ts,
+		GitBranch:     sess.GitBranch,
+		Model:         sess.Model,
+		Tool:          models.ToolCodex,
+		// One row per agent_message event — codex emits several per turn
+		// (see buildAgentMessageEvent's caller), so this is per-message
+		// assistant text, not a turn terminus. The genuine terminus is
+		// the `task_complete` event_msg row (buildTaskCompleteEvent).
+		ActionType:         models.ActionAssistantMessage,
 		Target:             preview,
 		Success:            true,
 		PrecedingReasoning: preview,
@@ -2987,43 +3095,6 @@ func buildCodexRateLimitEvent(sourceFile string, sess sessionContext, projectRoo
 		RawToolInput:  string(rawJSON),
 		MessageID:     fmt.Sprintf("ratelimit:%s:L%d", filepath.Base(sourceFile), lineNum),
 		Metadata:      meta,
-	}
-}
-
-// buildCodexReasoningEvent emits a ToolEvent for each
-// response_item.reasoning block. When summary text is present the
-// row carries that text in Target/ToolOutput; encrypted-only items
-// emit an opaque placeholder noting the encrypted byte count so the
-// reasoning's position-in-turn is visible in the action stream.
-// Stable source_event_id keys on filename + line so re-parses are
-// idempotent under the store's unique index.
-func (a *Adapter) buildCodexReasoningEvent(sourceFile string, sess sessionContext, projectRoot string, ts time.Time, rr responseItemReasoning, text string, lineNum int) models.ToolEvent {
-	var preview, output string
-	if text != "" {
-		preview = truncate(text, 200)
-		output = a.scrubber.String(contentcap.Cap(text, contentcap.DefaultMaxBytes))
-	} else if n := len(rr.EncryptedContent); n > 0 {
-		preview = fmt.Sprintf("(encrypted reasoning, %d bytes)", n)
-		output = preview
-	} else {
-		preview = "(reasoning)"
-		output = preview
-	}
-	return models.ToolEvent{
-		SourceFile:    sourceFile,
-		SourceEventID: fmt.Sprintf("reasoning:%s:L%d", filepath.Base(sourceFile), lineNum),
-		SessionID:     sess.SessionID,
-		ProjectRoot:   projectRoot,
-		Timestamp:     ts,
-		GitBranch:     sess.GitBranch,
-		Model:         sess.Model,
-		Tool:          models.ToolCodex,
-		ActionType:    models.ActionTaskComplete,
-		Target:        preview,
-		Success:       true,
-		RawToolName:   "codex.reasoning",
-		ToolOutput:    output,
-		MessageID:     fmt.Sprintf("reasoning:%s:L%d", filepath.Base(sourceFile), lineNum),
 	}
 }
 
@@ -3381,7 +3452,17 @@ func authoredBytes(actionType string, rawInput []byte) int64 {
 func authoredBytesFromPatch(patch string) int64 {
 	var n int64
 	for _, line := range strings.Split(patch, "\n") {
-		if line == "" || strings.HasPrefix(line, "+++") {
+		// No "+++" exclusion. Every caller is gated on the apply_patch
+		// envelope (`*** Begin Patch`), which uses `*** Add/Update File:`
+		// headers and never unified-diff `+++ b/file` ones — so the skip
+		// guarded a construct that cannot arrive here, while silently
+		// dropping real added source whose own text begins "++" (a C-style
+		// increment: source `++n` encodes as `+++n`, and source `++ n` as
+		// `+++ n`, so narrowing the predicate to require the space did not
+		// fix it either). Zero lines beginning "+++" of any kind exist in
+		// the reference corpus, so removing this changes no historical
+		// count — it only stops a future undercount.
+		if line == "" {
 			continue
 		}
 		if strings.HasPrefix(line, "+") {
@@ -3397,6 +3478,29 @@ func authoredBytesFromPatchChanges(changes map[string]patchApplyChange) int64 {
 		if ch.Type == "delete" {
 			continue
 		}
+		// UnifiedDiff is deliberately NOT counted, and this is the second
+		// time that needs saying: an `update` change carries only
+		// `unified_diff` (2,746 of the 3,492 changes in the reference
+		// corpus), so it scores zero here and that LOOKS like a bug.
+		//
+		// It is not — in the overwhelmingly common case. A patch normally
+		// ALSO emits an INVOCATION row from its custom_tool_call, and that
+		// row already counts the same authored bytes from its own
+		// `*** Begin Patch` text: measured on a live rollout, 107
+		// invocation rows / 142,823 B alongside 95 executor rows. Counting
+		// the diff here too double-counts authored output on every update,
+		// which is exactly what happened when this line was briefly added.
+		//
+		// The honest caveat: an executor row with NO invocation row (a
+		// truncated or mid-session-resumed rollout) therefore reports 0
+		// authored bytes for an update-only patch. That is real measurement
+		// loss on the recovery path, accepted because the recovery path is
+		// rare and the double-count was not.
+		//
+		// Note `add` content below is STILL double-counted for the same
+		// structural reason (~4.0 MB across the reference corpus). Fixing
+		// that properly means collapsing the duplicate ROW, not making one
+		// of the two rows lie about what it measured.
 		n += int64(len(ch.Content))
 	}
 	return n

@@ -9,6 +9,7 @@ import { fmtBytes, fmtCompact, fmtInt, fmtUSD } from "@/lib/format";
 import {
   activityLabel,
   basename,
+  burnRate,
   enableProcessCapture,
   flattenProcs,
   fmtAgo,
@@ -27,6 +28,7 @@ import {
   tpsBasisLabel,
   utilPct,
   WEAK_LINK_CONFIDENCE,
+  type BurnRate,
   type SessionNetworkSummary,
   type TerminalLinkErrorInfo,
   type TerminalSessionLink,
@@ -173,6 +175,7 @@ export function CockpitContent({ link, linkError, linkLoading, mountMs }: Cockpi
   const elapsedSecs = secondsSince(startIso, now);
 
   const runningCount = runningProcessCount(procs.data?.roots);
+  const burn = burnRate(msgRows, sd?.cost_usd, elapsedSecs);
 
   return (
     <Body>
@@ -209,7 +212,7 @@ export function CockpitContent({ link, linkError, linkLoading, mountMs }: Cockpi
       />
 
       {/* 3 — Cost strip */}
-      <CostStrip session={sd} predict={predict.data} err={session.error} />
+      <CostStrip session={sd} predict={predict.data} burn={burn} err={session.error} />
 
       {/* 4 — Context & tokens */}
       <ContextTokens session={sd} predict={predict.data} />
@@ -426,16 +429,26 @@ function fmtCost(n: number | null | undefined): string {
 function CostStrip({
   session,
   predict,
+  burn,
   err,
 }: {
   session?: SessionDetail | null;
   predict?: PredictResponse | null;
+  burn: BurnRate | null;
   err: Error | null;
 }) {
   if (err && !session) return <SectionErr label="Cost" />;
   const est = predict?.estimate;
   const nextLo = est?.has_estimate ? est.low.message_usd : null;
   const nextHi = est?.has_estimate ? est.high.message_usd : null;
+  // Projection is the running total plus one hour at the current rate —
+  // the forward number a rate exists to produce. Only meaningful once the
+  // total is known, so it follows cost_usd rather than defaulting it.
+  const total = session?.cost_usd;
+  const projected =
+    burn && total != null && Number.isFinite(total)
+      ? total + burn.usdPerHour
+      : null;
   return (
     <div>
       <SectionLabel>Cost</SectionLabel>
@@ -446,6 +459,22 @@ function CostStrip({
           </div>
           <div className="mt-1 text-[10.5px] text-fg-3">
             AI {fmtCost(session?.ai_cost_usd)} · tool {fmtCost(session?.tool_cost_usd)}
+          </div>
+        </div>
+        <div className="text-right" title={burnTitle(burn)}>
+          <div className="text-[10px] uppercase tracking-wide text-fg-4">burn</div>
+          <div className="text-[12px] font-medium tabular-nums text-fg-1">
+            {burn ? (
+              <>
+                {fmtCost(burn.usdPerHour)}
+                <span className="text-fg-3">/h</span>
+              </>
+            ) : (
+              <span className="text-fg-4">—</span>
+            )}
+          </div>
+          <div className="text-[10px] tabular-nums text-fg-3">
+            {projected != null ? <>+1h ≈ {fmtCost(projected)}</> : " "}
           </div>
         </div>
         <div className="text-right">
@@ -461,6 +490,20 @@ function CostStrip({
       </div>
     </div>
   );
+}
+
+// burnTitle names the basis on hover rather than in the strip, which has no
+// room for it. The distinction matters: a "recent" rate is what the session
+// is costing now, a "session" rate is diluted by every idle stretch since it
+// started, and reading one as the other is the whole risk of showing a rate.
+function burnTitle(burn: BurnRate | null): string {
+  if (!burn) {
+    return "No burn rate yet — a rate needs at least two timed turns, or a session with elapsed time and a known cost.";
+  }
+  if (burn.basis === "recent") {
+    return `Current rate: ${burn.turns} turn(s) over ${fmtElapsed(burn.spanSecs)}. The oldest fetched turn sets the window start and is excluded from the total, so the rate isn't inflated by counting a cost incurred before the window.`;
+  }
+  return `Session average over ${fmtElapsed(burn.spanSecs)} elapsed — the same elapsed shown in the header. Diluted by any idle time; a current rate needs at least two timed turns.`;
 }
 
 // --- 4: Context & tokens ---------------------------------------------------

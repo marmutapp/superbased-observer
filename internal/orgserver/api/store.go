@@ -35,17 +35,39 @@ type member struct {
 
 // memberByID returns the member, or (zero,false) if absent.
 func (s *store) memberByID(ctx context.Context, userID string) (member, bool, error) {
+	return memberByIDOn(ctx, s.db, userID)
+}
+
+// memberByIDOn is memberByID against an arbitrary rowQuerier, so the invite
+// mint can run the same lookup on its pinned transaction connection.
+func memberByIDOn(ctx context.Context, q rowQuerier, userID string) (member, bool, error) {
+	return scanMember(q.QueryRowContext(ctx,
+		`SELECT user_id, email, active, agent_public_key FROM org_members WHERE user_id = ?`, userID),
+		"api.store.memberByID")
+}
+
+// memberByEmailFoldOn resolves a member by a case-insensitive email match on
+// an arbitrary rowQuerier. Email addresses arrive from a human typing them
+// into an invite form; the stored address came from the IdP. Matching them
+// exactly would refuse a correct invite over letter case.
+func memberByEmailFoldOn(ctx context.Context, q rowQuerier, email string) (member, bool, error) {
+	return scanMember(q.QueryRowContext(ctx,
+		`SELECT user_id, email, active, agent_public_key FROM org_members
+		  WHERE lower(email) = lower(?) ORDER BY created_at LIMIT 1`, email),
+		"api.store.memberByEmailFold")
+}
+
+// scanMember decodes one org_members row, mapping ErrNoRows to (zero,false).
+func scanMember(row *sql.Row, where string) (member, bool, error) {
 	var m member
 	var active int
 	var pub sql.NullString
-	err := s.db.QueryRowContext(ctx,
-		`SELECT user_id, email, active, agent_public_key FROM org_members WHERE user_id = ?`, userID).
-		Scan(&m.UserID, &m.Email, &active, &pub)
+	err := row.Scan(&m.UserID, &m.Email, &active, &pub)
 	if errors.Is(err, sql.ErrNoRows) {
 		return member{}, false, nil
 	}
 	if err != nil {
-		return member{}, false, fmt.Errorf("api.store.memberByID: %w", err)
+		return member{}, false, fmt.Errorf("%s: %w", where, err)
 	}
 	m.Active = active != 0
 	m.PublicKey = pub.String
@@ -108,11 +130,14 @@ func (s *store) upsertSAMLUser(ctx context.Context, email, displayName string) (
 }
 
 // insertEnrolmentToken stores an argon2id-hashed one-time token for a user.
-func (s *store) insertEnrolmentToken(ctx context.Context, id, hash, userID string, expiresAt time.Time) error {
+// mintedBy is the inviter's user id, or "" for an unattributed mint (the CLI
+// path and every token minted before server migration 023) — stored as NULL
+// so the cap query never counts unattributed rows against anyone.
+func (s *store) insertEnrolmentToken(ctx context.Context, id, hash, userID, mintedBy string, expiresAt time.Time) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO enrolment_tokens (id, token_hash, user_id, created_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?)`,
-		id, hash, userID, s.now().Format(time.RFC3339Nano), expiresAt.Format(time.RFC3339Nano))
+		`INSERT INTO enrolment_tokens (id, token_hash, user_id, minted_by, created_at, expires_at)
+		 VALUES (?, ?, ?, NULLIF(?, ''), ?, ?)`,
+		id, hash, userID, mintedBy, s.now().Format(time.RFC3339Nano), expiresAt.Format(time.RFC3339Nano))
 	if err != nil {
 		return fmt.Errorf("api.store.insertEnrolmentToken: %w", err)
 	}

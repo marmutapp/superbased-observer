@@ -178,7 +178,20 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 			break
 		}
 	}
+	st.flagPendingOutcomes(&res)
 	return res, nil
+}
+
+// flagPendingOutcomes marks every tool call still waiting for its result
+// at EOF. Its Success=true is a placeholder, so the store holds
+// failure-context bookkeeping for the row until the matching
+// ActionOutcomeUpdate reports the real outcome.
+func (st *parseState) flagPendingOutcomes(res *adapter.ParseResult) {
+	for _, idx := range st.pendingCall {
+		if idx < len(res.ToolEvents) {
+			res.ToolEvents[idx].OutcomePending = true
+		}
+	}
 }
 
 // runtimeSidecar is the shape of the `<uuid>.runtime.json` file qwen
@@ -460,17 +473,49 @@ func toolResultOutput(rec *rawRecord) string {
 // stampResult finds the pending ToolEvent for callID and records its
 // outcome. A non-empty status of anything other than "success" marks the
 // event failed.
+//
+// When no pending call matches, the functionCall was emitted in an
+// EARLIER parse window and its row is already persisted (optimistically
+// successful): the outcome goes out as an ActionOutcomeUpdate keyed by
+// the same "tool:<callID>" SourceEventID callEventID produced. Only a
+// non-empty callID qualifies — the empty-id fallback id embeds the
+// record uuid + position, neither of which the result record carries.
 func (st *parseState) stampResult(callID, status, output string, res *adapter.ParseResult) {
+	var scrubbed string
+	if output != "" {
+		scrubbed = st.adapter.scrubber.String(contentcap.Cap(output, contentcap.DefaultMaxBytes))
+	}
 	idx, ok := st.pendingCall[callID]
 	if !ok || idx >= len(res.ToolEvents) {
+		if callID == "" {
+			return
+		}
+		// An absent status is NOT a verdict — in-window it leaves
+		// Success untouched, and cross-tick it must do the same: the
+		// persisted row may already read failed (a ui_telemetry
+		// tool_call event in the earlier window stamps status), and
+		// asserting success here would silently repair it. Output
+		// still ships; an error message would be equally invented.
+		// DurationMs stays 0 — the call is in the prior window and
+		// UpdateActionOutcome no-ops a zero.
+		up := models.ActionOutcomeUpdate{
+			SourceFile:    st.path,
+			SourceEventID: "tool:" + callID,
+			SuccessKnown:  status != "",
+			Success:       status == "success",
+			ToolOutput:    scrubbed,
+		}
+		if up.SuccessKnown && !up.Success && scrubbed != "" {
+			up.ErrorMessage = truncate(scrubbed, 500)
+		}
+		res.OutcomeUpdates = append(res.OutcomeUpdates, up)
 		return
 	}
 	ev := &res.ToolEvents[idx]
 	if status != "" {
 		ev.Success = status == "success"
 	}
-	if output != "" {
-		scrubbed := st.adapter.scrubber.String(contentcap.Cap(output, contentcap.DefaultMaxBytes))
+	if scrubbed != "" {
 		ev.ToolOutput = scrubbed
 		if !ev.Success {
 			ev.ErrorMessage = truncate(scrubbed, 500)
@@ -481,7 +526,7 @@ func (st *parseState) stampResult(callID, status, output string, res *adapter.Pa
 
 // emitSystem dispatches system records by subtype: ui_telemetry events
 // (api_response → TokenEvent + tool_call enrichment + api_error →
-// ActionAPIError) and slash_command → an informational ActionUnknown row.
+// ActionAPIError) and slash_command → an ActionUserPromptExpansion row.
 func (st *parseState) emitSystem(rec *rawRecord, res *adapter.ParseResult) {
 	if rec.SystemPayload == nil {
 		return
@@ -583,8 +628,15 @@ func (st *parseState) emitAPIError(rec *rawRecord, ev *rawUIEvent, res *adapter.
 	})
 }
 
-// emitSlashCommand records a slash-command invocation as an informational
-// ActionUnknown row (only the initial invocation phase, to avoid noise).
+// emitSlashCommand records a slash-command invocation as an
+// ActionUserPromptExpansion row (only the initial invocation phase, to
+// avoid noise): the user typed a `/command` shorthand that the CLI
+// expands into the real prompt, the same family as claude-code's own
+// slash-command expansion. Kept in sync with
+// internal/tooltax/table.go's qwen-code "qwen-code.slash_command" row
+// by internal/tooltax's TestStepFinishEmitSitesAgreeWithTooltax
+// (WP-T6 finding — this site previously hardcoded ActionUnknown, which
+// drifted against the tooltax table).
 func (st *parseState) emitSlashCommand(rec *rawRecord, res *adapter.ParseResult) {
 	cmd := strings.TrimSpace(rec.SystemPayload.RawCommand)
 	if cmd == "" || (rec.SystemPayload.Phase != "" && rec.SystemPayload.Phase != "invocation") {
@@ -599,7 +651,7 @@ func (st *parseState) emitSlashCommand(rec *rawRecord, res *adapter.ParseResult)
 		Timestamp:     parseTimestamp(rec.Timestamp),
 		GitBranch:     st.lastBranch,
 		Tool:          models.ToolQwenCode,
-		ActionType:    models.ActionUnknown,
+		ActionType:    models.ActionUserPromptExpansion,
 		Target:        truncate(scrubbed, 200),
 		RawToolName:   "qwen-code.slash_command",
 		RawToolInput:  scrubbed,

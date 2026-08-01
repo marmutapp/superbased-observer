@@ -409,6 +409,65 @@ func sessionShapeKey(r rawRow) string {
 		r.tokens.CacheRead, r.tokens.CacheCreation)
 }
 
+// MaxSessionIDsPerScope bounds how many session ids ride in ONE Options.
+// SessionIDs scope. Each id becomes a bound parameter in every source query
+// (api_turns / token_usage / summary_calls), and SQLite refuses a statement
+// with more than SQLITE_MAX_VARIABLE_NUMBER (32766 in modernc.org/sqlite) of
+// them — "SQL logic error: too many SQL variables (1)". 900 leaves ample room
+// for the window/project/tool binds that share the statement and keeps each
+// prepared statement small enough to plan cheaply.
+const MaxSessionIDsPerScope = 900
+
+// SessionRowsByID prices an ARBITRARILY LARGE set of session ids and returns
+// the per-session rows keyed by session id. It is the ONE place that knows the
+// bind-variable ceiling: ids are de-duplicated, chunked into
+// MaxSessionIDsPerScope batches, and each batch runs its own GroupBySession
+// Summary. Merging the batches is safe because a session id lands in exactly
+// one chunk, so no group is ever split across queries (aggregation stays
+// additive and nothing is double-counted).
+//
+// Shared by BOTH tag-rollup call sites — internal/intelligence/dashboard's
+// Server.tagRollup (GET /api/sessions/tags) and cmd/observer's computeTagRollup
+// (`observer tags`) — so a large tag vocabulary can't blow the bind cap on one
+// surface and not the other. Callers own GroupBy/Limit: this helper forces
+// GroupBySession and sizes Limit to the chunk, since a per-chunk limit would
+// otherwise silently drop sessions from the merged map.
+func (e *Engine) SessionRowsByID(ctx context.Context, db *sql.DB, opts Options, sessionIDs []string) (map[string]Row, error) {
+	out := make(map[string]Row, len(sessionIDs))
+	if len(sessionIDs) == 0 {
+		return out, nil
+	}
+	// De-duplicate first: a repeated id in two different chunks would be
+	// counted twice in the merged map.
+	seen := make(map[string]struct{}, len(sessionIDs))
+	ids := make([]string, 0, len(sessionIDs))
+	for _, id := range sessionIDs {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	for start := 0; start < len(ids); start += MaxSessionIDsPerScope {
+		end := start + MaxSessionIDsPerScope
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := opts
+		chunk.GroupBy = GroupBySession
+		chunk.SessionIDs = ids[start:end]
+		chunk.Limit = len(chunk.SessionIDs)
+		summary, err := e.Summary(ctx, db, chunk)
+		if err != nil {
+			return nil, fmt.Errorf("cost.SessionRowsByID: %w", err)
+		}
+		for _, row := range summary.Rows {
+			out[row.Key] = row
+		}
+	}
+	return out, nil
+}
+
 // Summary runs the query against db and returns a grouped rollup.
 func (e *Engine) Summary(ctx context.Context, db *sql.DB, opts Options) (Summary, error) {
 	if opts.GroupBy == "" {

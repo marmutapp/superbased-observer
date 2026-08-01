@@ -7,8 +7,22 @@
 
 import { markRemoteAuthLost } from "@/lib/authLoss";
 import { getRemoteCSRF, isRemoteView, setRemoteCSRF } from "@/lib/remote";
+import type {
+  SessionTagsRequest,
+  SessionTagsResponse,
+  TagManageRequest,
+  TagManageResponse,
+  TagRollupResponse,
+} from "@/lib/types";
 
-export type QueryParams = Record<string, string | number | boolean | undefined>;
+// QueryParams values may be a plain scalar (one `k=v`) or a string ARRAY,
+// which serializes as a REPEATED key (`k=a&k=b`) rather than a joined value.
+// The repeated form is what /api/sessions?tag=…&tag=… expects for its AND
+// semantics; an empty array contributes nothing at all.
+export type QueryParams = Record<
+  string,
+  string | number | boolean | string[] | undefined
+>;
 
 export class ApiError extends Error {
   constructor(
@@ -25,6 +39,15 @@ function buildUrl(path: string, params?: QueryParams): string {
   const qs = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
     if (v === undefined || v === "" || v === false) continue;
+    if (Array.isArray(v)) {
+      // Repeated key, one entry per element — `append`, never `set`, or the
+      // last element would silently win over the rest.
+      for (const item of v) {
+        if (item === "") continue;
+        qs.append(k, item);
+      }
+      continue;
+    }
     qs.set(k, String(v));
   }
   const s = qs.toString();
@@ -128,4 +151,53 @@ export async function fetchJSON<T>(
     throw new ApiError(res.status, url, body);
   }
   return res.json() as Promise<T>;
+}
+
+// ---------- session classification (tags / favorites / notes) ----------
+//
+// Thin typed wrappers over fetchJSON so every caller inherits the remote
+// CSRF + auth-recovery handling above rather than reaching for bare fetch.
+// docs/plans/session-classification-tags-plan-2026-07-31.md §4.
+
+const jsonPost = (body: unknown): RequestInit => ({
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(body),
+});
+
+// fetchTagRollup returns the tag vocabulary plus per-tag session/cost/token
+// rollup. Also the source of the TagEditor's suggestion list.
+export function fetchTagRollup(signal?: AbortSignal): Promise<TagRollupResponse> {
+  return fetchJSON<TagRollupResponse>("/api/sessions/tags", undefined, { signal });
+}
+
+// postSessionTags mutates one session's tags/favorite/note and returns the
+// server's post-mutation truth. `favorite`/`note` default to null =
+// "unchanged"; pass a value only when the mutation actually touches them.
+export function postSessionTags(
+  sessionId: string,
+  patch: Partial<SessionTagsRequest>,
+): Promise<SessionTagsResponse> {
+  const body: SessionTagsRequest = {
+    add: patch.add ?? [],
+    remove: patch.remove ?? [],
+    favorite: patch.favorite ?? null,
+    note: patch.note ?? null,
+  };
+  return fetchJSON<SessionTagsResponse>(
+    `/api/session/${encodeURIComponent(sessionId)}/tags`,
+    undefined,
+    jsonPost(body),
+  );
+}
+
+// manageTags renames or deletes a tag across every session that carries it.
+// The request is rename XOR delete — the union type enforces it at the call
+// site so a body carrying both can't be constructed.
+export function manageTags(req: TagManageRequest): Promise<TagManageResponse> {
+  return fetchJSON<TagManageResponse>(
+    "/api/sessions/tags/manage",
+    undefined,
+    jsonPost(req),
+  );
 }

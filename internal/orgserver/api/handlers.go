@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -50,6 +51,11 @@ type Handlers struct {
 	// pre-G13 wire shape). Set once at assembly via
 	// SetOrgPolicyPublicKey, before serving starts.
 	policyPubKey string
+	// invite is the delegated-invite policy ([server].member_invites +
+	// member_invite_monthly_cap). Zero value = delegation OFF, which is the
+	// default posture; set once at assembly via SetInviteOptions. See
+	// invite.go.
+	invite InviteOptions
 }
 
 // SetOrgPolicyPublicKey installs the org policy public key delivered
@@ -229,58 +235,118 @@ func (h *Handlers) PushBatch(w http.ResponseWriter, r *http.Request, params gen.
 	})
 }
 
-// mintTokenRequest / mintTokenResponse are the admin enrolment-token mint
-// contract (SAML-protected; M3 formalises it in the dashboard OpenAPI surface).
+// mintTokenRequest / mintTokenResponse are the enrolment-token mint contract
+// (SAML-protected; M3 formalises it in the dashboard OpenAPI surface).
+//
+// Email is an ALTERNATIVE addressing mode to UserID, added with delegated
+// invites: an inviter knows their teammate's address, not their SCIM UUID.
+// Exactly one of the two must be supplied. Email resolution never creates a
+// member — an unknown address is a 404.
+//
+// TTLDays is a POINTER so an omitted value (keep the server default) is
+// distinguishable from an explicit one, which must fall inside
+// [minInviteTTLDays, maxInviteTTLDays] — see inviteTTL.
 type mintTokenRequest struct {
 	UserID  string `json:"user_id"`
-	TTLDays int    `json:"ttl_days,omitempty"`
+	Email   string `json:"email,omitempty"`
+	TTLDays *int   `json:"ttl_days,omitempty"`
 }
 
 type mintTokenResponse struct {
 	Token     string `json:"token"`
 	TokenID   string `json:"token_id"`
 	UserID    string `json:"user_id"`
+	UserEmail string `json:"user_email,omitempty"`
 	ExpiresAt string `json:"expires_at"`
+	// MintedMonth/MonthlyCap are populated only for a CAPPED (delegated
+	// member) mint; an admin mint leaves them zero.
+	MintedMonth int `json:"minted_this_month,omitempty"`
+	MonthlyCap  int `json:"monthly_cap,omitempty"`
 }
 
-// MintEnrolmentToken handles POST /api/org/enrolment-tokens. It is mounted
-// behind RequireSAMLSession. It generates a 32-byte token, stores its
-// argon2id hash with a TTL, and returns the cleartext exactly once.
+// MintEnrolmentToken handles POST /api/org/enrolment-tokens. It generates a
+// 32-byte token, stores its argon2id hash with a TTL, and returns the
+// cleartext exactly once.
+//
+// AUTHORITY LIVES IN THE MIDDLEWARE (auth.RequireInviterSAML), which admits
+// an org admin unconditionally and a plain member only when
+// [server].member_invites is on, stamping the outcome as an auth.InviteRole.
+// This handler REFUSES InviteRoleNone: reaching the mint with no established
+// role means it was mounted without its gate, and the correct answer to that
+// is 403, not a token. That fail-closed check is what keeps "the mint is
+// admin-first" a property of the code rather than of the route table.
+//
+// A delegated (member) mint is additionally bounded by the per-actor monthly
+// cap and recorded with the inviter's identity; an admin mint is uncapped
+// (an admin can already mint from the CLI) but still audited.
 func (h *Handlers) MintEnrolmentToken(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	role := auth.InviteRoleFromContext(ctx)
+	if role == auth.InviteRoleNone {
+		auth.WriteError(w, http.StatusForbidden, "forbidden", "org-admin authority required")
+		return
+	}
+	// Defence in depth over the gate: the delegated role is only meaningful
+	// when the org opted in. The middleware already refuses a member when
+	// member_invites is off; re-checking here means the relaxation cannot be
+	// reached through ANY future mounting, and it keeps the flag's authority
+	// in the same file as the mint it authorises.
+	if role == auth.InviteRoleMember && !h.invite.MemberInvites {
+		auth.WriteError(w, http.StatusForbidden, "invites_disabled",
+			"this organisation does not allow member invites ([server].member_invites is false)")
+		return
+	}
+	actor, _ := auth.UserIDFromContext(ctx)
+
 	var req mintTokenRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		auth.WriteError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
 		return
 	}
-	if req.UserID == "" {
-		auth.WriteError(w, http.StatusBadRequest, "bad_request", "user_id is required")
+	target, err := parseInviteTarget(req.UserID, req.Email)
+	if err != nil {
+		auth.WriteError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	ctx := r.Context()
-
-	ttl := h.enrolTokenTTL
-	if req.TTLDays > 0 {
-		ttl = time.Duration(req.TTLDays) * 24 * time.Hour
+	ttl, err := inviteTTL(req.TTLDays, h.enrolTokenTTL)
+	if err != nil {
+		auth.WriteError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
 	}
 
-	cleartext, tokenID, expiresAt, err := MintEnrolmentTokenForUser(ctx, h.store.db, req.UserID, ttl)
+	res, err := h.mintDelegated(ctx, actor, target, ttl, role == auth.InviteRoleMember, sourceIPOf(r), role.String())
 	switch {
 	case errors.Is(err, ErrUserNotFound):
-		auth.WriteError(w, http.StatusNotFound, "not_found", "no such user")
+		auth.WriteError(w, http.StatusNotFound, "not_found",
+			"no active member with that email — a mint hands over a token for an EXISTING member, it does not create one")
+		return
+	case errors.Is(err, ErrInviteAttemptBudget):
+		auth.WriteError(w, http.StatusTooManyRequests, "invite_attempts_exceeded",
+			fmt.Sprintf("too many invites for addresses that are not active members (%d per hour); wait for the window to roll", inviteAttemptBudget))
+		return
+	case errors.Is(err, ErrInviteCapReached):
+		auth.WriteError(w, http.StatusTooManyRequests, "invite_cap_reached",
+			fmt.Sprintf("monthly invite cap reached (%d per member); it resets at the start of next month", h.invite.cap()))
 		return
 	case err != nil:
 		h.logger.Error("mint token", "err", err)
 		auth.WriteError(w, http.StatusInternalServerError, "internal", "could not store token")
 		return
 	}
-	h.logger.Info("enrolment token minted", "user_id", req.UserID, "token_id", tokenID)
+	h.logger.Info("enrolment token minted", "user_id", res.UserID, "token_id", res.TokenID, "actor", actor, "role", role.String())
 
-	writeJSON(w, http.StatusCreated, mintTokenResponse{
-		Token:     cleartext,
-		TokenID:   tokenID,
-		UserID:    req.UserID,
-		ExpiresAt: expiresAt.UTC().Format(time.RFC3339),
-	})
+	resp := mintTokenResponse{
+		Token:     res.Token,
+		TokenID:   res.TokenID,
+		UserID:    res.UserID,
+		UserEmail: res.UserEmail,
+		ExpiresAt: res.ExpiresAt.UTC().Format(time.RFC3339),
+	}
+	if role == auth.InviteRoleMember {
+		resp.MintedMonth = res.MintedThis
+		resp.MonthlyCap = res.MonthlyCap
+	}
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 // ErrUserNotFound is returned by MintEnrolmentTokenForUser when the target
@@ -292,7 +358,21 @@ var ErrUserNotFound = errors.New("api: no such user")
 // non-positive), and returns the cleartext exactly once. Shared by the HTTP
 // mint handler and the observer-org `new-enrolment-token` CLI command so
 // there is one minting implementation.
+//
+// The mint is UNATTRIBUTED (enrolment_tokens.minted_by stays NULL) — the
+// shape the CLI has: it runs as the server operator against the DB directly
+// and has no session identity. Attributed mints go through
+// MintEnrolmentTokenForUserBy.
 func MintEnrolmentTokenForUser(ctx context.Context, db *sql.DB, userID string, ttl time.Duration) (cleartext, tokenID string, expiresAt time.Time, err error) {
+	return MintEnrolmentTokenForUserBy(ctx, db, userID, "", ttl)
+}
+
+// MintEnrolmentTokenForUserBy is MintEnrolmentTokenForUser with inviter
+// attribution: mintedBy is recorded on the token row (empty = unattributed).
+// It is the single minting implementation; the attribution feeds both the
+// per-actor monthly cap and the server-side invite→enrolment conversion read
+// (server migration 023).
+func MintEnrolmentTokenForUserBy(ctx context.Context, db *sql.DB, userID, mintedBy string, ttl time.Duration) (cleartext, tokenID string, expiresAt time.Time, err error) {
 	s := newStore(db)
 	if _, ok, lookErr := s.memberByID(ctx, userID); lookErr != nil {
 		return "", "", time.Time{}, lookErr
@@ -302,26 +382,15 @@ func MintEnrolmentTokenForUser(ctx context.Context, db *sql.DB, userID string, t
 	if ttl <= 0 {
 		ttl = 7 * 24 * time.Hour
 	}
-	secret, err := newCleartextToken(32)
-	if err != nil {
-		return "", "", time.Time{}, err
-	}
-	// Only the secret is hashed; the token_id is the (non-secret) lookup key.
-	hash, err := hashToken(secret)
-	if err != nil {
-		return "", "", time.Time{}, err
-	}
-	tokenID, err = randID()
+	cleartext, tokenID, hash, err := newTokenMaterial()
 	if err != nil {
 		return "", "", time.Time{}, err
 	}
 	expiresAt = s.now().Add(ttl)
-	if err := s.insertEnrolmentToken(ctx, tokenID, hash, userID, expiresAt); err != nil {
+	if err := s.insertEnrolmentToken(ctx, tokenID, hash, userID, mintedBy, expiresAt); err != nil {
 		return "", "", time.Time{}, err
 	}
-	// The admin hands the developer this single compound string; the server
-	// resolves the user from token_id at enrol, so no user_id is needed there.
-	return tokenID + "." + secret, tokenID, expiresAt, nil
+	return cleartext, tokenID, expiresAt, nil
 }
 
 // resolveEnrolmentToken parses a compound "<token_id>.<secret>" token, looks up

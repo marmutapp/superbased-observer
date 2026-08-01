@@ -150,7 +150,10 @@ func TestWireAIClients_ExplicitCodexSelectsWindowsTarget(t *testing.T) {
 	defer proxyroute.SetWSLForTest(true)()
 
 	home := interactiveHome(t) // native home for the base-codex writes
-	winHome := t.TempDir()     // Windows USER home (override target)
+	// The Windows USER home must live UNDER the pinned HomeDir — a sandboxed
+	// caller's override is honoured only when contained
+	// (crossmount.AutoDetectSuppressed, 2026-07-31 follow-up round).
+	winHome := filepath.Join(home, "mnt", "c", "Users", "tester")
 	if err := os.MkdirAll(filepath.Join(winHome, ".codex"), 0o755); err != nil {
 		t.Fatal(err)
 	}

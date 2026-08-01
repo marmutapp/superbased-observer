@@ -11,7 +11,12 @@ import { ChartState } from "@/components/ChartState";
 import { RestartOverlay } from "@/components/RestartOverlay";
 import { useApi } from "@/lib/useApi";
 import { useDaemonRestart } from "@/lib/useDaemonRestart";
-import type { DoctorReport, HealthFailuresResponse } from "@/lib/types";
+import { isUpdateAvailable, useUpdateCheck } from "@/lib/version";
+import type {
+  DoctorReport,
+  HealthFailuresResponse,
+  StatusSnapshot,
+} from "@/lib/types";
 
 // HealthSection — the `observer doctor` checks in the dashboard
 // (usability arc P4.8 / review row D1). Read-only; the Details lines
@@ -22,6 +27,9 @@ export function HealthSection() {
   return (
     <>
       <DaemonCard />
+      <div className="mt-4">
+        <UpdateCard />
+      </div>
       <div className="mt-4">
         <DoctorCard />
       </div>
@@ -73,6 +81,77 @@ function DaemonCard() {
           {/http|501|not\s|unavailable/i.test(error)
             ? "Restart isn’t available on this dashboard — it needs the full daemon started with `observer start` (the standalone `observer dashboard` can’t re-exec itself)."
             : `Restart failed — ${error}`}
+        </p>
+      )}
+    </ChartShell>
+  );
+}
+
+// UpdateCard — the user-initiated update check (zero-network hardening
+// pass, 2026-07-30). Nothing here fetches on mount: the "Check for
+// updates" button is the only thing that ever contacts npm, and it
+// does so exactly once per click. See web/src/lib/version.ts and
+// `observer privacy` for the same claim verified from the CLI side.
+function UpdateCard() {
+  const status = useApi<StatusSnapshot>("/api/status");
+  const current = status.data?.version;
+  const { latest, checking, error, lastCheckedAt, checkNow } =
+    useUpdateCheck();
+  const updateAvailable = isUpdateAvailable(current, latest);
+  return (
+    <ChartShell
+      title="Updates"
+      sub="Checks npmjs.org only when you click below — never automatically, never in the background. No other page or timer triggers this request."
+    >
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="text-[11.5px] text-fg-3">
+          Running{" "}
+          <span className="font-mono text-fg-1">
+            v{current || "dev"}
+          </span>
+        </span>
+        <button
+          type="button"
+          onClick={() => void checkNow()}
+          disabled={checking}
+          className="rounded-2 border border-line-2 bg-bg-2 px-2.5 py-1 text-[11px] text-fg-2 hover:bg-bg-3 disabled:opacity-60"
+        >
+          {checking ? "Checking npm…" : "Check for updates"}
+        </button>
+        {lastCheckedAt && !checking && (
+          <span className="text-[11px] text-fg-4">
+            last checked {new Date(lastCheckedAt).toLocaleString()}
+          </span>
+        )}
+      </div>
+      {error && (
+        <p className="mt-2 text-[11.5px] text-danger">
+          Couldn’t reach registry.npmjs.org — check your network and try
+          again.
+        </p>
+      )}
+      {!error && latest && (
+        <p className="mt-2 text-[11.5px]">
+          {updateAvailable ? (
+            <>
+              <span className="text-accent">v{latest} is available</span> —
+              update with <kbd>npm i -g @superbased/observer</kbd> or{" "}
+              <kbd>pipx upgrade superbased-observer</kbd>, or read the{" "}
+              <a
+                href={`https://github.com/superbasedapp/observer/releases/tag/v${latest}`}
+                target="_blank"
+                rel="noreferrer"
+                className="text-accent hover:underline"
+              >
+                release notes
+              </a>
+              .
+            </>
+          ) : (
+            <span className="text-fg-3">
+              You’re on the latest published version.
+            </span>
+          )}
         </p>
       )}
     </ChartShell>

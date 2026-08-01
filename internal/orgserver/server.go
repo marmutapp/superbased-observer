@@ -139,6 +139,17 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Server, 
 
 	handlers := api.New(db, issuer, org,
 		time.Duration(cfg.Enrolment.DefaultTokenLifetimeDays)*24*time.Hour, logger)
+	// Delegated invites (Arc 2). Default OFF; the flag gates BOTH the SAML
+	// member relaxation and the agent invite endpoint, and the cap bounds
+	// every delegated mint on either surface.
+	handlers.SetInviteOptions(api.InviteOptions{
+		MemberInvites: cfg.Server.MemberInvites,
+		MonthlyCap:    cfg.Server.MemberInviteMonthlyCap,
+	})
+	if cfg.Server.MemberInvites {
+		logger.Info("orgserver: member invites ENABLED — any active SAML member (and any enrolled agent) may mint an enrolment token for an existing member",
+			"monthly_cap_per_member", cfg.Server.MemberInviteMonthlyCap)
+	}
 
 	// Org policy channel (guard spec §14.2): when a policy signing key
 	// is configured, deliver its public half at enrolment so agents
@@ -201,24 +212,20 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Server, 
 		keyPath := cfg.Policy.SigningKeyPath
 		policySigner = func() (ed25519.PrivateKey, error) { return auth.LoadSigningKey(keyPath) }
 	}
-	orgAPI := dashboard.NewAPI(db, rollupCache, dashboard.Options{
-		AdminEmails:          cfg.Dashboard.AdminEmails,
-		PolicyAdminEmails:    cfg.Dashboard.PolicyAdminEmails,
-		SecurityViewerEmails: cfg.Dashboard.SecurityViewerEmails,
-		PolicySigner:         policySigner,
-	}, logger)
+	orgAPI := dashboard.NewAPI(db, rollupCache, dashboardOptions(cfg, policySigner), logger)
 
 	handler := buildMux(buildDeps{
-		handlers:    handlers,
-		saml:        saml,
-		scimHandler: scimHandler,
-		orgAPI:      orgAPI,
-		sessions:    sessions,
-		scimToken:   scimToken,
-		logger:      logger,
-		db:          db,
-		adminEmails: cfg.Dashboard.AdminEmails,
-		devAuth:     cfg.Server.DevAuth,
+		handlers:      handlers,
+		saml:          saml,
+		scimHandler:   scimHandler,
+		orgAPI:        orgAPI,
+		sessions:      sessions,
+		scimToken:     scimToken,
+		logger:        logger,
+		db:            db,
+		adminEmails:   cfg.Dashboard.AdminEmails,
+		devAuth:       cfg.Server.DevAuth,
+		memberInvites: cfg.Server.MemberInvites,
 	})
 
 	// Shared email notifier (gap-register G9) — the OPTIONAL additional
@@ -301,6 +308,23 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Server, 
 // validates. Every failure is WARN-only so a misconfigured analytics block never
 // blocks server startup. Extracted from New to keep its cyclomatic complexity in
 // check.
+// dashboardOptions maps server config onto the dashboard API's options.
+//
+// Extracted from New so the Config → Options mapping is reachable from a test.
+// It is the seam where a field can silently stop being carried: an option that
+// stops being populated here leaves every handler test green while the value
+// never reaches a request. CopilotPerSeatPriceUSD is exactly that shape — it
+// was a configured value nothing read until the telemetry surface consumed it.
+func dashboardOptions(cfg config.Config, policySigner dashboard.PolicySigner) dashboard.Options {
+	return dashboard.Options{
+		AdminEmails:            cfg.Dashboard.AdminEmails,
+		PolicyAdminEmails:      cfg.Dashboard.PolicyAdminEmails,
+		SecurityViewerEmails:   cfg.Dashboard.SecurityViewerEmails,
+		PolicySigner:           policySigner,
+		CopilotPerSeatPriceUSD: cfg.CopilotAnalytics.PerSeatPriceUSD,
+	}
+}
+
 func buildCCScheduler(cfg config.Config, db *sql.DB, orgID string, logger *slog.Logger) *ccanalytics.Scheduler {
 	if !cfg.CCAnalytics.Enabled {
 		return nil
@@ -547,6 +571,10 @@ type buildDeps struct {
 	db          *sql.DB  // for /readyz
 	adminEmails []string // [dashboard].admin_emails — gates privileged /api/org/* routes
 	devAuth     bool     // M3.2: enables /auth/dev/login (compose-only convenience)
+	// memberInvites mirrors [server].member_invites: when true a non-admin
+	// SAML member may mint an enrolment token for an existing member, and
+	// the bearer-authenticated agent invite endpoint is live. Default false.
+	memberInvites bool
 }
 
 // buildMux assembles the route table and wraps it with global middleware.
@@ -566,7 +594,17 @@ func adminCheckerFor(db *sql.DB, adminEmails []string) auth.AdminChecker {
 			return false, nil
 		}
 		var email string
-		err := db.QueryRowContext(ctx, `SELECT email FROM org_members WHERE user_id = ?`, userID).Scan(&email)
+		// `AND active = 1` is load-bearing, not tidiness: a SAML session
+		// outlives the SCIM row it was issued against, so without it a
+		// DEPROVISIONED admin keeps full org-admin authority — every
+		// RequireAdminSAML route (policy publish, announcements, the token
+		// list, the spend export) plus the uncapped admin branch of
+		// RequireInviterSAML — for the whole session lifetime. Deactivation
+		// has to remove authority, not just future logins. Fixed at the
+		// CHECKER rather than per-route because "admin" and "still employed
+		// here" are one question, and every caller wants the same answer.
+		err := db.QueryRowContext(ctx,
+			`SELECT email FROM org_members WHERE user_id = ? AND active = 1`, userID).Scan(&email)
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
 		}
@@ -574,6 +612,31 @@ func adminCheckerFor(db *sql.DB, adminEmails []string) auth.AdminChecker {
 			return false, err
 		}
 		return allow[strings.ToLower(email)], nil
+	}
+}
+
+// activeMemberCheckerFor builds the auth.AdminChecker-shaped closure
+// RequireInviterSAML uses for the DELEGATED half of the invite gate: it
+// reports whether the session user is a currently-ACTIVE org member.
+//
+// It is deliberately a second, separate check rather than "has a session":
+// SAML JIT-creates a member row on first login and SCIM can deactivate it
+// later, so a deprovisioned-but-still-cookied user must not be able to hand
+// out enrolment tokens.
+func activeMemberCheckerFor(db *sql.DB) auth.AdminChecker {
+	return func(ctx context.Context, userID string) (bool, error) {
+		if userID == "" {
+			return false, nil
+		}
+		var active int
+		err := db.QueryRowContext(ctx, `SELECT active FROM org_members WHERE user_id = ?`, userID).Scan(&active)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return active != 0, nil
 	}
 }
 
@@ -662,7 +725,27 @@ func buildMux(d buildDeps) http.Handler {
 		d.sessions, adminCheckerFor(d.db, d.adminEmails),
 		auth.JSONUnauthorized(), auth.JSONForbidden(),
 	)
-	mux.Handle("POST /api/org/enrolment-tokens", requireAdminSAML(http.HandlerFunc(d.handlers.MintEnrolmentToken)))
+	// The mint endpoint keeps the admin gate as its FLOOR and adds exactly
+	// one opt-in relaxation: with [server].member_invites = true a non-admin
+	// ACTIVE member may also mint (the Teams bottom-up invite loop, Arc 2).
+	// Default false ⇒ RequireInviterSAML is byte-for-byte the old admin
+	// behaviour. The role it stamps drives the per-member monthly cap in the
+	// handler; the handler refuses a request carrying no role at all.
+	requireInviterSAML := auth.RequireInviterSAML(
+		d.sessions, adminCheckerFor(d.db, d.adminEmails), activeMemberCheckerFor(d.db),
+		d.memberInvites, auth.JSONUnauthorized(), auth.JSONForbidden(),
+	)
+	mux.Handle("POST /api/org/enrolment-tokens", requireInviterSAML(http.HandlerFunc(d.handlers.MintEnrolmentToken)))
+	// Admin read of outstanding/redeemed tokens — the "who did I invite and
+	// did they enrol" rail the web2 Invite page shows to admins. Admin-only
+	// (it names every developer in the org); a member sees only the token
+	// they just minted, in the mint response.
+	mux.Handle("GET /api/org/enrolment-tokens", requireAdminSAML(enrolmentTokensListHandler(d.db)))
+	// Bearer-authenticated sibling of the mint endpoint, for the NODE
+	// dashboard's invite affordance. Gated on the SAME member_invites flag,
+	// attributed to the enrolled subject, ALWAYS capped, always audited —
+	// the SAML endpoint is not weakened to serve it (see api.MintInviteToken).
+	mux.Handle("POST /api/agent/invite-token", auth.RequireBearer(d.handlers)(http.HandlerFunc(d.handlers.MintInviteToken)))
 
 	// Model-routing org policy registry (model-routing spec §R19.1/
 	// §R19.2): admin publish behind the SAML session (RBAC: the same
@@ -673,6 +756,20 @@ func buildMux(d buildDeps) http.Handler {
 	// remote enforce toggle exists).
 	mux.Handle("POST /api/org/routing-policy", requireAdminSAML(routingPolicyPublishHandler(d.db)))
 	mux.Handle("GET /api/agent/routing-policy", auth.RequireBearer(d.handlers)(routingPolicyGetHandler(d.db)))
+
+	// Org announcements (rail R3 of the dashboard-announcements plan
+	// §4): the same publish/fetch shape as the routing-policy registry
+	// above, and the same signing key. Admin publish + admin read of
+	// the current document behind the SAML admin gate (every publish
+	// lands an audit row in the SAME transaction); agent fetch behind
+	// the enrolment bearer, which is why this rail costs no new network
+	// behaviour on the node — it rides the poll the agent already makes.
+	// The document can only put dismissible text in a banner; the node's
+	// [dashboard].org_announcements switch silences it locally and no
+	// server-side override for that exists.
+	mux.Handle("POST /api/org/announcement", requireAdminSAML(announcementPublishHandler(d.db)))
+	mux.Handle("GET /api/org/announcement", requireAdminSAML(announcementCurrentHandler(d.db)))
+	mux.Handle("GET /api/agent/announcement", auth.RequireBearer(d.handlers)(announcementGetHandler(d.db)))
 	// §R19.5 org rollup audit export (CSV/JSON) — admin surface.
 	mux.Handle("GET /api/org/routing-summaries/export", requireAdminSAML(routingSummariesExportHandler(d.db)))
 	// T5 per-end-user spend rollup (org-budget guardrails plan §2.1) — admin

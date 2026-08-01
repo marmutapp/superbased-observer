@@ -16,6 +16,7 @@ import {
   LayoutDashboard,
   Lightbulb,
   type LucideIcon,
+  Megaphone,
   Radio,
   Receipt,
   ScrollText,
@@ -102,6 +103,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { to: "/security", label: "Security", icon: Shield },
       { to: "/policy", label: "Policy", icon: FileLock2 },
+      { to: "/announcements", label: "Announcements", icon: Megaphone },
       { to: "/audit", label: "Audit", icon: ScrollText },
     ],
   },

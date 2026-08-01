@@ -192,6 +192,127 @@ jobs:
         run: make verify-website-build
 
   # ----------------------------------------------------------------
+  # Track-page drift gate. website/track-gen derives the per-adapter
+  # "Track <tool> costs" pages from internal/integration.Capabilities()
+  # (the one-owner adapter capability registry) and rewrites the
+  # matching marker blocks in nav.toml + sitemap.xml. It has
+  # historically been run by hand, so a registry change (new adapter,
+  # changed capability row) could ship without anyone re-running it —
+  # this job closes that gap the same way website-build-drift does for
+  # the marketing pages: regenerate into a scratch copy, diff, never
+  # mutate the working tree.
+  # ----------------------------------------------------------------
+  track-build-drift:
+    name: track page drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+      - name: Verify
+        run: make verify-track-build
+
+  # ----------------------------------------------------------------
+  # Plugin-manifest drift gate. plugins/plugingen derives the in-tool
+  # plugin manifests (Claude Code plugin + marketplace catalog, Cursor
+  # MCP install deeplink, Gemini CLI extension, Goose listing, Codex
+  # plugin + catalog, OpenCode package wiring) by RUNNING the real
+  # `observer init` registrars — internal/mcp's Registrar and
+  # internal/hook's Registry — against a throwaway sandbox HOME. It is
+  # invoked by hand (`make plugins-build`), so a registrar change (new
+  # hook event, changed MCP argument) could ship with the published
+  # plugin still declaring the old wiring. This job closes that gap
+  # exactly like track-build-drift: regenerate into a scratch copy, diff,
+  # never mutate the working tree. See
+  # docs/plans/adapter-plugins-distribution-plan-2026-07-31.md §3.
+  #
+  # node + web deps are here for the SECOND half of the gate: the
+  # OpenCode package's hand-written TypeScript is parsed with the esbuild
+  # vendored in web/node_modules (the verify-taxonomy-ts pattern), so a
+  # syntax error in glue the Go tests can only substring-check cannot
+  # reach an operator's `npm publish`. Nothing is installed for the
+  # plugin itself.
+  # ----------------------------------------------------------------
+  plugins-build-drift:
+    name: plugin manifest drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+      - name: npm ci
+        run: |
+          cd web
+          npm ci
+      - name: Verify
+        run: make verify-plugins-build
+      # The public-repo assembly is a SECOND transpose on top of the
+      # generated tree (directory-per-surface -> repository-root, plus the
+      # release restamp), and it carries its own honesty gate. --self-check
+      # assembles twice into mktemp dirs, byte-diffs them and removes them,
+      # so a broken assembler or a README whose install-section anchors
+      # moved fails here rather than at publish time. It writes nothing
+      # into the working tree and publishes nothing.
+      - name: Verify plugins-repo assembly
+        run: bash scripts/assemble-plugins-repo.sh --self-check
+
+  # ----------------------------------------------------------------
+  # Action-taxonomy drift gate. web/taxgen mirrors internal/tooltax —
+  # the one owner of the cross-adapter tool/MCP taxonomy — into
+  # web/src/lib/actiontax.gen.*, which web/src/lib/actions.ts reads
+  # for its categories, action-type labels and MCP parse rules. It is
+  # invoked by hand (`make taxonomy-build`), so a new action type or
+  # category could ship with the dashboard still rendering the old
+  # vocabulary — which is exactly how the frontend grew its own
+  # divergent taxonomy before WP-T1. Same shape as plugins-build-drift:
+  # regenerate into a scratch dir, byte-diff, never mutate the working
+  # tree. See
+  # docs/plans/tool-taxonomy-standardization-plan-2026-07-31.md §1/§7.
+  #
+  # The second step is the CROSS-LANGUAGE half: the drift gate only
+  # proves the generated files match Go, so this compiles the real
+  # actions.ts (esbuild) and runs it against the generated vectors. It
+  # needs node + web deps — hence the setup-node/npm ci steps here,
+  # mirroring the frontend job — because a Go-side reference
+  # implementation of the TypeScript parser can only prove Go agrees
+  # with Go.
+  # ----------------------------------------------------------------
+  taxonomy-build-drift:
+    name: action taxonomy drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+      - name: npm ci
+        run: |
+          cd web
+          npm ci
+      - name: Verify generated artifacts
+        run: make verify-taxonomy-build
+      - name: Verify the real TypeScript against the Go oracle
+        run: make verify-taxonomy-ts
+      - name: Verify the generated backfill migration
+        run: make verify-taxonomy-migration
+      - name: Verify the generated assistant-text relabel migration
+        run: make verify-assistant-migration
+      - name: Verify the generated reasoning convergence migration
+        run: make verify-reasoning-migration
+
+  # ----------------------------------------------------------------
   # Helm chart smoke (Teams M5). Lint + template the observer-org chart,
   # then `helm install` it into an ephemeral kind cluster to prove the
   # rendered manifests are accepted by a real API server and the release

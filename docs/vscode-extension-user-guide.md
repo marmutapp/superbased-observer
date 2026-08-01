@@ -94,7 +94,8 @@ dashboard panel.
 
 Three states:
 
-- **Live** (normal) — the dollar amount + a graph icon.
+- **Live** (normal) — the dollar amount + a graph icon, prefixed with
+  the `▞ superbased` wordmark (turn it off with `observer.statusBar.wordmark = false`).
 - **Idle** (warning background) — "SuperBased idle" when no daemon
   is running.
 - **Degraded** (error background) — "SuperBased unreachable" when the

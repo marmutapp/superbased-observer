@@ -120,6 +120,9 @@ func buildEvents(
 	}
 
 	emittedSessions := map[string]struct{}{}
+	// Reasoning is never its own action row (B3) — it rides the next
+	// event this batch emits. See reasoningThread for the semantics.
+	var pending reasoningThread
 	for _, m := range messages {
 		sess, ok := sessions[m.SessionID]
 		if !ok {
@@ -138,15 +141,14 @@ func buildEvents(
 			// Reasoning path — Hermes persists the model's chain-of-
 			// thought in messages.reasoning / reasoning_content
 			// (schema-v14; both populated identically in the live
-			// corpus). Emit a standalone, visible hermes.reasoning row
-			// (matches gemini/cline/codex) so the timeline shows the
-			// thinking that preceded the tool calls / response below.
-			// Suppressed for hook-covered sessions to mirror the tool-
-			// call/text dedup discipline (hooks carry their own rows).
-			if !isHooked(sess.ID) {
-				if r := hermesReasoning(m); r != "" {
-					toolEvents = append(toolEvents, assistantReasoningEvent(m, sess, sourceFile, sc, r))
-				}
+			// corpus). B3: it mints NO row of its own; it is held and
+			// threaded onto the first event this message produces (a
+			// tool call, else the assistant text) as
+			// PrecedingReasoning. Capture is NOT hook-gated the way
+			// the retired row was — threading adds no row, so there is
+			// no hook/SQLite duplicate to suppress.
+			if r := strings.TrimSpace(hermesReasoning(m)); r != "" {
+				pending.set(sess.ID, r)
 			}
 			// Tool calls path — emit one ToolEvent per element of the
 			// tool_calls JSON. Suppressed for hook-covered sessions:
@@ -160,6 +162,9 @@ func buildEvents(
 				} else {
 					for callIdx, call := range calls {
 						evt := assistantToolEvent(m, sess, call, callIdx, resultsByCallID, sourceFile, sc)
+						if r := pending.take(sess.ID, sc); r != "" {
+							evt.PrecedingReasoning = r
+						}
 						toolEvents = append(toolEvents, evt)
 					}
 				}
@@ -174,14 +179,37 @@ func buildEvents(
 			// batches); pre-fix all 5 were invisible to the
 			// dashboard.
 			if m.Content.Valid && strings.TrimSpace(m.Content.String) != "" {
-				toolEvents = append(toolEvents, assistantTextEvent(m, sess, sourceFile, sc))
+				evt := assistantTextEvent(m, sess, sourceFile, sc)
+				// The message's own reasoning, when no tool call on this
+				// message already consumed it.
+				if r := pending.take(sess.ID, sc); r != "" {
+					evt.PrecedingReasoning = r
+				}
+				toolEvents = append(toolEvents, evt)
 			}
 		case "user":
 			// User prompt — the operator's typed message. Skipped
 			// pre-fix because the original buildEvents only handled
 			// tool calls. Live corpus 20260605_154029_7b8623 has 6
 			// user rows; all 6 invisible pre-fix.
+			//
+			// WP-T6 finding H1: Hermes's own verify-on-stop loop (and
+			// its codex-ack continuation) inject synthetic follow-ups
+			// as role='user' messages, indistinguishable from real
+			// input by role alone. isHarnessSyntheticUserMessage
+			// detects the grounded "[System: " prefix (see
+			// usermessage.go) and skips them — a harness reminder is
+			// not developer activity, and counting it as user_prompt
+			// would shrink the boundary count internal/predict's
+			// fan-out ladder resolves T from.
+			// A user turn is a reasoning boundary: thinking left
+			// unconsumed by the previous turn is dropped, never stamped
+			// onto the new turn's rows.
+			pending.clear()
 			if m.Content.Valid && strings.TrimSpace(m.Content.String) != "" {
+				if isHarnessSyntheticUserMessage(m.Content.String) {
+					continue
+				}
 				toolEvents = append(toolEvents, userPromptEvent(m, sess, sourceFile, sc))
 			}
 		case "tool":
@@ -279,36 +307,52 @@ func hermesReasoning(m messageRow) string {
 	return ""
 }
 
-// assistantReasoningEvent maps an assistant message's reasoning text
-// into a standalone, visible reasoning row (ActionTaskComplete +
-// RawToolName "hermes.reasoning"), mirroring the cross-adapter
-// convention (gemini.reasoning / cline.reasoning / opencode.reasoning).
-// No token/cost fields — usage flows through the session token row.
-func assistantReasoningEvent(m messageRow, sess sessionRow, sourceFile string, sc *scrub.Scrubber, reasoning string) models.ToolEvent {
-	body := reasoning
+// reasoningThread holds an assistant message's chain-of-thought until
+// the next event consumes it as PrecedingReasoning. Pre-B3 the text
+// minted its own ActionTaskComplete row (`hermes.reasoning`) — a phantom
+// action for something the model never did.
+//
+// Semantics (grok-style default adopted by B3):
+//
+//   - CONSUMED-ONCE: the first successor event (the message's first tool
+//     call, else its assistant-text row) takes it and clears it, so one
+//     block of thinking is never stamped onto a whole session.
+//   - LAST-WINS: an unconsumed body is replaced by a newer one — the
+//     nearest thinking is the one that introduced the call.
+//   - TURN-BOUNDARY DISCARD: a role='user' message clears it.
+//   - SESSION-SCOPED: one hermes state.db holds many sessions and the
+//     message scan interleaves them, so reasoning never crosses a
+//     session id.
+type reasoningThread struct {
+	sessionID string
+	text      string
+}
+
+// set records a reasoning body for a session (last-wins).
+func (t *reasoningThread) set(sessionID, body string) {
+	t.sessionID, t.text = sessionID, body
+}
+
+// clear drops any pending reasoning (turn boundary).
+func (t *reasoningThread) clear() { t.sessionID, t.text = "", "" }
+
+// take consumes the pending reasoning for sessionID, or returns "" when
+// nothing is pending / it belongs to another session. Scrubbing + the
+// 200-char cap happen HERE (at flush) so the preview convention the
+// retired `hermes.reasoning` row carried is preserved unchanged.
+func (t *reasoningThread) take(sessionID string, sc *scrub.Scrubber) string {
+	if t.text == "" || t.sessionID != sessionID {
+		return ""
+	}
+	body := t.text
 	if sc != nil {
 		body = sc.String(body)
 	}
-	preview := body
-	if len(preview) > 200 {
-		preview = preview[:200]
+	if len(body) > 200 {
+		body = body[:200]
 	}
-	return models.ToolEvent{
-		SourceFile:         sourceFile,
-		SourceEventID:      fmt.Sprintf("m%d:reasoning", m.ID),
-		SessionID:          m.SessionID,
-		ProjectRoot:        normalizeProjectRoot(sess.CWD),
-		Timestamp:          unixFloatToTime(m.Timestamp),
-		Tool:               models.ToolHermes,
-		Model:              stripProviderPrefix(sess.Model),
-		ActionType:         models.ActionTaskComplete,
-		Target:             preview,
-		Success:            true,
-		PrecedingReasoning: preview,
-		RawToolName:        "hermes.reasoning",
-		ToolOutput:         contentcap.Cap(body, contentcap.DefaultMaxBytes),
-		MessageID:          fmt.Sprintf("hermes-msg-%d", m.ID),
-	}
+	t.clear()
+	return body
 }
 
 // assistantTextEvent maps a role='assistant' message with non-empty

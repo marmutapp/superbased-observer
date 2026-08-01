@@ -185,6 +185,88 @@ export function newestAssistantWithOutput(rows: MessageRow[]): MessageRow | null
   return best;
 }
 
+export type BurnRate = {
+  usdPerHour: number;
+  /** How the rate was derived, so the UI can label it instead of implying
+   *  a precision it doesn't have. */
+  basis: "recent" | "session";
+  /** Seconds the rate was measured over. */
+  spanSecs: number;
+  /** Turns in the numerator (0 for the session-average basis). */
+  turns: number;
+};
+
+/** Burn rate in USD/hour for a running session — the number that answers
+ *  "should I stop this?", which a running total never does.
+ *
+ *  Preferred basis is the turns the cockpit already polls (a tail, not the
+ *  whole session), so the rate reflects what the session is costing NOW
+ *  rather than being diluted by earlier idle time. The oldest fetched turn
+ *  is the window BOUNDARY, not a sample: its cost was incurred before the
+ *  window opened, so it sets the denominator but is excluded from the
+ *  numerator. Counting it would inflate the rate by N/(N-1) — ~20% at the
+ *  cockpit's tail of six.
+ *
+ *  Falls back to the session average over the same elapsed value the header
+ *  displays, so the two can never disagree. Returns null when neither basis
+ *  is available, rather than a confident "$0.00/h" on no evidence — a rate
+ *  needs an interval, and that is the failure mode this codebase keeps
+ *  fixing. Note the precise claim: null means NO BASIS. A basis that really
+ *  measures zero dollars still returns 0, which is an observation, not a
+ *  guess — and it agrees with the session total rendered beside it.
+ */
+export function burnRate(
+  rows: MessageRow[],
+  costUsd?: number | null,
+  elapsedSecs?: number | null,
+): BurnRate | null {
+  if (rows.length >= 2) {
+    const sorted = [...rows].sort(
+      (a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp),
+    );
+    const startMs = Date.parse(sorted[0].timestamp);
+    const spanSecs =
+      (Date.parse(sorted[sorted.length - 1].timestamp) - startMs) / 1000;
+    if (Number.isFinite(spanSecs) && spanSecs > 0) {
+      // Exclude EVERY row at the boundary instant, not just index 0. A user
+      // turn and the assistant turn answering it routinely share a
+      // timestamp, and skipping only the first would count the other's cost
+      // against a window it contributed no time to.
+      let usd = 0;
+      let turns = 0;
+      for (const m of sorted) {
+        if (Date.parse(m.timestamp) === startMs) continue;
+        usd += Number.isFinite(m.cost_usd) ? m.cost_usd : 0;
+        turns++;
+      }
+      // usd > 0, not turns > 0: the backend synthesizes user rows with a
+      // zero cost, so a tail like [user $0, assistant $1, user $0] leaves a
+      // costless row after boundary exclusion and would report a "recent"
+      // $0/h — a basis label claiming we measured current spend when we
+      // measured none. Fall through to the session average instead.
+      const usdPerHour = usd / (spanSecs / 3600);
+      if (usd > 0 && Number.isFinite(usdPerHour)) {
+        return { usdPerHour, basis: "recent", spanSecs, turns };
+      }
+    }
+  }
+  if (
+    costUsd != null &&
+    Number.isFinite(costUsd) &&
+    costUsd >= 0 &&
+    elapsedSecs != null &&
+    elapsedSecs > 0
+  ) {
+    return {
+      usdPerHour: costUsd / (elapsedSecs / 3600),
+      basis: "session",
+      spanSecs: elapsedSecs,
+      turns: 0,
+    };
+  }
+  return null;
+}
+
 /** A short "what just happened" label for the newest message row. */
 export function activityLabel(m: MessageRow): string {
   const calls = m.tool_calls ?? [];

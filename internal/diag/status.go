@@ -52,6 +52,26 @@ type StatusSnapshot struct {
 	// on every OS. Not omitempty: an absent field is the wire signal
 	// for "daemon too old to know", which the client handles.
 	HostOS string `json:"host_os"`
+
+	// QueryErrors counts the individual lookups in Snapshot that FAILED and
+	// were swallowed into a zero value. Snapshot is deliberately tolerant —
+	// a partial schema, a table that pre-dates its migration, or a scan cut
+	// short must still yield whatever else is readable rather than an
+	// all-or-nothing error — but that tolerance is indistinguishable, at the
+	// wire, from a genuinely empty database. This field is the distinction:
+	// 0 means every lookup answered, N>0 means N of the numbers in this
+	// snapshot are fabricated zeros rather than measurements.
+	//
+	// It exists so a CONSUMER can refuse to treat a degraded snapshot as
+	// fact — the dashboard's /api/status cache declines to memoize any
+	// snapshot with QueryErrors > 0, since a cached partial would keep
+	// serving fabricated zeros for the whole TTL, long after the transient
+	// condition that caused them had cleared.
+	//
+	// omitempty: the wire shape only grows when something actually went
+	// wrong, so a healthy daemon's response is byte-identical to before this
+	// field existed and no client is required to know about it.
+	QueryErrors int `json:"query_errors,omitempty"`
 }
 
 // SnapshotCounts holds the row counts for each table the user cares about.
@@ -112,12 +132,27 @@ func Snapshot(ctx context.Context, database *sql.DB, dbPath string) (StatusSnaps
 		snap.DBSizeBytes = fi.Size()
 	}
 
+	// note records a lookup that failed and was swallowed into a zero value,
+	// so the caller can tell a partial snapshot from an empty database (see
+	// StatusSnapshot.QueryErrors).
+	//
+	// sql.ErrNoRows is deliberately NOT counted: "no row" is a legitimate
+	// ANSWER — an empty actions table, a fresh install with no advisor
+	// digest — not a failure to read. Counting it would mark every new
+	// install permanently degraded, which is the precise opposite of what
+	// this signal is for.
+	note := func(err error) {
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			snap.QueryErrors++
+		}
+	}
+
 	// Schema version — tolerated on error (schema may be partial); the
-	// destination stays zero-valued, so the result is discarded explicitly.
-	_ = database.QueryRowContext(
+	// destination stays zero-valued, so only the failure is recorded.
+	note(database.QueryRowContext(
 		ctx,
 		`SELECT CAST(value AS INTEGER) FROM schema_meta WHERE key='version'`,
-	).Scan(&snap.SchemaVersion)
+	).Scan(&snap.SchemaVersion))
 
 	tableCounts := []struct {
 		table string
@@ -136,14 +171,14 @@ func Snapshot(ctx context.Context, database *sql.DB, dbPath string) (StatusSnaps
 		{"router_decisions", &snap.Counts.RouterDecisions},
 	}
 	for _, tc := range tableCounts {
-		_ = database.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+tc.table).Scan(tc.dest)
+		note(database.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+tc.table).Scan(tc.dest))
 	}
 
 	// Live sessions: distinct sessions with activity in the last 15
 	// minutes across the three activity tables — the /api/live
 	// definition (its default window), as a count instead of a feed.
 	liveSince := time.Now().UTC().Add(-15 * time.Minute).Format(time.RFC3339Nano)
-	_ = database.QueryRowContext(
+	note(database.QueryRowContext(
 		ctx, `
 		SELECT COUNT(DISTINCT session_id) FROM (
 			SELECT session_id FROM actions WHERE timestamp >= ?
@@ -153,22 +188,22 @@ func Snapshot(ctx context.Context, database *sql.DB, dbPath string) (StatusSnaps
 			SELECT session_id FROM token_usage WHERE timestamp >= ?
 		) WHERE session_id IS NOT NULL AND session_id <> ''`,
 		liveSince, liveSince, liveSince,
-	).Scan(&snap.Counts.LiveSessions)
+	).Scan(&snap.Counts.LiveSessions))
 
 	// Advisor active-suggestion count from the digest snapshot (tolerant:
 	// table may not exist pre-migration-039, payload may lack the field).
-	_ = database.QueryRowContext(
+	note(database.QueryRowContext(
 		ctx,
 		`SELECT CAST(COALESCE(json_extract(payload, '$.total_count'), 0) AS INTEGER)
 		 FROM advisor_digest WHERE id = 1`,
-	).Scan(&snap.Counts.Suggestions)
+	).Scan(&snap.Counts.Suggestions))
 
 	// Last action overall.
 	var lastTS, lastTool sql.NullString
-	_ = database.QueryRowContext(
+	note(database.QueryRowContext(
 		ctx,
 		`SELECT timestamp, tool FROM actions ORDER BY timestamp DESC LIMIT 1`,
-	).Scan(&lastTS, &lastTool)
+	).Scan(&lastTS, &lastTool))
 	if lastTS.Valid {
 		if t, err := time.Parse(time.RFC3339Nano, lastTS.String); err == nil {
 			snap.LastActionAt = t
@@ -181,12 +216,14 @@ func Snapshot(ctx context.Context, database *sql.DB, dbPath string) (StatusSnaps
 	// Per-tool last seen.
 	rows, err := database.QueryContext(ctx,
 		`SELECT tool, MAX(timestamp), COUNT(*) FROM actions GROUP BY tool ORDER BY tool`)
+	note(err)
 	if err == nil {
 		defer rows.Close()
 		for rows.Next() {
 			var ta ToolActivity
 			var ts string
 			if err := rows.Scan(&ta.Tool, &ts, &ta.ActionCount); err != nil {
+				note(err)
 				continue
 			}
 			if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
@@ -194,14 +231,18 @@ func Snapshot(ctx context.Context, database *sql.DB, dbPath string) (StatusSnaps
 			}
 			snap.PerToolLastSeen = append(snap.PerToolLastSeen, ta)
 		}
+		// A cursor that dies mid-walk (a cancelled scan, a closing DB) leaves
+		// a SHORT list that looks exactly like a small install. Only rows.Err
+		// tells the two apart.
+		note(rows.Err())
 	}
 
 	// Failures in the last 24 hours.
 	cutoff := time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339Nano)
-	_ = database.QueryRowContext(
+	note(database.QueryRowContext(
 		ctx,
 		`SELECT COUNT(*) FROM failure_context WHERE timestamp >= ?`, cutoff,
-	).Scan(&snap.RecentFailures24)
+	).Scan(&snap.RecentFailures24))
 
 	return snap, nil
 }
@@ -248,6 +289,17 @@ func FormatStatus(s StatusSnapshot) string {
 			fmt.Fprintf(&b, "  %-12s %d actions, last %s\n",
 				ta.Tool, ta.ActionCount, ta.LastSeenAt.Format(time.RFC3339))
 		}
+	}
+	// QueryErrors is the completeness signal (see its doc comment): silent
+	// when 0 so a healthy status stays noise-free, loud when non-zero so
+	// the reader can't mistake a degraded read for a genuinely empty DB.
+	if s.QueryErrors > 0 {
+		word := "query"
+		if s.QueryErrors != 1 {
+			word = "queries"
+		}
+		fmt.Fprintf(&b, "WARNING:          %d %s failed — the counts above are INCOMPLETE, do not trust them as exact\n",
+			s.QueryErrors, word)
 	}
 	return b.String()
 }

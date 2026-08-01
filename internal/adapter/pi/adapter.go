@@ -248,32 +248,20 @@ func (a *Adapter) parseMessageLine(sourceFile string, line rawLine, lineNum int,
 			MessageID:          userMessageID(line.ID, lineNum),
 		})
 	case "assistant":
+		// REASONING SEMANTICS (B3 convergence, 2026-07-31): the model's
+		// thinking is carried ONLY as PrecedingReasoning on the events it
+		// precedes — the tool calls below and the terminal
+		// `message.assistant.<stop>` row. It is deliberately NOT emitted as
+		// a standalone task_complete row of its own: a reasoning block is
+		// not an action, and the phantom rows it minted polluted every
+		// action aggregate (see docs/plans/b3-reasoning-convergence-plan-
+		// 2026-07-31.md §1). Pi's threading is FAN-OUT within the message:
+		// one thinking block reaches every tool call of that assistant
+		// message plus its terminus, because Pi carries the whole turn in
+		// one record and there is no ordering between the blocks to
+		// consume against.
 		reasoning := messageThinking(msg.Content)
 		assistantMessageID := assistantMessageID(line.ID, lineNum)
-		// Emit the model's thinking as a standalone, visible reasoning row
-		// (was only threaded into PrecedingReasoning) so the chain-of-thought
-		// is in the timeline. The terminal `message.assistant.<stop>` row
-		// below stays task_complete — it is the turn-terminus marker (carries
-		// stop_reason + success/error), not the plain assistant text.
-		if reasoning != "" {
-			rp := truncate(a.scrubber.String(reasoning), 200)
-			res.ToolEvents = append(res.ToolEvents, models.ToolEvent{
-				SourceFile:         sourceFile,
-				SourceEventID:      firstNonEmpty("reasoning:"+line.ID, fmt.Sprintf("reasoning:L%d", lineNum)),
-				SessionID:          state.SessionID,
-				ProjectRoot:        state.ProjectRoot,
-				Timestamp:          ts,
-				Model:              modelName(state),
-				Tool:               models.ToolPi,
-				ActionType:         models.ActionTaskComplete,
-				Target:             rp,
-				Success:            true,
-				PrecedingReasoning: rp,
-				RawToolName:        "pi.reasoning",
-				ToolOutput:         a.scrubber.String(reasoning),
-				MessageID:          assistantMessageID,
-			})
-		}
 		for _, content := range msg.Content {
 			if content.Type != "toolCall" {
 				continue

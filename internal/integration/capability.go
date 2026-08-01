@@ -417,3 +417,55 @@ type BinaryResolveSpec struct {
 	ProbeDirs []ProbeDir
 	Installs  []InstallHint
 }
+
+// Vocabulary is an adapter's NATIVE TOOL VOCABULARY row: whether the
+// canonical cross-adapter taxonomy table (internal/tooltax) carries
+// tool-specific rows for this adapter, so the raw tool names it captures
+// resolve to a canonical action type + category instead of falling into
+// `unknown`. It is the WP-T3 teeth of
+// docs/plans/tool-taxonomy-standardization-plan-2026-07-31.md: the same
+// enforcement that pins Binary / Handoff / Routability today, applied to
+// the taxonomy.
+//
+// It is DECLARED here and CROSS-CHECKED against the real table by
+// TestVocabularyDeclaredForEveryAdapter (registry_coverage_test.go, which
+// lives in the external test package and can therefore import both).
+// Declaring rather than computing is deliberate on two counts: the
+// registry is the ONE place a new adapter is forced to state its
+// cross-cutting capabilities, and the pure integration package keeps its
+// stdlib-only import set (no dependency on tooltax).
+//
+// Honesty rule, same as every other cell: the ZERO value is "not
+// declared" and FAILS the coverage test. A row says exactly one of two
+// things:
+//
+//   - InTaxonomy true — internal/tooltax carries rows for this tool. The
+//     test verifies the rows actually exist, so a new adapter that adds a
+//     registry row without adding its native names to the table goes red.
+//   - InTaxonomy false WITH a non-empty Note — the adapter's capture
+//     genuinely has NO native tool names to canonicalize. The five
+//     browser-chat `*-web` rows are this case: the MV3 extension captures
+//     prompt/answer turns out of a chat UI, never tool calls, so there is
+//     no vocabulary and fabricating one would be a lie. The test verifies
+//     tooltax carries no rows for such a tool either.
+type Vocabulary struct {
+	// InTaxonomy is true when internal/tooltax carries tool-specific rows
+	// for this adapter's native tool names.
+	InTaxonomy bool
+	// Note documents an honest zero (why this adapter has no native tool
+	// vocabulary at all) or a partial-coverage caveat. REQUIRED when
+	// InTaxonomy is false; optional otherwise.
+	Note string
+}
+
+// Declared reports whether the vocabulary cell has been filled in at all.
+// A row that is neither in the taxonomy nor carries an honest-zero note is
+// undeclared, which is the state registry_coverage_test.go rejects.
+//
+// Declared() deliberately accepts ANY non-empty Note — a data type cannot
+// judge whether a sentence is true. The truth of an honest zero is checked
+// where the evidence lives, against the adapter's SOURCE:
+// TestHonestZeroVocabularyHasNoClassifier walks the adapter package and
+// fails the row if it ships a name-based action classifier after all. Do
+// not try to move that judgement in here.
+func (v Vocabulary) Declared() bool { return v.InTaxonomy || v.Note != "" }

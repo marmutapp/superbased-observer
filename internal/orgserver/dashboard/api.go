@@ -43,6 +43,7 @@ type API struct {
 	policyAdmins map[string]bool
 	secViewers   map[string]bool
 	policySigner PolicySigner
+	copilotSeat  float64
 	logger       *slog.Logger
 	now          func() time.Time
 }
@@ -64,6 +65,13 @@ type Options struct {
 	PolicyAdminEmails    []string
 	SecurityViewerEmails []string
 	PolicySigner         PolicySigner
+	// CopilotPerSeatPriceUSD is [copilot_analytics].per_seat_price_usd — the
+	// plan's per-seat monthly price. The seats API returns counts only, so
+	// without it the telemetry surface can report seat COUNTS but not the
+	// subscription cost, which is normally the larger of Copilot's two cost
+	// feeds. Zero means unconfigured and the cost is omitted rather than
+	// rendered as $0.
+	CopilotPerSeatPriceUSD float64
 }
 
 // NewAPI constructs the dashboard API over the server DB.
@@ -77,6 +85,7 @@ func NewAPI(db *sql.DB, cache *rollup.Cache, opts Options, logger *slog.Logger) 
 		policyAdmins: emailSet(opts.PolicyAdminEmails),
 		secViewers:   emailSet(opts.SecurityViewerEmails),
 		policySigner: opts.PolicySigner,
+		copilotSeat:  opts.CopilotPerSeatPriceUSD,
 		logger:       logger,
 		now:          func() time.Time { return time.Now().UTC() },
 	}
@@ -337,7 +346,9 @@ func (a *API) OrgTelemetry(w http.ResponseWriter, r *http.Request, params gen.Or
 	}
 	win := windowOf(params.Days)
 	res, err := rollup.Cached(a.cache, rollup.CacheKey("telemetry", rollup.Scope{Admin: true}, win), rollup.TTLOverview,
-		func() (rollup.TelemetryResult, error) { return rollup.Telemetry(r.Context(), a.db, win, a.now()) })
+		func() (rollup.TelemetryResult, error) {
+			return rollup.Telemetry(r.Context(), a.db, win, a.now(), a.copilotSeat)
+		})
 	if err != nil {
 		a.fail(w, "telemetry", err)
 		return

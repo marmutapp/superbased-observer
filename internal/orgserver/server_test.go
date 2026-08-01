@@ -10,6 +10,7 @@ import (
 
 	"github.com/marmutapp/superbased-observer/internal/orgcontract"
 	gen "github.com/marmutapp/superbased-observer/internal/orgserver/api/gen"
+	"github.com/marmutapp/superbased-observer/internal/orgserver/config"
 )
 
 func TestLoadSCIMToken(t *testing.T) {
@@ -64,5 +65,32 @@ func TestBearerSecurityScopeAware(t *testing.T) {
 	guarded.ServeHTTP(rec, req)
 	if called || rec.Code != http.StatusUnauthorized {
 		t.Errorf("marked route without bearer should 401: called=%v code=%d", called, rec.Code)
+	}
+}
+
+// TestDashboardOptionsCarriesCopilotSeatPrice pins the Config → Options seam.
+//
+// The handler-level test in internal/orgserver/dashboard proves
+// Options → API → rollup → JSON, but it INJECTS the price into Options, so
+// deleting the line here that reads it from config would leave that test
+// green while the configured price silently stopped reaching any request.
+// per_seat_price_usd already spent a release in exactly that state — set by
+// admins, read by nothing — so the seam gets its own assertion.
+func TestDashboardOptionsCarriesCopilotSeatPrice(t *testing.T) {
+	cfg := config.Default()
+	cfg.CopilotAnalytics.PerSeatPriceUSD = 39 // Enterprise plan, not the 19 default
+
+	opts := dashboardOptions(cfg, nil)
+
+	if opts.CopilotPerSeatPriceUSD != 39 {
+		t.Errorf("CopilotPerSeatPriceUSD = %v, want 39 — config.copilot_analytics.per_seat_price_usd is not reaching the dashboard API",
+			opts.CopilotPerSeatPriceUSD)
+	}
+	// Guard against the mapping being satisfied by the default rather than the
+	// configured value: 19 is what Default() sets, so a hardcoded default would
+	// pass a naive assertion.
+	if opts.CopilotPerSeatPriceUSD == config.Default().CopilotAnalytics.PerSeatPriceUSD {
+		t.Errorf("CopilotPerSeatPriceUSD matched the package default (%v) rather than the configured 39",
+			config.Default().CopilotAnalytics.PerSeatPriceUSD)
 	}
 }

@@ -42,6 +42,21 @@ func newTestHandlers(t *testing.T) (*Handlers, *sql.DB) {
 	return New(d, issuer, org, 7*24*time.Hour, nil), d
 }
 
+// mintRequest builds a POST /api/org/enrolment-tokens request carrying the
+// invite role auth.RequireInviterSAML would have stamped, so a handler test
+// can exercise the mint without standing up the middleware chain. actor may
+// be empty for the admin role (an admin mint is unattributed-safe); a member
+// mint needs a real actor id for the cap query.
+//
+// It exists because MintEnrolmentToken FAILS CLOSED on a missing role — see
+// the handler doc — so "no context" is a 403 by design, not an oversight.
+func mintRequest(role auth.InviteRole, actor, body string) *http.Request {
+	r := httptest.NewRequest(http.MethodPost, "/api/org/enrolment-tokens", bytes.NewReader([]byte(body)))
+	ctx := auth.ContextWithInviteRole(r.Context(), role)
+	ctx = auth.ContextWithUserID(ctx, actor)
+	return r.WithContext(ctx)
+}
+
 // seedMember inserts an active member directly.
 func seedMember(t *testing.T, d *sql.DB, userID, email string) {
 	t.Helper()
@@ -60,8 +75,7 @@ func TestEnrollFlow(t *testing.T) {
 
 	// Mint an enrolment token via the admin endpoint.
 	mintRec := httptest.NewRecorder()
-	h.MintEnrolmentToken(mintRec, httptest.NewRequest(http.MethodPost, "/api/org/enrolment-tokens",
-		bytes.NewReader([]byte(`{"user_id":"user-1"}`))))
+	h.MintEnrolmentToken(mintRec, mintRequest(auth.InviteRoleAdmin, "admin-1", `{"user_id":"user-1"}`))
 	if mintRec.Code != http.StatusCreated {
 		t.Fatalf("mint: code=%d body=%s", mintRec.Code, mintRec.Body.String())
 	}
@@ -136,10 +150,32 @@ func TestEnrollRejections(t *testing.T) {
 func TestMintRejectsUnknownUser(t *testing.T) {
 	h, _ := newTestHandlers(t)
 	rec := httptest.NewRecorder()
-	h.MintEnrolmentToken(rec, httptest.NewRequest(http.MethodPost, "/api/org/enrolment-tokens",
-		bytes.NewReader([]byte(`{"user_id":"ghost"}`))))
+	h.MintEnrolmentToken(rec, mintRequest(auth.InviteRoleAdmin, "admin-1", `{"user_id":"ghost"}`))
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("code=%d, want 404", rec.Code)
+	}
+}
+
+// TestMintFailsClosedWithoutInviteRole pins the handler-side backstop: the
+// mint refuses a request that carries no auth.InviteRole, i.e. one that did
+// not come through auth.RequireInviterSAML. A future mis-mount behind the
+// weaker RequireSAMLSession must 403, not hand a token to any SSO-capable
+// user (the exact regression the admin gate was added to close).
+func TestMintFailsClosedWithoutInviteRole(t *testing.T) {
+	h, d := newTestHandlers(t)
+	seedMember(t, d, "user-1", "dev@acme.example")
+	rec := httptest.NewRecorder()
+	h.MintEnrolmentToken(rec, httptest.NewRequest(http.MethodPost, "/api/org/enrolment-tokens",
+		bytes.NewReader([]byte(`{"user_id":"user-1"}`))))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("code=%d, want 403 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var n int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM enrolment_tokens`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("refused mint left %d token rows, want 0", n)
 	}
 }
 

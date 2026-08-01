@@ -32,6 +32,7 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/scrub"
 	"github.com/marmutapp/superbased-observer/internal/stash"
 	"github.com/marmutapp/superbased-observer/internal/store"
+	"github.com/marmutapp/superbased-observer/internal/tooltax"
 )
 
 // Options configures a Server.
@@ -68,6 +69,13 @@ type Options struct {
 	// smart keep-warm). Zero value disables the cache-status surface
 	// (Enabled=false), so tests and read-only callers need not set it.
 	CacheWarm config.CacheWarmConfig
+	// Dashboard carries the [dashboard] tunables that the SERVER reads
+	// (Addr is resolved in cmd, not here). Today that is
+	// OrgAnnouncements, the node operator's opt-out for rail R3 of the
+	// announcements plan. Zero value ⇒ the org rail is off, so a caller
+	// that never sets it (tests, embedders) serves the release rail
+	// only — the same degrade a solo install already gets.
+	Dashboard config.DashboardConfig
 	// Logger receives operational messages.
 	Logger *slog.Logger
 	// ExtraRoutes are additional (pattern, handler) pairs a separable
@@ -93,6 +101,20 @@ type Options struct {
 	// (Rescan / Run All) only re-walks paths a current adapter
 	// matches, so it can never close those rows.
 	RecognizesSessionFile func(path string) bool
+	// CursorSemanticsFor, when non-nil, tells /api/health/watcher what
+	// a parse_cursors row's saved cursor MEANS for that path — a byte
+	// offset into an append-only log, an opaque SQLite watermark, an
+	// undecodable encrypted store, or a file that yields tokens but
+	// never actions. Wired alongside RecognizesSessionFile from the
+	// adapter registry, and resolved to plain capability flags at that
+	// boundary so this package never learns adapter types or branches
+	// on tool names.
+	//
+	// Without it every row is treated as a byte-offset tail (the
+	// pre-capability behaviour), which reports SQLite-backed adapters
+	// as permanently behind AND permanently misrouted — a banner the
+	// recovery flow can never close.
+	CursorSemanticsFor func(path string) CursorSemantics
 	// ProxyPort is the resolved observer-proxy port (cfg.Proxy.Port).
 	// Used by /api/setup/codex to compute the desired
 	// ~/.codex/config.toml base_url. Zero falls back to 8820.
@@ -265,6 +287,11 @@ type EnrolmentService interface {
 	Status(ctx context.Context) (orgclient.EnrolmentState, error)
 	Unenroll(ctx context.Context) error
 	LastPayload(ctx context.Context) ([]byte, error)
+	// MintInviteToken asks the enrolled org server for a one-time enrolment
+	// token for a teammate (the Teams bottom-up invite loop). It is
+	// user-initiated from Settings → Enrolment and adds no network posture:
+	// same server, same credential the push loop already uses.
+	MintInviteToken(ctx context.Context, email string, ttlDays int) (orgclient.InviteToken, error)
 }
 
 // Server wires the /api/* endpoints and static file handler.
@@ -390,6 +417,23 @@ type Server struct {
 	sensitiveViewers   map[uint64]sensitiveViewer
 	sensitiveViewerSeq uint64
 
+	// statusSnap memoizes GET /api/status's diag.Snapshot for
+	// statusSnapshotTTL, with singleflight semantics on a miss. The SPA
+	// polls that endpoint from TWO always-mounted chrome components on a 5s
+	// ticker plus the active page's own hook, and the snapshot is an
+	// unfiltered COUNT(*) over a dozen tables — without this, a status scan
+	// was permanently in flight against the same SQLite reader every other
+	// panel queries. See status_cache.go for the full rationale; the cache
+	// lives HERE, on the Server, so the endpoint has exactly one owner.
+	statusSnap statusSnapshotCache
+
+	// snapshotFn produces the /api/status snapshot. Defaults to
+	// diag.Snapshot (set in New); tests override it to count how many times
+	// the scan actually ran, which is the only way to observe the cache
+	// without a corpus large enough for its cost to show up as latency.
+	// Same injected-IO discipline as processCapabilityFn / execBackfill.
+	snapshotFn func(context.Context, *sql.DB, string) (diag.StatusSnapshot, error)
+
 	// Demo mode (P6.7). demoDB holds the seeded temp database while
 	// demo mode is active — data endpoints read it through Server.db()
 	// (atomic: the getter sits on every data handler's path).
@@ -463,6 +507,7 @@ func New(opts Options) (*Server, error) {
 		// other in-process writer (see the configWriteMu field doc).
 		configWriteMu:       config.WriteLock(),
 		processCapabilityFn: realProcessCapability(opts.Logger),
+		snapshotFn:          diag.Snapshot,
 	}
 	// Wire the controller's session-revoke hook (F2): when a device logs ITSELF
 	// out, close any read-only sensitive viewer that device left open — the
@@ -487,21 +532,37 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// sessionSubRouteCapabilities is the explicit suffix→Capability table for the
-// mutating sub-routes under the dynamic `/api/session/<id>/…` pattern (plan
-// §9.1). ServeMux cannot match a verb that is a path SUFFIX after a dynamic id
-// segment as its own pattern, so `/api/session/` carries a View base (its GET
-// reads must work remotely) and these unsafe sub-routes resolve here — Execute
-// for the per-session ops a paired remote owner legitimately drives. This makes
-// the classification EXPLICIT (enumerated + pinned by
-// TestSessionSubRouteCapabilities) rather than silent View→Execute
-// auto-escalation. Any NEW mutating `/api/session/` sub-route must be added here
-// with its intended tier; a Local-class sub-route would need a dedicated
-// pattern instead (there is none today).
+// sessionSubRouteCapabilities is the DECLARED (documentation + test) suffix→
+// Capability table for the mutating sub-routes under the dynamic
+// `/api/session/<id>/…` pattern (plan §9.1).
+//
+// It is NOT consulted at request time. ServeMux cannot match a verb that is a
+// path SUFFIX after a dynamic id segment as its own pattern, so `/api/session/`
+// is registered once with a View base (its GET reads must work remotely) and
+// the PRODUCTION protection for these unsafe sub-routes is the generic
+// method-aware escalation in requiredCapability (remote.go): a View-classified
+// route requires Execute for POST/PUT/DELETE/PATCH. That is what actually
+// refuses an anonymous or view-only remote principal — pinned by
+// TestRemoteAuthzMatrix (POST /api/session/<id>/resume) and, for classification,
+// TestSessionTagsRemoteAuthzRefusesNonExecute.
+//
+// What this table buys is a REVIEW gate, not enforcement: it forces the
+// intended tier of every mutating session sub-route to be written down and
+// enumerated (TestSessionSubRouteCapabilities fails when a suffix is added or
+// removed without a decision here), so the silent View→Execute default is a
+// checked decision rather than an unexamined one. A sub-route whose intended
+// tier is anything OTHER than Execute — a Local one, say — cannot be expressed
+// here at all: it would need its own registered pattern, because the escalation
+// this table documents can only ever produce Execute. There is none today.
 var sessionSubRouteCapabilities = map[string]Capability{
 	"/handoff": CapabilityExecute,
 	"/launch":  CapabilityExecute,
 	"/resume":  CapabilityExecute,
+	// Session classification (tags / favorite / note, plan §4). Execute, not
+	// Local: tagging last night's runs "junk" from a phone during remote review
+	// is a primary flow, and the content written is user-authored review
+	// metadata — never machine-reaching config.
+	"/tags": CapabilityExecute,
 }
 
 // remotelyExecutableExtraRoutes is the explicit allowlist of mutation-method
@@ -609,6 +670,13 @@ func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[st
 	reg("/api/verbosity/aggregate", V, s.handleVerbosityAggregate)
 	reg("/api/sessions", V, s.handleSessions)
 	reg("/api/sessions/calendar", V, s.handleSessionsCalendar)
+	// Session classification (plan §4). The vocabulary + per-tag rollup is a
+	// pure read (View); vocabulary MANAGEMENT (rename/delete across every
+	// session) is a whole-route Execute mutation — the same tier as the
+	// per-session /tags sub-route, and for the same reason (user-authored
+	// review metadata a paired remote owner legitimately drives).
+	reg("/api/sessions/tags", V, s.handleSessionsTags)
+	reg("/api/sessions/tags/manage", X, s.handleSessionsTagsManage)
 	// /api/session/ keeps a View base — its many GET sub-route reads must work
 	// remotely — while its mutating sub-routes resolve explicitly via
 	// sessionSubRouteCapabilities (§9.1): /handoff + /launch are Execute (a
@@ -691,6 +759,10 @@ func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[st
 	reg("/api/live", V, s.handleLive)
 	reg("/api/search", V, s.handleSearch)
 	reg("/api/budget", V, s.handleBudget)
+	// Announcements are admin-authored banner copy (release-embedded today,
+	// org-distributed later) — nothing about this install, nothing sensitive,
+	// so View: a remote viewer should see the same banner the owner does.
+	reg("/api/announcements", V, s.handleAnnouncements)
 	// experiments POST CREATES an A/B experiment (management) → whole-route
 	// Local. stop is POST-only management.
 	reg("/api/experiments", L, s.handleExperiments)
@@ -759,6 +831,7 @@ func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[st
 	reg("/api/projects", V, s.handleProjects)
 	reg("/api/export.xlsx", V, s.handleExportXLSX)
 	reg("/api/analysis/headline", V, s.handleAnalysisHeadline)
+	reg("/api/statusline", V, s.handleStatuslineTile)
 	reg("/api/analysis/trend", V, s.handleAnalysisTrend)
 	reg("/api/analysis/movers", V, s.handleAnalysisMovers)
 	reg("/api/analysis/top-sessions", V, s.handleAnalysisTopSessions)
@@ -798,6 +871,15 @@ func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[st
 	reg("/api/enrolment/status", V, s.handleEnrolmentStatus)
 	reg("/api/enrolment/last-payload", V, s.handleEnrolmentLastPayload)
 	reg("/api/enrolment/unenroll", L, s.handleEnrolmentUnenroll)
+	// Mints a one-time enrolment token for a teammate through the org server
+	// this node is already enrolled with. EXECUTE, not Local: it is a real
+	// mutation (it creates a credential on the org server) so it must never
+	// sit at plain View, but it is exactly the kind of action a paired remote
+	// owner legitimately drives — the same tier as the session /tags and
+	// vocabulary-management writes. It reaches the ORG server, never this
+	// machine's config or filesystem, which is what separates it from the
+	// Local tier.
+	reg("/api/enrolment/invite", X, s.handleEnrolmentInvite)
 	// Remote-access management surface (dashboard-management-surface plan §9).
 	// Reads are View (a paired remote owner may see state/audit/sessions — never
 	// the secret, §11); mutations are Local (arm/disarm/rotate + session revoke
@@ -1054,8 +1136,22 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 // to auto-clear once the operator has restarted.
 var processStartedAt = time.Now().UTC()
 
+// handleStatus serves GET /api/status — the daemon's own state (row counts,
+// schema version, last-seen-per-tool, DB size).
+//
+// The snapshot comes from statusSnapshot, NOT straight from diag.Snapshot:
+// the scan is an unfiltered COUNT(*) over a dozen tables and the SPA polls
+// this endpoint from three places at once, so it is memoized per
+// statusSnapshotTTL with singleflight on a miss (status_cache.go).
+//
+// Version / StartedAt / UptimeSeconds are stamped AFTER cache retrieval and
+// are deliberately outside the cache: they describe THIS process at THIS
+// instant, and uptime in particular is the one field on this endpoint a human
+// watches move. Freezing it for the TTL would be the exact dishonesty the
+// cache is not allowed to introduce. The value returned by statusSnapshot is
+// a copy, so stamping mutates only this request's snapshot.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	snap, err := diag.Snapshot(r.Context(), s.db(), s.opts.DBPath)
+	snap, err := s.statusSnapshot(r.Context())
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -1510,7 +1606,7 @@ func parseSessionsSortParams(r *http.Request) (sortBy string, desc bool) {
 	switch sortBy {
 	case "session", "tool", "project", "started_at", "elapsed", "actions",
 		"input", "cache_r", "cache_w", "output", "cost", "quality",
-		"errors", "redundancy":
+		"errors", "redundancy", "favorite":
 	default:
 		sortBy = "started_at"
 	}
@@ -1565,6 +1661,13 @@ func sessionsSQLOrderClause(sortBy string, desc bool) string {
 		expr = "COALESCE(s.error_rate, -1.0)"
 	case "redundancy":
 		expr = "COALESCE(s.redundancy_ratio, -1.0)"
+	case "favorite":
+		// EXISTS rather than a LEFT JOIN so the shared FROM clause (and every
+		// caller of it — data / total / scored_count) stays untouched; a
+		// session with no annotation row sorts as 0. Default direction is DESC,
+		// so `sort_by=favorite` alone means "starred first".
+		expr = "(SELECT COUNT(*) FROM session_annotations sa" +
+			" WHERE sa.session_id = s.id AND sa.favorite = 1)"
 	}
 	return expr + " " + dir + ", s.started_at DESC, s.id ASC"
 }
@@ -1617,6 +1720,47 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	if project != "" {
 		where = append(where, "s.project_id = (SELECT id FROM projects WHERE root_path = ?)")
 		args = append(args, project)
+	}
+	// Session-classification filters (plan §4). `tag` is REPEATABLE with AND
+	// semantics — one EXISTS subquery per tag — and `favorite=1` is an EXISTS on
+	// session_annotations. Both land in the SHARED `where` slice so the data
+	// query, the pagination `total`, and `scored_count` all agree on which
+	// sessions exist (the coherence rule the window predicate already follows).
+	// A malformed tag is a 400 rather than a silent no-match: returning the
+	// unfiltered list under a filter the user asked for would lie.
+	//
+	// The repeatable param is DEDUPED (after normalization) and CAPPED at
+	// maxSessionTagFilters: each accepted tag appends a correlated EXISTS
+	// subquery to a WHERE clause that also drives the `total` COUNT and
+	// scored_count, so an unbounded `?tag=` list is an authenticated
+	// amplification lever (one cheap request → an arbitrarily long EXISTS
+	// chain executed three times). Duplicates are dropped rather than rejected:
+	// `?tag=x&tag=X` is the same filter written twice, and answering it is more
+	// useful than 400-ing it.
+	seenTags := make(map[string]struct{}, 4)
+	for _, raw := range r.URL.Query()["tag"] {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		tag, err := store.NormalizeTag(raw)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if _, dup := seenTags[tag]; dup {
+			continue
+		}
+		if len(seenTags) >= maxSessionTagFilters {
+			http.Error(w, fmt.Sprintf("too many tag filters: at most %d distinct tags per request", maxSessionTagFilters),
+				http.StatusBadRequest)
+			return
+		}
+		seenTags[tag] = struct{}{}
+		where = append(where, "EXISTS (SELECT 1 FROM session_tags st WHERE st.session_id = s.id AND st.tag = ?)")
+		args = append(args, tag)
+	}
+	if v := strings.TrimSpace(r.URL.Query().Get("favorite")); v == "1" || strings.EqualFold(v, "true") {
+		where = append(where, "EXISTS (SELECT 1 FROM session_annotations sa WHERE sa.session_id = s.id AND sa.favorite = 1)")
 	}
 	if !since.IsZero() {
 		sinceStr := since.Format(time.RFC3339Nano)
@@ -1821,6 +1965,15 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		// session leaned on. Empty when no proxy/JSONL rows captured
 		// a model (rare; usually means scraped fallback).
 		Models []string `json:"models,omitempty"`
+		// Session classification (plan §4), attached post-scan from the two
+		// batched store loads (one query each per page — never per row).
+		// HasNote is a flag, not the note itself: the list renders a marker and
+		// the detail panel fetches the text. ALL THREE carry omitempty so an
+		// unclassified corpus emits the byte-identical payload it did before
+		// tags existed (the pinned tests/invariant/golden/sessions.json).
+		Tags     []string `json:"tags,omitempty"`
+		Favorite bool     `json:"favorite,omitempty"`
+		HasNote  bool     `json:"has_note,omitempty"`
 	}
 	var out []sessRow
 	for rows.Next() {
@@ -2048,6 +2201,30 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			s.opts.Logger.Warn("sessions: per-session model list failed", "err", mErr)
+		}
+	}
+
+	// Attach session classification for the page: exactly TWO batched store
+	// queries (tags + annotations), both scoped to the page's session ids. A
+	// failure degrades the page to "no classification shown" rather than 500ing
+	// the whole list — tags are an annotation layer, not the data.
+	if len(pageIDs) > 0 {
+		st := store.New(s.db())
+		if tagsBySession, tErr := st.ListSessionTags(r.Context(), pageIDs); tErr == nil {
+			for i := range out {
+				out[i].Tags = tagsBySession[out[i].ID]
+			}
+		} else {
+			s.opts.Logger.Warn("sessions: per-session tag load failed", "err", tErr)
+		}
+		if annots, aErr := st.ListAnnotations(r.Context(), pageIDs); aErr == nil {
+			for i := range out {
+				a := annots[out[i].ID]
+				out[i].Favorite = a.Favorite
+				out[i].HasNote = a.Note != ""
+			}
+		} else {
+			s.opts.Logger.Warn("sessions: per-session annotation load failed", "err", aErr)
 		}
 	}
 
@@ -2734,6 +2911,14 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 	// (Verbosity) card. Read-side: visible narrative/artifact bytes
 	// segmented from assistant text + authored code (writes + shell
 	// commands) from actions.content_bytes (migration 054).
+	// Sub-route: /api/session/<id>/tags → session classification mutation
+	// (POST): add/remove tags, toggle the favorite star, set the note. Execute
+	// via sessionSubRouteCapabilities, like /launch and /resume.
+	if strings.HasSuffix(id, "/tags") {
+		id = strings.TrimSuffix(id, "/tags")
+		s.handleSessionTags(w, r, id)
+		return
+	}
 	if strings.HasSuffix(id, "/verbosity") {
 		id = strings.TrimSuffix(id, "/verbosity")
 		s.handleSessionVerbosity(w, r, id)
@@ -2848,6 +3033,13 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 		// resume but launchable → the Continue-in… fork), or "none". Derived
 		// from the integration registry by capability SHAPE. Always present.
 		Resume sessionResumeInfo `json:"resume"`
+		// Session classification (plan §4): the tags this session carries, the
+		// favorite star, and the full note text (the list endpoint ships only a
+		// has_note flag). Tags is always [] not null so the frontend can map
+		// unconditionally, like Children above.
+		Tags     []string `json:"tags"`
+		Favorite bool     `json:"favorite"`
+		Note     string   `json:"note,omitempty"`
 	}
 
 	var d sessionDetail
@@ -3262,6 +3454,26 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 	// native / handoff / none, derived from the integration registry by
 	// capability shape so the frontend never branches on tool name.
 	d.Resume = resumeInfoForTool(d.Tool)
+
+	// Session classification (plan §4). Degrades to the unclassified state on
+	// error — an annotation-layer failure must not 500 the whole detail view.
+	{
+		st := store.New(s.db())
+		if tags, tErr := st.SessionTags(r.Context(), id); tErr == nil {
+			d.Tags = tags
+		} else {
+			s.opts.Logger.Warn("session detail: tag load failed", "err", tErr)
+		}
+		if annot, aErr := st.GetSessionAnnotation(r.Context(), id); aErr == nil {
+			d.Favorite = annot.Favorite
+			d.Note = annot.Note
+		} else {
+			s.opts.Logger.Warn("session detail: annotation load failed", "err", aErr)
+		}
+	}
+	if d.Tags == nil {
+		d.Tags = []string{}
+	}
 
 	writeJSON(w, d)
 }
@@ -5015,10 +5227,41 @@ func (s *Server) handleToolsBreakdown(w http.ResponseWriter, r *http.Request) {
 		where = append(where, "project_id = (SELECT id FROM projects WHERE root_path = ?)")
 		args = append(args, project)
 	}
+	whereClause := strings.Join(where, " AND ")
+	acc := newBreakdownAccumulator()
+
+	// Two scans, both folded incrementally — nothing is retained per
+	// group, so this handler's memory is bounded by the taxonomy
+	// (tools × action types, tools × surfaces) and not by the corpus.
+	//
+	// Pass 1 is the SURFACE attribution. tooltax.Resolve needs the native
+	// name (action_type alone cannot say whether a run_command came from
+	// a builtin Bash tool or from an MCP server's shell), but
+	// raw_tool_name is unrestricted free text, so the group count is
+	// O(vocabulary) only by observation — a corpus with a unique name per
+	// action would make it O(actions). The LIMIT is the actual bound; it
+	// orders by COUNT(*) DESC so the mass of the corpus is what survives,
+	// and whatever the cap excludes is reconciled into the `unresolved`
+	// surface bucket by the accumulator's remainder (sum(by_surface) ==
+	// total stays true). Native names never leave this function — the
+	// response carries counts, not names.
+	//
+	// It runs BEFORE the totals pass so that concurrent ingest between
+	// the two scans can only make the totals larger, never the surface
+	// sum larger than the total.
+	if err := s.foldBreakdownSurfaces(r.Context(), acc, whereClause, args); err != nil {
+		writeErr(w, err)
+		return
+	}
+
+	// Pass 2 is the exact, UNCAPPED totals: (tool, action_type) is
+	// bounded by the taxonomy itself (~30 tools × ~50 action types), so
+	// total / by_type / by_category stay exact — the pre-WP-T5 contract
+	// is untouched by the cap above.
 	//nolint:gosec // G202: SQL structure (WHERE/JOIN/scope fragments and any IN placeholder list) is built from code constants; all values are bound via ? args.
 	q := `SELECT tool, action_type, COUNT(*)
 	      FROM actions
-	      WHERE ` + strings.Join(where, " AND ") + `
+	      WHERE ` + whereClause + `
 	      GROUP BY tool, action_type
 	      ORDER BY tool, COUNT(*) DESC`
 	rows, err := s.db().QueryContext(r.Context(), q, args...)
@@ -5027,13 +5270,6 @@ func (s *Server) handleToolsBreakdown(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer rows.Close()
-	type toolBreakdown struct {
-		Tool   string         `json:"tool"`
-		Total  int            `json:"total"`
-		ByType map[string]int `json:"by_type"`
-	}
-	idx := map[string]*toolBreakdown{}
-	order := []string{}
 	for rows.Next() {
 		var t, atype string
 		var n int
@@ -5041,28 +5277,51 @@ func (s *Server) handleToolsBreakdown(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, err)
 			return
 		}
-		b, ok := idx[t]
-		if !ok {
-			b = &toolBreakdown{Tool: t, ByType: map[string]int{}}
-			idx[t] = b
-			order = append(order, t)
-		}
-		b.ByType[atype] = n
-		b.Total += n
+		acc.AddActionTypeCount(t, atype, n)
 	}
-	out := make([]toolBreakdown, 0, len(order))
-	for _, t := range order {
-		out = append(out, *idx[t])
+	if err := rows.Err(); err != nil {
+		writeErr(w, err)
+		return
 	}
-	// Sort by Total descending so the densest tool sits at the top of
-	// the chart (matches user intuition).
-	sort.SliceStable(out, func(i, j int) bool {
-		return out[i].Total > out[j].Total
-	})
 	writeJSON(w, map[string]any{
-		"days":  days,
-		"tools": out,
+		"days": days,
+		// The canonical key spaces, so the client renders both new
+		// dimensions in tooltax's display order instead of its own.
+		"categories": tooltax.Categories(),
+		"surfaces":   breakdownSurfaceKeys(),
+		"tools":      acc.Rows(),
 	})
+}
+
+// foldBreakdownSurfaces runs /api/tools/breakdown's capped native-name
+// pass, streaming each (tool, raw_tool_name) group straight into the
+// accumulator. It is a separate function so the cursor is closed by
+// defer on every path, and so the handler reads as two passes.
+func (s *Server) foldBreakdownSurfaces(ctx context.Context, acc *breakdownAccumulator, whereClause string, args []any) error {
+	//nolint:gosec // G202: SQL structure (WHERE/JOIN/scope fragments and any IN placeholder list) is built from code constants; all values are bound via ? args.
+	q := `SELECT tool, COALESCE(raw_tool_name, ''), COUNT(*)
+	      FROM actions
+	      WHERE ` + whereClause + `
+	      GROUP BY tool, raw_tool_name
+	      ORDER BY COUNT(*) DESC
+	      LIMIT ?`
+	qArgs := make([]any, 0, len(args)+1)
+	qArgs = append(qArgs, args...)
+	qArgs = append(qArgs, breakdownNativeGroupCap)
+	rows, err := s.db().QueryContext(ctx, q, qArgs...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var tool, rawName string
+		var n int
+		if err := rows.Scan(&tool, &rawName, &n); err != nil {
+			return err
+		}
+		acc.AddNativeCount(tool, rawName, n)
+	}
+	return rows.Err()
 }
 
 // handleProjects serves /api/projects — every project root the observer
@@ -5530,6 +5789,18 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeJSONStatus emits an arbitrary JSON body with an explicit status. Used
+// where a handler needs a structured, machine-readable refusal ({error,
+// message}) rather than writeErrStatus's single error string — the enrolment
+// invite proxy maps each org-server refusal to its own code so the UI copy
+// can name the real cause.
+func writeJSONStatus(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
 

@@ -8,7 +8,11 @@
 //
 //	/api/agent/enroll          — public (the one-time token is the credential)
 //	/api/agent/push            — Ed25519 bearer (scope-aware, via the generated wrapper)
-//	/api/org/enrolment-tokens  — SAML session (admin)
+//	/api/agent/invite-token    — Ed25519 bearer; ALSO gated on [server].member_invites
+//	POST /api/org/enrolment-tokens — SAML session (admin; or an active member
+//	                             when [server].member_invites is on — see
+//	                             auth.RequireInviterSAML)
+//	GET  /api/org/enrolment-tokens — SAML session (admin only, always)
 //	/scim/v2/*                 — static SCIM token
 //	/saml/*                    — SAML SP endpoints (public by nature)
 //	/                          — SAML session (browser; redirects to SSO)

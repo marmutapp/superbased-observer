@@ -58,6 +58,7 @@ const NAV: { to: string; label: string }[] = [
   { to: "/suggestions", label: "Suggestions" },
   { to: "/security", label: "Security" },
   { to: "/policy", label: "Policy" },
+  { to: "/announcements", label: "Announcements" },
   { to: "/audit", label: "Audit" },
   { to: "/invite", label: "Invite" },
   { to: "/settings", label: "Settings" },

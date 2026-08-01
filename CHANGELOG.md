@@ -2,6 +2,481 @@
 
 All notable changes to SuperBased Observer are documented here.
 
+## [1.28.0] — 2026-08-01
+
+### Added
+
+- **feat(cli): `observer statusline` — one-line, fail-open, wordmarked
+  cost status.** Prints a single line — the `▞ superbased` wordmark plus
+  (when available) the current session's cost, today's total observed
+  spend, and the active model name — for Claude Code's `statusLine`
+  contract or any host tool that execs a command and reads stdout.
+  Input precedence is piped stdin JSON, then `--session-cost`/`--model`/
+  `--cwd` flags, then `OBSERVER_STATUSLINE_SESSION_COST`/
+  `OBSERVER_STATUSLINE_MODEL` env vars, then nothing — segments are
+  omitted, never rendered as a fabricated `$0.00`. The "today" segment
+  comes from a new, lean `GET /api/statusline` daemon endpoint over a
+  bounded, loopback-only HTTP call (`--timeout`, default `80ms`); when
+  no daemon is running, or it doesn't answer in time, that segment (and
+  only that segment) is silently omitted and the command still exits 0.
+  `--no-daemon` skips the daemon attempt entirely; `--explain` reports
+  which data path was used to stderr; `--json` emits a machine-readable
+  line. All dollar figures are
+  estimated list-price totals, not invoiced amounts, stated once at
+  `--help` and at registration time, never per-render. Registration is
+  opt-in via `observer init --statusline` (writes Claude Code
+  `settings.json`'s top-level `"statusLine"` key) — never implied by
+  `--all`, never auto-registered by `observer start`; `--uninstall`
+  removes the key entirely. A Claude Code install detected only on the
+  Windows side of a cross-OS WSL setup gets an honest WARN, not a
+  cross-OS bridge. The VS Code status bar's live-state text also picks
+  up the same `▞ superbased` wordmark prefix
+  (`observer.statusBar.wordmark`, default `true`, to turn it off). The
+  daemon side adds migration 074 (`idx_token_usage_timestamp`) so the
+  endpoint's "today" aggregate is an index scan, not a table scan. See
+  [`docs/observer-statusline.md`](docs/observer-statusline.md).
+- **feat(cli): `observer usage` — zero-install one-shot cost report (the
+  `npx @superbased/observer` activation path).** Scans every detected AI
+  coding tool's own local session files into a throwaway temp database,
+  prints one tool × model cost table, and deletes the database again.
+  Zero configuration, zero network calls: pricing is embedded in the
+  binary and the default path never reads `~/.observer/config.toml` or
+  any `OBSERVER_*` environment variable, never writes any AI tool's
+  config, and never binds a port. Flags: `--since` (default `30d`,
+  accepts `7d|30d|90d|all|RFC3339`), `--days`, `--group-by`
+  (`tool-model|tool|model|day`), `--tool`, `--budget` (default `30s`,
+  `0` = unlimited, prints an honest `partial:` footer on expiry),
+  `--json`, `--keep-db`, `--config` (opt back into a real config and its
+  pricing overrides), `--no-progress`. Bare `observer` now runs this same
+  report on a machine with no local SuperBased state at all (no
+  `~/.observer/observer.db`, no `config.toml`, no daemon listening) — a
+  state branch, never an invocation-channel branch — and prints the
+  usual welcome screen otherwise; `OBSERVER_ONESHOT=off` always forces
+  the welcome screen. New pure package `internal/oneshot`. See
+  [`docs/one-shot-usage-report.md`](docs/one-shot-usage-report.md).
+- **docs: repo-landing hygiene fixes.** README gets a "Try it in one
+  command" block (the `npx`/`observer usage` activation path, immediately
+  above Install) and a plain, no-count "⭐ Star this repo" badge + CTA
+  line near the top. `scripts/release.sh`'s public-mirror re-staging now
+  also carves out `docs/deployment-models.md`, `docs/remote-access.md`,
+  `docs/session-handoff.md`, `docs/cache-tracking.md`, and the
+  `docs/guard-{rules,policy-authoring,compliance}.md` trio, fixing four
+  confirmed-live 404s on the public repo's README links (all three
+  re-staging sites — the force-add list, the `.gitignore` negation
+  block, and the `docs_leaks` sanity-check regex — kept in sync). Both
+  README hero infographics regenerated from new **versioned HTML
+  sources** (`docs/assets/infographics/gen/` + `render.mjs` — the old
+  images were one-offs with no source in the repo): current single-word
+  lockup, correct counts (29 adapters / 25 MCP tools), and the
+  proxy-accuracy / cache-attribution / routing differentiators now in
+  the pixels. The stale `13-trajectories.png` screenshot recaptured from
+  the web2 admin dashboard's Trajectory Explorer (the node dashboard no
+  longer hosts that page).
+- **feat(mcp): droid + Command Code MCP registration.** `observer init`
+  can now register the SuperBased MCP server into Factory Droid and
+  Command Code — one locate row + Installed probe + registry `MCPTarget`
+  each, following the grounded droid pattern. Registry rows only; no
+  new switches (integration-registry discipline).
+- **feat(store,dashboard,web,cli): session tags/favorites/notes.** New
+  migration 075 backs a `sessiontags` store seam behind Execute-class
+  routes (mutations gated the same way as every other write path), plus
+  an `observer tag`/`observer tags` CLI with exact-first-then-index-range
+  prefix resolution. The dashboard gains `TagPill`/`TagEditor`,
+  star-favorite toggles, a note field, server-side tag+favorite filters,
+  and a tags rollup panel; the rollup query is chunked past SQLite's
+  32766 bind-variable ceiling (`cost.SessionRowsByID`, capped at 900
+  session IDs per scope — the pre-fix symptom was cost columns silently
+  zeroing out, not an error). Remote devices are honestly read-only for
+  tag mutation: the only `Execute`-class mint is terminal-scoped and
+  loopback, so a phone or tablet viewing the dashboard sees the
+  classification controls disabled with a stated reason rather than a
+  control that quietly fails. Mutations are validate-before-write atomic
+  and single-flight; a conflicting note edit surfaces a hint instead of
+  silently overwriting. Privacy pins cover the new columns end to end
+  (a canary tag proven never pushed under `admin_managed`). See
+  [`docs/dashboard-walkthrough.md`](docs/dashboard-walkthrough.md)
+  ("Classifying sessions: tags, favorites, notes").
+- **feat(announce,web,orgserver,orgclient,web2): dashboard
+  announcements, three rails.** New pure package `internal/announce`
+  backs **R1**, a `GET /api/announcements` embedded rail with a
+  dismissible `AnnouncementBanner` (ack tracked in `sb_announce_ack`,
+  never re-shown once dismissed). **R2** is a click-only npm-metadata
+  piggyback — the `superbased.announcement` field an operator authors
+  into `npm/observer/package.json` at publish time and the dashboard
+  reads passively; an always-on background poll was considered and
+  rejected for the zero-network posture `observer privacy` states, and
+  the choice is written down on the measurement-honesty page. **R3** is
+  a signed org-distribution rail on the routing-policy pattern: agent
+  migration 076 (a node-side cache) + server migration 022, a
+  `[dashboard].org_announcements` gate (partial-merge default tested),
+  and a web2 composer as the first UI consumer of the sign-and-distribute
+  mechanism. See Fixed below for the security round that hardened R3
+  before it shipped, and
+  [`docs/teams-operations.md`](docs/teams-operations.md) §7 for the
+  publish/retract/trust-model/opt-out operator reference.
+- **feat(tooltax,web): canonical cross-adapter tool taxonomy.** New pure
+  package `internal/tooltax` (WP-T1) is a 1,074-row table across all 30
+  tool identities, with `MCPIdentity` as the one owner of MCP-tool
+  naming — a corpus-measured slash-form convention was dropped on
+  zero corpus evidence rather than guessed at, closing a taint
+  false-positive class; `models.IsMCPToolName` now delegates to it, and
+  the routing package's independent zero-imports pin correctly refuses
+  the same delegation, with equivalence proven from the tooltax side
+  instead. WP-T2 generates a TypeScript mirror (`actiontax.gen.json` →
+  `actions.ts` as a reader) so the dashboard's category/colour data
+  can't drift from the Go table, aligns the MCP-parser divergence to Go,
+  and adds a `taxonomy-build-drift` CI job. A codex gate round then
+  closed the real hole the first pass left open: the Go-side test suite
+  stayed green while a hand-written TS reader could still silently
+  diverge, so the fix is a REAL-TS parity gate that esbuild-compiles the
+  actual `actions.ts` against 28 Go-oracle vectors, a generated literal
+  category union that makes a missing `CATEGORY_COLOR` a compile error
+  instead of a silent runtime fallback, and `C:/`-drive plus
+  POSIX-colon path guards.
+- **feat(mcp,cli,docs): published stable MCP local contract.**
+  [`docs/mcp-contract.md`](docs/mcp-contract.md) documents the full
+  25-tool tier table (18 stable, 4 conditional, 3 experimental) and
+  `observer contract --json` emits it as machine-readable data, backed
+  by conformance tests that pin it against the real server; the README
+  gains an Integrations section pointing at it. A codex round then made
+  the published invariants actually true: a `days`-parameter clamp
+  closes a gap between the documented and enforced range, every one of
+  the 25 tools' required parameters and all 18 stable tools' result keys
+  are wire-checked, and the markdown drift-gate test now parses BOTH the
+  doc and the generated mirror instead of one — the prior version could
+  pass while blind to a real divergence between them.
+- **feat(plugins): adapter distribution as installable plugins, Phase 1
+  in-repo — not yet published.** `plugins/plugingen` satisfies the
+  one-owner registration rule by execution rather than duplication: it
+  runs the real `observer init` registrars (`mcp.Registrar`,
+  `hook.Registry`) against a sandbox `$HOME` and transposes their exact
+  output into `plugins/claude-code/` (a marketplace root plus a plugin
+  directory — `plugin.json`, `.mcp.json`, `hooks.json` with all 22
+  events) and `plugins/cursor/deeplink.txt` (a static, exact-config
+  base64 deeplink, with its inherent one-click-install caveat stated
+  rather than hidden). A byte-for-byte `verify-plugins-build` plus a
+  `plugins-build-drift` CI job keep the generated trees honest, and
+  `sync-npm-version.sh` now stamps both plugin manifests with the full
+  semver (an opaque version pin, not MV3's numeric-core trap). Nothing
+  is published: the `superbasedapp/observer-plugins` repo, the Claude
+  Code marketplace listing, and the Cursor deeplink distribution all
+  stay operator-gated pending a decision on a known caveat — installing
+  the plugin alongside `observer init --claude-code` double-registers
+  hooks, so both would fire on every event until that's deduped.
+- **feat(orgserver,orgclient,web2): Teams member-invite loop,
+  default-off.** `[server].member_invites` (default `false`) lets an
+  active admin mint a capped, audited, time-boxed invite link — server
+  migration 023 backs the monthly cap and the `invite_minted` audit
+  trail — with a web2 invite composer page and a node-dashboard nudge on
+  the `Execute`-class surface. Conversion is reconstructed by joining
+  `minted_by` against `used_at`; nothing new goes on the agent wire. See
+  Fixed below for the security round that closed eight findings (seven
+  fixed, one documented) before this shipped.
+- **feat(plugins): one-command install for 20 AI coding tools, published
+  as the public `superbasedapp/plugins` repo.** Each supported tool can
+  now wire SuperBased up through its own native plugin or extension
+  mechanism instead of a hand-edited config file. The repo is *assembled*
+  from this one, never hand-maintained: `scripts/assemble-plugins-repo.sh`
+  runs the REAL `observer init` registrars (`mcp.Registrar` +
+  `hook.Registry`) against a sandbox `HOME` and transposes their exact
+  output, so a plugin manifest can never drift from what `init` actually
+  writes. Coverage grew across three waves to a **52-file** assembled
+  tree: six native manifests (kimi-code, qoder, devin, droid, openclaw,
+  antigravity — validated with each vendor's own validator where one
+  exists), six generated config listings (crush, kiro-cli, copilot-cli,
+  kilo-code, roo-code, open-interpreter), a Gemini CLI extension, a Goose
+  listing, a Codex plugin + marketplace, and a Copilot
+  `vscode:mcp/install` deep link. `@superbased/opencode-plugin` is
+  published to npm. Cowork's `.mcpb` bundle is built but deliberately
+  **not** claimed as supported until a live install verifies it.
+- **feat(tooltax): a canonical tool-name taxonomy shared by every
+  adapter.** A single 1,074-row table (30 tools) is now the one owner of
+  what each tool call *is* — its canonical name, category, and surface —
+  replacing per-adapter string matching. Adapters read `tooltax.For`;
+  migration 077 backfills historical rows whose `action_type` was
+  `unknown`; the dashboard gains a `/api/tools/breakdown` endpoint with
+  real category and surface dimensions; and `observer adapters` gains a
+  `VOCAB` column reporting, per adapter, whether its vocabulary is
+  grounded or honestly unknown.
+- **feat(db): test runs can no longer touch your real database.** `db.Open`
+  now refuses any path inside the operator's actual `~/.observer` when
+  running under `go test`, returning `ErrRealDBInTest` before `sql.Open`.
+  This closes a real incident in which a working-tree test resolved
+  `config.Default()`'s live path and ran a migration against the 16 GB
+  production store. The gate resolves symlinks across the full path and
+  checks hard links via `os.SameFile`, guards both migration entry points
+  (including `internal/orgserver/db`), and fails loudly rather than
+  skipping when the home directory can't be resolved.
+
+- **feat(orgserver,web2): GitHub Copilot seat subscriptions are finally
+  priced.** The seats API returns COUNTS ONLY, so `/api/org/telemetry`
+  reported "50 seats" and the metered overage while the subscription
+  those seats cost — normally the larger of Copilot's two cost feeds —
+  appeared nowhere. `[copilot_analytics].per_seat_price_usd` existed and
+  defaulted to $19, but **nothing read it**: an admin could set it and
+  change nothing. `SeatStats` now carries `per_seat_price_usd` and
+  `monthly_usd` (`total × price`), threaded from config through the
+  dashboard options, and the org dashboard renders a "Seat subscription"
+  tile plus a summary stat. Both are omitted entirely when the price is
+  unconfigured — absent means "price not supplied", never "seats are
+  free". **The unit trap is preserved at every level:** `monthly_usd` is
+  a point-in-time monthly fee and is never summed into `cost_usd`
+  (additive per-day metered spend) — asserted in Go, on the wire, and in
+  every UI aggregate. A non-finite or negative price is now refused at
+  config validation: TOML accepts the literals `nan` and `inf` without
+  error, and `inf` would otherwise reach `encoding/json`, which refuses
+  it *after* the 200 status is already sent.
+
+- **feat(cockpit): burn rate on the session cost strip.** A running
+  total never answers "should I stop this?" — a rate does. The terminal
+  cockpit's cost strip gains $/h plus a +1h projection. The rate is
+  measured over the turns the cockpit already polls so it reflects
+  current spend rather than being diluted by earlier idle time; the
+  oldest fetched turn is the window boundary, so it sets the denominator
+  but is excluded from the numerator. Falls back to the session average
+  over the same elapsed the header shows, and returns nothing — never a
+  confident $0.00/h — when neither basis exists.
+
+### Fixed
+
+- **fix(codex): patch rows no longer land with an empty input.** Modern
+  Codex invokes `apply_patch` from inside an `exec` custom_tool_call and
+  the executor stamps `patch_apply_end` with its own `exec-<uuid>` id,
+  while the response_item carries `call_<hash>`. Different namespaces, so
+  the join could never match on current builds and every patch row took
+  the standalone path with no `raw_tool_input`. Measured over a
+  393-rollout corpus: 2,059 exec-uuid vs 416 call_hash. There is no join
+  to repair, so the standalone path now reconstructs the input from the
+  producer's own `changes` object, with the rendering owned in one place
+  so a live-captured row and a `backfill --codex-tool-input` recovery are
+  byte-identical. On one live update-heavy session this took empty inputs
+  from 95 to 0.
+
+  Authored-byte accounting was deliberately left alone after measurement
+  proved the obvious "fix" wrong: an `update` change carries only
+  `unified_diff` and scores zero here, which *looks* like a bug, but every
+  patch also emits an invocation row that already counts the same bytes
+  from its own patch text (107 invocation rows / 142,823 B alongside 95
+  executor rows). Counting the diff as well double-counts every update.
+  The reasoning is now written into the code so the zero is not "fixed"
+  again.
+
+- **fix(dashboard): Compression tiles show an em dash, not a confident
+  zero.** `deriveTotals()` returned an all-zero object whenever the
+  timeseries query had no data, so five tiles rendered "$0.00 saved
+  across 0 compression events" from the moment the page mounted — and
+  because the loading flag also clears on error, a failed query settled
+  that zero in as a confident, wrong answer. The no-data branch now
+  yields undefined, which the existing null-safe formatters render as an
+  em dash: loading keeps the pulse, an error settles to a static dash.
+
+- **test(terminal): one flaked assertion can no longer kill an entire
+  package.** A cache-cleared `-race` sweep reported `FAIL cmd/observer
+  2400s` — the full 40-minute timeout. The cause was not slowness:
+  `TestTerminalPidSeederEndToEnd` failed an assertion and then deadlocked
+  in cleanup, because the PTY stub's `Kill`/`Close` were no-ops that never
+  unblocked the parked reader, so `Manager.Shutdown`'s unbounded
+  `wg.Wait()` never returned. Being a serial test, it left ~340 parallel
+  tests in the same package waiting and never run — the package reported
+  FAIL having executed almost none of itself. The prior "green" sweep
+  could not have caught this: `cmd/observer` was one of the 193/195
+  cached packages. With the stub honouring `Close`, the same failure now
+  takes 6.9s instead of 40 minutes.
+
+- **fix(dashboard): cache-savings counterfactual no longer zeroed for
+  proxy-recorded turns.** Rows with a recorded cache read > 0
+  contributed $0 to the "saved by caching" counterfactual, understating
+  cache savings roughly 3× on real corpora. Found by the Show HN corpus
+  mining pass; the memo's savings claims are gated on this fix.
+- **fix(store): outcome-update seam hardened.** Cross-tick
+  `tool_results` outcome flips now persist action outcomes through ONE
+  store-owned seam instead of per-adapter writes, closed across two
+  adversarial review rounds (evidence-gated 1→0 self-heal included).
+- **fix(hook,init): settings.json writer classes hardened (9 call
+  sites).** Two pre-existing defect classes shared by the hooks/cursor/
+  statusline registrars: the `any`-decode re-indent path could mangle
+  big integers (float64), reformat numbers, HTML-escape strings, panic
+  on JSON null, and silently collapse duplicate keys — now re-indents
+  RAW bytes; and the read-modify-write used a fixed temp name with no
+  lock — now unique temps + a cross-process advisory lock +
+  re-read-after-lock. Plus: loose ownership matching tightened, symlink
+  clobbering refused, a 5 MiB size cap, PID-reuse liveness via
+  `/proc` cmdline, and oversize-stdin handling on the statusline path.
+- **fix(hook): registrar write-path hardening, second pass.** The
+  deferred WP9 ledger: `hook_checksums.json` writes now take the
+  cross-process advisory lock and rename a unique temp file (was an
+  unlocked plain write); the codex `hooks.json`/`config.toml` writers
+  drop their fixed `.tmp` names for unique-temp atomic writes under
+  per-path locks with re-read-after-lock; and the unregister path
+  refuses to delete a symlinked config file instead of silently
+  unlinking the link while the target keeps stale hooks. Each pinned
+  by a concurrent-writer or symlink regression test.
+- **fix(adapter): foreign-mount SQLite mirror staging unified under
+  `internal/adapter/mirrorbase`.** Seven adapters staged cross-mount DB
+  mirrors into persistent `~/.cache` during parsing through copied
+  helper code; the new single-owner seam scopes them, and
+  `observer usage` redirects mirrors into its throwaway scratch
+  directory (live-verified: a one-shot run adds zero cache entries).
+- **fix(integration): npm Binary-row honesty.** Dropped impossible
+  `.exe` spellings from 10 npm-distributed CLI tools' Windows binary
+  rows — npm shims install `.cmd`/`.ps1` wrappers, never raw `.exe`.
+- **feat(web): share surfaces + camera-ready wordmark + once-only star
+  prompt.** CommunityCard can share a real personal stat the user opts
+  into ("$X tracked across N tools this month — superbased.app"), with
+  the exact text previewed before sharing and a static-link fallback
+  (never "$0.00 tracked"). MilestonesCard brag moments gain share/copy
+  actions. The four hero stat surfaces (Cost, Suggestions, Milestones,
+  Report) carry a muted in-frame `▞ superbased` wordmark so a native
+  screenshot travels with attribution — no export pipeline. A
+  lazygit-pattern once-only GitHub star prompt appears after a week of
+  real usage (never in demo mode, never twice). A new open-ended
+  Feedback issue form joins the GitHub templates.
+- **feat(cli): `observer privacy` — verifiable zero-network posture.**
+  Prints an honest, config-derived egress report: every listening
+  socket (loopback-only except the opt-in tailnet remote-access
+  listener) and every outbound path the binary can take, each with its
+  gate and this config's actual on/off state; `--json` for scripting.
+  Paired with two changes that make the claim exact: the dashboard's
+  npm-registry update check is now **user-initiated only** (a "Check
+  for updates" card in Settings → Health; no fetch on tab load, no
+  background timer), and a new website page,
+  `/docs/reference/measurement-honesty`, states the
+  compression-savings retraction plainly and documents the provable
+  accuracy claims that replace it.
+- **feat(website): three new competitor comparison pages** (CodeBurn,
+  Claude Code Usage Monitor, TokenTracker), authored from a dated
+  2026-07-30 re-verification of every competitor claim, with steelman
+  sections and the competitors' newest features stated fairly. New
+  `make track-build` / `verify-track-build` + a CI drift gate; fixed a
+  track-gen idempotency bug (marker blocks re-appended at EOF instead
+  of spliced in place, which could permanently redden a byte-for-byte
+  drift gate).
+- **fix(website): tool-count drift sweep.** Live compare pages said "26
+  coding tools" against 29 shipped adapters; the four compare pages are
+  corrected and `track-gen` now derives counts from `len(roster)` so the
+  class can't recur (new accuracy-check Check B2 guards it).
+- **fix(orgserver,orgclient,store): org-announcements rail hardened
+  before release (adversarial review, six findings, all fixed).** The
+  rail was built by cloning the routing-policy distribution rail, and
+  cloning a mechanism cloned its weaknesses into a context that couldn't
+  tolerate them. Three HIGHs, all fixable because the rail was still
+  unreleased: the signature covered the body only — no version, no rail
+  identity — so a captured signed document replayed at a bumped version
+  froze a node's cache via its own monotonic short-circuit, an old
+  retraction replayed cleared every banner, and because the org server
+  has one shared signing identity, a genuinely-signed routing-policy
+  document verified as a valid announcement. Fixed with
+  `orgcontract.AnnouncementSigningMessage` (a domain tag, the version,
+  and the body, hashed together) — the routing rail keeps its released
+  wire shape as-is, and the residual is now tracked as ledger row
+  **ROUTING-SIG-1** (`docs/security.md`) instead of silently inherited.
+  Announcement TOFU also consulted only its own rail's pin, so a node
+  enrolled for months would accept any key on its first announcement
+  fetch — closed in `internal/orgclient/orgpin.go`, one org identity now
+  enforced across both rails. And unenrolment left a departed org's
+  cached banner (and its pinned key) live, risking poisoning
+  re-enrolment into a different org — `store.DeleteEnrolment` now clears
+  both distribution caches. Three smaller fixes: the per-cycle poll is
+  now stated in `observer privacy` instead of left implicit; both
+  endpoints' 1 MiB caps applied to the read only and ignored trailing
+  bytes, now `orgcontract.DecodeCapped`; and `"[]"`/`"null"` were a third
+  and fourth silent spelling of a retraction, now one representation.
+  Every fix carries a regression test proven to fail pre-fix by inline
+  mutation against a document the org genuinely signed.
+- **fix(orgserver): member-invite loop hardened before release
+  (adversarial review, eight findings, seven fixed, one documented).**
+  Two HIGHs: the monthly mint cap was read-then-insert across two
+  connections with tens of milliseconds of argon2id hashing between
+  them, so concurrent mints could all read the same pre-mint count and
+  all land past the cap — now one `BEGIN IMMEDIATE` transaction,
+  mutation-proved by an 8-goroutine hammer test; and a SCIM-deactivated
+  admin with a still-live SAML cookie kept minting uncapped because the
+  admin branch returned before any liveness check — fixed both at the
+  invite gate and, more broadly, at `adminCheckerFor` (`AND active = 1`),
+  restoring deactivation as an authority revocation across every
+  `RequireAdminSAML` route. Three MEDs: `ttl_days` was unbounded (a
+  273-year token was mintable) and is now clamped 1–90 with explicit-zero
+  rejected rather than treated as "omitted"; the invite-lookup
+  404-vs-201 response was a membership oracle, now rate-limited to 20
+  failed lookups/hour per inviter (server migration 024, storing only
+  the inviter id and timestamp — never the probed address); and the
+  enrol link is now copy-only text rather than a clickable URL (the SPA
+  has no `/enrol/:token` route, so navigability bought nothing and only
+  cost exposure to link-unfurlers and mail scanners). One MED + one LOW:
+  inviter attribution now survives SCIM deletion via a `minted_by`
+  fallback, and the invite audit's `source_ip` no longer trusts
+  `X-Forwarded-For` (new ledger row **XFF-1** for two pre-existing,
+  deliberately-deferred XFF-trusting audit sites elsewhere in the org
+  server). One LOW documented rather than fixed: target-deletion CASCADE
+  frees a cap slot early, recorded in `docs/teams-operations.md` §8.2 as
+  needing member-lifecycle authority that already outranks the cap.
+- **fix(adapters): model reasoning no longer files itself as a completed
+  task.** Fifteen adapters minted a separate action row — typed
+  `task_complete` — every time the model produced a reasoning block,
+  inventing 15,734 phantom "task completions" in a live corpus for work
+  the model never did. Reasoning is not an action; it is something the
+  model did on the way to one. Every adapter now carries it as
+  `preceding_reasoning` on the *successor* event and mints no row at all.
+  Threading is consumed-once, last-wins, discarded at a turn boundary,
+  and never crosses a session id. Opaque or encrypted reasoning
+  placeholders are never threaded anywhere. Affected: crush, hermes,
+  cline-cli, antigravity, cursor, opencode, kilo-code-cli, codex,
+  open-interpreter, openclaw, cline, cowork, pi, copilot, copilot-cli,
+  gemini.
+- **fix(dashboard): `/api/status` no longer saturates the daemon.**
+  `diag.Snapshot` costs several seconds of `COUNT(*)`s on a large
+  database, and two always-mounted chrome components polled it every 5
+  seconds — so a scan was permanently in flight and starved every other
+  query (measured first-load latencies reached 36 s). The snapshot is now
+  computed behind a 15-second TTL + singleflight cache. Crucially the
+  scan runs **detached** from the caller's request context: the previous
+  fix was incomplete because the client aborts its prior fetch each tick,
+  cancelling whichever poller held the gate and serialising the scans
+  anyway. Degraded snapshots now carry a `QueryErrors` count and are
+  returned but never cached.
+- **fix(cursor): the reasoning stash is now safe across hook processes.**
+  Cursor is a hook adapter — one process per event — so its pending
+  reasoning needs an on-disk carrier. The first implementation raced:
+  under contention, 190 of 200 iterations double-threaded a thought and 8
+  of 200 reads saw a truncated file. It is now an atomic rename-claim
+  protocol — writes land at a unique temporary name and rename over the
+  target, and consumers claim by renaming the target to a nonce first, so
+  exactly one participant can win a name. Proven under `-race` with
+  multiple concurrent participants.
+- **fix(gemini): a failed call no longer records itself as a success.** A
+  legacy-shaped failed call persisted `success=1` forever. The verdict is
+  now taken from the response body — but only for *meaningful* errors
+  (non-blank strings, non-empty objects or arrays). `{"error": false}`,
+  `0`, `[]`, `{}`, and bare booleans or numbers never invent a failure.
+- **fix(plugins): two wrong-plugin-resolution hazards caught before
+  publication.** Both were reproduced live, not theorised. Factory's
+  `droid` resolved `./superbased` at the repo root to the *Claude Code*
+  plugin directory — hooks and all — so the plugin was relocated to
+  `factory/superbased`. `qodercli plugins marketplace add` likewise
+  installed the Claude plugin via its binary's literal search order;
+  closed with a root `.qoder-plugin/marketplace.json` whose schema was
+  extracted from the shipped binary, then verified end to end.
+
+### Changed
+
+- **Migration 079 deletes ~15,050 content-free reasoning rows on first
+  run, and your action counts will drop.** This is the historical half of
+  the reasoning fix above: the `(reasoning)` and `(encrypted reasoning, N
+  bytes)` placeholder rows written by the retired emit sites, plus their
+  FTS search excerpts, are removed, and 7 stale cursor rows are rewritten.
+  Those rows have no content, never had content, and were never threaded
+  anywhere — deleting them removes rows, not information. **Aggregate
+  action counts on the dashboard will fall accordingly; this is the
+  intended correction, not data loss.** Everything content-bearing is
+  kept, including the 329 codex reasoning rows carrying real summary text
+  and all 15 gemini reasoning rows (deleting those was measured to be
+  lossy). An id high-water marker is recorded in `schema_meta` before the
+  deletes so the result can be re-verified afterwards. Schema golden
+  moves 78 → 79.
+- `scripts/sync-npm-version.sh` now stamps **11** plugin-side manifests
+  in addition to the npm and VS Code packages, with a set-equality test
+  in both directions so a new manifest cannot be silently missed.
+
 ## [1.27.0] — 2026-07-29
 
 ### Added

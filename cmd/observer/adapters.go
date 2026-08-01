@@ -49,10 +49,10 @@ func newAdaptersCmd() *cobra.Command {
 // renderAdapterMatrix writes the capability matrix as an aligned table.
 func renderAdapterMatrix(w io.Writer, caps []integration.Capability) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ADAPTER\tPROXY\tSURFACE\tHOOK\tMCP\tNATIVE\tTOKEN\tHANDOFF\tATTACH\tRESUME")
+	fmt.Fprintln(tw, "ADAPTER\tPROXY\tSURFACE\tHOOK\tMCP\tNATIVE\tTOKEN\tVOCAB\tHANDOFF\tATTACH\tRESUME")
 	for _, c := range caps {
 		fmt.Fprintf(
-			tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			c.Tool,
 			proxyCell(c.Proxy),
 			routabilityCell(c.Routability),
@@ -60,6 +60,7 @@ func renderAdapterMatrix(w io.Writer, caps []integration.Capability) {
 			mcpCell(c.MCP),
 			nativeCell(c.Native),
 			tokenCell(c.TokenTier),
+			vocabCell(c.Vocabulary),
 			handoffCell(c.Handoff),
 			attachCell(c.Attach),
 			resumeCell(c),
@@ -69,14 +70,18 @@ func renderAdapterMatrix(w io.Writer, caps []integration.Capability) {
 	fmt.Fprintln(tw, "legend\tPROXY = route observer applies today (or dash). SURFACE = the")
 	fmt.Fprintln(tw, "\tsurface-specific routability bucket (routable / after-upstream /")
 	fmt.Fprintln(tw, "\tafter-bridge / probe / native-exempt). TOKEN shows the capture")
-	fmt.Fprintln(tw, "\ttier, with (gap) flagging a known hole. HANDOFF shows the")
-	fmt.Fprintln(tw, "\tsession-handoff transcript tier + launch mode (seeded /")
-	fmt.Fprintln(tw, "\tdoc-assisted); a dash is the actions-only carry floor (file")
-	fmt.Fprintln(tw, "\tlane only, not launchable in the embedded terminal). ATTACH =")
-	fmt.Fprintln(tw, "\tcan hand the PTY to the daemon for dashboard jump-in")
-	fmt.Fprintln(tw, "\t(`observer <x> --attach`). RESUME = how a closed session")
-	fmt.Fprintln(tw, "\treopens: native (the tool's own resume) / handoff (a")
-	fmt.Fprintln(tw, "\t--continue-from fork) / dash (neither).")
+	fmt.Fprintln(tw, "\ttier, with (gap) flagging a known hole. VOCAB = the adapter's")
+	fmt.Fprintln(tw, "\tnative tool names are carried by the canonical taxonomy")
+	fmt.Fprintln(tw, "\t(internal/tooltax), so its tool calls resolve to canonical")
+	fmt.Fprintln(tw, "\taction types; a dash means the capture has no native tool")
+	fmt.Fprintln(tw, "\tvocabulary at all (`observer doctor <tool>` prints the grounded")
+	fmt.Fprintln(tw, "\treason). HANDOFF shows the session-handoff transcript tier +")
+	fmt.Fprintln(tw, "\tlaunch mode (seeded / doc-assisted); a dash is the")
+	fmt.Fprintln(tw, "\tactions-only carry floor (file lane only, not launchable in")
+	fmt.Fprintln(tw, "\tthe embedded terminal). ATTACH = can hand the PTY to the")
+	fmt.Fprintln(tw, "\tdaemon for dashboard jump-in (`observer <x> --attach`).")
+	fmt.Fprintln(tw, "\tRESUME = how a closed session reopens: native (the tool's own")
+	fmt.Fprintln(tw, "\tresume) / handoff (a --continue-from fork) / dash (neither).")
 	_ = tw.Flush()
 }
 
@@ -168,6 +173,20 @@ func tokenCell(t integration.TokenTier) string {
 		return tier + " (gap)"
 	}
 	return tier
+}
+
+// vocabCell renders the adapter's NATIVE TOOL VOCABULARY coverage: "yes"
+// when the canonical taxonomy (internal/tooltax) carries rows for this
+// adapter's native tool names, else the honest-zero dash used by every
+// other empty cell in this table. There is deliberately no third rendering
+// for the honest-zero rows' Note — the matrix is a one-token-per-cell grid,
+// and the grounded reason belongs where it fits verbatim: `observer doctor
+// <tool>`. Dispatches on the declared capability, never on tool name.
+func vocabCell(v integration.Vocabulary) string {
+	if v.InTaxonomy {
+		return "yes"
+	}
+	return "—"
 }
 
 // handoffCell renders the session-handoff capability compactly: the

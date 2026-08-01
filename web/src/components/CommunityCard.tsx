@@ -1,5 +1,15 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Obs } from "@/components/Obs";
+import { useApi } from "@/lib/useApi";
+import { fmtUSD } from "@/lib/format";
+import {
+  SHARE_SITE_URL,
+  emailShareURL as buildEmailShareURL,
+  linkedInShareURL as buildLinkedInShareURL,
+  shareOrCopy,
+  xShareURL as buildXShareURL,
+} from "@/lib/share";
+import type { MonthlyReport } from "@/lib/types";
 
 // CommunityCard — the operator/node/developer "get involved" surface on the
 // Overview setup page. Four honest calls to action: star the public repo,
@@ -11,10 +21,20 @@ import { Obs } from "@/components/Obs";
 // Matches the OnboardingCard idiom (raw section, calm body, one pixel-chip
 // accent) rather than a chart shell — it's a persistent footer-style card, not
 // a data panel, so it is not dismissable.
+//
+// Growth-review §4 upgrade (2026-07-30): the "Refer a friend" share payload
+// is upgraded from a static generic link to an OPT-IN real personal stat —
+// "$X tracked across N tools this month". The number comes from the SAME
+// /api/report/monthly endpoint Report.tsx already renders (current month,
+// all projects) — no new backend route. When there's no data yet (fresh
+// install, zero sessions this month) the toggle has nothing to offer and the
+// share falls back to the static link; it never renders "$0.00 tracked".
+// The exact composed text is always visible above the share button before
+// the user acts on it (honesty gate — they see what they'd post).
 
 const REPO = "https://github.com/superbasedapp/observer";
 const ISSUES = `${REPO}/issues`;
-const SITE = "https://superbased.app/";
+const SITE = SHARE_SITE_URL;
 const CONTACT = "contact@superbased.app";
 
 // Curated, consented testimonials. Empty until we have real ones to show —
@@ -22,21 +42,43 @@ const CONTACT = "contact@superbased.app";
 // renders them instead of the collect-CTA.
 const TESTIMONIALS: { quote: string; author: string; role?: string }[] = [];
 
-const SHARE_TEXT =
-  "I've been using SuperBased to see what my AI coding tools actually cost and do — it's worth a look:";
+// No appended URL here: X / email / the native share sheet all add
+// the superbased.app link themselves via their own `url` param (see
+// xShareURL / emailShareURL / shareOrCopy below) — appending it again
+// in the text would double it up. LinkedIn's share intent only takes
+// a url param at all (no text), so it never sees this string.
+const SHARE_TEXT_STATIC =
+  "I've been using SuperBased to see what my AI coding tools actually cost and do — it's worth a look";
 
-function xShareURL(): string {
-  const p = new URLSearchParams({ text: SHARE_TEXT, url: SITE });
-  return `https://twitter.com/intent/tweet?${p.toString()}`;
+function currentMonth(): string {
+  return new Date().toISOString().slice(0, 7);
+}
+
+// buildPersonalStatText composes the opt-in personal-stat share line from
+// this month's report totals, or returns null when there's nothing honest
+// to say yet (no cost, no tools with spend this month). Gated on the
+// ROUNDED display value, not the raw float — a sub-cent cost (e.g.
+// $0.001) rounds to "$0.00" via fmtUSD, and we'd rather suppress the
+// stat than let it render as "$0.00 tracked" (compare formatted
+// strings, not `cost <= 0`, so any float that displays as $0.00 is
+// caught). No trailing site URL — X / email / the native share sheet
+// append it themselves (see the SHARE_TEXT_STATIC comment above).
+function buildPersonalStatText(r: MonthlyReport | null): string | null {
+  const cost = r?.totals?.cost_usd ?? 0;
+  const toolCount = (r?.by_tool ?? []).filter((t) => t.cost_usd > 0).length;
+  const displayCost = fmtUSD(cost);
+  if (displayCost === fmtUSD(0) || toolCount <= 0) return null;
+  return `${displayCost} tracked across ${toolCount} tool${toolCount === 1 ? "" : "s"} this month`;
+}
+
+function xShareURL(text: string): string {
+  return buildXShareURL(text, SITE);
 }
 function linkedInShareURL(): string {
-  const p = new URLSearchParams({ url: SITE });
-  return `https://www.linkedin.com/sharing/share-offsite/?${p.toString()}`;
+  return buildLinkedInShareURL(SITE);
 }
-function emailShareURL(): string {
-  const subject = encodeURIComponent("You should try SuperBased");
-  const body = encodeURIComponent(`${SHARE_TEXT}\n\n${SITE}`);
-  return `mailto:?subject=${subject}&body=${body}`;
+function emailShareURL(text: string): string {
+  return buildEmailShareURL("You should try SuperBased", text, SITE);
 }
 function feedbackURL(): string {
   const subject = encodeURIComponent("SuperBased — feedback / testimonial");
@@ -137,24 +179,28 @@ export function CommunityLinksMini() {
 
 export function CommunityCard() {
   const [shared, setShared] = useState<"idle" | "copied">("idle");
+  // Opt-in — off by default; the user actively chooses to include a real
+  // number in what they post. Disabled (and forced off) when there's
+  // nothing honest to show yet.
+  const [includeStats, setIncludeStats] = useState(false);
+
+  const monthly = useApi<MonthlyReport>(
+    "/api/report/monthly",
+    { month: currentMonth() },
+    [],
+  );
+  const personalStat = useMemo(
+    () => buildPersonalStatText(monthly.data),
+    [monthly.data],
+  );
+  const shareText =
+    includeStats && personalStat ? personalStat : SHARE_TEXT_STATIC;
 
   const share = async () => {
-    // Prefer the native share sheet; fall back to copying the site link.
-    const data = { title: "SuperBased", text: SHARE_TEXT, url: SITE };
-    try {
-      if (typeof navigator !== "undefined" && navigator.share) {
-        await navigator.share(data);
-        return;
-      }
-    } catch {
-      // user cancelled or share failed — fall through to copy
-    }
-    try {
-      await navigator.clipboard.writeText(SITE);
+    const result = await shareOrCopy(shareText, { url: SITE });
+    if (result === "copied") {
       setShared("copied");
       window.setTimeout(() => setShared("idle"), 2000);
-    } catch {
-      window.open(SITE, "_blank", "noreferrer");
     }
   };
 
@@ -197,7 +243,7 @@ export function CommunityCard() {
               </span>
               <span className="min-w-0">
                 <span className="block text-[12px] font-semibold text-fg-1 group-hover:text-accent">
-                  {shared === "copied" ? "Link copied ✓" : "Refer a friend"}
+                  {shared === "copied" ? "Copied ✓" : "Refer a friend"}
                 </span>
                 <span className="mt-0.5 block text-[11px] text-fg-4">
                   Share SuperBased with someone who'd find it useful.
@@ -212,16 +258,44 @@ export function CommunityCard() {
             />
           </div>
 
+          {/* Share payload preview — the exact text below is what
+              "Refer a friend" / X / LinkedIn / email will post; the
+              operator sees it before acting, never a hidden payload. */}
+          <div className="mt-3 rounded-2 border border-line-2 bg-bg-1 px-3 py-2">
+            <label className="flex items-center gap-2 text-[11px] text-fg-3">
+              <input
+                type="checkbox"
+                checked={includeStats}
+                disabled={!personalStat}
+                onChange={(e) => setIncludeStats(e.target.checked)}
+                className="h-3 w-3 shrink-0 rounded border-line-2 accent-accent disabled:opacity-40"
+              />
+              <span>
+                Include this month's stats in the share
+                {!personalStat && (
+                  <span className="text-fg-4"> (nothing tracked yet this month)</span>
+                )}
+              </span>
+            </label>
+            <p className="mt-1.5 truncate text-[11px] italic text-fg-2">
+              &ldquo;{shareText}&rdquo;
+            </p>
+            <p className="mt-1.5 text-[10.5px] text-fg-4">
+              X, email, and the native share sheet add the superbased.app
+              link automatically. LinkedIn shares the link only — no text.
+            </p>
+          </div>
+
           {/* Direct share links (fallback + reach) */}
           <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-fg-4">
             <span>Share via</span>
-            <a href={xShareURL()} target="_blank" rel="noreferrer noopener" className="font-medium text-accent hover:underline">
+            <a href={xShareURL(shareText)} target="_blank" rel="noreferrer noopener" className="font-medium text-accent hover:underline">
               X
             </a>
             <a href={linkedInShareURL()} target="_blank" rel="noreferrer noopener" className="font-medium text-accent hover:underline">
               LinkedIn
             </a>
-            <a href={emailShareURL()} className="font-medium text-accent hover:underline">
+            <a href={emailShareURL(shareText)} className="font-medium text-accent hover:underline">
               email
             </a>
           </div>

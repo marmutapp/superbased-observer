@@ -1139,8 +1139,8 @@ func TestParseRolloutResponseItem(t *testing.T) {
 	// precedes the tool calls (also feeds the per-turn PrecedingReasoning
 	// chain on the following tool events).
 	row := res.ToolEvents[1]
-	if row.ActionType != models.ActionTaskComplete {
-		t.Errorf("event 1 action: %s want task_complete", row.ActionType)
+	if row.ActionType != models.ActionAssistantMessage {
+		t.Errorf("event 1 action: %s want assistant_message", row.ActionType)
 	}
 	if row.RawToolName != "codex.assistant_text" {
 		t.Errorf("event 1 raw_tool_name: %q want codex.assistant_text", row.RawToolName)
@@ -1702,7 +1702,8 @@ func TestParseRolloutCompacted(t *testing.T) {
 // {type:"summary_text", text:"..."} segments, those should thread
 // into the turn's PrecedingReasoning chain — same place agent_message
 // already lives. This test forces a populated summary into the
-// fixture and verifies the next exec_command_end inherits it.
+// fixture and verifies the next exec_command_end inherits it, and
+// (B3) that the reasoning item itself mints no action row.
 func TestParseRolloutResponseItemReasoning(t *testing.T) {
 	t.Parallel()
 
@@ -1725,27 +1726,21 @@ func TestParseRolloutResponseItemReasoning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseSessionFile: %v", err)
 	}
-	// v1.4.53: reasoning now emits its own row in addition to feeding
-	// the per-turn agentMessages cache. So we expect:
-	//   1) the codex.reasoning row from the response_item.reasoning
-	//   2) the exec_command_end row that inherits the text as PrecedingReasoning
-	if len(res.ToolEvents) != 2 {
-		t.Fatalf("tool events: %d want 2 (reasoning row + exec_command_end)", len(res.ToolEvents))
+	// B3 (2026-07-31): reasoning mints NO row of its own — v1.4.53's
+	// standalone `codex.reasoning` row is retired. The ONLY event here
+	// is the exec_command_end, which inherits the summary text through
+	// the per-turn agentMessages cache as PrecedingReasoning.
+	if len(res.ToolEvents) != 1 {
+		t.Fatalf("tool events: %d want 1 (exec_command_end only; reasoning is never an action row)", len(res.ToolEvents))
 	}
-	var reasoningRow, execRow *models.ToolEvent
+	var execRow *models.ToolEvent
 	for i := range res.ToolEvents {
-		switch res.ToolEvents[i].RawToolName {
-		case "codex.reasoning":
-			reasoningRow = &res.ToolEvents[i]
-		case "exec_command_end":
+		if strings.Contains(strings.ToLower(res.ToolEvents[i].RawToolName), "reasoning") {
+			t.Fatalf("reasoning-named action row emitted: raw=%q %+v", res.ToolEvents[i].RawToolName, res.ToolEvents[i])
+		}
+		if res.ToolEvents[i].RawToolName == "exec_command_end" {
 			execRow = &res.ToolEvents[i]
 		}
-	}
-	if reasoningRow == nil {
-		t.Fatalf("missing codex.reasoning row; got %+v", res.ToolEvents)
-	}
-	if !strings.Contains(reasoningRow.ToolOutput, "run the test suite") {
-		t.Errorf("reasoning row ToolOutput must carry summary text; got %q", reasoningRow.ToolOutput)
 	}
 	if execRow == nil {
 		t.Fatalf("missing exec_command_end row; got %+v", res.ToolEvents)
@@ -1848,8 +1843,8 @@ func TestParseSessionFile_AgentMessageEmitsAssistantTextRow(t *testing.T) {
 		if ev.RawToolName != "codex.assistant_text" {
 			t.Errorf("event[%d] RawToolName = %q, want codex.assistant_text", i, ev.RawToolName)
 		}
-		if ev.ActionType != models.ActionTaskComplete {
-			t.Errorf("event[%d] ActionType = %q, want %q", i, ev.ActionType, models.ActionTaskComplete)
+		if ev.ActionType != models.ActionAssistantMessage {
+			t.Errorf("event[%d] ActionType = %q, want %q", i, ev.ActionType, models.ActionAssistantMessage)
 		}
 		if ev.Target != want {
 			t.Errorf("event[%d] Target = %q, want %q", i, ev.Target, want)
@@ -2865,13 +2860,15 @@ func TestParseRolloutRateLimitsCapturedFromTokenCount(t *testing.T) {
 	}
 }
 
-// TestParseRolloutReasoningEmptySummaryEmitsPlaceholderRow pins
-// that response_item.reasoning items with NO summary text (the
-// 100% case in Codex Desktop builds inspected through 2026-05)
-// still emit a row carrying an opaque (encrypted N bytes)
-// placeholder, so the reasoning's existence is visible in the
-// timeline even when the content is unrecoverable.
-func TestParseRolloutReasoningEmptySummaryEmitsPlaceholderRow(t *testing.T) {
+// TestParseRolloutReasoningEmptySummaryEmitsNothing pins the B3
+// contract for the dominant Codex shape: a response_item.reasoning
+// with NO summary text (the 100% case in Codex Desktop builds
+// inspected through 2026-05) produces NOTHING AT ALL. v1.4.53 minted
+// an opaque "(encrypted reasoning, N bytes)" placeholder row for it —
+// 15,040 content-free phantom task_complete rows in the live corpus.
+// A placeholder is never an action and is never threaded either: with
+// no readable summary there is nothing to carry.
+func TestParseRolloutReasoningEmptySummaryEmitsNothing(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -2892,21 +2889,19 @@ func TestParseRolloutReasoningEmptySummaryEmitsPlaceholderRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseSessionFile: %v", err)
 	}
-	var row *models.ToolEvent
-	for i := range res.ToolEvents {
-		if res.ToolEvents[i].RawToolName == "codex.reasoning" {
-			row = &res.ToolEvents[i]
-			break
+	for _, ev := range res.ToolEvents {
+		if strings.Contains(strings.ToLower(ev.RawToolName), "reasoning") {
+			t.Errorf("reasoning-named action row emitted: raw=%q %+v", ev.RawToolName, ev)
+		}
+		if strings.Contains(ev.Target, "encrypted reasoning") || ev.Target == "(reasoning)" {
+			t.Errorf("placeholder reasoning text surfaced as an action target: %+v", ev)
+		}
+		if strings.Contains(ev.PrecedingReasoning, "encrypted reasoning") || ev.PrecedingReasoning == "(reasoning)" {
+			t.Errorf("placeholder reasoning text threaded into PrecedingReasoning: %+v", ev)
 		}
 	}
-	if row == nil {
-		t.Fatalf("no codex.reasoning row emitted; got %+v", res.ToolEvents)
-	}
-	if !strings.Contains(row.Target, "encrypted reasoning") {
-		t.Errorf("empty-summary reasoning Target must mention 'encrypted reasoning'; got %q", row.Target)
-	}
-	if !strings.Contains(row.Target, "42 bytes") {
-		t.Errorf("encrypted-byte-count proxy missing from Target; got %q", row.Target)
+	if len(res.ToolEvents) != 0 {
+		t.Errorf("encrypted-only reasoning produced %d events, want 0: %+v", len(res.ToolEvents), res.ToolEvents)
 	}
 }
 

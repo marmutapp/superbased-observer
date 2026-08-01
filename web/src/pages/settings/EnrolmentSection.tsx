@@ -3,7 +3,7 @@ import { ChartShell, SlideOver, StatCard, Tooltip } from "@/components/primitive
 import { ChartState } from "@/components/ChartState";
 import { useApi } from "@/lib/useApi";
 import { fmtBytes, fmtInt } from "@/lib/format";
-import type { EnrolmentStatus } from "@/lib/types";
+import type { EnrolmentInvite, EnrolmentStatus } from "@/lib/types";
 
 // EnrolmentSection is the Settings → Enrolment page: it shows whether this
 // agent is enrolled in a Teams org, what the last push shared, lets the
@@ -101,6 +101,18 @@ export function EnrolmentSection() {
             <code className="font-mono text-fg-1">observer enroll &lt;org-url&gt; &lt;token&gt;</code>,
             then set <code className="font-mono text-fg-1">[org_client] enabled = true</code> and
             restart <code className="font-mono text-fg-1">observer start</code>.
+            <div className="mt-2 text-fg-3">
+              Working in a team and don&apos;t have an org server yet?{" "}
+              <a
+                href="https://superbased.app/docs/teams/getting-started"
+                target="_blank"
+                rel="noreferrer"
+                className="text-accent underline underline-offset-2"
+              >
+                Teams getting-started guide
+              </a>{" "}
+              — bring one up locally in about five minutes.
+            </div>
           </div>
         ) : (
           <div className="space-y-4">
@@ -115,6 +127,7 @@ export function EnrolmentSection() {
               />
             </div>
             <LastPush push={data?.last_push} />
+            <InviteTeammate />
           </div>
         )}
       </ChartState>
@@ -148,6 +161,166 @@ function LastPush({ push }: { push?: EnrolmentStatus["last_push"] }) {
         <span>{fmtBytes(push.bytes)}</span>
         {push.error && <span className="text-danger">{push.error}</span>}
       </div>
+    </div>
+  );
+}
+
+// InviteTeammate is the loop-closing nudge: an enrolled developer can hand a
+// teammate a one-time enrolment token without going through an admin — IF the
+// org has enabled it ([server].member_invites on the org server).
+//
+// Every authority decision is the org server's. This component only asks; a
+// refusal is rendered as honest copy naming the exact cause (the disabled-copy
+// rule: say WHICH dependency is missing, never a bare "unavailable"):
+//
+//   403 — the org has not enabled member invites, and names the server key
+//   404 — the teammate isn't a member yet (an invite is a handoff, not a signup)
+//   429 — this developer's monthly allowance is spent
+//   409 — this agent isn't enrolled
+//
+// The minted token is held in component state only, shown once, and cleared on
+// reset — it is never written anywhere node-side.
+function InviteTeammate() {
+  const [open, setOpen] = useState(false);
+  const [email, setEmail] = useState("");
+  const [state, setState] = useState<"idle" | "working" | "done" | "err">("idle");
+  const [message, setMessage] = useState("");
+  const [invite, setInvite] = useState<EnrolmentInvite | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  async function mint(e: React.FormEvent) {
+    e.preventDefault();
+    if (!email.trim()) return;
+    setState("working");
+    setMessage("");
+    try {
+      const res = await fetch("/api/enrolment/invite", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: email.trim() }),
+      });
+      const body = await res.json().catch(() => ({}) as Record<string, string>);
+      if (!res.ok) {
+        setState("err");
+        setMessage(body.message || `server returned ${res.status}`);
+        return;
+      }
+      setInvite(body as EnrolmentInvite);
+      setState("done");
+    } catch (err) {
+      setState("err");
+      setMessage(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  function reset() {
+    setInvite(null);
+    setEmail("");
+    setState("idle");
+    setMessage("");
+    setCopied(false);
+  }
+
+  if (!open) {
+    return (
+      <div className="rounded-2 border border-dashed border-line-2 bg-bg-3/40 px-4 py-3 text-[12px] text-fg-2">
+        <span className="font-medium text-fg-1">Working in a team?</span> Invite a teammate
+        who is already a member of this organisation — they get a one-time enrolment token.{" "}
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          className="rounded-2 border border-line-2 bg-bg-2 px-2.5 py-1 text-[11px] text-fg-1 hover:bg-bg-3"
+        >
+          Invite a teammate
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-2 border border-line-1 bg-bg-2 px-4 py-3 text-[12px]">
+      <div className="mb-2 flex items-center justify-between">
+        <div className="font-medium text-fg-1">Invite a teammate</div>
+        <button
+          type="button"
+          onClick={() => {
+            reset();
+            setOpen(false);
+          }}
+          className="rounded-2 border border-line-2 px-2 py-0.5 text-[11px] text-fg-3 hover:bg-bg-3"
+        >
+          Close
+        </button>
+      </div>
+
+      {invite ? (
+        <div className="space-y-2">
+          <div className="text-fg-2">
+            One-time token for <b className="text-fg-1">{invite.user_email}</b>. Send them this
+            command — it works once and expires {invite.expires_at}.
+          </div>
+          <div className="flex items-center gap-2">
+            <code className="flex-1 break-all rounded-2 border border-line-1 bg-bg-1 px-2 py-1 font-mono text-[11.5px] text-fg-1">
+              {invite.command}
+            </code>
+            <button
+              type="button"
+              onClick={() => {
+                void navigator.clipboard?.writeText(invite.command);
+                setCopied(true);
+              }}
+              className="rounded-2 border border-line-2 bg-bg-2 px-2.5 py-1 text-[11px] text-fg-1 hover:bg-bg-3"
+            >
+              {copied ? "Copied" : "Copy"}
+            </button>
+          </div>
+          <div className="text-warn">
+            Shown once. Nothing here is stored on this machine — close this panel and the token
+            is gone.
+          </div>
+          {invite.monthly_cap > 0 && (
+            <div className="text-fg-3">
+              {invite.minted_this_month} of {invite.monthly_cap} invites used this month.
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={reset}
+            className="rounded-2 border border-line-2 bg-bg-2 px-2.5 py-1 text-[11px] text-fg-2 hover:bg-bg-3"
+          >
+            Invite someone else
+          </button>
+        </div>
+      ) : (
+        <form onSubmit={mint} className="space-y-2">
+          <div className="text-fg-3">
+            They must already be a member of your organisation — an invite hands over a token, it
+            does not create an account.
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              type="email"
+              required
+              value={email}
+              onChange={(ev) => setEmail(ev.target.value)}
+              placeholder="teammate@example.com"
+              className="flex-1 rounded-2 border border-line-2 bg-bg-1 px-2.5 py-1 text-[12px] text-fg-1"
+            />
+            <button
+              type="submit"
+              disabled={state === "working" || !email.trim()}
+              className="rounded-2 border border-line-2 bg-bg-2 px-3 py-1 text-[11px] font-medium text-fg-1 disabled:opacity-40"
+            >
+              {state === "working" ? "Minting…" : "Mint invite"}
+            </button>
+          </div>
+          {state === "err" && (
+            <div className="rounded-2 border border-danger/40 bg-danger-soft px-3 py-2 text-[11.5px] text-danger">
+              {message}
+            </div>
+          )}
+        </form>
+      )}
     </div>
   );
 }

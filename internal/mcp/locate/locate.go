@@ -80,6 +80,19 @@ func Locations(home string) []Location {
 		// daemon writing a Windows VS Code Cline) is resolved dynamically via
 		// crossmount in the registrar (the cline-windows virtual target).
 		{Client: "cline", Path: ClineSettingsPath(home, runtime.GOOS), Format: FormatMCPServersJSON},
+		// Factory AI's droid CLI reuses claude-code/cursor's
+		// {"mcpServers":{}} shape in its OWN file, grounded live 2026-07-29
+		// (docs/plans/factory-droid-adapter-plan-2026-07-29.md). Note: the
+		// droid adapter deliberately never reads ~/.factory's root-level
+		// settings.json/auth files (plaintext BYOK keys live there); this
+		// row only ever touches mcp.json, a sibling file.
+		{Client: "droid", Path: filepath.Join(home, ".factory", "mcp.json"), Format: FormatMCPServersJSON},
+		// commandcode.ai's npm CLI reuses the same {"mcpServers":{}} shape
+		// in its own file, grounded 2026-07-29 from the npm package's
+		// cli.mjs getUserMcpConfigPath + bundled reference/mcp.md. The
+		// commandcode adapter never reads ~/.commandcode/auth.json (API
+		// keys); this row only ever touches mcp.json, a sibling file.
+		{Client: "command-code", Path: filepath.Join(home, ".commandcode", "mcp.json"), Format: FormatMCPServersJSON},
 	}
 }
 

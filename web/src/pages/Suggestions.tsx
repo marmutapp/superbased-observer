@@ -9,6 +9,7 @@ import {
 import { Pagination } from "@/components/DataTable";
 import { ChartState } from "@/components/ChartState";
 import { HelpInd } from "@/components/HelpInd";
+import { HeroWordmark } from "@/components/HeroWordmark";
 import { CoinsIcon } from "@/components/icons";
 import { useApi } from "@/lib/useApi";
 import { useFilters, windowLabel, windowParams } from "@/lib/filters";
@@ -82,7 +83,11 @@ export function SuggestionsPage() {
         helpId="tab.suggestions"
       />
 
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+      {/* Camera-ready pass (growth-review §4): "avoidable spend" is the
+          screenshot-shaped headline number on this page — a subtle
+          corner wordmark carries the crop. */}
+      <div className="relative grid grid-cols-1 gap-3 pb-4 sm:grid-cols-3">
+        <HeroWordmark />
         <HeroStat
           label={spendLabel}
           helpId="tile.suggestions.avoidable"

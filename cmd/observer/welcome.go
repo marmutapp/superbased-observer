@@ -36,6 +36,7 @@ func printWelcome(cmd *cobra.Command) error {
 		fmt.Fprintf(out, "  daemon      not detected — start it with `observer start`\n")
 	}
 	fmt.Fprint(out, "\n")
+	fmt.Fprint(out, "  observer usage     one-shot cost table (no daemon, temp DB)\n")
 	fmt.Fprintf(out, "  observer start     proxy + watcher + dashboard (http://%s)\n", dashAddr)
 	fmt.Fprint(out, "  observer init      wire hooks / MCP / proxy routing into your AI tools\n")
 	fmt.Fprint(out, "  observer doctor    health checks\n")

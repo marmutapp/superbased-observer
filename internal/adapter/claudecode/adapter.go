@@ -18,6 +18,7 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/models"
 	"github.com/marmutapp/superbased-observer/internal/platform/crossmount"
 	"github.com/marmutapp/superbased-observer/internal/scrub"
+	"github.com/marmutapp/superbased-observer/internal/tooltax"
 )
 
 // EffortLookup fetches the claudecode_effort sidecar map for a session.
@@ -126,71 +127,29 @@ var nativeTools = map[string]struct{}{
 	"AskUserQuestion": {},
 }
 
-// actionMap translates Claude Code tool names to the normalized taxonomy.
+// actionMap translates Claude Code tool names to the normalized
+// taxonomy. It is READ OUT of internal/tooltax, the one owner of the
+// cross-adapter tool vocabulary (WP-T3 of
+// docs/plans/tool-taxonomy-standardization-plan-2026-07-31.md). The
+// hand-maintained literal that used to live here is now the
+// claude-code rows of tooltax's ordered canonical table — add new
+// native tool names THERE, not here.
 //
 // Shell-variant coverage: Bash is the canonical Claude Code tool name on
 // Linux/macOS/WSL, but Windows-side Claude Code (and operator-installed
 // shell wrappers) also surface PowerShell, pwsh, cmd, and cmd.exe as
-// raw tool names. Without these mappings they fall through to
+// raw tool names. Without those rows they fall through to
 // ActionUnknown and silently drop out of the dashboard's
 // run_command-filtered views (see Issue #6 cross-adapter sweep).
-var actionMap = map[string]string{
-	"Read":         models.ActionReadFile,
-	"Write":        models.ActionWriteFile,
-	"Edit":         models.ActionEditFile,
-	"MultiEdit":    models.ActionEditFile,
-	"NotebookEdit": models.ActionEditFile,
-	"Bash":         models.ActionRunCommand,
-	"PowerShell":   models.ActionRunCommand,
-	"powershell":   models.ActionRunCommand,
-	"pwsh":         models.ActionRunCommand,
-	"cmd":          models.ActionRunCommand,
-	"cmd.exe":      models.ActionRunCommand,
-	"sh":           models.ActionRunCommand,
-	"Grep":         models.ActionSearchText,
-	"Glob":         models.ActionSearchFiles,
-	"WebSearch":    models.ActionWebSearch,
-	"WebFetch":     models.ActionWebFetch,
-	// Agent is Claude Code's sub-agent launcher. Each Agent call kicks
-	// off a sub-agent runtime; on current Claude Code 2.1.x that
-	// runtime's activity is written to its OWN JSONL file under
-	// <session-uuid>/subagents/agent-(acompact-)?XXX.jsonl, sharing the
-	// parent's sessionId but with isSidechain:true on every line. The
-	// adapter watches that subdirectory automatically (UnderAnyWatchRoot)
-	// so subagent rows ingest under the same session_id as the parent.
-	// Tagging the parent's tool_use as spawn_subagent lets users count
-	// fan-out distinctly from regular tool work. (Pre-2.1 the comment
-	// here claimed activity was inline in the parent file with
-	// isSidechain markers; that's no longer true. Updated by v1.6.10
-	// claude-code audit, doc DH1.)
-	"Agent": models.ActionSpawnSubagent,
-	// TaskCreate / TaskUpdate / TaskList / TaskGet / TaskOutput /
-	// TaskStop are the structured-todo-list tools (the local equivalent
-	// of an internal task tracker the agent uses to plan its own work).
-	// Map all six to ActionTodoUpdate so the Actions tab can filter
-	// the agent's planning chatter as a single bucket.
-	"TaskCreate": models.ActionTodoUpdate,
-	"TaskUpdate": models.ActionTodoUpdate,
-	"TaskList":   models.ActionTodoUpdate,
-	"TaskGet":    models.ActionTodoUpdate,
-	"TaskOutput": models.ActionTodoUpdate,
-	"TaskStop":   models.ActionTodoUpdate,
-	// TodoWrite is the older / pre-Task* todo tool name (Claude Code
-	// renamed the family in 2.0+ but legacy sessions still emit this).
-	// Same semantic bucket as Task*.
-	"TodoWrite": models.ActionTodoUpdate,
-	// AskUserQuestion is Claude Code's interactive prompt tool — maps
-	// to the existing ActionAskUser constant.
-	"AskUserQuestion": models.ActionAskUser,
-	// EnterPlanMode / ExitPlanMode are tool calls that toggle Claude
-	// Code's plan mode. Map to the same ActionPermissionMode constant
-	// that v1.6.10's B4 metadata-line handler uses for `permission-mode`
-	// JSONL lines (acceptEdits / plan entry/exit) — both surface the
-	// same dashboard dimension ("when did the agent enter/leave plan
-	// mode") and should aggregate together.
-	"EnterPlanMode": models.ActionPermissionMode,
-	"ExitPlanMode":  models.ActionPermissionMode,
-}
+//
+// tooltax.For returns LITERAL rows only, so the `mcp__*` glob is still
+// resolved by the models.IsMCPToolName fallback in toolUseEvent —
+// unchanged behaviour.
+//
+// TestActionMapPreservesPreTooltaxFixture pins every pre-conversion
+// pair as still present and unchanged; TestActionMapTooltaxAdditions
+// pins the intended additions so an unreviewed one is loud.
+var actionMap = tooltax.For(models.ToolClaudeCode)
 
 // rawLine is the shape of a single JSONL record we care about. Claude Code's
 // actual format is richer; we decode only the fields we need and let extras
@@ -863,53 +822,93 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 						pending[block.ID] = idx
 					}
 				case "tool_result":
-					if idx, ok := pending[block.ToolUseID]; ok {
-						body := decodeResultContent(block.Content)
-						scrubbed := a.scrubber.String(body)
-						res.ToolEvents[idx].ToolOutput = scrubbed
-						if block.IsError {
-							res.ToolEvents[idx].Success = false
-							res.ToolEvents[idx].ErrorMessage = truncateResult(scrubbed)
-						}
-						// Wall-clock duration: gap between the tool_use's
-						// assistant-message timestamp and the tool_result's
-						// user-message timestamp. Anthropic's JSONL doesn't
-						// emit a structured per-tool elapsed field, so the
-						// successor-timestamp delta is the only signal we
-						// have. Skip when either timestamp is zero (legacy
-						// rows) or the gap is negative (clock skew).
-						//
-						// V7e / audit B5 — cap inferred durations at 30
-						// minutes (1,800,000ms). Claude Code's Bash tool
-						// has a documented hard ceiling of 30min; native
-						// tools (Read/Write/Edit/Grep/Glob) run in
-						// sub-second wallclock. ANY computed duration
-						// above the cap is a capture artifact — typically
-						// auto-compact stitching the original tool_use
-						// timestamp to a tool_result that landed hours
-						// later, or session-idle resume re-attributing a
-						// pending tool_use to a much-later result. Prior
-						// audit (docs/claudecode-bash-duration-audit-
-						// 2026-05-15.md) measured 246.4 false hours
-						// across 62 rows on the maintainer corpus.
-						const maxInferredDurationMs int64 = 30 * 60 * 1000
-						call := &res.ToolEvents[idx]
-						if call.DurationMs == 0 && !call.Timestamp.IsZero() && !ts.IsZero() {
-							if d := ts.Sub(call.Timestamp).Milliseconds(); d > 0 {
-								if d > maxInferredDurationMs {
-									d = 0
-								}
-								call.DurationMs = d
-							}
-						}
-						delete(pending, block.ToolUseID)
+					// Cap BEFORE scrubbing (qwencode's order): the
+					// 1 MiB ToolOutput contract in models.ToolEvent is
+					// the store's, so a multi-megabyte result body must
+					// never leave the adapter uncapped — in-window or
+					// cross-tick.
+					scrubbed := a.scrubber.String(
+						contentcap.Cap(decodeResultContent(block.Content), contentcap.DefaultMaxBytes),
+					)
+					var resultErr string
+					if block.IsError {
+						resultErr = truncateResult(scrubbed)
 					}
+					idx, ok := pending[block.ToolUseID]
+					if !ok {
+						// Cross-tick: the tool_use lives in a PREVIOUS
+						// parse window, so its row is already persisted
+						// optimistically successful and the correlation
+						// map is empty. Hand the outcome to the store
+						// keyed by the same (source_file, block id) pair
+						// toolUseEvent used as SourceEventID. DurationMs
+						// stays 0 — the call's timestamp is in the prior
+						// window; UpdateActionOutcome no-ops a zero.
+						if block.ToolUseID != "" {
+							res.OutcomeUpdates = append(res.OutcomeUpdates, models.ActionOutcomeUpdate{
+								SourceFile:    path,
+								SourceEventID: block.ToolUseID,
+								SuccessKnown:  true, // is_error is always a verdict
+								Success:       !block.IsError,
+								ErrorMessage:  resultErr,
+								ToolOutput:    scrubbed,
+							})
+						}
+						continue
+					}
+					res.ToolEvents[idx].ToolOutput = scrubbed
+					if block.IsError {
+						res.ToolEvents[idx].Success = false
+						res.ToolEvents[idx].ErrorMessage = resultErr
+					}
+					// Wall-clock duration: gap between the tool_use's
+					// assistant-message timestamp and the tool_result's
+					// user-message timestamp. Anthropic's JSONL doesn't
+					// emit a structured per-tool elapsed field, so the
+					// successor-timestamp delta is the only signal we
+					// have. Skip when either timestamp is zero (legacy
+					// rows) or the gap is negative (clock skew).
+					//
+					// V7e / audit B5 — cap inferred durations at 30
+					// minutes (1,800,000ms). Claude Code's Bash tool
+					// has a documented hard ceiling of 30min; native
+					// tools (Read/Write/Edit/Grep/Glob) run in
+					// sub-second wallclock. ANY computed duration
+					// above the cap is a capture artifact — typically
+					// auto-compact stitching the original tool_use
+					// timestamp to a tool_result that landed hours
+					// later, or session-idle resume re-attributing a
+					// pending tool_use to a much-later result. Prior
+					// audit (docs/claudecode-bash-duration-audit-
+					// 2026-05-15.md) measured 246.4 false hours
+					// across 62 rows on the maintainer corpus.
+					const maxInferredDurationMs int64 = 30 * 60 * 1000
+					call := &res.ToolEvents[idx]
+					if call.DurationMs == 0 && !call.Timestamp.IsZero() && !ts.IsZero() {
+						if d := ts.Sub(call.Timestamp).Milliseconds(); d > 0 {
+							if d > maxInferredDurationMs {
+								d = 0
+							}
+							call.DurationMs = d
+						}
+					}
+					delete(pending, block.ToolUseID)
 				}
 			}
 		}
 
 		if readErr == io.EOF {
 			break
+		}
+	}
+
+	// Whatever is still in `pending` at EOF is a tool_use whose result
+	// this window never saw. Its Success=true is a placeholder, so flag
+	// it: the store holds failure-context bookkeeping for these rows
+	// until the matching ActionOutcomeUpdate reports the real outcome.
+	for _, idx := range pending {
+		if idx < len(res.ToolEvents) {
+			res.ToolEvents[idx].OutcomePending = true
 		}
 	}
 
@@ -1250,14 +1249,19 @@ func (a *Adapter) assistantTextEvent(
 		resolvedMsgID = "asst:" + line.UUID
 	}
 	return models.ToolEvent{
-		SourceFile:         sourceFile,
-		SourceEventID:      fmt.Sprintf("%s:text:%d", line.UUID, blockIdx),
-		SessionID:          line.SessionID,
-		ProjectRoot:        projectRoot,
-		Timestamp:          ts,
-		GitBranch:          line.GitBranch,
-		Tool:               models.ToolClaudeCode,
-		ActionType:         models.ActionTaskComplete,
+		SourceFile:    sourceFile,
+		SourceEventID: fmt.Sprintf("%s:text:%d", line.UUID, blockIdx),
+		SessionID:     line.SessionID,
+		ProjectRoot:   projectRoot,
+		Timestamp:     ts,
+		GitBranch:     line.GitBranch,
+		Tool:          models.ToolClaudeCode,
+		// Per-text-block row: one per `text` content block of EVERY
+		// assistant message, mid-turn included (85% of claude-code turns
+		// carry more than one). assistant_message, not task_complete —
+		// the turn-terminal row is the Stop hook's, which keeps
+		// task_complete (cmd/observer/hook.go::buildClaudeStopEvent).
+		ActionType:         models.ActionAssistantMessage,
 		Target:             preview,
 		Success:            true,
 		PrecedingReasoning: preview,

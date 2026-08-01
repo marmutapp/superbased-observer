@@ -112,11 +112,17 @@ func newBackfillCmd() *cobra.Command {
 		clinecliRescan         bool
 		cacheRescan            bool
 		codexForkDedup         bool
-		apply                  bool
-		all                    bool
-		dryRun                 bool
-		jsonOut                bool
-		limit                  int
+
+		reasoningConverge        bool
+		reasoningConvergeDiscard bool
+
+		codexToolInput bool
+
+		apply   bool
+		all     bool
+		dryRun  bool
+		jsonOut bool
+		limit   int
 	)
 	cmd := &cobra.Command{
 		Use:   "backfill",
@@ -211,6 +217,22 @@ classification.
                          Dry run reports matched rows / tokens /
                          sessions; --apply DELETEs them (idempotent)
                          and backfills session fork lineage.
+    --reasoning-converge Converge the B3 reasoning residue: carry each
+                         surviving reasoning task_complete row's text
+                         onto its successor's preceding_reasoning, then
+                         delete the row (migration 079's dependency
+                         protocol). Dry run reports per-tool counts and
+                         which rows it will NOT delete because their
+                         text would be destroyed; --apply mutates.
+    --codex-tool-input   Re-derive raw_tool_input for the codex-family
+                         rows genuinely MISSING one, by re-reading the
+                         rollout files. Grounded per action_type: the
+                         assistant_message / task_complete /
+                         turn_aborted / session_start rows legitimately
+                         have NO input and are reported in their own
+                         bucket, never written to. Joins on
+                         source_event_id = the record's call_id. Never
+                         overwrites, never invents; --apply mutates.
 
   ┌─ Convenience / utility ────────────────────────────────────────┐
   └─────────────────────────────────────────────────────────────────┘
@@ -272,7 +294,7 @@ historical rows in sync with the latest schema and adapter behaviour.`,
 				!claudecodeUserPrompts && !claudecodeAPIErrors &&
 				!cursorUserPrompts && !cursorSubagents && !coworkRescan && !coworkProjectRoot && !codexRescan &&
 				!antigravityRescan && !antigravityCliRescan && !geminiCliRescan && !copilotCliRescan && !hermesRescan && !clinecliRescan && !cacheRescan &&
-				!codexForkDedup {
+				!codexForkDedup && !reasoningConverge && !codexToolInput {
 				return fmt.Errorf("nothing to backfill — pass one of the dimension flags or --all")
 			}
 
@@ -330,6 +352,8 @@ historical rows in sync with the latest schema and adapter behaviour.`,
 				CursorUserPrompts      *CursorUserPromptsBackfill      `json:"cursor_user_prompts,omitempty"`
 				CursorSubagents        *CursorSubagentsBackfill        `json:"cursor_subagents,omitempty"`
 				CodexForkDedup         *CodexForkDedupBackfill         `json:"codex_fork_dedup,omitempty"`
+				ReasoningConverge      *ReasoningConvergeBackfill      `json:"reasoning_converge,omitempty"`
+				CodexToolInput         *ToolInputBackfill              `json:"codex_tool_input,omitempty"`
 			}{}
 
 			// --all kicks a full rescan from offset 0 BEFORE the surgical
@@ -392,7 +416,9 @@ historical rows in sync with the latest schema and adapter behaviour.`,
 			//   - token_usage.web_search_requests populated from
 			//     event_msg/web_search_end counts
 			//   - new ActionRateLimit rows from token_count.rate_limits
-			//   - new codex.reasoning rows from response_item.reasoning
+			// (codex.reasoning rows are no longer minted — B3 converged
+			// reasoning onto preceding_reasoning; a rescan re-parses the
+			// same records without re-creating the phantom rows)
 			// Standalone or composable with --all; (source_file,
 			// source_event_id) UNIQUE keeps it idempotent.
 			if codexRescan {
@@ -1038,6 +1064,30 @@ historical rows in sync with the latest schema and adapter behaviour.`,
 				}
 			}
 
+			if reasoningConverge {
+				var convergeOut io.Writer
+				if !jsonOut {
+					convergeOut = cmd.OutOrStdout()
+				}
+				res, err := backfillReasoningConverge(cmd.Context(), database, apply, reasoningConvergeDiscard, convergeOut)
+				if err != nil {
+					return err
+				}
+				summary.ReasoningConverge = &res
+			}
+
+			if codexToolInput {
+				var toolInputOut io.Writer
+				if !jsonOut {
+					toolInputOut = cmd.OutOrStdout()
+				}
+				res, err := backfillToolInput(cmd.Context(), database, apply, toolInputOut)
+				if err != nil {
+					return err
+				}
+				summary.CodexToolInput = &res
+			}
+
 			if jsonOut {
 				body, _ := json.MarshalIndent(summary, "", "  ")
 				fmt.Fprintln(cmd.OutOrStdout(), string(body))
@@ -1079,7 +1129,10 @@ historical rows in sync with the latest schema and adapter behaviour.`,
 	cmd.Flags().BoolVar(&copilotCliRescan, "copilot-cli-rescan", false, "Fast rescan of the GitHub Copilot CLI tree only — re-walks events.jsonl under ~/.copilot/session-state AND process-*.log under ~/.copilot/logs (cross-mount aware). Run after enabling `copilot --log-level debug` to retrofit Tier-1 accurate input/cache/reasoning tokens onto historical sessions. Idempotent.")
 	cmd.Flags().BoolVar(&cacheRescan, "cache-rescan", false, "Re-walk claude-code transcripts through the Tier-2 cache observation engine to populate historical cache_segments / cache_entries / cache_events rows. Order-sensitive within each file (chain dependency); files in mtime order. Idempotent via CacheEventExistsForMessage — a turn already captured by the Tier-1 proxy path skips Tier-2 emission, so re-runs are no-ops and proxy-already-observed turns don't double-write. Use after enabling [cachetrack].enabled on a daemon that has historical claude-code traffic, or after upgrading to a build that closes a cachetrack bug (Fix B deep canonicalize / x-anthropic-billing-header exclusion / etc.) to retrofit corrected attribution onto past sessions. Picked up by --all.")
 	cmd.Flags().BoolVar(&codexForkDedup, "codex-fork-dedup", false, "Purge historical duplicate codex token_usage rows created when a fork / subagent spawn replayed its parent rollout's token_count telemetry into the child's rollout (~65% of codex input tokens in a pre-fix DB are these duplicates). Enumerates codex token_usage source_files, re-runs the fork-replay detector, and matches the replayed tk:<basename>:L<line> rows. DRY-RUN BY DEFAULT — reports matched rows / summed tokens (input/output/cache_read/reasoning/web_search/est_cost) / sessions touched and deletes nothing; pass --apply to delete. Uses a 2s safety margin (vs the strict-boundary ingest suppression) so a second-boundary or clock-regression edge case is never auto-deleted. Also backfills session lineage (forked_from_id / parent_thread_id / thread_source) onto pre-fix sessions. NOT part of --all (destructive). Idempotent — deletes by (source_file, source_event_id) key. CAVEATS: duplicate rows already pushed to an org server are NOT retracted (server ingest is INSERT OR IGNORE) — this cleans the local DB only; and any cache_events / cache_segments the replayed rows produced are NOT cascade-deleted (node-local cache tables are left as-is).")
-	cmd.Flags().BoolVar(&apply, "apply", false, "Actually perform destructive deletes for --codex-fork-dedup (default is dry-run, which reports what WOULD be deleted and touches nothing).")
+	cmd.Flags().BoolVar(&reasoningConverge, "reasoning-converge", false, "Converge the B3 reasoning residue (docs/plans/b3-reasoning-convergence-plan-2026-07-31.md): the content-bearing `*.reasoning` / `cursor.thinking` task_complete rows migration 079 deliberately kept because deleting them would be lossy. Carries each row's full text onto its successor's preceding_reasoning under B3's own semantics (consumed-once / last-wins / turn-boundary-discarded / never crossing a session id / never overwriting a populated successor), then deletes the row through migration 079's dependency protocol (action_excerpts + failure_context deleted, file_state / retrieval_signals / guard_events / process_runs / process_events references NULLed). DB-only — the text already lives in the rows (target = the 200-char preview, raw_tool_output = the full body), so no source file is re-parsed. DRY-RUN BY DEFAULT; pass --apply to mutate. One transaction, so a mid-run failure can never leave a row deleted with its text uncarried. NOT part of --all (destructive). Idempotent. A row is deleted only when its bytes provably survive — see --reasoning-converge-discard-unresolved.")
+	cmd.Flags().BoolVar(&reasoningConvergeDiscard, "reasoning-converge-discard-unresolved", false, "Widen --reasoning-converge's delete to every row B3's semantics account for, including the ones whose text B3 sends nowhere (superseded by last-wins, discarded at a turn boundary, no successor in the session, or a successor whose preceding_reasoning already holds DIFFERENT text). That is the strict reading of B3 and it DESTROYS reasoning text that exists nowhere else — the dry run reports exactly how many rows and bytes. Rows whose raw_tool_output diverges from target are never deleted under either setting.")
+	cmd.Flags().BoolVar(&codexToolInput, "codex-tool-input", false, "Re-derive raw_tool_input for the codex-family rows that are genuinely MISSING one, by re-reading the rollout files the rows came from. The candidate set is grounded per action_type, not assumed: four of the six codex action types with an empty raw_tool_input (assistant_message / task_complete / turn_aborted / session_start) come from emit sites that assign no input because the event HAS none — empty is correct there and this pass never writes to them, reporting them in their own named bucket. Only edit_file (patch_apply_end.changes, which buildPatchApplyStandaloneEvent drops) and web_search are recoverable. Rows join to source records on source_event_id = the record's own call_id — never on ordinal position or timestamp. Never overwrites a populated raw_tool_input; a missing file, an absent record or an empty derived value all stay UNRESOLVED rather than gaining a fabricated value. DRY-RUN BY DEFAULT; pass --apply to mutate. One transaction. NOT part of --all. Idempotent.")
+	cmd.Flags().BoolVar(&apply, "apply", false, "Actually perform destructive deletes for --codex-fork-dedup and --reasoning-converge, and the writes for --codex-tool-input (default is dry-run, which reports what WOULD change and touches nothing).")
 	cmd.Flags().BoolVar(&all, "all", false, "Run every supported backfill in one invocation (recommended after upgrading)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Snapshot the live DB via VACUUM INTO and run the requested backfills against the snapshot instead of the live DB. Reports what WOULD update; live DB untouched. Snapshot is deleted on exit. See docs/backfill-flag-audit-2026-05-19.md.")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Emit JSON")

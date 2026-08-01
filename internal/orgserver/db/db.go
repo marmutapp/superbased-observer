@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	agentdb "github.com/marmutapp/superbased-observer/internal/db"
 	"github.com/marmutapp/superbased-observer/internal/orgserver/db/migrations"
 	"github.com/marmutapp/superbased-observer/internal/platform/sqlitedsn"
 
@@ -43,6 +44,15 @@ type Options struct {
 func Open(ctx context.Context, opts Options) (*sql.DB, error) {
 	if opts.Path == "" {
 		return nil, errors.New("orgserver/db.Open: Path is required")
+	}
+	// Live-DB test isolation gate (incident "task #17", 2026-07-30). The org
+	// server DB normally lives at /var/lib/observer-org/server.db, but nothing
+	// stops a test from pointing this opener at the agent's ~/.observer —
+	// which would WAL-lock and migrate the operator's live store just as
+	// effectively as the agent opener would. One owner: the predicate is
+	// agentdb's, never a second copy. Inert in production.
+	if err := agentdb.GuardLiveDB(opts.Path); err != nil {
+		return nil, err
 	}
 	busy := opts.BusyTimeout
 	if busy <= 0 {
@@ -110,6 +120,11 @@ func integrityCheck(ctx context.Context, db *sql.DB) error {
 // transaction on a pinned connection — identical concurrency contract to the
 // agent's internal/db runner (see its comment for the full rationale).
 func runMigrations(ctx context.Context, db *sql.DB) error {
+	// Live-DB test isolation gate, handle form — see the note in Open. Guards
+	// the damage site for callers that build a raw handle themselves.
+	if err := agentdb.GuardLiveDBHandle(ctx, db); err != nil {
+		return err
+	}
 	entries, err := readMigrationEntries()
 	if err != nil {
 		return err

@@ -1,0 +1,1 @@
+vscode:mcp/install?%7B%22name%22%3A%22observer%22%2C%22type%22%3A%22stdio%22%2C%22command%22%3A%22observer%22%2C%22args%22%3A%5B%22serve%22%5D%7D

@@ -15,6 +15,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/marmutapp/superbased-observer/internal/adapter"
+	"github.com/marmutapp/superbased-observer/internal/adapter/mirrorbase"
 	"github.com/marmutapp/superbased-observer/internal/contentcap"
 	"github.com/marmutapp/superbased-observer/internal/git"
 	"github.com/marmutapp/superbased-observer/internal/models"
@@ -85,11 +86,18 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 	defer database.Close()
 
 	rootCache := map[string]string{}
+	// Resolve reasoning → successor assignment BEFORE any emitter runs,
+	// so the threading can't depend on loader order (see
+	// loadReasoningIndex). Reasoning parts are never rows of their own.
+	reasoning, err := a.loadReasoningIndex(ctx, database, fromOffset)
+	if err != nil {
+		return adapter.ParseResult{}, fmt.Errorf("opencode.ParseSessionFile: reasoning index: %w", err)
+	}
 	prompts, err := a.loadUserPromptEvents(ctx, database, dbPath, fromOffset, rootCache)
 	if err != nil {
 		return adapter.ParseResult{}, fmt.Errorf("opencode.ParseSessionFile: prompts: %w", err)
 	}
-	tools, err := a.loadToolEvents(ctx, database, dbPath, fromOffset, rootCache)
+	tools, err := a.loadToolEvents(ctx, database, dbPath, fromOffset, rootCache, reasoning)
 	if err != nil {
 		return adapter.ParseResult{}, fmt.Errorf("opencode.ParseSessionFile: tools: %w", err)
 	}
@@ -97,17 +105,13 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 	if err != nil {
 		return adapter.ParseResult{}, fmt.Errorf("opencode.ParseSessionFile: completions: %w", err)
 	}
-	assistantTexts, err := a.loadAssistantTextEvents(ctx, database, dbPath, fromOffset, rootCache)
+	assistantTexts, err := a.loadAssistantTextEvents(ctx, database, dbPath, fromOffset, rootCache, reasoning)
 	if err != nil {
 		return adapter.ParseResult{}, fmt.Errorf("opencode.ParseSessionFile: assistant_text: %w", err)
 	}
 	subtasks, err := a.loadSubtaskEvents(ctx, database, dbPath, fromOffset, rootCache)
 	if err != nil {
 		return adapter.ParseResult{}, fmt.Errorf("opencode.ParseSessionFile: subtasks: %w", err)
-	}
-	reasonings, err := a.loadReasoningEvents(ctx, database, dbPath, fromOffset, rootCache)
-	if err != nil {
-		return adapter.ParseResult{}, fmt.Errorf("opencode.ParseSessionFile: reasoning: %w", err)
 	}
 	stepFinishes, err := a.loadStepFinishEvents(ctx, database, dbPath, fromOffset, rootCache)
 	if err != nil {
@@ -135,7 +139,6 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 	res.ToolEvents = append(res.ToolEvents, completions...)
 	res.ToolEvents = append(res.ToolEvents, assistantTexts...)
 	res.ToolEvents = append(res.ToolEvents, subtasks...)
-	res.ToolEvents = append(res.ToolEvents, reasonings...)
 	res.ToolEvents = append(res.ToolEvents, stepFinishes...)
 	res.ToolEvents = append(res.ToolEvents, todos...)
 	res.TokenEvents = append(res.TokenEvents, tokens...)
@@ -357,7 +360,80 @@ func (a *Adapter) userPromptEvent(ctx context.Context, db *sql.DB, sourceFile st
 	}, true, nil
 }
 
-func (a *Adapter) loadToolEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string) ([]models.ToolEvent, error) {
+// reasoningIndex maps a part id to the chain-of-thought body that
+// immediately precedes that part inside the SAME message — the
+// assignment computed once by loadReasoningIndex, then read by the
+// per-row emitters.
+type reasoningIndex map[string]string
+
+// loadReasoningIndex resolves which successor part each `reasoning`
+// part belongs to, so the body can be threaded onto that successor's
+// PrecedingReasoning instead of minting a row of its own (B3
+// convergence — docs/plans/b3-reasoning-convergence-plan-2026-07-31.md
+// §1). Semantics match grok's reference shape:
+//
+//   - CONSUMED-ONCE: a reasoning body is threaded onto exactly ONE
+//     successor — the first `tool` or `text` part after it. Two tool
+//     calls following one thought do NOT both claim it (that is
+//     cline/cowork's deliberate fan-out, not opencode's: OpenCode
+//     stores every part separately and in order, so the real successor
+//     is knowable here and guessing wider would be invention).
+//   - LAST-WINS: consecutive reasoning parts with no successor between
+//     them collapse; the newest is the one threaded.
+//   - TURN BOUNDARY: the walk is partitioned by message id, so a
+//     thought can never leak past its own assistant turn.
+//
+// The assignment is computed in ONE ordered pass here rather than
+// inside the individual loaders precisely so it can't depend on the
+// order the loaders happen to run in.
+//
+// The window is widened from the incremental `time_updated > ?` slice
+// to every part of the messages that slice touches: a poll tick can
+// land between a reasoning part and its successor, and the successor's
+// batch would otherwise see no reasoning at all. Parts of earlier
+// batches that the widening pulls in are harmless — nothing re-emits
+// them.
+func (a *Adapter) loadReasoningIndex(ctx context.Context, db *sql.DB, fromOffset int64) (reasoningIndex, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT p.id, p.message_id, json_extract(p.data, '$.type'), COALESCE(json_extract(p.data, '$.text'), '')
+		  FROM part p
+		 WHERE p.message_id IN (SELECT message_id FROM part WHERE time_updated > ?)
+		   AND json_extract(p.data, '$.type') IN ('reasoning', 'tool', 'text')
+		 ORDER BY p.message_id ASC, p.time_created ASC, p.id ASC`, fromOffset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	idx := reasoningIndex{}
+	var curMessage, pending string
+	for rows.Next() {
+		var partID, messageID, partType, text string
+		if err := rows.Scan(&partID, &messageID, &partType, &text); err != nil {
+			return nil, err
+		}
+		if messageID != curMessage {
+			curMessage, pending = messageID, ""
+		}
+		if partType == "reasoning" {
+			if body := strings.TrimSpace(text); body != "" {
+				pending = body
+			}
+			continue
+		}
+		if pending != "" {
+			idx[partID] = pending
+			pending = ""
+		}
+	}
+	return idx, rows.Err()
+}
+
+// threaded returns the reasoning body assigned to a part, or "" when
+// none was.
+func (r reasoningIndex) threaded(partID string) string { return r[partID] }
+
+func (a *Adapter) loadToolEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string, reasoning reasoningIndex) ([]models.ToolEvent, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT p.id, p.message_id, p.session_id, COALESCE(s.directory, ''), p.time_created, p.time_updated, p.data, m.data
 		  FROM part p
@@ -377,7 +453,7 @@ func (a *Adapter) loadToolEvents(ctx context.Context, db *sql.DB, sourceFile str
 		if err := rows.Scan(&row.ID, &row.MessageID, &row.SessionID, &row.Directory, &row.TimeCreate, &row.TimeUpdate, &row.Data, &row.Message); err != nil {
 			return nil, err
 		}
-		ev, ok := a.toolEvent(sourceFile, row, rootCache)
+		ev, ok := a.toolEvent(sourceFile, row, rootCache, reasoning)
 		if ok {
 			out = append(out, ev)
 		}
@@ -385,7 +461,7 @@ func (a *Adapter) loadToolEvents(ctx context.Context, db *sql.DB, sourceFile str
 	return out, rows.Err()
 }
 
-func (a *Adapter) toolEvent(sourceFile string, row partRow, rootCache map[string]string) (models.ToolEvent, bool) {
+func (a *Adapter) toolEvent(sourceFile string, row partRow, rootCache map[string]string, reasoning reasoningIndex) (models.ToolEvent, bool) {
 	var msg messageData
 	if err := json.Unmarshal([]byte(row.Message), &msg); err != nil {
 		return models.ToolEvent{}, false
@@ -428,6 +504,19 @@ func (a *Adapter) toolEvent(sourceFile string, row partRow, rootCache map[string
 	if part.State.Time.Start > 0 && part.State.Time.End > part.State.Time.Start {
 		durationMs = part.State.Time.End - part.State.Time.Start
 	}
+	// PRECEDENCE: the chain-of-thought body assigned by
+	// loadReasoningIndex WINS over the part's own `title`. The title is
+	// OpenCode's one-line UI label for the call ("Run npm start"), not
+	// reasoning — it was only ever occupying this column because nothing
+	// better reached it. The title stays as the fallback so calls in
+	// messages with no reasoning part are unchanged.
+	preReason := truncate(strings.TrimSpace(part.State.Title), 200)
+	if body := reasoning.threaded(row.ID); body != "" {
+		preReason = truncate(body, 200)
+		if a.scrubber != nil {
+			preReason = a.scrubber.String(preReason)
+		}
+	}
 	return models.ToolEvent{
 		SourceFile:         sourceFile,
 		SourceEventID:      "part:" + row.ID,
@@ -441,7 +530,7 @@ func (a *Adapter) toolEvent(sourceFile string, row partRow, rootCache map[string
 		Success:            success,
 		ErrorMessage:       truncate(errMsg, 500),
 		DurationMs:         durationMs,
-		PrecedingReasoning: truncate(strings.TrimSpace(part.State.Title), 200),
+		PrecedingReasoning: preReason,
 		RawToolName:        part.Tool,
 		RawToolInput:       rawInput,
 		ToolOutput:         output,
@@ -540,7 +629,7 @@ func withStopReason(meta *models.ActionMetadata, reason string) *models.ActionMe
 // carries no body. This loader complements it by surfacing the
 // actual text content. No token/cost fields are set; token usage
 // flows through loadTokenEvents.
-func (a *Adapter) loadAssistantTextEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string) ([]models.ToolEvent, error) {
+func (a *Adapter) loadAssistantTextEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string, reasoning reasoningIndex) ([]models.ToolEvent, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT p.id, p.message_id, p.session_id, COALESCE(s.directory, ''), p.time_created, p.time_updated, p.data, m.data
 		  FROM part p
@@ -561,7 +650,7 @@ func (a *Adapter) loadAssistantTextEvents(ctx context.Context, db *sql.DB, sourc
 		if err := rows.Scan(&row.ID, &row.MessageID, &row.SessionID, &row.Directory, &row.TimeCreate, &row.TimeUpdate, &row.Data, &row.Message); err != nil {
 			return nil, err
 		}
-		ev, ok := a.assistantTextEvent(sourceFile, row, rootCache)
+		ev, ok := a.assistantTextEvent(sourceFile, row, rootCache, reasoning)
 		if ok {
 			out = append(out, ev)
 		}
@@ -569,7 +658,7 @@ func (a *Adapter) loadAssistantTextEvents(ctx context.Context, db *sql.DB, sourc
 	return out, rows.Err()
 }
 
-func (a *Adapter) assistantTextEvent(sourceFile string, row partRow, rootCache map[string]string) (models.ToolEvent, bool) {
+func (a *Adapter) assistantTextEvent(sourceFile string, row partRow, rootCache map[string]string, reasoning reasoningIndex) (models.ToolEvent, bool) {
 	var msg messageData
 	if err := json.Unmarshal([]byte(row.Message), &msg); err != nil {
 		return models.ToolEvent{}, false
@@ -591,6 +680,16 @@ func (a *Adapter) assistantTextEvent(sourceFile string, row partRow, rootCache m
 		preview = a.scrubber.String(preview)
 		output = a.scrubber.String(output)
 	}
+	// The chain-of-thought that preceded this text part wins over the
+	// legacy self-preview (the row's own body echoed into its reasoning
+	// column, which told a reader nothing).
+	preReason := preview
+	if rb := reasoning.threaded(row.ID); rb != "" {
+		preReason = truncate(rb, 200)
+		if a.scrubber != nil {
+			preReason = a.scrubber.String(preReason)
+		}
+	}
 	return models.ToolEvent{
 		SourceFile:         sourceFile,
 		SourceEventID:      "asst:" + row.ID,
@@ -602,7 +701,7 @@ func (a *Adapter) assistantTextEvent(sourceFile string, row partRow, rootCache m
 		ActionType:         models.ActionAssistantMessage,
 		Target:             preview,
 		Success:            true,
-		PrecedingReasoning: preview,
+		PrecedingReasoning: preReason,
 		RawToolName:        "opencode.assistant_text",
 		ToolOutput:         output,
 		MessageID:          row.MessageID,
@@ -651,90 +750,6 @@ type stepFinishPartData struct {
 		} `json:"cache"`
 	} `json:"tokens"`
 	Cost float64 `json:"cost"`
-}
-
-// loadReasoningEvents surfaces OpenCode `reasoning` parts — the
-// model's visible chain-of-thought body. Pre-fix the adapter dropped
-// these parts silently; only the per-message ReasoningTokens count
-// landed on TokenEvents, never the actual text. Each non-empty
-// reasoning part emits an ActionTaskComplete row with
-// RawToolName="opencode.reasoning" and ToolOutput=scrubbed text,
-// analogous to loadAssistantTextEvents.
-func (a *Adapter) loadReasoningEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string) ([]models.ToolEvent, error) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT p.id, p.message_id, p.session_id, COALESCE(s.directory, ''), p.time_created, p.time_updated, p.data, m.data
-		  FROM part p
-		  JOIN message m ON m.id = p.message_id
-		  LEFT JOIN session s ON s.id = p.session_id
-		 WHERE p.time_updated > ?
-		   AND json_extract(p.data, '$.type') = 'reasoning'
-		 ORDER BY p.time_updated ASC, p.id ASC`, fromOffset)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []models.ToolEvent
-	for rows.Next() {
-		var row partRow
-		if err := rows.Scan(&row.ID, &row.MessageID, &row.SessionID, &row.Directory, &row.TimeCreate, &row.TimeUpdate, &row.Data, &row.Message); err != nil {
-			return nil, err
-		}
-		ev, ok := a.reasoningEvent(sourceFile, row, rootCache)
-		if ok {
-			out = append(out, ev)
-		}
-	}
-	return out, rows.Err()
-}
-
-func (a *Adapter) reasoningEvent(sourceFile string, row partRow, rootCache map[string]string) (models.ToolEvent, bool) {
-	var msg messageData
-	if err := json.Unmarshal([]byte(row.Message), &msg); err != nil {
-		return models.ToolEvent{}, false
-	}
-	var part reasoningPartData
-	if err := json.Unmarshal([]byte(row.Data), &part); err != nil {
-		return models.ToolEvent{}, false
-	}
-	body := strings.TrimSpace(part.Text)
-	if body == "" {
-		return models.ToolEvent{}, false
-	}
-	project := a.resolveProjectRoot(firstNonEmpty(msg.Path.Cwd, row.Directory), rootCache)
-	model := firstNonEmpty(msg.ModelID, msg.Model.ModelID)
-	when := millisToTime(part.Time.Start)
-	if when.IsZero() {
-		when = millisToTime(row.TimeCreate)
-	}
-	var durationMs int64
-	if part.Time.Start > 0 && part.Time.End > part.Time.Start {
-		durationMs = part.Time.End - part.Time.Start
-	}
-	preview := truncate(body, 200)
-	output := contentcap.Cap(body, contentcap.DefaultMaxBytes)
-	if a.scrubber != nil {
-		preview = a.scrubber.String(preview)
-		output = a.scrubber.String(output)
-	}
-	return models.ToolEvent{
-		SourceFile:         sourceFile,
-		SourceEventID:      "reasoning:" + row.ID,
-		SessionID:          row.SessionID,
-		ProjectRoot:        project,
-		Timestamp:          chooseTime(when, time.Time{}, 0),
-		Model:              model,
-		Tool:               models.ToolOpenCode,
-		ActionType:         models.ActionTaskComplete,
-		Target:             preview,
-		Success:            true,
-		DurationMs:         durationMs,
-		PrecedingReasoning: preview,
-		RawToolName:        "opencode.reasoning",
-		ToolOutput:         output,
-		MessageID:          row.MessageID,
-		Metadata:           effortMetadata(msg.Variant),
-	}, true
 }
 
 // loadStepFinishEvents surfaces OpenCode `step-finish` parts as
@@ -798,13 +813,17 @@ func (a *Adapter) stepFinishEvent(sourceFile string, row partRow, rootCache map[
 		Timestamp:     chooseTime(when, time.Time{}, 0),
 		Model:         model,
 		Tool:          models.ToolOpenCode,
-		ActionType:    models.ActionUnknown,
-		Target:        firstNonEmpty(part.Reason, "step-finish"),
-		Success:       true,
-		RawToolName:   "opencode.step_finish",
-		RawToolInput:  row.Data,
-		MessageID:     row.MessageID,
-		Metadata:      effortMetadata(msg.Variant),
+		// tooltax/table.go:345 ratifies "opencode.step_finish" as
+		// ActionHarnessCall (WP-T4; backfilled by migration 077) — this
+		// emit site must agree, or every NEW row drifts back to
+		// unknown (WP-T6 finding B4).
+		ActionType:   models.ActionHarnessCall,
+		Target:       firstNonEmpty(part.Reason, "step-finish"),
+		Success:      true,
+		RawToolName:  "opencode.step_finish",
+		RawToolInput: row.Data,
+		MessageID:    row.MessageID,
+		Metadata:     effortMetadata(msg.Variant),
 	}, true
 }
 
@@ -1158,7 +1177,9 @@ func openReadOnlyDB(path string) (*sql.DB, error) {
 // opencode/opencode.db on a WSL2 Linux host reading the Windows-side
 // OpenCode Desktop store) it stages a local mirror — copying the
 // SQLite trio (.db + -wal + -shm) into a per-source cache dir under
-// os.UserCacheDir() and returning the path to the mirrored .db.
+// mirrorbase.Base() (the single-owner seam over os.UserCacheDir(),
+// overridable per-process for one-shot lifecycles) and returning the
+// path to the mirrored .db.
 //
 // Why the mirror is load-bearing on /mnt/c: modernc.org/sqlite returns
 // SQLITE_IOERR_SHORT_READ (4618) when opening the foreign-mount path
@@ -1177,12 +1198,12 @@ func stageMirrorIfForeign(srcDB string) (string, error) {
 	if !isForeignMountPath(srcDB) {
 		return srcDB, nil
 	}
-	cache, err := os.UserCacheDir()
-	if err != nil || cache == "" {
-		cache = os.TempDir()
+	base, err := mirrorbase.Base()
+	if err != nil || base == "" {
+		base = filepath.Join(os.TempDir(), "superbased-observer")
 	}
 	sum := sha256.Sum256([]byte(srcDB))
-	mirrorDir := filepath.Join(cache, "superbased-observer", "opencode-mirror", hex.EncodeToString(sum[:8]))
+	mirrorDir := filepath.Join(base, "opencode-mirror", hex.EncodeToString(sum[:8]))
 	if err := os.MkdirAll(mirrorDir, 0o700); err != nil {
 		return "", fmt.Errorf("mkdir mirror: %w", err)
 	}

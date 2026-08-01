@@ -31,11 +31,18 @@ func TestParseSessionFile_CapturesMessagesToolsAndUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseSessionFile: %v", err)
 	}
-	// 5 events: user_prompt + pi.reasoning(a1) + read_file(a1) +
-	// pi.reasoning(a2) + task_complete(a2). Standalone reasoning rows are
-	// emitted per assistant message that carries `thinking` content.
-	if got := len(res.ToolEvents); got != 5 {
-		t.Fatalf("expected 5 tool events, got %d", got)
+	// 3 events: user_prompt + read_file(a1) + task_complete(a2).
+	// UPDATED 2026-07-31 (B3 convergence): the two standalone
+	// `pi.reasoning` rows this test used to expect are gone — thinking
+	// is threaded onto the events it precedes (the tool call and the
+	// turn terminus), never minted as an action of its own.
+	if got := len(res.ToolEvents); got != 3 {
+		t.Fatalf("expected 3 tool events, got %d (%+v)", got, res.ToolEvents)
+	}
+	for _, ev := range res.ToolEvents {
+		if ev.RawToolName == "pi.reasoning" {
+			t.Fatalf("pi.reasoning row minted: %+v", ev)
+		}
 	}
 	if got := res.ToolEvents[0].ActionType; got != models.ActionUserPrompt {
 		t.Fatalf("first action_type = %q", got)
@@ -43,26 +50,28 @@ func TestParseSessionFile_CapturesMessagesToolsAndUsage(t *testing.T) {
 	if got := res.ToolEvents[0].MessageID; got != "user:u1" {
 		t.Fatalf("user message_id = %q", got)
 	}
-	if got := res.ToolEvents[1].RawToolName; got != "pi.reasoning" {
-		t.Fatalf("second raw_tool_name = %q, want pi.reasoning", got)
+	if got := res.ToolEvents[1].ActionType; got != models.ActionReadFile {
+		t.Fatalf("second action_type = %q", got)
 	}
-	if got := res.ToolEvents[2].ActionType; got != models.ActionReadFile {
-		t.Fatalf("third action_type = %q", got)
-	}
-	if got := res.ToolEvents[2].MessageID; got != "a1" {
+	if got := res.ToolEvents[1].MessageID; got != "a1" {
 		t.Fatalf("tool message_id = %q", got)
 	}
-	if got := res.ToolEvents[2].PrecedingReasoning; got != "Need to read." {
+	if got := res.ToolEvents[1].PrecedingReasoning; got != "Need to read." {
 		t.Fatalf("preceding reasoning = %q", got)
 	}
-	if got := res.ToolEvents[2].ToolOutput; got != "# SuperBased Observer" {
+	if got := res.ToolEvents[1].ToolOutput; got != "# SuperBased Observer" {
 		t.Fatalf("tool output = %q", got)
 	}
-	if got := res.ToolEvents[4].ActionType; got != models.ActionTaskComplete {
-		t.Fatalf("fifth action_type = %q", got)
+	if got := res.ToolEvents[2].ActionType; got != models.ActionTaskComplete {
+		t.Fatalf("third action_type = %q", got)
 	}
-	if got := res.ToolEvents[4].MessageID; got != "a2" {
+	if got := res.ToolEvents[2].MessageID; got != "a2" {
 		t.Fatalf("task_complete message_id = %q", got)
+	}
+	// The a2 thinking block reaches the terminus row instead of minting
+	// one of its own.
+	if got := res.ToolEvents[2].PrecedingReasoning; got != "Done." {
+		t.Fatalf("terminus preceding reasoning = %q, want the threaded thinking", got)
 	}
 	if got := len(res.TokenEvents); got != 2 {
 		t.Fatalf("expected 2 token events, got %d", got)

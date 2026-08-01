@@ -38,6 +38,14 @@ func mcpRoutingPriceFn(engine *cost.Engine) routing.PriceFn {
 // get_model_recommendation
 // -----------------------------------------------------------------------------
 
+// The published bounds of get_model_recommendation's `days` argument.
+// ONE owner for both the advertised input schema and the boundary clamp,
+// so the documented `maximum` and the enforced maximum cannot drift.
+const (
+	modelRecommendationDefaultDays = 30
+	modelRecommendationMaxDays     = 365
+)
+
 type getModelRecommendationTool struct {
 	db     *sql.DB
 	engine *cost.Engine
@@ -68,7 +76,7 @@ func (*getModelRecommendationTool) InputSchema() map[string]any {
 				"type":        "integer",
 				"description": "Evidence window in days. Default 30.",
 				"minimum":     1,
-				"maximum":     365,
+				"maximum":     modelRecommendationMaxDays,
 			},
 		},
 	}
@@ -102,9 +110,25 @@ func (t *getModelRecommendationTool) Invoke(ctx context.Context, raw json.RawMes
 		}
 	}
 
+	// Silent limit clamping (docs/mcp-contract.md, "Server-level
+	// invariants"): an out-of-range `days` is capped at the documented
+	// maximum instead of erroring, the same way get_file_history clamps
+	// `limit` to 100 and get_failure_context clamps it to 50. Absent /
+	// zero / negative means "use the documented default"; anything above
+	// the schema's `maximum` is silently pinned to it, so an oversized
+	// request succeeds with the documented window rather than sending an
+	// absurd cutoff date down to LoadModelValueFacts.
+	days := args.Days
+	if days <= 0 {
+		days = modelRecommendationDefaultDays
+	}
+	if days > modelRecommendationMaxDays {
+		days = modelRecommendationMaxDays
+	}
+
 	st := store.New(t.db)
 	facts, err := st.LoadModelValueFacts(ctx, modelvalue.LoadOptions{
-		WindowDays: args.Days, ProjectRoot: args.ProjectRoot,
+		WindowDays: days, ProjectRoot: args.ProjectRoot,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("load facts: %w", err)

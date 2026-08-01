@@ -12,6 +12,7 @@ import (
 
 	"github.com/marmutapp/superbased-observer/internal/failure"
 	"github.com/marmutapp/superbased-observer/internal/models"
+	"github.com/marmutapp/superbased-observer/internal/tooltax"
 )
 
 // Pattern type ids. Stored in project_patterns.pattern_type.
@@ -229,12 +230,17 @@ type crossToolData struct {
 }
 
 func (d *Deriver) crossTool(ctx context.Context, pid int64, opts Options) ([]row, error) {
+	// Site 1/6 of the WP-T5 taxonomy de-dup: the whole file category
+	// (== {edit_file, read_file, write_file}), not a hand-listed triple.
+	// Cross-tool provenance is about a file being TOUCHED, so a read
+	// counts as much as a write — plain category equality.
+	//nolint:gosec // G202: the only interpolation is an IN placeholder list built from a code-constant set; every value is bound via ? args.
 	q := `SELECT target, tool, timestamp
 	      FROM actions
 	      WHERE project_id = ?
-	            AND action_type IN ('read_file', 'edit_file', 'write_file')
+	            AND action_type IN (` + inPlaceholders(len(fileActionTypes)) + `)
 	            AND target != '' AND tool != ''`
-	args := []any{pid}
+	args := append([]any{pid}, bindArgs(fileActionTypes)...)
 	if !opts.Since.IsZero() {
 		q += " AND timestamp >= ?"
 		args = append(args, opts.Since.UTC().Format(time.RFC3339Nano))
@@ -384,19 +390,26 @@ type hotFileData struct {
 }
 
 func (d *Deriver) hotFiles(ctx context.Context, pid int64, opts Options) ([]row, error) {
+	// Site 2/6 of the WP-T5 taxonomy de-dup. The scope predicate is the
+	// whole file category (plain equality, as in crossTool); the three
+	// SUM(CASE) columns name INDIVIDUAL action types on purpose — they
+	// are the hot-file breakdown's own reads/edits/writes fields, not a
+	// set — so they bind the tooltax constants rather than a category.
+	//nolint:gosec // G202: the only interpolation is an IN placeholder list built from a code-constant set; every value is bound via ? args.
 	q := `SELECT target,
-	             SUM(CASE WHEN action_type = 'read_file'  THEN 1 ELSE 0 END) AS reads,
-	             SUM(CASE WHEN action_type = 'edit_file'  THEN 1 ELSE 0 END) AS edits,
-	             SUM(CASE WHEN action_type = 'write_file' THEN 1 ELSE 0 END) AS writes,
+	             SUM(CASE WHEN action_type = ? THEN 1 ELSE 0 END) AS reads,
+	             SUM(CASE WHEN action_type = ? THEN 1 ELSE 0 END) AS edits,
+	             SUM(CASE WHEN action_type = ? THEN 1 ELSE 0 END) AS writes,
 	             COUNT(*) AS total,
 	             MAX(timestamp) AS last_ts,
 	             COUNT(DISTINCT session_id) AS sessions,
 	             GROUP_CONCAT(DISTINCT tool) AS tools
 	      FROM actions
 	      WHERE project_id = ?
-	            AND action_type IN ('read_file', 'edit_file', 'write_file')
+	            AND action_type IN (` + inPlaceholders(len(fileActionTypes)) + `)
 	            AND target != ''`
-	args := []any{pid}
+	args := []any{tooltax.ActionReadFile, tooltax.ActionEditFile, tooltax.ActionWriteFile, pid}
+	args = append(args, bindArgs(fileActionTypes)...)
 	if !opts.Since.IsZero() {
 		q += " AND timestamp >= ?"
 		args = append(args, opts.Since.UTC().Format(time.RFC3339Nano))
@@ -475,11 +488,16 @@ func (d *Deriver) coChange(ctx context.Context, pid int64, opts Options) ([]row,
 	// Walk edit_file / write_file actions in session order; every pair that
 	// shares a session forms an undirected edge. Keyed by sorted-tuple to
 	// avoid dup (a,b) + (b,a).
+	// Site 3/6 of the WP-T5 taxonomy de-dup: the file category MINUS
+	// read_file. Co-change is "these two files CHANGE together", so a
+	// read must not create an edge.
+	//nolint:gosec // G202: the only interpolation is an IN placeholder list built from a code-constant set; every value is bound via ? args.
 	q := `SELECT session_id, target, timestamp, tool
 	      FROM actions
-	      WHERE project_id = ? AND action_type IN ('edit_file', 'write_file')
+	      WHERE project_id = ? AND action_type IN (` +
+		inPlaceholders(len(mutatingFileActionTypes)) + `)
 	            AND target != ''`
-	args := []any{pid}
+	args := append([]any{pid}, bindArgs(mutatingFileActionTypes)...)
 	if !opts.Since.IsZero() {
 		q += " AND timestamp >= ?"
 		args = append(args, opts.Since.UTC().Format(time.RFC3339Nano))
@@ -611,6 +629,10 @@ type commonCommandData struct {
 }
 
 func (d *Deriver) commonCommands(ctx context.Context, pid int64, opts Options) ([]row, error) {
+	// Site 4/6 of the WP-T5 taxonomy de-dup: the whole cmd category,
+	// which is exactly {run_command} — plain equality with the literal
+	// this replaced.
+	//nolint:gosec // G202: the only interpolation is an IN placeholder list built from a code-constant set; every value is bound via ? args.
 	q := `SELECT target,
 	             COUNT(*) AS n,
 	             SUM(CASE WHEN success THEN 1 ELSE 0 END) AS ok,
@@ -618,8 +640,9 @@ func (d *Deriver) commonCommands(ctx context.Context, pid int64, opts Options) (
 	             COUNT(DISTINCT session_id) AS sessions,
 	             GROUP_CONCAT(DISTINCT tool) AS tools
 	      FROM actions
-	      WHERE project_id = ? AND action_type = 'run_command' AND target != ''`
-	args := []any{pid}
+	      WHERE project_id = ? AND action_type IN (` +
+		inPlaceholders(len(commandActionTypes)) + `) AND target != ''`
+	args := append([]any{pid}, bindArgs(commandActionTypes)...)
 	if !opts.Since.IsZero() {
 		q += " AND timestamp >= ?"
 		args = append(args, opts.Since.UTC().Format(time.RFC3339Nano))
@@ -701,11 +724,18 @@ func (d *Deriver) editTestPairs(ctx context.Context, pid int64, opts Options) ([
 	// Scan sessions; whenever an edit_file on target X is followed within
 	// the same session by a run_command that looks like a test (contains
 	// "test" case-insensitive), count the (X → command) pair.
+	// Site 5/6 of the WP-T5 taxonomy de-dup: the union of the mutating
+	// half of the file category (site 3's set — a read is not an edit)
+	// and the whole cmd category (site 4's set). The Go switch below
+	// still branches on the individual action types: the SET is the
+	// scope, the SWITCH is the semantics.
+	//nolint:gosec // G202: the only interpolation is an IN placeholder list built from a code-constant set; every value is bound via ? args.
 	q := `SELECT session_id, action_type, target, timestamp, tool
 	      FROM actions
-	      WHERE project_id = ? AND action_type IN ('edit_file', 'write_file', 'run_command')
+	      WHERE project_id = ? AND action_type IN (` +
+		inPlaceholders(len(mutatingFileOrCommandActionTypes)) + `)
 	            AND target != ''`
-	args := []any{pid}
+	args := append([]any{pid}, bindArgs(mutatingFileOrCommandActionTypes)...)
 	if !opts.Since.IsZero() {
 		q += " AND timestamp >= ?"
 		args = append(args, opts.Since.UTC().Format(time.RFC3339Nano))
@@ -829,9 +859,14 @@ type onboardingData struct {
 func (d *Deriver) onboardingSequences(ctx context.Context, pid int64, opts Options) ([]row, error) {
 	// For each session, take the first 3 read_file targets in timestamp
 	// order. Group by the tuple. Top-N tuples become onboarding patterns.
+	// Site 6/6 of the WP-T5 taxonomy de-dup. This one is NOT a category:
+	// an onboarding sequence is the first files a session READS, so the
+	// file category would wrongly pull in edits and writes. It binds the
+	// single tooltax action-type constant instead — de-duplicating the
+	// string literal without widening the semantics.
 	q := `SELECT session_id, target, timestamp, tool FROM actions
-	      WHERE project_id = ? AND action_type = 'read_file' AND target != ''`
-	args := []any{pid}
+	      WHERE project_id = ? AND action_type = ? AND target != ''`
+	args := []any{pid, tooltax.ActionReadFile}
 	if !opts.Since.IsZero() {
 		q += " AND timestamp >= ?"
 		args = append(args, opts.Since.UTC().Format(time.RFC3339Nano))

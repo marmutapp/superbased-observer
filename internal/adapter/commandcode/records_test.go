@@ -101,6 +101,10 @@ func TestMapToolName(t *testing.T) {
 		// grounded — observed in live Phase-0 capture
 		{"read_file (grounded)", "read_file", models.ActionReadFile, true},
 		{"read_directory (grounded)", "read_directory", models.ActionSearchFiles, true},
+		// grounded — WP-T6 live probe finding B1 (2026-07-31): command-code's
+		// ONLY shell tool; normalizes to "shellcommand", distinct from
+		// "runshellcommand" (run_shell_command), so it needs its own row.
+		{"shell_command (grounded)", "shell_command", models.ActionRunCommand, true},
 		// normalization is case / separator insensitive
 		{"camelCase variant", "readFile", models.ActionReadFile, true},
 		{"kebab variant", "read-directory", models.ActionSearchFiles, true},

@@ -282,6 +282,13 @@ export type SessionRow = {
   // token_usage rows, ordered by turn count desc (heaviest first).
   // Empty when no proxy/JSONL capture preserved model info.
   models?: string[];
+  // Session classification (docs/plans/session-classification-tags-plan-2026-07-31.md).
+  // All three are `omitempty` on the wire — an untagged session, or an
+  // older daemon that predates the feature, simply omits them. Never
+  // assume presence; treat absent as "no tags / not favorited / no note".
+  tags?: string[];
+  favorite?: boolean;
+  has_note?: boolean;
 };
 
 export type SessionsResponse = {
@@ -826,6 +833,54 @@ export type SessionDetail = {
   // session on this tool can be reopened, derived server-side by capability
   // shape. Always present.
   resume: SessionResumeInfo;
+  // Session classification (see SessionRow above). Optional for the same
+  // reason: a daemon that predates the feature omits them entirely.
+  tags?: string[];
+  favorite?: boolean;
+  note?: string;
+};
+
+// ---------- session classification: tags / favorites / notes ----------
+// docs/plans/session-classification-tags-plan-2026-07-31.md §4.
+
+// TagRollup is one row of GET /api/sessions/tags: the vocabulary entry
+// plus its per-tag rollup (session count, cost, tokens).
+export type TagRollup = {
+  tag: string;
+  sessions: number;
+  cost_usd: number;
+  tokens: number;
+};
+
+export type TagRollupResponse = {
+  tags: TagRollup[];
+};
+
+// SessionTagsRequest is the POST /api/session/<id>/tags body. `add`/`remove`
+// are always sent (possibly empty); `favorite`/`note` are null when the
+// mutation does not touch them — null means "leave as is", not "clear".
+export type SessionTagsRequest = {
+  add: string[];
+  remove: string[];
+  favorite: boolean | null;
+  note: string | null;
+};
+
+// SessionTagsResponse is the server's post-mutation truth for one session.
+export type SessionTagsResponse = {
+  tags: string[];
+  favorite: boolean;
+  note: string;
+};
+
+// TagManageRequest is the POST /api/sessions/tags/manage body: rename XOR
+// delete, never both.
+export type TagManageRequest =
+  | { rename: { from: string; to: string } }
+  | { delete: string };
+
+export type TagManageResponse = {
+  affected: number;
 };
 
 // SessionResumeInfo tells the Resume affordance which mechanism to offer,
@@ -1773,14 +1828,40 @@ export type SetupCodex = {
 
 // ---------- /api/tools/breakdown ----------
 
+// Capture-depth honesty block (taxonomy plan §4). expressible_categories
+// is 0 AND vocabulary_declared false when tooltax has no rows for the
+// tool — an honest "not mapped", not "expresses nothing".
+export type ToolBreakdownCoverage = {
+  observed_categories: number;
+  expressible_categories: number;
+  // How many observed categories fall OUTSIDE the declared vocabulary.
+  // observed_categories can exceed expressible_categories (the shared
+  // mcp__ rule and harness failure/meta events belong to no adapter's
+  // declared vocabulary), so the two are never a ratio — this key is
+  // what explains the excess. See lib/actions.ts::coverageCaption.
+  observed_beyond_declared: number;
+  canonical_categories: number;
+  vocabulary_declared: boolean;
+};
+
 export type ToolBreakdown = {
   tool: string;
   total: number;
   by_type: Record<string, number>;
+  // Canonical taxonomy dimensions, computed server-side through
+  // internal/tooltax at query time (never stored). by_surface is keyed on
+  // the canonical surfaces plus "unresolved" for rows whose native tool
+  // name did not resolve.
+  by_category: Record<string, number>;
+  by_surface: Record<string, number>;
+  coverage: ToolBreakdownCoverage;
 };
 
 export type ToolsBreakdownResponse = {
   days: number;
+  // The canonical key spaces, in tooltax display order.
+  categories: string[];
+  surfaces: string[];
   tools: ToolBreakdown[];
 };
 
@@ -2079,6 +2160,22 @@ export type EnrolmentStatus = {
   enrolled_at?: string;
   credential_store?: string;
   last_push?: EnrolmentLastPush | null;
+};
+
+// EnrolmentInvite is POST /api/enrolment/invite. The org server mints a
+// one-time enrolment token for a teammate who is ALREADY a member of the org;
+// `command` is the paste-ready enroll line. The token is shown once and is
+// never stored node-side — the org server holds only its argon2id hash.
+// minted_this_month / monthly_cap report the caller's per-member allowance.
+export type EnrolmentInvite = {
+  token: string;
+  token_id: string;
+  user_email: string;
+  expires_at: string;
+  org_url: string;
+  minted_this_month: number;
+  monthly_cap: number;
+  command: string;
 };
 
 // --- Advisor (suggestions engine, spec §15.7) ---

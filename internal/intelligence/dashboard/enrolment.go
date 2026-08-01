@@ -1,7 +1,13 @@
 package dashboard
 
 import (
+	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
+	"strings"
+
+	"github.com/marmutapp/superbased-observer/internal/orgclient"
 )
 
 // enrolmentStatusResponse is the wire shape of GET /api/enrolment/status.
@@ -101,4 +107,116 @@ func (s *Server) handleEnrolmentUnenroll(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, map[string]bool{"unenrolled": true})
+}
+
+// inviteRequest is the POST /api/enrolment/invite body: the teammate's email
+// (they must already be a member of the org) and an optional token TTL.
+type inviteRequest struct {
+	Email   string `json:"email"`
+	TTLDays int    `json:"ttl_days,omitempty"`
+}
+
+// inviteResponse is what the UI renders: the one-time token plus the org URL,
+// so it can show a paste-ready `observer enroll <org-url> <token>` snippet.
+// The token is shown once and is never stored node-side.
+type inviteResponse struct {
+	Token       string `json:"token"`
+	TokenID     string `json:"token_id"`
+	UserEmail   string `json:"user_email"`
+	ExpiresAt   string `json:"expires_at"`
+	OrgURL      string `json:"org_url"`
+	MintedMonth int    `json:"minted_this_month"`
+	MonthlyCap  int    `json:"monthly_cap"`
+	Command     string `json:"command"`
+}
+
+// handleEnrolmentInvite serves POST /api/enrolment/invite: mint a one-time
+// enrolment token for a teammate through the org server this node is already
+// enrolled with (the loop-closing nudge of the Teams invite arc).
+//
+// It is a THIN PROXY over the orgclient seam — every authority decision is the
+// org server's: whether delegated invites are allowed at all
+// ([server].member_invites), who the mint is attributed to (the enrolment
+// bearer's subject, which this node cannot choose), the monthly cap, and the
+// audit row. Nothing here can widen any of that.
+//
+// The refusals are mapped to distinct statuses so the UI can be honest about
+// the cause rather than showing a generic failure:
+//
+//	409 — this node is not enrolled (nothing to invite into)
+//	403 — the org has not enabled member invites
+//	404 — no such active member (an invite is a handoff, not a signup)
+//	429 — this user's monthly invite allowance is spent
+func (s *Server) handleEnrolmentInvite(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.opts.OrgClient == nil {
+		writeJSONStatus(w, http.StatusConflict, map[string]string{
+			"error": "not_enrolled",
+			"message": "this agent is not enrolled in an organisation — enrol first with " +
+				"`observer enroll <org-url> <token>` (see docs/teams-getting-started.md)",
+		})
+		return
+	}
+
+	var req inviteRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&req); err != nil {
+		writeJSONStatus(w, http.StatusBadRequest, map[string]string{
+			"error": "bad_request", "message": "invalid JSON body",
+		})
+		return
+	}
+	if strings.TrimSpace(req.Email) == "" {
+		writeJSONStatus(w, http.StatusBadRequest, map[string]string{
+			"error": "bad_request", "message": "email is required",
+		})
+		return
+	}
+
+	tok, err := s.opts.OrgClient.MintInviteToken(r.Context(), req.Email, req.TTLDays)
+	switch {
+	case errors.Is(err, orgclient.ErrNotEnrolled):
+		writeJSONStatus(w, http.StatusConflict, map[string]string{
+			"error": "not_enrolled",
+			"message": "this agent is not enrolled in an organisation — enrol first with " +
+				"`observer enroll <org-url> <token>` (see docs/teams-getting-started.md)",
+		})
+		return
+	case errors.Is(err, orgclient.ErrInvitesDisabled):
+		writeJSONStatus(w, http.StatusForbidden, map[string]string{
+			"error": "invites_disabled",
+			"message": "your organisation does not allow member invites — an org admin must set " +
+				"[server].member_invites = true on the org server",
+		})
+		return
+	case errors.Is(err, orgclient.ErrInviteTargetUnknown):
+		writeJSONStatus(w, http.StatusNotFound, map[string]string{
+			"error": "not_found",
+			"message": "no active member with that email — an invite hands over a token for someone " +
+				"your org has already provisioned; ask an admin to add them first",
+		})
+		return
+	case errors.Is(err, orgclient.ErrInviteCapReached):
+		writeJSONStatus(w, http.StatusTooManyRequests, map[string]string{
+			"error":   "invite_cap_reached",
+			"message": "you have used your monthly invite allowance; it resets at the start of next month",
+		})
+		return
+	case err != nil:
+		writeErr(w, err)
+		return
+	}
+
+	writeJSON(w, inviteResponse{
+		Token:       tok.Token,
+		TokenID:     tok.TokenID,
+		UserEmail:   tok.UserEmail,
+		ExpiresAt:   tok.ExpiresAt,
+		OrgURL:      tok.OrgServerURL,
+		MintedMonth: tok.MintedMonth,
+		MonthlyCap:  tok.MonthlyCap,
+		Command:     "observer enroll " + tok.OrgServerURL + " " + tok.Token,
+	})
 }

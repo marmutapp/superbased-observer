@@ -1,0 +1,39 @@
+{
+  "name": "superbased",
+  "version": "1.28.0",
+  "description": "Token, cost and cache observability for Codex. Wires the SuperBased Observer MCP server. Requires the `observer` binary already on your PATH (npm i -g @superbased/observer, or pipx install superbased-observer) — this plugin is wiring only and installs no binary.",
+  "author": {
+    "name": "Santosh Kathira",
+    "email": "contact@superbased.app",
+    "url": "https://superbased.app/"
+  },
+  "homepage": "https://superbased.app/",
+  "repository": "https://github.com/superbasedapp/plugins",
+  "license": "Apache-2.0",
+  "keywords": [
+    "cost",
+    "cost-tracking",
+    "mcp",
+    "observability",
+    "tokens",
+    "usage"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "SuperBased Observer",
+    "shortDescription": "Local-first token, cost and cache observability",
+    "longDescription": "Query your own coding-agent history from inside Codex: per-session token and cost totals, cache behaviour, project patterns and past tool output. All data stays in a local SQLite database. Requires the `observer` binary already on your PATH.",
+    "developerName": "SuperBased",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://superbased.app/",
+    "defaultPrompt": [
+      "What did my coding agents cost this week?",
+      "Summarise my last session's token usage.",
+      "What are the hot files in this project?"
+    ]
+  }
+}

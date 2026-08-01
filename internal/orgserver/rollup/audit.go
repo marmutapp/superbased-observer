@@ -58,6 +58,15 @@ const (
 	// disclosure than the content-free per-item scores, so it gets its own
 	// distinct, louder action string; target_detail carries the run ref.
 	ActionViewEvalItemContent = "view_eval_item_content"
+	// ActionInviteMinted records an enrolment-token mint through an
+	// authenticated surface (the SAML mint endpoint or the agent
+	// invite-token endpoint) — Arc 2 of the Teams bottom-up invite loop.
+	// actor_user_id is the INVITER; target_detail carries the invited user
+	// id, the non-secret token_id, and which surface was used. This is a
+	// grant of enrolment authority for another identity, so it is recorded
+	// whether the inviter was an admin or a delegated member — the row is
+	// how an org reconstructs "who handed out which token".
+	ActionInviteMinted = "invite_minted"
 )
 
 // WriteAudit appends one audit_log row. It is the single writer for the table,

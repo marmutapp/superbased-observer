@@ -119,7 +119,11 @@ tmp/
 # unaffected. Exceptions re-included via negation patterns: docs/assets/
 # (README screenshots/infographics referenced from the public README and
 # the npm package page) and the customer-facing docs linked from those
-# READMEs — the Teams trio and docs/compression-modes.md.
+# READMEs — the Teams trio, docs/compression-modes.md, the
+# deployment-models/remote-access/session-handoff/cache-tracking quartet,
+# and the guard-rules/guard-policy-authoring/guard-compliance/
+# guard-enforce-runbook quartet (all linked from the public README;
+# 2026-07-30 hygiene-review fix).
 /AGENTS.md
 /CLAUDE.md
 /PROGRESS.md
@@ -144,6 +148,14 @@ tmp/
 !/docs/recipes/codex-variant.toml
 !/docs/vscode-extension.md
 !/docs/vscode-extension-user-guide.md
+!/docs/deployment-models.md
+!/docs/remote-access.md
+!/docs/session-handoff.md
+!/docs/cache-tracking.md
+!/docs/guard-rules.md
+!/docs/guard-policy-authoring.md
+!/docs/guard-compliance.md
+!/docs/guard-enforce-runbook.md
 /scripts/release.sh
 
 # Marketing website + design source-of-truth — published from the

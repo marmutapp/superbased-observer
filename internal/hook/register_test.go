@@ -3,10 +3,14 @@ package hook
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func setupRegistry(t *testing.T) *Registry {
@@ -935,12 +939,12 @@ func TestRegisterClaudeCodeRefreshesOnConfigPathChange(t *testing.T) {
 // crossmount auto-detect doesn't depend on /mnt/c presence.
 func TestRegisterCursorWindowsFreshInstall(t *testing.T) {
 	t.Parallel()
-	winHome := t.TempDir() // stand-in for /mnt/c/Users/<u>
+	wslHome := t.TempDir()
+	winHome := nestedWinHome(t, wslHome) // must live UNDER the pinned HomeDir
 	cursorDir := filepath.Join(winHome, ".cursor")
 	if err := os.MkdirAll(cursorDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	wslHome := t.TempDir()
 	r, err := NewRegistry(Options{
 		BinaryPath:        "/home/marmutapp/superbased-observer/bin/observer",
 		HomeDir:           wslHome,
@@ -1003,11 +1007,11 @@ func TestRegisterCursorWindowsFreshInstall(t *testing.T) {
 // ambiguous on a host with multiple WSL distros — better to fail
 // loudly at install time than write a broken hooks.json.
 func TestRegisterCursorWindowsRequiresDistro(t *testing.T) {
-	winHome := t.TempDir()
+	wslHome := t.TempDir()
+	winHome := nestedWinHome(t, wslHome) // must live UNDER the pinned HomeDir
 	if err := os.MkdirAll(filepath.Join(winHome, ".cursor"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	wslHome := t.TempDir()
 	t.Setenv("WSL_DISTRO_NAME", "")
 	r, err := NewRegistry(Options{
 		BinaryPath:        "/x",
@@ -1036,12 +1040,12 @@ func TestRegisterCursorWindowsRequiresDistro(t *testing.T) {
 // binary paths (e.g. /tmp smoke-test vs production install).
 func TestRegisterCursorWindowsCrossBinaryPathRefresh(t *testing.T) {
 	t.Parallel()
-	winHome := t.TempDir()
+	wslHome := t.TempDir()
+	winHome := nestedWinHome(t, wslHome) // must live UNDER the pinned HomeDir
 	cursorDir := filepath.Join(winHome, ".cursor")
 	if err := os.MkdirAll(cursorDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	wslHome := t.TempDir()
 
 	// First install: binary at /tmp/observer-A.
 	first, err := NewRegistry(Options{
@@ -1094,7 +1098,8 @@ func TestRegisterCursorWindowsCrossBinaryPathRefresh(t *testing.T) {
 // overwritten. Force=false → return error; Force=true → overwrite.
 func TestRegisterCursorWindowsRespectsForeignEntry(t *testing.T) {
 	t.Parallel()
-	winHome := t.TempDir()
+	wslHome := t.TempDir()
+	winHome := nestedWinHome(t, wslHome) // must live UNDER the pinned HomeDir
 	cursorDir := filepath.Join(winHome, ".cursor")
 	if err := os.MkdirAll(cursorDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -1105,7 +1110,6 @@ func TestRegisterCursorWindowsRespectsForeignEntry(t *testing.T) {
 	if err := os.WriteFile(hooksPath, []byte(foreign), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	wslHome := t.TempDir()
 	r, err := NewRegistry(Options{
 		BinaryPath:        "/tmp/observer",
 		HomeDir:           wslHome,
@@ -1128,11 +1132,11 @@ func TestRegisterCursorWindowsRespectsForeignEntry(t *testing.T) {
 // already-installed hooks.json and asserts no events get re-added.
 func TestRegisterCursorWindowsIdempotent(t *testing.T) {
 	t.Parallel()
-	winHome := t.TempDir()
+	wslHome := t.TempDir()
+	winHome := nestedWinHome(t, wslHome) // must live UNDER the pinned HomeDir
 	if err := os.MkdirAll(filepath.Join(winHome, ".cursor"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	wslHome := t.TempDir()
 	r, err := NewRegistry(Options{
 		BinaryPath:        "/opt/observer/bin/observer",
 		HomeDir:           wslHome,
@@ -1539,12 +1543,12 @@ func TestObserverEntryHeuristicsAreDisjoint(t *testing.T) {
 // /mnt/c presence at test time.
 func TestRegisterClaudeCodeWindowsFreshInstall(t *testing.T) {
 	t.Parallel()
-	winHome := t.TempDir() // stand-in for /mnt/c/Users/<u>
+	wslHome := t.TempDir()
+	winHome := nestedWinHome(t, wslHome) // must live UNDER the pinned HomeDir
 	claudeDir := filepath.Join(winHome, ".claude")
 	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	wslHome := t.TempDir()
 	r, err := NewRegistry(Options{
 		BinaryPath:        "/home/marmutapp/superbased-observer/bin/observer",
 		HomeDir:           wslHome,
@@ -1607,11 +1611,11 @@ func TestRegisterClaudeCodeWindowsFreshInstall(t *testing.T) {
 // error path — without one, the wsl.exe wrapper would be ambiguous on
 // a host with multiple distros and we'd write a broken settings.json.
 func TestRegisterClaudeCodeWindowsRequiresDistro(t *testing.T) {
-	winHome := t.TempDir()
+	wslHome := t.TempDir()
+	winHome := nestedWinHome(t, wslHome) // must live UNDER the pinned HomeDir
 	if err := os.MkdirAll(filepath.Join(winHome, ".claude"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	wslHome := t.TempDir()
 	t.Setenv("WSL_DISTRO_NAME", "")
 	r, err := NewRegistry(Options{
 		BinaryPath:        "/x",
@@ -1636,11 +1640,11 @@ func TestRegisterClaudeCodeWindowsRequiresDistro(t *testing.T) {
 // settings.json. Counts post-register groups under each event.
 func TestRegisterClaudeCodeWindowsIdempotent(t *testing.T) {
 	t.Parallel()
-	winHome := t.TempDir()
+	wslHome := t.TempDir()
+	winHome := nestedWinHome(t, wslHome) // must live UNDER the pinned HomeDir
 	if err := os.MkdirAll(filepath.Join(winHome, ".claude"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	wslHome := t.TempDir()
 	opts := Options{
 		BinaryPath:        "/bin/observer",
 		HomeDir:           wslHome,
@@ -1680,7 +1684,8 @@ func TestRegisterClaudeCodeWindowsIdempotent(t *testing.T) {
 // Register to fail loudly (no --force). User's hook is left untouched.
 func TestRegisterClaudeCodeWindowsConflictGuard(t *testing.T) {
 	t.Parallel()
-	winHome := t.TempDir()
+	wslHome := t.TempDir()
+	winHome := nestedWinHome(t, wslHome) // must live UNDER the pinned HomeDir
 	claudeDir := filepath.Join(winHome, ".claude")
 	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -1690,7 +1695,6 @@ func TestRegisterClaudeCodeWindowsConflictGuard(t *testing.T) {
 	if err := os.WriteFile(settingsPath, []byte(prior), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	wslHome := t.TempDir()
 	r, _ := NewRegistry(Options{
 		BinaryPath:        "/bin/observer",
 		HomeDir:           wslHome,
@@ -1718,7 +1722,8 @@ func TestRegisterClaudeCodeWindowsConflictGuard(t *testing.T) {
 // matched-checksum case.
 func TestUnregisterClaudeCodeWindowsRoundTrip(t *testing.T) {
 	t.Parallel()
-	winHome := t.TempDir()
+	wslHome := t.TempDir()
+	winHome := nestedWinHome(t, wslHome) // must live UNDER the pinned HomeDir
 	claudeDir := filepath.Join(winHome, ".claude")
 	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -1731,7 +1736,6 @@ func TestUnregisterClaudeCodeWindowsRoundTrip(t *testing.T) {
 	if err := os.WriteFile(settingsPath, []byte(prior), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	wslHome := t.TempDir()
 	opts := Options{
 		BinaryPath:        "/bin/observer",
 		HomeDir:           wslHome,
@@ -1767,13 +1771,14 @@ func TestUnregisterClaudeCodeWindowsRoundTrip(t *testing.T) {
 // option path is exercised so the test doesn't depend on /mnt/c.
 func TestInstalledClaudeCodeWindows(t *testing.T) {
 	t.Parallel()
-	winHome := t.TempDir()
+	wslHome := t.TempDir()
+	winHome := nestedWinHome(t, wslHome) // must live UNDER the pinned HomeDir
 	if err := os.MkdirAll(filepath.Join(winHome, ".claude"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	r, _ := NewRegistry(Options{
 		BinaryPath:        "/bin/observer",
-		HomeDir:           t.TempDir(),
+		HomeDir:           wslHome,
 		WindowsClaudeHome: winHome,
 	})
 	got := r.Installed()
@@ -1787,4 +1792,1119 @@ func TestInstalledClaudeCodeWindows(t *testing.T) {
 	if !found {
 		t.Errorf("Installed()=%v does not include claude-code-windows", got)
 	}
+}
+
+// --- Statusline registration tests (docs/plans/observer-statusline-plan-2026-07-30.md §5.1/§7) ---
+
+// readStatuslineEntry reads back the "statusLine" key from path as a
+// claudeStatuslineEntry, failing the test if it's missing or malformed.
+func readStatuslineEntry(t *testing.T, path string) claudeStatuslineEntry {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(body, &settings); err != nil {
+		t.Fatalf("parse %s: %v\n%s", path, err, body)
+	}
+	raw, ok := settings["statusLine"]
+	if !ok {
+		t.Fatalf("%s has no \"statusLine\" key", path)
+	}
+	var entry claudeStatuslineEntry
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		t.Fatalf("statusLine value not the expected shape: %v\n%s", err, raw)
+	}
+	return entry
+}
+
+func TestRegisterClaudeCodeStatuslineFreshInstall(t *testing.T) {
+	t.Parallel()
+	r := setupRegistry(t)
+	res := r.RegisterClaudeCodeStatusline()
+	if res.Error != nil {
+		t.Fatalf("RegisterClaudeCodeStatusline: %v", res.Error)
+	}
+	if len(res.HooksAdded) != 1 || res.HooksAdded[0] != "statusLine" {
+		t.Errorf("HooksAdded=%v want [statusLine]", res.HooksAdded)
+	}
+
+	entry := readStatuslineEntry(t, res.ConfigPath)
+	if entry.Type != "command" {
+		t.Errorf("type=%q want command", entry.Type)
+	}
+	if entry.Padding != 0 {
+		t.Errorf("padding=%d want 0", entry.Padding)
+	}
+	if !strings.Contains(entry.Command, r.opts.BinaryPath) || !strings.HasSuffix(entry.Command, " statusline") {
+		t.Errorf("command=%q does not look like <bin> statusline", entry.Command)
+	}
+
+	// The "hooks" key must not exist — this registration path never
+	// touches it.
+	body, _ := os.ReadFile(res.ConfigPath)
+	var settings map[string]json.RawMessage
+	_ = json.Unmarshal(body, &settings)
+	if _, ok := settings["hooks"]; ok {
+		t.Error("statusline registration wrote a \"hooks\" key — it must never touch hooks")
+	}
+
+	// Checksum file should be written (recordChecksum is reused unchanged).
+	csPath := filepath.Join(r.opts.HomeDir, ".observer", "hook_checksums.json")
+	if _, err := os.Stat(csPath); err != nil {
+		t.Errorf("checksum file not created: %v", err)
+	}
+}
+
+// TestRegisterClaudeCodeStatuslineLeavesHooksUntouched registers hooks
+// first, then statusline, and asserts the "hooks" block written by
+// registerClaudeCode is byte-for-byte the same afterwards — the
+// statusline registrar patches a sibling top-level key, never the
+// "hooks" map itself.
+func TestRegisterClaudeCodeStatuslineLeavesHooksUntouched(t *testing.T) {
+	t.Parallel()
+	r := setupRegistry(t)
+	hookRes := r.Register("claude-code")
+	if hookRes.Error != nil {
+		t.Fatalf("Register(claude-code): %v", hookRes.Error)
+	}
+	before, err := os.ReadFile(hookRes.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var beforeSettings map[string]json.RawMessage
+	if err := json.Unmarshal(before, &beforeSettings); err != nil {
+		t.Fatal(err)
+	}
+
+	slRes := r.RegisterClaudeCodeStatusline()
+	if slRes.Error != nil {
+		t.Fatalf("RegisterClaudeCodeStatusline: %v", slRes.Error)
+	}
+
+	after, err := os.ReadFile(slRes.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var afterSettings map[string]json.RawMessage
+	if err := json.Unmarshal(after, &afterSettings); err != nil {
+		t.Fatal(err)
+	}
+	if string(beforeSettings["hooks"]) != string(afterSettings["hooks"]) {
+		t.Errorf("\"hooks\" key changed after statusline registration:\nbefore=%s\nafter=%s", beforeSettings["hooks"], afterSettings["hooks"])
+	}
+	if _, ok := afterSettings["statusLine"]; !ok {
+		t.Error("statusLine key missing after registration")
+	}
+}
+
+func TestRegisterClaudeCodeStatuslineConflictBlocksWithoutForce(t *testing.T) {
+	t.Parallel()
+	r := setupRegistry(t)
+	path := filepath.Join(r.opts.HomeDir, ".claude", "settings.json")
+	pre := `{"statusLine":{"type":"command","command":"/usr/local/bin/ccstatusline","padding":0}}`
+	if err := os.WriteFile(path, []byte(pre), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	res := r.RegisterClaudeCodeStatusline()
+	if res.Error == nil {
+		t.Fatal("expected conflict error for a foreign statusLine entry")
+	}
+	if !strings.Contains(res.Error.Error(), "ccstatusline") {
+		t.Errorf("error %q does not name the existing foreign command", res.Error)
+	}
+	// The foreign entry must survive untouched.
+	body, _ := os.ReadFile(path)
+	if !strings.Contains(string(body), "ccstatusline") {
+		t.Error("foreign statusLine entry was clobbered without --force")
+	}
+
+	// With --force, it overwrites.
+	r.opts.Force = true
+	res = r.RegisterClaudeCodeStatusline()
+	if res.Error != nil {
+		t.Fatalf("force register: %v", res.Error)
+	}
+	entry := readStatuslineEntry(t, path)
+	if strings.Contains(entry.Command, "ccstatusline") {
+		t.Error("--force did not overwrite the foreign entry")
+	}
+	if !strings.Contains(entry.Command, "statusline") {
+		t.Errorf("forced entry does not look like ours: %+v", entry)
+	}
+}
+
+// TestRegisterClaudeCodeStatuslineRefreshesStaleBinaryPath pins the
+// refresh-on-drift behaviour: an existing entry recognised as
+// observer-written (by isObserverStatuslineEntry) but pointing at a
+// stale binary path is silently rewritten — no --force needed, unlike
+// a genuinely foreign entry.
+func TestRegisterClaudeCodeStatuslineRefreshesStaleBinaryPath(t *testing.T) {
+	t.Parallel()
+	r := setupRegistry(t)
+	path := filepath.Join(r.opts.HomeDir, ".claude", "settings.json")
+	stale := `{"statusLine":{"type":"command","command":"/old/path/observer statusline","padding":0}}`
+	if err := os.WriteFile(path, []byte(stale), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	res := r.RegisterClaudeCodeStatusline()
+	if res.Error != nil {
+		t.Fatalf("RegisterClaudeCodeStatusline: %v", res.Error)
+	}
+	if len(res.AlreadySet) != 0 {
+		t.Errorf("AlreadySet=%v want none — a stale binary path must refresh, not short-circuit", res.AlreadySet)
+	}
+	entry := readStatuslineEntry(t, path)
+	if strings.Contains(entry.Command, "/old/path/") {
+		t.Errorf("stale observer entry was not refreshed: %+v", entry)
+	}
+	if !strings.Contains(entry.Command, r.opts.BinaryPath) {
+		t.Errorf("refreshed entry does not carry the current binary path: %+v", entry)
+	}
+}
+
+// TestRegisterClaudeCodeStatuslineIdempotent pins BOTH the AlreadySet
+// signal AND the "no needless rewrite" contract: a second identical
+// run must not touch the file on disk (mtime unchanged) and must not
+// re-record the checksum.
+func TestRegisterClaudeCodeStatuslineIdempotent(t *testing.T) {
+	t.Parallel()
+	r := setupRegistry(t)
+	first := r.RegisterClaudeCodeStatusline()
+	if first.Error != nil {
+		t.Fatalf("first: %v", first.Error)
+	}
+
+	fi1, err := os.Stat(first.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csPath := filepath.Join(r.opts.HomeDir, ".observer", "hook_checksums.json")
+	csBefore, err := os.ReadFile(csPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Sleep isn't reliable in CI; instead assert via content-equality AND
+	// that no HooksAdded/error occurred, which is the behavioural contract
+	// that implies "we returned before any write call".
+	second := r.RegisterClaudeCodeStatusline()
+	if second.Error != nil {
+		t.Fatalf("second: %v", second.Error)
+	}
+	if len(second.HooksAdded) != 0 {
+		t.Errorf("second run added %v — want no-op", second.HooksAdded)
+	}
+	if len(second.AlreadySet) != 1 || second.AlreadySet[0] != "statusLine" {
+		t.Errorf("AlreadySet=%v want [statusLine]", second.AlreadySet)
+	}
+
+	fi2, err := os.Stat(first.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi1.ModTime().Equal(fi2.ModTime()) {
+		t.Errorf("settings.json mtime changed on idempotent re-run: %v -> %v", fi1.ModTime(), fi2.ModTime())
+	}
+	csAfter, err := os.ReadFile(csPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(csBefore) != string(csAfter) {
+		t.Error("checksum file rewritten on idempotent re-run")
+	}
+}
+
+func TestRegisterClaudeCodeStatuslinePreservesUnknownKeys(t *testing.T) {
+	t.Parallel()
+	r := setupRegistry(t)
+	path := filepath.Join(r.opts.HomeDir, ".claude", "settings.json")
+	pre := `{"theme":"dark","permissions":{"allow":["bash"]},"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"/usr/local/bin/other-hook"}]}]}}`
+	if err := os.WriteFile(path, []byte(pre), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	res := r.RegisterClaudeCodeStatusline()
+	if res.Error != nil {
+		t.Fatalf("RegisterClaudeCodeStatusline: %v", res.Error)
+	}
+	body, _ := os.ReadFile(path)
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["theme"] != "dark" {
+		t.Errorf("theme lost: %v", got["theme"])
+	}
+	if _, ok := got["permissions"]; !ok {
+		t.Error("permissions lost")
+	}
+	hooksBlock, ok := got["hooks"].(map[string]any)
+	if !ok {
+		t.Fatal("hooks block lost")
+	}
+	preHook, ok := hooksBlock["PreToolUse"].([]any)
+	if !ok || len(preHook) == 0 {
+		t.Fatal("PreToolUse hook group lost")
+	}
+	if _, ok := got["statusLine"]; !ok {
+		t.Error("statusLine key missing")
+	}
+}
+
+func TestUnregisterClaudeCodeStatuslineRemovesKeyEntirely(t *testing.T) {
+	t.Parallel()
+	r := setupRegistry(t)
+	// Seed an unrelated key first so the file survives the unregister
+	// (isolating "the key is removed entirely" from "the whole file is
+	// removed when it becomes empty", which is covered separately by
+	// TestUnregisterClaudeCodeStatuslineNoopWhenAbsent / the empty-file
+	// removal branch exercised implicitly by the fresh-install-only case
+	// below).
+	path := filepath.Join(r.opts.HomeDir, ".claude", "settings.json")
+	if err := os.WriteFile(path, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	regRes := r.RegisterClaudeCodeStatusline()
+	if regRes.Error != nil {
+		t.Fatalf("register: %v", regRes.Error)
+	}
+
+	unregRes := r.UnregisterClaudeCodeStatusline()
+	if unregRes.Error != nil {
+		t.Fatalf("UnregisterClaudeCodeStatusline: %v", unregRes.Error)
+	}
+	if len(unregRes.HooksRemoved) != 1 || unregRes.HooksRemoved[0] != "statusLine" {
+		t.Errorf("HooksRemoved=%v want [statusLine]", unregRes.HooksRemoved)
+	}
+
+	body, err := os.ReadFile(regRes.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(body, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if settings["theme"] == nil || string(settings["theme"]) != `"dark"` {
+		t.Errorf("unrelated \"theme\" key lost during unregister: %v", settings["theme"])
+	}
+	if _, ok := settings["statusLine"]; ok {
+		t.Error("\"statusLine\" key still present after unregister — must be removed entirely, not blanked")
+	}
+}
+
+// TestUnregisterClaudeCodeStatuslinePreservesHooksAndForeignEntry
+// covers two things in one settings.json: unregistering statusline
+// must (a) leave a co-resident "hooks" block untouched, and (b) never
+// touch a FOREIGN "statusLine" belonging to another tool.
+func TestUnregisterClaudeCodeStatuslinePreservesHooksAndForeignEntry(t *testing.T) {
+	t.Parallel()
+	r := setupRegistry(t)
+	hookRes := r.Register("claude-code")
+	if hookRes.Error != nil {
+		t.Fatalf("Register(claude-code): %v", hookRes.Error)
+	}
+	path := filepath.Join(r.opts.HomeDir, ".claude", "settings.json")
+	// Hand-inject a foreign statusLine into the same file after the hook
+	// registration (simulating a user who wrote their own before ever
+	// running `observer init --statusline`).
+	body, _ := os.ReadFile(path)
+	var settings map[string]json.RawMessage
+	_ = json.Unmarshal(body, &settings)
+	settings["statusLine"] = json.RawMessage(`{"type":"command","command":"/usr/local/bin/ccstatusline","padding":0}`)
+	patched, _ := json.Marshal(settings)
+	if err := os.WriteFile(path, patched, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	res := r.UnregisterClaudeCodeStatusline()
+	if res.Error != nil {
+		t.Fatalf("UnregisterClaudeCodeStatusline: %v", res.Error)
+	}
+	if !res.Skipped {
+		t.Error("expected Skipped=true for a foreign statusLine entry")
+	}
+	if len(res.HooksKept) != 1 || res.HooksKept[0] != "statusLine" {
+		t.Errorf("HooksKept=%v want [statusLine]", res.HooksKept)
+	}
+
+	after, _ := os.ReadFile(path)
+	if !strings.Contains(string(after), "ccstatusline") {
+		t.Error("foreign statusLine entry was removed — must be left untouched")
+	}
+	var afterSettings map[string]json.RawMessage
+	if err := json.Unmarshal(after, &afterSettings); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := afterSettings["hooks"]; !ok {
+		t.Error("hooks block lost during statusline unregister")
+	}
+}
+
+// TestUnregisterClaudeCodeStatuslineRemovesEmptyFile covers the other
+// half of "removed entirely, not blanked": when statusLine was the
+// ONLY top-level key, unregister removes settings.json rather than
+// leaving an empty "{}" file behind.
+func TestUnregisterClaudeCodeStatuslineRemovesEmptyFile(t *testing.T) {
+	t.Parallel()
+	r := setupRegistry(t)
+	regRes := r.RegisterClaudeCodeStatusline()
+	if regRes.Error != nil {
+		t.Fatalf("register: %v", regRes.Error)
+	}
+
+	unregRes := r.UnregisterClaudeCodeStatusline()
+	if unregRes.Error != nil {
+		t.Fatalf("UnregisterClaudeCodeStatusline: %v", unregRes.Error)
+	}
+	if _, err := os.Stat(regRes.ConfigPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("settings.json should be removed once empty, got err=%v", err)
+	}
+}
+
+func TestUnregisterClaudeCodeStatuslineNoopWhenAbsent(t *testing.T) {
+	t.Parallel()
+	r := setupRegistry(t)
+	// No file at all.
+	res := r.UnregisterClaudeCodeStatusline()
+	if res.Error != nil {
+		t.Fatalf("unexpected error: %v", res.Error)
+	}
+	if !res.Skipped {
+		t.Error("expected Skipped=true when settings.json doesn't exist")
+	}
+
+	// File exists but has no "statusLine" key.
+	path := filepath.Join(r.opts.HomeDir, ".claude", "settings.json")
+	if err := os.WriteFile(path, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res = r.UnregisterClaudeCodeStatusline()
+	if res.Error != nil {
+		t.Fatalf("unexpected error: %v", res.Error)
+	}
+	if !res.Skipped {
+		t.Error("expected Skipped=true when \"statusLine\" key is absent")
+	}
+	if len(res.HooksRemoved) != 0 {
+		t.Errorf("HooksRemoved=%v want none", res.HooksRemoved)
+	}
+}
+
+// TestUnregisterClaudeCodeStatuslineChecksumDriftGuard pins the
+// checksum-mismatch guard: once the file has been hand-edited since
+// install (checksum mismatch), unregister refuses without --force and
+// succeeds with it — mirroring unregisterClaudeCode's own guard.
+func TestUnregisterClaudeCodeStatuslineChecksumDriftGuard(t *testing.T) {
+	t.Parallel()
+	r := setupRegistry(t)
+	regRes := r.RegisterClaudeCodeStatusline()
+	if regRes.Error != nil {
+		t.Fatalf("register: %v", regRes.Error)
+	}
+
+	// Hand-edit the file (append an unrelated key) so its hash no longer
+	// matches the recorded checksum, without touching "statusLine" itself.
+	body, _ := os.ReadFile(regRes.ConfigPath)
+	var settings map[string]json.RawMessage
+	_ = json.Unmarshal(body, &settings)
+	settings["theme"] = json.RawMessage(`"dark"`)
+	patched, _ := json.Marshal(settings)
+	if err := os.WriteFile(regRes.ConfigPath, patched, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	res := r.UnregisterClaudeCodeStatusline()
+	if res.Error == nil {
+		t.Fatal("expected checksum-mismatch error without --force")
+	}
+	if res.ChecksumMatch {
+		t.Error("ChecksumMatch=true but the file was hand-edited")
+	}
+
+	r.opts.Force = true
+	res = r.UnregisterClaudeCodeStatusline()
+	if res.Error != nil {
+		t.Fatalf("force unregister: %v", res.Error)
+	}
+	if len(res.HooksRemoved) != 1 {
+		t.Errorf("HooksRemoved=%v want [statusLine]", res.HooksRemoved)
+	}
+}
+
+// TestObserverStatuslineEntryHeuristic pins isObserverStatuslineEntry's
+// recognition contract directly (independent of the full read-modify-
+// write path above).
+func TestObserverStatuslineEntryHeuristic(t *testing.T) {
+	t.Parallel()
+	r := setupRegistry(t)
+	cmd := shellQuoteIfNeeded(forwardSlashPath(r.opts.BinaryPath)) + " statusline"
+	if !isObserverStatuslineEntry(cmd) {
+		t.Errorf("isObserverStatuslineEntry(%q)=false, want true", cmd)
+	}
+	if isObserverStatuslineEntry("/usr/local/bin/ccstatusline") {
+		t.Error("isObserverStatuslineEntry matched a foreign command with no \" statusline\" substring")
+	}
+	if isObserverStatuslineEntry("/usr/bin/faststatusline") {
+		t.Error("isObserverStatuslineEntry matched a substring without the required leading space")
+	}
+}
+
+// TestRegisterUnregisterClaudeCodeStatuslineDryRun pins the --dry-run
+// contract: nothing is written to disk, but the result still reports
+// what WOULD happen.
+func TestRegisterUnregisterClaudeCodeStatuslineDryRun(t *testing.T) {
+	t.Parallel()
+	r := setupRegistry(t)
+	r.opts.DryRun = true
+	res := r.RegisterClaudeCodeStatusline()
+	if res.Error != nil {
+		t.Fatalf("RegisterClaudeCodeStatusline dry-run: %v", res.Error)
+	}
+	if len(res.HooksAdded) != 1 {
+		t.Errorf("HooksAdded=%v want [statusLine]", res.HooksAdded)
+	}
+	path := filepath.Join(r.opts.HomeDir, ".claude", "settings.json")
+	if _, err := os.ReadFile(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dry-run wrote settings.json (err=%v) — must not write", err)
+	}
+
+	// Seed a real file, then dry-run an unregister and confirm the key
+	// survives.
+	r.opts.DryRun = false
+	realRes := r.RegisterClaudeCodeStatusline()
+	if realRes.Error != nil {
+		t.Fatalf("register: %v", realRes.Error)
+	}
+	r.opts.DryRun = true
+	unregRes := r.UnregisterClaudeCodeStatusline()
+	if unregRes.Error != nil {
+		t.Fatalf("UnregisterClaudeCodeStatusline dry-run: %v", unregRes.Error)
+	}
+	if len(unregRes.HooksRemoved) != 1 {
+		t.Errorf("HooksRemoved=%v want [statusLine] reported even in dry-run", unregRes.HooksRemoved)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("dry-run unregister deleted the file: %v", err)
+	}
+	if !strings.Contains(string(body), "statusLine") {
+		t.Error("dry-run unregister actually removed the key from disk — must not write")
+	}
+}
+
+// --- Settings-writer hardening tests (adversarial review F7-F11) ---
+//
+// These pin the read-preserve-write contract of the SHARED
+// settings.json machinery (readSettingsFile / decodeSettingsObject /
+// writeJSONIndented) that the hooks, MCP and statusline registrars all
+// funnel through — the statusline registrar merely made the pre-existing
+// classes visible.
+
+// TestSettingsJSONNullRefused pins F7(a): a settings.json whose whole
+// body is the JSON literal `null` unmarshals a map to NIL, so the next
+// `settings[key] = ...` used to PANIC ("assignment to entry in nil
+// map"). It must instead be refused with an error naming the file — an
+// explicit null is not a settings object, so treating it as {} and
+// overwriting it would be a silent data decision we have no right to
+// make.
+func TestSettingsJSONNullRefused(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		run  func(r *Registry) error
+	}{
+		{"statusline-register", func(r *Registry) error { return r.RegisterClaudeCodeStatusline().Error }},
+		{"statusline-unregister", func(r *Registry) error { return r.UnregisterClaudeCodeStatusline().Error }},
+		{"hooks-register", func(r *Registry) error { return r.Register("claude-code").Error }},
+		{"hooks-unregister", func(r *Registry) error { return r.Unregister("claude-code").Error }},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := setupRegistry(t)
+			path := filepath.Join(r.opts.HomeDir, ".claude", "settings.json")
+			if err := os.WriteFile(path, []byte("null\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err := tc.run(r) // must not panic
+			if err == nil {
+				t.Fatal("expected an error for a settings.json containing JSON null")
+			}
+			if !strings.Contains(err.Error(), "JSON null") || !strings.Contains(err.Error(), path) {
+				t.Errorf("error %q does not name the malformed file and the null shape", err)
+			}
+			body, readErr := os.ReadFile(path)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if strings.TrimSpace(string(body)) != "null" {
+				t.Errorf("refused run mutated the file: %q", body)
+			}
+		})
+	}
+}
+
+// TestSettingsJSONDuplicateTopLevelKeyRefused pins F7(b): duplicate
+// top-level keys are silently collapsed to the LAST one by
+// encoding/json, so a read-modify-write would destroy whichever copy
+// another tool was reading. Detected by token-walking the top level and
+// refused by name.
+func TestSettingsJSONDuplicateTopLevelKeyRefused(t *testing.T) {
+	t.Parallel()
+	r := setupRegistry(t)
+	path := filepath.Join(r.opts.HomeDir, ".claude", "settings.json")
+	pre := `{"theme":"dark","permissions":{"allow":["bash"]},"theme":"light"}`
+	if err := os.WriteFile(path, []byte(pre), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	res := r.RegisterClaudeCodeStatusline()
+	if res.Error == nil {
+		t.Fatal("expected an error for duplicate top-level keys")
+	}
+	if !strings.Contains(res.Error.Error(), `"theme"`) || !strings.Contains(res.Error.Error(), "duplicate") {
+		t.Errorf("error %q does not name the duplicated key", res.Error)
+	}
+	body, _ := os.ReadFile(path)
+	if string(body) != pre {
+		t.Errorf("refused run mutated the file:\n got %s\nwant %s", body, pre)
+	}
+
+	// The hooks registrar shares the reader, so it refuses identically.
+	hookRes := r.Register("claude-code")
+	if hookRes.Error == nil || !strings.Contains(hookRes.Error.Error(), "duplicate") {
+		t.Errorf("hooks registrar error=%v, want a duplicate-key refusal", hookRes.Error)
+	}
+
+	// A single occurrence of the same key is of course fine.
+	if err := os.WriteFile(path, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if res := r.RegisterClaudeCodeStatusline(); res.Error != nil {
+		t.Fatalf("well-formed file refused: %v", res.Error)
+	}
+}
+
+// TestSettingsWriterPreservesUnrelatedValuesLosslessly pins F7(c): the
+// shared writer re-indents unrelated top-level values from their RAW
+// bytes (json.Indent) instead of decoding them through `any`. Decoding
+// mangled every one of these: 2^53+1 through float64, number
+// formatting, and \u-escaping of HTML-ish characters inside strings.
+// Exercised through BOTH the statusline and the hooks registrar,
+// because they share writeJSONIndented.
+func TestSettingsWriterPreservesUnrelatedValuesLosslessly(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		run  func(r *Registry) error
+	}{
+		{"statusline", func(r *Registry) error { return r.RegisterClaudeCodeStatusline().Error }},
+		{"hooks", func(r *Registry) error { return r.Register("claude-code").Error }},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := setupRegistry(t)
+			path := filepath.Join(r.opts.HomeDir, ".claude", "settings.json")
+			pre := `{"bigInt":9007199254740993,"exact":1.500,"exp":1e3,"html":"a<b&c>d","nested":{"id":12345678901234567890}}`
+			if err := os.WriteFile(path, []byte(pre), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.run(r); err != nil {
+				t.Fatalf("register: %v", err)
+			}
+			body, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := string(body)
+			for _, want := range []string{
+				"9007199254740993",     // not ...992
+				"1.500",                // not 1.5 / 1
+				"1e3",                  // not 1000
+				"a<b&c>d",              // not a\u003cb\u0026c\u003ed
+				"12345678901234567890", // beyond float64 entirely
+			} {
+				if !strings.Contains(got, want) {
+					t.Errorf("value %q did not round-trip losslessly:\n%s", want, got)
+				}
+			}
+			// And the result is still valid JSON with our key added.
+			var settings map[string]json.RawMessage
+			if err := json.Unmarshal(body, &settings); err != nil {
+				t.Fatalf("writer produced invalid JSON: %v\n%s", err, got)
+			}
+			if len(settings) != 6 {
+				t.Errorf("top-level key count=%d want 6 (5 preserved + ours): %v", len(settings), got)
+			}
+		})
+	}
+}
+
+// TestObserverStatuslineEntryOwnership pins F8: " statusline" as a bare
+// substring is not an ownership signal. Ours = an observer-basename
+// executable whose FIRST argument is exactly "statusline".
+func TestObserverStatuslineEntryOwnership(t *testing.T) {
+	t.Parallel()
+	ours := []string{
+		"/opt/observer/bin/observer statusline",
+		"observer statusline",
+		"'/home/u/My Stuff/observer' statusline",
+		`D:/programsx/superbased-observer/bin/observer.exe statusline`,
+		`"C:/Program Files/observer/observer.exe" statusline`,
+		"/usr/local/bin/observer-v1.8.3 statusline",
+		"/tmp/observer-A statusline",
+		"/opt/bin/superbased statusline",
+		"/opt/observer/bin/observer statusline --theme compact", // future flag-carrying variant of OUR command
+	}
+	for _, cmd := range ours {
+		if !isObserverStatuslineEntry(cmd) {
+			t.Errorf("isObserverStatuslineEntry(%q)=false, want true (ours)", cmd)
+		}
+	}
+	foreign := []string{
+		"node /opt/acme statusline --theme compact", // the F8 report case
+		"/usr/local/bin/ccstatusline",
+		"/usr/bin/faststatusline",
+		"/usr/local/bin/ccstatusline statusline",
+		"python3 -m ccstatusline statusline",
+		"/opt/acme/observer-ish/bin/acme statusline", // observer only in a DIRECTORY name
+		"/opt/observer/bin/observer hook claude-code session-start",
+		"/opt/observer/bin/observer status --statusline",
+		"bash -c 'observer statusline'", // wrapper shape we never write
+		"",
+		"'/opt/observer/bin/observer statusline", // unbalanced quote ⇒ ambiguous ⇒ foreign
+	}
+	for _, cmd := range foreign {
+		if isObserverStatuslineEntry(cmd) {
+			t.Errorf("isObserverStatuslineEntry(%q)=true, want false (foreign)", cmd)
+		}
+	}
+}
+
+// TestRegisterClaudeCodeStatuslineForeignStatuslineSubcommandBlocks is
+// the F8 end-to-end: a third-party statusline tool invoked as
+// `<exe> statusline ...` is FOREIGN — register blocks without --force
+// and unregister leaves it alone.
+func TestRegisterClaudeCodeStatuslineForeignStatuslineSubcommandBlocks(t *testing.T) {
+	t.Parallel()
+	r := setupRegistry(t)
+	path := filepath.Join(r.opts.HomeDir, ".claude", "settings.json")
+	pre := `{"statusLine":{"type":"command","command":"node /opt/acme statusline --theme compact","padding":0}}`
+	if err := os.WriteFile(path, []byte(pre), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	res := r.RegisterClaudeCodeStatusline()
+	if res.Error == nil {
+		t.Fatal("expected a conflict error for a foreign `<exe> statusline` command")
+	}
+	if !strings.Contains(res.Error.Error(), "/opt/acme") || !strings.Contains(res.Error.Error(), "--force") {
+		t.Errorf("error %q should name the foreign command and the --force escape", res.Error)
+	}
+	body, _ := os.ReadFile(path)
+	if string(body) != pre {
+		t.Errorf("foreign statusLine was rewritten:\n%s", body)
+	}
+
+	// Uninstall must not adopt-and-delete it either.
+	unreg := r.UnregisterClaudeCodeStatusline()
+	if unreg.Error != nil {
+		t.Fatalf("unregister: %v", unreg.Error)
+	}
+	if len(unreg.HooksKept) != 1 || unreg.HooksKept[0] != "statusLine" {
+		t.Errorf("HooksKept=%v want [statusLine] — a foreign statusline must be kept", unreg.HooksKept)
+	}
+	body, _ = os.ReadFile(path)
+	if !strings.Contains(string(body), "/opt/acme") {
+		t.Error("uninstall removed a foreign statusline entry")
+	}
+}
+
+// TestRegisterClaudeCodeStatuslineRefreshesOtherObserverPath is F8's
+// other half: OUR entry written by a differently-installed observer
+// binary (different directory, suffixed name) still refreshes silently.
+func TestRegisterClaudeCodeStatuslineRefreshesOtherObserverPath(t *testing.T) {
+	t.Parallel()
+	for _, stale := range []string{
+		"/usr/lib/node_modules/@superbased/observer/bin/observer statusline",
+		"/usr/local/bin/observer-v1.8.3 statusline",
+		`'C:/Program Files/observer/observer.exe' statusline`,
+	} {
+		stale := stale
+		t.Run(stale, func(t *testing.T) {
+			t.Parallel()
+			r := setupRegistry(t)
+			path := filepath.Join(r.opts.HomeDir, ".claude", "settings.json")
+			body, err := json.Marshal(map[string]any{
+				"statusLine": map[string]any{"type": "command", "command": stale, "padding": 0},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			res := r.RegisterClaudeCodeStatusline()
+			if res.Error != nil {
+				t.Fatalf("a differently-installed observer entry should refresh, got: %v", res.Error)
+			}
+			entry := readStatuslineEntry(t, path)
+			if !strings.Contains(entry.Command, r.opts.BinaryPath) {
+				t.Errorf("entry not refreshed to the current binary: %+v", entry)
+			}
+		})
+	}
+}
+
+// TestSettingsWriterUsesUniqueTempAndLeavesNoArtifacts pins F9(a): the
+// writer must not use a FIXED `settings.json.tmp` (two observer
+// processes would splice each other's half-written body), and must
+// leave neither temp nor lock files behind on success.
+func TestSettingsWriterUsesUniqueTempAndLeavesNoArtifacts(t *testing.T) {
+	t.Parallel()
+	r := setupRegistry(t)
+	dir := filepath.Join(r.opts.HomeDir, ".claude")
+	path := filepath.Join(dir, "settings.json")
+
+	if res := r.Register("claude-code"); res.Error != nil {
+		t.Fatalf("Register: %v", res.Error)
+	}
+	if res := r.RegisterClaudeCodeStatusline(); res.Error != nil {
+		t.Fatalf("RegisterClaudeCodeStatusline: %v", res.Error)
+	}
+
+	if _, err := os.Stat(path + ".tmp"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("fixed-name temp file %s exists (err=%v) — temp names must be unique", path+".tmp", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() == "settings.json" {
+			continue
+		}
+		t.Errorf("leftover artifact in %s: %s (temp/lock files must be cleaned up)", dir, e.Name())
+	}
+
+	// Mutation-detecting half: OCCUPY the old fixed temp name with a
+	// DIRECTORY. A writer that still used `<path>.tmp` cannot write
+	// there and would fail; a unique os.CreateTemp name is unaffected.
+	blocker := path + ".tmp"
+	if err := os.Mkdir(blocker, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r.opts.BinaryPath = "/opt/observer3/bin/observer" // force a real rewrite
+	if res := r.RegisterClaudeCodeStatusline(); res.Error != nil {
+		t.Fatalf("write failed with %s occupied — the temp name is not unique: %v", blocker, res.Error)
+	}
+	entry := readStatuslineEntry(t, path)
+	if !strings.Contains(entry.Command, "/opt/observer3/") {
+		t.Errorf("refresh did not land: %+v", entry)
+	}
+	if fi, err := os.Stat(blocker); err != nil || !fi.IsDir() {
+		t.Errorf("the occupied fixed temp name was disturbed (err=%v)", err)
+	}
+}
+
+// TestSettingsWriterRereadsBeforeMutating pins F9(c): every
+// registration takes the lock and then reads a FRESH snapshot, so a
+// key another process added between our two write windows is preserved
+// rather than clobbered by a stale in-memory copy.
+func TestSettingsWriterRereadsBeforeMutating(t *testing.T) {
+	t.Parallel()
+	r := setupRegistry(t)
+	path := filepath.Join(r.opts.HomeDir, ".claude", "settings.json")
+
+	if res := r.RegisterClaudeCodeStatusline(); res.Error != nil {
+		t.Fatalf("first register: %v", res.Error)
+	}
+
+	// Simulate another process editing the file between our locked
+	// windows (the lock is released when the call returns).
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var external map[string]json.RawMessage
+	if err := json.Unmarshal(body, &external); err != nil {
+		t.Fatal(err)
+	}
+	external["externalKey"] = json.RawMessage(`{"added":"by-another-process"}`)
+	patched, err := json.Marshal(external)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, patched, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second registration that actually rewrites the file (binary path
+	// drifted, so it's a refresh, not a no-op).
+	r.opts.BinaryPath = "/opt/observer2/bin/observer"
+	if res := r.RegisterClaudeCodeStatusline(); res.Error != nil {
+		t.Fatalf("second register: %v", res.Error)
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(after, &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["externalKey"]; !ok {
+		t.Errorf("externally-added key lost by the second registration:\n%s", after)
+	}
+	entry := readStatuslineEntry(t, path)
+	if !strings.Contains(entry.Command, "/opt/observer2/") {
+		t.Errorf("second registration did not refresh the command: %+v", entry)
+	}
+}
+
+// TestConcurrentSettingsWritersDoNotCorrupt exercises F9(b) under
+// -race: many observer processes-worth of registrars hammering ONE
+// settings.json must each complete without error and leave a valid,
+// complete file (never a spliced temp body, never a lost unrelated
+// key).
+//
+// Each registry gets its OWN ChecksumsPath: hook_checksums.json is a
+// separate unsynchronized read-modify-write (a pre-existing race
+// outside this file-set's five findings), and sharing it here would
+// test that instead of what this test is about.
+func TestConcurrentSettingsWritersDoNotCorrupt(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, ".claude", "settings.json")
+	if err := os.WriteFile(path, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	const writers = 8
+	var wg sync.WaitGroup
+	errs := make([]error, writers)
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			r, err := NewRegistry(Options{
+				BinaryPath:    fmt.Sprintf("/opt/observer-%d/bin/observer", i),
+				HomeDir:       home,
+				ChecksumsPath: filepath.Join(home, fmt.Sprintf(".observer-%d", i), "hook_checksums.json"),
+			})
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			errs[i] = r.RegisterClaudeCodeStatusline().Error
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("writer %d: %v", i, err)
+		}
+	}
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("settings.json corrupted by concurrent writers: %v\n%s", err, body)
+	}
+	if string(got["theme"]) != `"dark"` {
+		t.Errorf("unrelated key lost: theme=%s", got["theme"])
+	}
+	entry := readStatuslineEntry(t, path)
+	if !isObserverStatuslineEntry(entry.Command) {
+		t.Errorf("final statusLine is not a well-formed observer entry: %+v", entry)
+	}
+}
+
+// TestSettingsWriterFollowsSymlink pins F10: a dotfile-manager setup
+// where ~/.claude/settings.json is a SYMLINK into a tracked repo must
+// keep its link — we rewrite the TARGET, not replace the link with a
+// regular file.
+func TestSettingsWriterFollowsSymlink(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dotfiles := t.TempDir()
+	target := filepath.Join(dotfiles, "claude-settings.json")
+	if err := os.WriteFile(target, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(home, ".claude", "settings.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable on this platform/privilege level: %v", err)
+	}
+
+	r, err := NewRegistry(Options{
+		BinaryPath:    "/opt/observer/bin/observer",
+		HomeDir:       home,
+		ChecksumsPath: filepath.Join(home, ".observer", "hook_checksums.json"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res := r.RegisterClaudeCodeStatusline(); res.Error != nil {
+		t.Fatalf("RegisterClaudeCodeStatusline: %v", res.Error)
+	}
+
+	fi, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("settings.json is no longer a symlink — the link was replaced by a regular file")
+	}
+	body, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("symlink target is not valid JSON: %v\n%s", err, body)
+	}
+	if _, ok := got["statusLine"]; !ok {
+		t.Errorf("symlink TARGET did not receive the statusLine key:\n%s", body)
+	}
+	if string(got["theme"]) != `"dark"` {
+		t.Errorf("target's existing key lost: theme=%s", got["theme"])
+	}
+	// No temp file stranded in the target's directory.
+	entries, err := os.ReadDir(dotfiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(target) {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("temp artifacts left beside the symlink target: %v", names)
+	}
+}
+
+// TestSettingsFileOverSizeCapRefused pins F11: settings.json is read
+// with a 5 MiB cap checked via Stat BEFORE the read; an over-cap file is
+// refused with no mutation rather than slurped into memory.
+func TestSettingsFileOverSizeCapRefused(t *testing.T) {
+	t.Parallel()
+	r := setupRegistry(t)
+	path := filepath.Join(r.opts.HomeDir, ".claude", "settings.json")
+
+	pad := bytes.Repeat([]byte("a"), int(maxSettingsFileBytes))
+	body := append(append([]byte(`{"pad":"`), pad...), []byte(`"}`)...)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() <= maxSettingsFileBytes {
+		t.Fatalf("test fixture is %d bytes, not over the %d-byte cap", fi.Size(), maxSettingsFileBytes)
+	}
+
+	res := r.RegisterClaudeCodeStatusline()
+	if res.Error == nil {
+		t.Fatal("expected an error for an over-cap settings.json")
+	}
+	if !strings.Contains(res.Error.Error(), "limit") || !strings.Contains(res.Error.Error(), path) {
+		t.Errorf("error %q should name the file and the size limit", res.Error)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() != fi.Size() {
+		t.Errorf("over-cap file was mutated: %d -> %d bytes", fi.Size(), after.Size())
+	}
+
+	// The hooks registrar shares the reader — same refusal.
+	if hookRes := r.Register("claude-code"); hookRes.Error == nil || !strings.Contains(hookRes.Error.Error(), "limit") {
+		t.Errorf("hooks registrar error=%v, want a size-cap refusal", hookRes.Error)
+	}
+
+	// Just UNDER the cap is read normally.
+	small := append(append([]byte(`{"pad":"`), bytes.Repeat([]byte("a"), 1024)...), []byte(`"}`)...)
+	if err := os.WriteFile(path, small, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if res := r.RegisterClaudeCodeStatusline(); res.Error != nil {
+		t.Fatalf("under-cap file refused: %v", res.Error)
+	}
+}
+
+// TestLockSettingsFileBreaksStaleLock pins the stale-lock escape hatch:
+// a lock file left behind by a crashed observer must not wedge
+// registration forever.
+func TestLockSettingsFileBreaksStaleLock(t *testing.T) {
+	t.Parallel()
+	r := setupRegistry(t)
+	path := filepath.Join(r.opts.HomeDir, ".claude", "settings.json")
+	lockPath := path + settingsLockSuffix
+	if err := os.WriteFile(lockPath, []byte("pid=999999 acquired=whenever\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().Add(-2 * settingsLockStale)
+	if err := os.Chtimes(lockPath, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	res := r.RegisterClaudeCodeStatusline()
+	if res.Error != nil {
+		t.Fatalf("a stale lock must be broken, got: %v", res.Error)
+	}
+	if _, err := os.Stat(lockPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("lock file not released after registration (err=%v)", err)
+	}
+	readStatuslineEntry(t, path) // and the write actually happened
+}
+
+// TestLockSettingsFileHeldBlocksSecondWriter pins that a live lock is
+// respected: while one writer holds it, another times out with an
+// actionable error instead of racing the read-modify-write.
+func TestLockSettingsFileHeldBlocksSecondWriter(t *testing.T) {
+	t.Parallel()
+	r := setupRegistry(t)
+	path := filepath.Join(r.opts.HomeDir, ".claude", "settings.json")
+
+	unlock, err := lockSettingsFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res := r.RegisterClaudeCodeStatusline()
+	if res.Error == nil {
+		t.Fatal("expected a lock-timeout error while the lock is held")
+	}
+	if !strings.Contains(res.Error.Error(), "waiting for") {
+		t.Errorf("error %q does not explain the lock wait", res.Error)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("blocked registration still wrote settings.json (err=%v)", err)
+	}
+
+	unlock()
+	if res := r.RegisterClaudeCodeStatusline(); res.Error != nil {
+		t.Fatalf("registration after release: %v", res.Error)
+	}
+	readStatuslineEntry(t, path)
 }

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/marmutapp/superbased-observer/internal/models"
 	"github.com/marmutapp/superbased-observer/internal/platform/protowire"
 )
 
@@ -415,8 +416,8 @@ func TestParseStructuredTrajectory_AssistantTextExtraction(t *testing.T) {
 	if te.RawToolName != "structured.assistant_text" {
 		t.Errorf("RawToolName = %q, want structured.assistant_text", te.RawToolName)
 	}
-	if te.ActionType != "task_complete" {
-		t.Errorf("ActionType = %q, want task_complete", te.ActionType)
+	if te.ActionType != "assistant_message" {
+		t.Errorf("ActionType = %q, want assistant_message", te.ActionType)
 	}
 	if !strings.Contains(te.ToolOutput, "analyze the search implementation") {
 		t.Errorf("ToolOutput = %q, want assistant text body", te.ToolOutput)
@@ -601,5 +602,138 @@ func TestParseStructuredTrajectory_ArtifactBrainFallback(t *testing.T) {
 	wantTarget := "C:/Users/u/.gemini/antigravity/brain/uuid/task.md"
 	if got.ToolEvents[0].Target != wantTarget {
 		t.Errorf("Target = %q, want %q (brain URI fallback when no workspace pair)", got.ToolEvents[0].Target, wantTarget)
+	}
+}
+
+// buildB3Step builds a 1.2[] step entry carrying any combination of the
+// fields the B3 reasoning-threading test needs: a file-view tool call
+// (1.2.14.1), a user prompt (1.2.19.2), assistant text (1.2.20.1) and
+// per-step reasoning (1.2.20.3).
+func buildB3Step(t *testing.T, ts uint64, fileURI, userPrompt, assistantText, reasoning string) []byte {
+	t.Helper()
+	stepBody := protowire.AppendBytesField(
+		nil, 5, // 1.2.5
+		protowire.AppendBytesField(
+			nil, 1, // 1.2.5.1
+			protowire.AppendVarintField(nil, 1, ts), // 1.2.5.1.1
+		),
+	)
+	if fileURI != "" {
+		stepBody = append(stepBody, protowire.AppendBytesField(
+			nil, 14, protowire.AppendBytesField(nil, 1, []byte(fileURI)), // 1.2.14.1
+		)...)
+	}
+	if userPrompt != "" {
+		stepBody = append(stepBody, protowire.AppendBytesField(
+			nil, 19, protowire.AppendBytesField(nil, 2, []byte(userPrompt)), // 1.2.19.2
+		)...)
+	}
+	if assistantText != "" || reasoning != "" {
+		var planner []byte
+		if assistantText != "" {
+			planner = append(planner, protowire.AppendBytesField(nil, 1, []byte(assistantText))...) // 1.2.20.1
+		}
+		if reasoning != "" {
+			planner = append(planner, protowire.AppendBytesField(nil, 3, []byte(reasoning))...) // 1.2.20.3
+		}
+		stepBody = append(stepBody, protowire.AppendBytesField(nil, 20, planner)...)
+	}
+	return protowire.AppendBytesField(nil, 2, stepBody) // 1.2 → step
+}
+
+// TestParseStructuredTrajectory_ReasoningNeverMintsAnAction is the B3
+// regression pin for antigravity. A step's 1.2.20.3 reasoning body must
+// produce NO ToolEvent (it used to mint a phantom `structured.reasoning`
+// task_complete row) and must instead ride the next emitted event's
+// PrecedingReasoning under consumed-once / last-wins /
+// turn-boundary-discard.
+func TestParseStructuredTrajectory_ReasoningNeverMintsAnAction(t *testing.T) {
+	turn := protowire.AppendBytesField(nil, 3, buildTurn(t, 100, 0, 50, 1000, 0)) // 1.3
+	steps := [][]byte{
+		// 0: user turn — starts clean.
+		buildB3Step(t, 1769687800, "", "do the thing", "", ""),
+		// 1: reasoning only → pending.
+		buildB3Step(t, 1769687810, "", "", "", "THINK_ONE"),
+		// 2: file_view — the first successor takes it.
+		buildB3Step(t, 1769687820, "file:///c:/proj/a.go", "", "", ""),
+		// 3: another file_view — nothing left (consumed-once).
+		buildB3Step(t, 1769687830, "file:///c:/proj/b.go", "", "", ""),
+		// 4: reasoning that the next user turn discards.
+		buildB3Step(t, 1769687840, "", "", "", "STALE_ACROSS_TURN"),
+		// 5: user turn → discard.
+		buildB3Step(t, 1769687850, "", "second thing", "", ""),
+		// 6: file_view — empty (turn-boundary discard).
+		buildB3Step(t, 1769687860, "file:///c:/proj/c.go", "", "", ""),
+		// 7 + 8: last-wins — the newer reasoning replaces the older.
+		buildB3Step(t, 1769687870, "", "", "", "FIRST"),
+		buildB3Step(t, 1769687880, "", "", "", "SECOND"),
+		buildB3Step(t, 1769687890, "file:///c:/proj/d.go", "", "", ""),
+	}
+	var body []byte
+	for _, s := range steps {
+		body = append(body, s...)
+	}
+	wire := protowire.AppendBytesField(nil, 1, append(body, turn...))
+
+	got := ParseStructuredTrajectory(wire, "uuid-b3", "/tmp/proj", "/tmp/uuid-b3.pb", nil)
+
+	byTarget := map[string]models.ToolEvent{}
+	for _, ev := range got.ToolEvents {
+		if strings.Contains(strings.ToLower(ev.RawToolName), "reasoning") {
+			t.Fatalf("reasoning-named action row emitted: raw=%q %+v", ev.RawToolName, ev)
+		}
+		for _, b := range []string{"THINK_ONE", "STALE_ACROSS_TURN", "FIRST", "SECOND"} {
+			if ev.Target == b || ev.ToolOutput == b {
+				t.Fatalf("reasoning body %q surfaced as action content: %+v", b, ev)
+			}
+		}
+		byTarget[ev.Target] = ev
+	}
+
+	cases := []struct{ target, want, why string }{
+		{"c:/proj/a.go", "THINK_ONE", "the reasoning that preceded it"},
+		{"c:/proj/b.go", "", "consumed-once: the previous file_view took it"},
+		{"c:/proj/c.go", "", "turn-boundary discard: a user prompt intervened"},
+		{"c:/proj/d.go", "SECOND", "last-wins: the newer reasoning replaces the older"},
+	}
+	for _, c := range cases {
+		ev, ok := byTarget[c.target]
+		if !ok {
+			t.Fatalf("missing file_view event for %q; got %v", c.target, got.ToolEvents)
+		}
+		if ev.PrecedingReasoning != c.want {
+			t.Errorf("%s PrecedingReasoning = %q, want %q (%s)", c.target, ev.PrecedingReasoning, c.want, c.why)
+		}
+	}
+}
+
+// TestParseStructuredTrajectory_ReasoningPreferredOverAssistantSelfPreview
+// pins the one place B3 changes an existing field's value: an
+// assistant_text row with real reasoning available carries THAT, not its
+// legacy self-preview. Without reasoning the self-preview is unchanged.
+func TestParseStructuredTrajectory_ReasoningPreferredOverAssistantSelfPreview(t *testing.T) {
+	turn := protowire.AppendBytesField(nil, 3, buildTurn(t, 100, 0, 50, 1000, 0))
+	// One step carrying BOTH assistant text and reasoning (the live
+	// PLANNER_RESPONSE shape), then a bare assistant-text step.
+	body := buildB3Step(t, 1769687900, "", "", "Here is the plan.", "WHY_THE_PLAN")
+	body = append(body, buildB3Step(t, 1769687910, "", "", "No thinking here.", "")...)
+	wire := protowire.AppendBytesField(nil, 1, append(body, turn...))
+
+	got := ParseStructuredTrajectory(wire, "uuid-b3b", "/tmp/proj", "/tmp/uuid-b3b.pb", nil)
+
+	byTarget := map[string]models.ToolEvent{}
+	for _, ev := range got.ToolEvents {
+		if strings.Contains(strings.ToLower(ev.RawToolName), "reasoning") {
+			t.Fatalf("reasoning-named action row emitted: raw=%q %+v", ev.RawToolName, ev)
+		}
+		byTarget[ev.Target] = ev
+	}
+	// The reasoning lands on the SAME step's assistant_text row: the
+	// step walk sets reasoningText before the row is built.
+	if got := byTarget["Here is the plan."].PrecedingReasoning; got != "WHY_THE_PLAN" {
+		t.Errorf("assistant_text PrecedingReasoning = %q, want WHY_THE_PLAN", got)
+	}
+	if got := byTarget["No thinking here."].PrecedingReasoning; got != "No thinking here." {
+		t.Errorf("reasoning-less assistant_text PrecedingReasoning = %q, want the legacy self-preview", got)
 	}
 }

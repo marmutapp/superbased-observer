@@ -29,6 +29,7 @@ import { ProjectDetailPage } from "@/pages/ProjectDetail";
 import { AuditPage } from "@/pages/Audit";
 import { InvitePage } from "@/pages/Invite";
 import { PolicyPage } from "@/pages/Policy";
+import { AnnouncementsPage } from "@/pages/Announcements";
 import { SecurityPage } from "@/pages/Security";
 import { SettingsPage } from "@/pages/Settings";
 
@@ -65,6 +66,7 @@ export default function App() {
         <Route path="/projects/:id" element={<ProjectDetailPage />} />
         <Route path="/security" element={<SecurityPage />} />
         <Route path="/policy" element={<PolicyPage />} />
+        <Route path="/announcements" element={<AnnouncementsPage />} />
         <Route path="/invite" element={<InvitePage />} />
         <Route path="/audit" element={<AuditPage />} />
         <Route path="/settings" element={<SettingsPage />} />

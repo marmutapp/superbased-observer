@@ -11,13 +11,31 @@ import (
 
 	"github.com/BurntSushi/toml"
 
+	"github.com/marmutapp/superbased-observer/internal/claudeplugin"
 	"github.com/marmutapp/superbased-observer/internal/mcp/locate"
 	"github.com/marmutapp/superbased-observer/internal/platform/crossmount"
 )
 
+// claudeCodeMCPPath reports the config file the claude-code MCP entry
+// would have been written to, for reporting on the skip path (where the
+// normal locate lookup below never runs). Empty when the client is not
+// in the locate table.
+func claudeCodeMCPPath(home string) string {
+	if loc, ok := locate.ForClient("claude-code", home); ok {
+		return loc.Path
+	}
+	return ""
+}
+
 // ServerName is the registration entry name written into each AI tool's
 // MCP config. Stable so re-running init is idempotent.
 const ServerName = "observer"
+
+// allHomes is the crossmount-home enumeration seam — a package var (mirroring
+// internal/hook and internal/proxyroute) so a test can inject a fixed
+// multi-home layout instead of depending on a real /mnt/c mount (restore it in
+// a defer).
+var allHomes = crossmount.AllHomes
 
 // RegistrationResult summarizes one MCP registration.
 type RegistrationResult struct {
@@ -27,6 +45,31 @@ type RegistrationResult struct {
 	AlreadySet bool
 	DryRun     bool
 	Error      error
+
+	// Skipped reports that the registrar deliberately wrote nothing
+	// because the tool already carries observer's MCP server through its
+	// own packaging surface — today, the Claude Code plugin, whose
+	// .mcp.json declares the same stdio server. Not an error: Claude
+	// Code namespaces a plugin's server separately from a user-config
+	// one (`plugin:<plugin>:<server>` vs `<server>`), so both being
+	// present loads the observer tool schema TWICE per turn instead of
+	// colliding. SkipReason names the artifact that proved it. Both zero
+	// on every other path.
+	Skipped    bool
+	SkipReason string
+
+	// SkipAdvice is the operator-facing next step that goes with
+	// SkipReason. Empty means "the default plugin advice applies" (the
+	// printer supplies it), so the plugin skip path is unchanged; the
+	// cross-OS sandbox skip (see crossmount.AutoDetectSuppressed) sets it
+	// because the --force escape hatch deliberately does NOT apply there.
+	SkipAdvice string
+
+	// ProbeWarning is a NON-FATAL note: the plugin probe could not read a
+	// file it needed, so this registrar wrote its entry without being able
+	// to rule out a plugin already declaring the same server. Registration
+	// still happened (fail-open to wiring). Empty on every conclusive path.
+	ProbeWarning string
 }
 
 // RegisterOptions parameterizes Registrar.
@@ -61,13 +104,22 @@ type RegisterOptions struct {
 }
 
 // Registrar dispatches MCP registrations per tool.
-type Registrar struct{ opts RegisterOptions }
+type Registrar struct {
+	opts RegisterOptions
+	// homeOverride is the caller-supplied RegisterOptions.HomeDir VERBATIM,
+	// kept before NewRegistrar defaults it to the real $HOME. Non-empty
+	// means "the caller pinned this registrar's home", which switches OFF
+	// crossmount auto-detection for the cross-OS "cline-windows" target —
+	// see crossmount.AutoDetectSuppressed (incident 2026-07-31).
+	homeOverride string
+}
 
 // NewRegistrar validates opts and returns a Registrar.
 func NewRegistrar(opts RegisterOptions) (*Registrar, error) {
 	if opts.BinaryPath == "" {
 		return nil, errors.New("mcp.NewRegistrar: BinaryPath is required")
 	}
+	homeOverride := opts.HomeDir
 	if opts.HomeDir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -75,7 +127,7 @@ func NewRegistrar(opts RegisterOptions) (*Registrar, error) {
 		}
 		opts.HomeDir = home
 	}
-	return &Registrar{opts: opts}, nil
+	return &Registrar{opts: opts, homeOverride: homeOverride}, nil
 }
 
 // Installed reports which supported tools have a config directory present.
@@ -104,12 +156,26 @@ func (r *Registrar) Installed() []string {
 	if dir := r.detectWindowsClineSettingsDir(); dir != "" {
 		tools = append(tools, "cline-windows")
 	}
+	if r.dirExists(filepath.Join(r.opts.HomeDir, ".factory")) {
+		tools = append(tools, "droid")
+	}
+	if r.dirExists(filepath.Join(r.opts.HomeDir, ".commandcode")) {
+		tools = append(tools, "command-code")
+	}
 	return tools
 }
 
 func (r *Registrar) dirExists(p string) bool {
 	fi, err := os.Stat(p)
 	return err == nil && fi.IsDir()
+}
+
+// foreignAutoDetectSuppressed reports whether this registrar's caller pinned
+// HomeDir (a sandbox) without naming the Windows-side home for the cross-OS
+// target being resolved. See crossmount.AutoDetectSuppressed for the rule and
+// the 2026-07-31 incident it exists to make structurally impossible.
+func (r *Registrar) foreignAutoDetectSuppressed(override string) bool {
+	return crossmount.AutoDetectSuppressed(r.homeOverride, override)
 }
 
 // Register writes (or verifies) the MCP entry for tool. Supported values:
@@ -124,6 +190,31 @@ func (r *Registrar) Register(tool string) RegistrationResult {
 	if tool == "cline-windows" {
 		return r.registerClineWindows()
 	}
+	// Double-wiring guard, the MCP half of hook.registerClaudeCode's.
+	// The Claude Code plugin bundles a .mcp.json declaring this same
+	// server, and a plugin server is namespaced separately from a
+	// user-config one, so writing ours on top loads the schema twice.
+	// Claude Code is the only client with an in-tool plugin surface that
+	// carries observer today; --force still writes.
+	//
+	// A skip needs AFFIRMATIVE evidence: when the probe cannot read
+	// settings.json it reports Uncertain and we register anyway, carrying
+	// the failure as a non-fatal ProbeWarning. Losing the MCP wiring
+	// because a config file was corrupt would be the worse failure.
+	var probeWarning string
+	if tool == "claude-code" && !r.opts.Force {
+		pd := claudeplugin.Detect(r.opts.HomeDir)
+		if pd.Active {
+			return RegistrationResult{
+				Tool:       tool,
+				ConfigPath: claudeCodeMCPPath(r.opts.HomeDir),
+				Skipped:    true,
+				SkipReason: pd.Reason(),
+				DryRun:     r.opts.DryRun,
+			}
+		}
+		probeWarning = pd.Warning()
+	}
 	loc, ok := locate.ForClient(tool, r.opts.HomeDir)
 	if !ok {
 		return RegistrationResult{
@@ -132,14 +223,17 @@ func (r *Registrar) Register(tool string) RegistrationResult {
 			DryRun: r.opts.DryRun,
 		}
 	}
+	var res RegistrationResult
 	switch loc.Format {
 	case locate.FormatCodexTOML:
-		return r.registerCodexTOML(loc.Path)
+		res = r.registerCodexTOML(loc.Path)
 	case locate.FormatOpenCodeJSON:
-		return r.registerOpenCodeJSON(loc.Path)
+		res = r.registerOpenCodeJSON(loc.Path)
 	default:
-		return r.registerJSONMCP(tool, loc.Path)
+		res = r.registerJSONMCP(tool, loc.Path)
 	}
+	res.ProbeWarning = probeWarning
+	return res
 }
 
 // mcpServerEntry is the canonical shape both Claude Code and Cursor accept
@@ -233,6 +327,21 @@ func (r *Registrar) registerClineWindows() RegistrationResult {
 	res := RegistrationResult{Tool: "cline-windows", DryRun: r.opts.DryRun}
 	path := r.detectWindowsClineSettings()
 	if path == "" {
+		if r.foreignAutoDetectSuppressed(r.opts.WindowsClineHome) {
+			// Deliberate no-write, not a host problem — see
+			// crossmount.AutoDetectSuppressed (incident 2026-07-31).
+			res.Skipped = true
+			if r.opts.WindowsClineHome == "" {
+				res.SkipReason = "HomeDir was pinned by the caller but no WindowsClineHome was given — cross-OS globalStorage resolution is suppressed (incident 2026-07-31)"
+			} else {
+				res.SkipReason = fmt.Sprintf(
+					"WindowsClineHome (%s) resolves OUTSIDE the pinned HomeDir (%s) — cross-OS globalStorage resolution is suppressed (incident 2026-07-31)",
+					r.opts.WindowsClineHome, r.homeOverride,
+				)
+			}
+			res.SkipAdvice = "nothing written; a sandboxed caller must set WindowsClineHome to a home UNDER its own HomeDir to wire this target (--force does not lift this)."
+			return res
+		}
 		res.Error = errors.New("mcp.registerClineWindows: no Windows-side VS Code Cline globalStorage detected (set WindowsClineHome or run where crossmount sees /mnt/c/Users/<u>/AppData/Roaming/Code/.../cline_mcp_settings.json)")
 		return res
 	}
@@ -258,10 +367,18 @@ func (r *Registrar) registerClineWindows() RegistrationResult {
 // path (resolved via crossmount), or "" if no Windows VS Code Cline
 // globalStorage is reachable. Honors WindowsClineHome when set.
 func (r *Registrar) detectWindowsClineSettings() string {
+	// Sandbox gate FIRST — before the override branch, because an override
+	// pointing OUTSIDE the pinned home is exactly the escape hatch that
+	// re-opened this hole. See crossmount.AutoDetectSuppressed (incident
+	// 2026-07-31). Production never pins HomeDir, so this is false on every
+	// real path and a bare override still wins unconditionally.
+	if r.foreignAutoDetectSuppressed(r.opts.WindowsClineHome) {
+		return ""
+	}
 	if r.opts.WindowsClineHome != "" {
 		return locate.ClineSettingsPath(r.opts.WindowsClineHome, crossmount.OSWindows)
 	}
-	for _, h := range crossmount.AllHomes() {
+	for _, h := range allHomes() {
 		if h.OS != crossmount.OSWindows {
 			continue
 		}

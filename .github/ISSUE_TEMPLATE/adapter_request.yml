@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Observer supports 26 AI coding tools today via per-tool
+        Observer supports every major AI coding tool via per-tool
         adapters. If yours isn't one of them, this form helps us
         (or you!) scope a new adapter. See CONTRIBUTING.md if you'd
         like to build it yourself — adapter contributions are

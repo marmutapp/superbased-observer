@@ -382,3 +382,139 @@ func actionTypes(evs []models.ToolEvent) []string {
 	}
 	return out
 }
+
+// TestToolResultCrossTickEmitsOutcomeUpdate pins the parser half of the
+// store outcome-update seam. A tool_use and its tool_result are separate
+// JSONL records; when a poll tick ends between them the call row is
+// already persisted optimistically successful and the next parse window
+// resumes with an empty pendingCall map. The outcome must leave as an
+// ActionOutcomeUpdate keyed by the same "tool:<tool_use_id>"
+// SourceEventID the emit side built — the store's action upsert cannot
+// flip success / error_message, so a dropped update is permanent.
+func TestToolResultCrossTickEmitsOutcomeUpdate(t *testing.T) {
+	const (
+		userLine = `{"type":"user","uuid":"u-1","timestamp":"2026-07-09T04:54:27.199Z","message":{"role":"user","content":"run the tests"},"parentUuid":null,"isSidechain":false,"cwd":"/home/dev/proj","sessionId":"sess-xt","gitBranch":"main"}`
+		callLine = `{"type":"assistant","uuid":"u-2","timestamp":"2026-07-09T04:54:32.528Z","message":{"id":"chatcmpl-A","role":"assistant","content":[{"type":"tool_use","id":"call_xt","name":"Bash","input":{"command":"go test ./..."}}]},"parentUuid":"u-1","isSidechain":false,"cwd":"/home/dev/proj","sessionId":"sess-xt","gitBranch":"main"}`
+	)
+
+	cases := []struct {
+		name       string
+		resultLine string
+		wantID     string
+		wantOK     bool
+		wantErrMsg bool
+	}{
+		{
+			name:       "failed call",
+			resultLine: `{"type":"user","uuid":"u-3","timestamp":"2026-07-09T04:54:33.625Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_xt","content":"--- FAIL: TestFoo\nexit status 1","is_error":true}]},"parentUuid":"u-2","isSidechain":false,"cwd":"/home/dev/proj","sessionId":"sess-xt","gitBranch":"main"}`,
+			wantID:     "tool:call_xt",
+			wantOK:     false,
+			wantErrMsg: true,
+		},
+		{
+			name:       "successful call",
+			resultLine: `{"type":"user","uuid":"u-3","timestamp":"2026-07-09T04:54:33.625Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_xt","content":"ok 12 tests","is_error":false}]},"parentUuid":"u-2","isSidechain":false,"cwd":"/home/dev/proj","sessionId":"sess-xt","gitBranch":"main"}`,
+			wantID:     "tool:call_xt",
+			wantOK:     true,
+		},
+		{
+			name:       "result with no tool_use_id is unkeyable and dropped",
+			resultLine: `{"type":"user","uuid":"u-3","timestamp":"2026-07-09T04:54:33.625Z","message":{"role":"user","content":[{"type":"tool_result","content":"orphan","is_error":true}]},"parentUuid":"u-2","isSidechain":false,"cwd":"/home/dev/proj","sessionId":"sess-xt","gitBranch":"main"}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			projects := filepath.Join(root, ".qoder", "projects")
+			dst := filepath.Join(projects, "-home-dev-proj", "s.jsonl")
+			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			a := newTestAdapter(projects, filepath.Join(root, ".qoder", "logs", "sessions"))
+
+			// Window 1: the transcript ends right after the tool_use.
+			if err := os.WriteFile(dst, []byte(userLine+"\n"+callLine+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			res1, err := a.ParseSessionFile(context.Background(), dst, 0)
+			if err != nil {
+				t.Fatalf("first parse: %v", err)
+			}
+			var call *models.ToolEvent
+			for i := range res1.ToolEvents {
+				if res1.ToolEvents[i].SourceEventID == "tool:call_xt" {
+					call = &res1.ToolEvents[i]
+				}
+			}
+			if call == nil {
+				t.Fatalf("first parse produced no tool:call_xt event: %+v", res1.ToolEvents)
+			}
+			if !call.Success {
+				t.Error("first parse: call should be optimistically successful")
+			}
+			if !call.OutcomePending {
+				t.Error("first parse: an unanswered call must be flagged OutcomePending, or the store files failure-context bookkeeping on an outcome nobody observed")
+			}
+			if len(res1.OutcomeUpdates) != 0 {
+				t.Errorf("first parse emitted %d outcome updates, want 0", len(res1.OutcomeUpdates))
+			}
+
+			// Window 2: the result lands, cursor resumes past the call.
+			if err := os.WriteFile(dst, []byte(userLine+"\n"+callLine+"\n"+tc.resultLine+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			res2, err := a.ParseSessionFile(context.Background(), dst, res1.NewOffset)
+			if err != nil {
+				t.Fatalf("second parse: %v", err)
+			}
+			if tc.wantID == "" {
+				if len(res2.OutcomeUpdates) != 0 {
+					t.Fatalf("unkeyable result produced %+v, want no updates", res2.OutcomeUpdates)
+				}
+				return
+			}
+
+			// The same transcript parsed WHOLE resolves the pair
+			// in-window, so nothing is left pending.
+			resFull, err := a.ParseSessionFile(context.Background(), dst, 0)
+			if err != nil {
+				t.Fatalf("full parse: %v", err)
+			}
+			var fullCall *models.ToolEvent
+			for i := range resFull.ToolEvents {
+				if resFull.ToolEvents[i].SourceEventID == "tool:call_xt" {
+					fullCall = &resFull.ToolEvents[i]
+				}
+			}
+			if fullCall == nil || fullCall.OutcomePending {
+				t.Errorf("in-window pairing left OutcomePending set: %+v", resFull.ToolEvents)
+			}
+			if len(res2.OutcomeUpdates) != 1 {
+				t.Fatalf("OutcomeUpdates: got %d want 1 (%+v)", len(res2.OutcomeUpdates), res2.OutcomeUpdates)
+			}
+			up := res2.OutcomeUpdates[0]
+			if up.SourceFile != dst {
+				t.Errorf("SourceFile = %q, want %q", up.SourceFile, dst)
+			}
+			if up.SourceEventID != tc.wantID {
+				t.Errorf("SourceEventID = %q, want %q", up.SourceEventID, tc.wantID)
+			}
+			if up.Success != tc.wantOK {
+				t.Errorf("Success = %v, want %v", up.Success, tc.wantOK)
+			}
+			if tc.wantErrMsg && up.ErrorMessage == "" {
+				t.Error("ErrorMessage empty on an is_error result")
+			}
+			if !tc.wantErrMsg && up.ErrorMessage != "" {
+				t.Errorf("ErrorMessage = %q on a clean result, want empty", up.ErrorMessage)
+			}
+			if up.ToolOutput == "" {
+				t.Error("ToolOutput empty, want the result body")
+			}
+			if up.DurationMs != 0 {
+				t.Errorf("DurationMs = %d, want 0 (the call lived in the prior window)", up.DurationMs)
+			}
+		})
+	}
+}

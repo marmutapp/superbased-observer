@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useApi } from "@/lib/useApi";
 import { fmtBytes, fmtCompact, fmtInt, fmtUSD } from "@/lib/format";
+import { HeroWordmark } from "@/components/HeroWordmark";
 import type { MonthlyReport, ProjectsResponse } from "@/lib/types";
 
 // Monthly statement (P6.6): a print-friendly document over
@@ -81,7 +82,11 @@ export function ReportPage() {
             </p>
           </header>
 
-          <section className="flex flex-wrap gap-x-8 gap-y-2">
+          {/* Camera-ready pass (growth-review §4): the statement headline
+              is the number a client-billable screenshot / PDF travels
+              with — a subtle corner wordmark carries it, print-visible. */}
+          <section className="relative flex flex-wrap gap-x-8 gap-y-2 pb-3">
+            <HeroWordmark />
             <Headline label="Total spend" value={fmtUSD(r.totals?.cost_usd ?? 0)} big />
             <Headline label="Sessions" value={fmtInt(r.totals?.sessions ?? 0)} />
             <Headline label="API turns" value={fmtInt(r.totals?.turns ?? 0)} />

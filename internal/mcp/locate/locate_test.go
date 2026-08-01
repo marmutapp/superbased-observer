@@ -19,6 +19,8 @@ func TestLocations(t *testing.T) {
 		{Client: "codex", Path: filepath.Join(home, ".codex", "config.toml"), Format: FormatCodexTOML},
 		{Client: "opencode", Path: filepath.Join(home, ".config", "opencode", "opencode.json"), Format: FormatOpenCodeJSON},
 		{Client: "cline", Path: ClineSettingsPath(home, runtime.GOOS), Format: FormatMCPServersJSON},
+		{Client: "droid", Path: filepath.Join(home, ".factory", "mcp.json"), Format: FormatMCPServersJSON},
+		{Client: "command-code", Path: filepath.Join(home, ".commandcode", "mcp.json"), Format: FormatMCPServersJSON},
 	}
 	got := Locations(home)
 	if len(got) != len(want) {

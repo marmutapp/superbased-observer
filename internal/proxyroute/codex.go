@@ -64,6 +64,13 @@ type RegistrationResult struct {
 	// operator doesn't have. The verified writers (codex/claude/hermes)
 	// never set it (they error on a missing config instead).
 	ConfigMissing bool
+	// SkipReason, when non-empty, explains a deliberate no-write that is
+	// NOT "the tool isn't installed": today only the cross-OS sandbox gate
+	// (a caller pinned HomeDir but named no Windows-side home — see
+	// crossmount.AutoDetectSuppressed, incident 2026-07-31). Set alongside
+	// ConfigMissing so existing callers keep treating it as a benign skip;
+	// Error stays nil.
+	SkipReason string
 	// PriorBaseURL / UpstreamID / UpstreamRoot are populated by writers that
 	// route through a /up/<id> prefix (hermes): the upstream the operator must
 	// add to [proxy.upstreams]. Zero for the fixed-upstream writers (codex).
@@ -73,13 +80,22 @@ type RegistrationResult struct {
 }
 
 // Registrar dispatches proxy-routing config writes per tool.
-type Registrar struct{ opts RegisterOptions }
+type Registrar struct {
+	opts RegisterOptions
+	// homeOverride is the caller-supplied RegisterOptions.HomeDir VERBATIM,
+	// kept before NewRegistrar defaults it to the real $HOME. Non-empty
+	// means "the caller pinned this registrar's home", which switches OFF
+	// crossmount auto-detection for the cross-OS "-windows" route writers —
+	// see crossmount.AutoDetectSuppressed (incident 2026-07-31).
+	homeOverride string
+}
 
 // NewRegistrar validates opts and returns a Registrar.
 func NewRegistrar(opts RegisterOptions) (*Registrar, error) {
 	if opts.ProxyPort <= 0 || opts.ProxyPort > 65535 {
 		return nil, fmt.Errorf("proxyroute.NewRegistrar: ProxyPort %d out of range", opts.ProxyPort)
 	}
+	homeOverride := opts.HomeDir
 	if opts.HomeDir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -87,7 +103,7 @@ func NewRegistrar(opts RegisterOptions) (*Registrar, error) {
 		}
 		opts.HomeDir = home
 	}
-	return &Registrar{opts: opts}, nil
+	return &Registrar{opts: opts, homeOverride: homeOverride}, nil
 }
 
 // codexBaseURL is the value we write into the custom provider's base_url.

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +22,36 @@ func TestLoadMissingFileReturnsDefaults(t *testing.T) {
 	}
 	if cfg.SAML.AttributeMapping["email"] != "Email" {
 		t.Errorf("default attribute mapping email = %q, want Email", cfg.SAML.AttributeMapping["email"])
+	}
+	// Delegated invites are admin OPT-IN: an org that never heard of the
+	// feature must not get it. This is the config half of the default-off
+	// posture (the gate half lives in auth.RequireInviterSAML).
+	if cfg.Server.MemberInvites {
+		t.Error("server.member_invites defaults to true — delegated invites must be opt-in")
+	}
+	if cfg.Server.MemberInviteMonthlyCap != 10 {
+		t.Errorf("member_invite_monthly_cap = %d, want 10", cfg.Server.MemberInviteMonthlyCap)
+	}
+}
+
+// TestMemberInvitesLoadsFromTOML pins the key spelling + section. The v1.8.2
+// N6 class (a key silently landing under the wrong section header) is exactly
+// what would make a security-relevant flag read as its zero value.
+func TestMemberInvitesLoadsFromTOML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	body := "[server]\nlisten = \":9443\"\nmember_invites = true\nmember_invite_monthly_cap = 3\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Server.MemberInvites {
+		t.Error("member_invites did not load from [server]")
+	}
+	if cfg.Server.MemberInviteMonthlyCap != 3 {
+		t.Errorf("member_invite_monthly_cap = %d, want 3", cfg.Server.MemberInviteMonthlyCap)
 	}
 }
 
@@ -125,6 +156,23 @@ func TestValidate(t *testing.T) {
 			c.Email.TLSMode = "ssl"
 		}, "tls_mode"},
 		{"email missing host", func(c *Config) { c.Email.Enabled = true; c.Email.From = "f@x" }, "host is required"},
+		// A zero/negative invite cap would silently mean "no member may ever
+		// invite", which member_invites = false already says. Refuse the
+		// ambiguous spelling rather than pick a meaning.
+		{"zero invite cap", func(c *Config) { c.Server.MemberInviteMonthlyCap = 0 }, "member_invite_monthly_cap"},
+		{"negative invite cap", func(c *Config) { c.Server.MemberInviteMonthlyCap = -1 }, "member_invite_monthly_cap"},
+		// A negative plan price does not bill negatively — the telemetry
+		// rollup refuses to price seats at all below zero — so the only
+		// visible effect is seat cost silently vanishing from the dashboard.
+		// Zero stays legal: it means "price not supplied".
+		{"negative per-seat price", func(c *Config) { c.CopilotAnalytics.PerSeatPriceUSD = -19 }, "per_seat_price_usd"},
+		// TOML accepts the literals `nan` and `inf` without error, and `< 0`
+		// catches neither. `nan` silently unprices seats; `inf` reaches
+		// encoding/json, which refuses it AFTER writeJSON has already sent
+		// 200 — a 200 with no valid body.
+		{"NaN per-seat price", func(c *Config) { c.CopilotAnalytics.PerSeatPriceUSD = math.NaN() }, "per_seat_price_usd"},
+		{"+Inf per-seat price", func(c *Config) { c.CopilotAnalytics.PerSeatPriceUSD = math.Inf(1) }, "per_seat_price_usd"},
+		{"-Inf per-seat price", func(c *Config) { c.CopilotAnalytics.PerSeatPriceUSD = math.Inf(-1) }, "per_seat_price_usd"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

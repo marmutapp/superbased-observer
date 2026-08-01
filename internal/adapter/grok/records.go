@@ -278,7 +278,7 @@ func mapToolName(name string) string {
 		return models.ActionSearchText
 	case "listdir", "listdirectory", "glob", "findfiles", "filesearch", "ls", "readfolder":
 		return models.ActionSearchFiles
-	case "websearch", "search_web", "browsersearch":
+	case "websearch", "browsersearch":
 		return models.ActionWebSearch
 	case "webfetch", "fetch", "fetchurl", "readurl", "browse", "openurl":
 		return models.ActionWebFetch

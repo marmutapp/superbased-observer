@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -104,6 +105,60 @@ func TestGetModelRecommendation_EvidenceBacked(t *testing.T) {
 	}
 	if int(rec["baseline_turns"].(float64)) != 60 || int(rec["suggested_turns"].(float64)) != 60 {
 		t.Errorf("sample sizes = %v / %v, want 60 / 60", rec["baseline_turns"], rec["suggested_turns"])
+	}
+}
+
+// TestGetModelRecommendation_DaysClamped pins the "silent limit clamping"
+// server-level invariant published in docs/mcp-contract.md for THIS stable
+// tool's `days` argument: an out-of-range value is capped at the documented
+// maximum (365) instead of erroring or being forwarded verbatim, and an
+// absent / zero / negative value falls back to the documented default (30).
+//
+// The tool echoes the resolved window back as `window_days`, so the clamp is
+// directly observable. If the clamp is reverted, `days: 2147483647` comes
+// back as `window_days: 2147483647` and every out-of-range row below fires.
+func TestGetModelRecommendation_DaysClamped(t *testing.T) {
+	s, _, _ := testServer(t)
+	cases := []struct {
+		name string
+		args map[string]any
+		want int
+	}{
+		{name: "absent", args: map[string]any{}, want: 30},
+		{name: "zero", args: map[string]any{"days": 0}, want: 30},
+		{name: "negative", args: map[string]any{"days": -5}, want: 30},
+		{name: "minimum", args: map[string]any{"days": 1}, want: 1},
+		{name: "in-range", args: map[string]any{"days": 90}, want: 90},
+		{name: "maximum", args: map[string]any{"days": 365}, want: 365},
+		{name: "one-over", args: map[string]any{"days": 366}, want: 365},
+		{name: "max-int32", args: map[string]any{"days": 2147483647}, want: 365},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			out := callTool(t, s, "get_model_recommendation", tc.args)
+			got, ok := out["window_days"].(float64)
+			if !ok {
+				t.Fatalf("window_days missing/not numeric in %v", out)
+			}
+			if int(got) != tc.want {
+				t.Errorf("days=%v → window_days = %d, want %d — the documented [1,365] clamp "+
+					"(docs/mcp-contract.md, \"Silent limit clamping\") is not enforced at the tool boundary",
+					tc.args["days"], int(got), tc.want)
+			}
+		})
+	}
+}
+
+// TestGetModelRecommendation_HugeDaysBehavesLike365 is the behavioural half
+// of the clamp pin: an absurd `days` must produce a byte-identical result to
+// the documented maximum, not merely "not error".
+func TestGetModelRecommendation_HugeDaysBehavesLike365(t *testing.T) {
+	s, _, _ := testServer(t)
+	atMax := callTool(t, s, "get_model_recommendation", map[string]any{"days": 365})
+	huge := callTool(t, s, "get_model_recommendation", map[string]any{"days": 2147483647})
+	if !reflect.DeepEqual(atMax, huge) {
+		t.Errorf("days=2147483647 did not behave identically to days=365:\n  365: %v\n huge: %v", atMax, huge)
 	}
 }
 

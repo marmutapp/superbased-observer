@@ -2,6 +2,7 @@ package kimicode
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -328,5 +329,137 @@ func TestReadTranscriptByWalk(t *testing.T) {
 	}
 	if len(msgs) == 0 {
 		t.Fatal("no messages from walk-resolved transcript")
+	}
+}
+
+// TestToolResultCrossTickEmitsOutcomeUpdate pins the parser half of the
+// store outcome-update seam. A tool.call and its tool.result are separate
+// wire records; when a poll tick ends between them the call row is
+// already persisted optimistically successful and the next parse window
+// resumes with an empty pendingCall map. The outcome must leave as an
+// ActionOutcomeUpdate keyed by the same "tool:<id>" SourceEventID
+// emitToolCall built — the store's action upsert cannot flip success /
+// error_message, so a dropped update is permanent.
+//
+// The emit side keys on toolCallId||uuid and the result side on
+// toolCallId||parentUuid; the cases below cover both the agreeing
+// (toolCallId present) shape and the parentUuid fallback.
+func TestToolResultCrossTickEmitsOutcomeUpdate(t *testing.T) {
+	const (
+		metaLine = `{"type": "metadata", "protocol_version": "1.4", "created_at": 1783573417212}`
+		callLine = `{"type": "context.append_loop_event", "event": {"type": "tool.call", "uuid": "call_xt", "turnId": "0", "step": 1, "toolCallId": "call_xt", "name": "Bash", "args": {"command": "go test ./..."}, "display": {"kind": "command", "command": "go test ./...", "cwd": "/home/dev/proj", "language": "bash"}}, "time": 1783573418000}`
+	)
+
+	cases := []struct {
+		name       string
+		resultLine string
+		wantOK     bool
+		wantErrMsg bool
+	}{
+		{
+			name:       "failed call keyed by toolCallId",
+			resultLine: `{"type": "context.append_loop_event", "event": {"type": "tool.result", "parentUuid": "call_xt", "toolCallId": "call_xt", "result": {"error": "exit status 1: FAIL", "isError": true}}, "time": 1783573418200}`,
+			wantErrMsg: true,
+		},
+		{
+			name:       "successful call keyed by toolCallId",
+			resultLine: `{"type": "context.append_loop_event", "event": {"type": "tool.result", "parentUuid": "call_xt", "toolCallId": "call_xt", "result": {"output": "ok 12 tests"}}, "time": 1783573418200}`,
+			wantOK:     true,
+		},
+		{
+			// No toolCallId: the result side falls back to parentUuid,
+			// which the emit side wrote as the call's own uuid.
+			name:       "failed call keyed by parentUuid fallback",
+			resultLine: `{"type": "context.append_loop_event", "event": {"type": "tool.result", "parentUuid": "call_xt", "result": {"error": "exit status 1: FAIL", "isError": true}}, "time": 1783573418200}`,
+			wantErrMsg: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			dst := filepath.Join(root, "wd_proj_ab12cd34ef56",
+				"session_99999999-9999-4999-8999-999999999999", "agents", "main", "wire.jsonl")
+			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			a := NewWithOptions(nil, root)
+
+			// Window 1: the wire log ends right after the tool.call.
+			if err := os.WriteFile(dst, []byte(metaLine+"\n"+callLine+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			res1, err := a.ParseSessionFile(context.Background(), dst, 0)
+			if err != nil {
+				t.Fatalf("first parse: %v", err)
+			}
+			var call *models.ToolEvent
+			for i := range res1.ToolEvents {
+				if res1.ToolEvents[i].SourceEventID == "tool:call_xt" {
+					call = &res1.ToolEvents[i]
+				}
+			}
+			if call == nil {
+				t.Fatalf("first parse produced no tool:call_xt event: %+v", res1.ToolEvents)
+			}
+			if !call.Success {
+				t.Error("first parse: call should be optimistically successful")
+			}
+			if !call.OutcomePending {
+				t.Error("first parse: an unanswered call must be flagged OutcomePending, or the store files failure-context bookkeeping on an outcome nobody observed")
+			}
+			if len(res1.OutcomeUpdates) != 0 {
+				t.Errorf("first parse emitted %d outcome updates, want 0", len(res1.OutcomeUpdates))
+			}
+
+			// Window 2: the result lands, cursor resumes past the call.
+			if err := os.WriteFile(dst, []byte(metaLine+"\n"+callLine+"\n"+tc.resultLine+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			res2, err := a.ParseSessionFile(context.Background(), dst, res1.NewOffset)
+			if err != nil {
+				t.Fatalf("second parse: %v", err)
+			}
+			// The same transcript parsed WHOLE resolves the pair
+			// in-window, so nothing is left pending.
+			resFull, err := a.ParseSessionFile(context.Background(), dst, 0)
+			if err != nil {
+				t.Fatalf("full parse: %v", err)
+			}
+			var fullCall *models.ToolEvent
+			for i := range resFull.ToolEvents {
+				if resFull.ToolEvents[i].SourceEventID == "tool:call_xt" {
+					fullCall = &resFull.ToolEvents[i]
+				}
+			}
+			if fullCall == nil || fullCall.OutcomePending {
+				t.Errorf("in-window pairing left OutcomePending set: %+v", resFull.ToolEvents)
+			}
+			if len(res2.OutcomeUpdates) != 1 {
+				t.Fatalf("OutcomeUpdates: got %d want 1 (%+v)", len(res2.OutcomeUpdates), res2.OutcomeUpdates)
+			}
+			up := res2.OutcomeUpdates[0]
+			if up.SourceFile != dst {
+				t.Errorf("SourceFile = %q, want %q", up.SourceFile, dst)
+			}
+			if up.SourceEventID != "tool:call_xt" {
+				t.Errorf("SourceEventID = %q, want tool:call_xt", up.SourceEventID)
+			}
+			if up.Success != tc.wantOK {
+				t.Errorf("Success = %v, want %v", up.Success, tc.wantOK)
+			}
+			if tc.wantErrMsg && up.ErrorMessage == "" {
+				t.Error("ErrorMessage empty on an isError result")
+			}
+			if !tc.wantErrMsg && up.ErrorMessage != "" {
+				t.Errorf("ErrorMessage = %q on a clean result, want empty", up.ErrorMessage)
+			}
+			if up.ToolOutput == "" {
+				t.Error("ToolOutput empty, want the result body")
+			}
+			if up.DurationMs != 0 {
+				t.Errorf("DurationMs = %d, want 0 (the call lived in the prior window)", up.DurationMs)
+			}
+		})
 	}
 }

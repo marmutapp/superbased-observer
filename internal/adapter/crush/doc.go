@@ -20,6 +20,16 @@
 //     tool_call and tool_result live in SEPARATE messages (assistant
 //     vs. role="tool"), paired by tool_call id.
 //
+// Reasoning emission (B3, 2026-07-31): a `reasoning` part mints NO
+// action row. Crush's thinking text rides the NEXT assistant-text or
+// tool-call event as PrecedingReasoning, capped at the same 200-char
+// preview the retired `crush.reasoning` row carried and scrubbed at the
+// flush site. Consumption is grok-style — consumed-once (the first
+// successor clears it), last-wins (a newer reasoning part replaces an
+// unconsumed one), discarded at a user-prompt turn boundary. The state
+// spans messages within one ParseSessionFile call because Crush writes
+// the reasoning part and the tool_call it introduces on different rows.
+//
 // Token capture is session-level: one TokenEvent per session carrying
 // the cumulative prompt/completion counts + Crush's own cost in
 // TokenEvent.EstimatedCostUSD, with model+provider resolved from the

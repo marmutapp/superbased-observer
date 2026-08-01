@@ -51,6 +51,14 @@ func (s *Server) handleDemoStart(w http.ResponseWriter, r *http.Request) {
 	}
 	s.demoCleanup = cleanup
 	s.demoDB.Store(demoDB)
+	// Drop any memoized /api/status snapshot: the database every data
+	// surface reads has just changed identity AND contents. The cache keys on
+	// the *sql.DB pointer, which catches the common case, but pointer keying
+	// alone cannot survive a start/stop round trip with no status request in
+	// between — the real DB's pre-demo entry would still be live and would be
+	// served as if nothing had happened. Invalidating at the swap makes the
+	// guarantee explicit rather than incidental.
+	s.statusSnap.invalidate()
 	s.opts.Logger.Info("demo mode started — data surfaces now serve the seeded sample database")
 	writeJSON(w, map[string]any{"available": true, "active": true})
 }
@@ -73,6 +81,10 @@ func (s *Server) handleDemoStop(w http.ResponseWriter, r *http.Request) {
 	// in-flight query racing the close gets one transient error — the
 	// page reloads after a clear, so nothing user-visible persists.
 	s.demoDB.Store(nil)
+	// Same reason as the start path: the operator clearing the banner expects
+	// the REAL numbers back immediately, not whatever this cache last read
+	// from the real database before demo mode began.
+	s.statusSnap.invalidate()
 	if s.demoCleanup != nil {
 		if err := s.demoCleanup(); err != nil {
 			s.opts.Logger.Warn("demo cleanup", "err", err)

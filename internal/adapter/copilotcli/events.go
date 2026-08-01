@@ -795,26 +795,21 @@ func emitEvent(st *parserState, env eventEnvelope, path string, out *adapter.Par
 			// back — the ToolEvent's Model column is informational and
 			// has historically been left empty for unattributed actions.
 			// We only fill it with d.Model or subagent-resolved model.)
-			reasoning := reasoningProxy(d.ReasoningText, d.ReasoningOpaque)
-			// Emit the reasoning as a standalone, visible row (was only
-			// threaded into PrecedingReasoning) so the chain-of-thought is
-			// in the timeline (matches cline/gemini/cowork/openclaw/…).
-			if reasoning != "" {
-				out.ToolEvents = append(out.ToolEvents, models.ToolEvent{
-					SourceFile:         path,
-					SourceEventID:      env.ID + ":reasoning",
-					SessionID:          st.sessionID,
-					Timestamp:          ts,
-					Model:              toolModel,
-					Tool:               models.ToolCopilotCLI,
-					ActionType:         models.ActionTaskComplete,
-					Target:             truncate(reasoning, 256),
-					Success:            true,
-					RawToolName:        models.ToolCopilotCLI + ".reasoning",
-					PrecedingReasoning: truncate(reasoning, 256),
-					MessageID:          d.MessageID,
-				})
-			}
+			// B3 (2026-07-31): reasoning mints NO row of its own — it
+			// briefly emitted a standalone `cline-cli`-style
+			// `<tool>.reasoning` task_complete row, a phantom action for
+			// something the model never did. The reasoning is a SIBLING
+			// FIELD of the assistant message it belongs to
+			// (data.reasoningText / .reasoningOpaque), so threading is
+			// direct and unconditional — no pending state, no
+			// consumption ordering: the assistant_text row below carries
+			// it in PrecedingReasoning. A reasoning-only message (no
+			// content, or one that carries tool requests instead)
+			// therefore produces nothing here — there is no successor
+			// row in this branch to carry it. An OPAQUE-ONLY reasoning
+			// field carries nothing either (see threadableReasoning):
+			// an encrypted blob is not content, uniformly with codex.
+			reasoning := threadableReasoning(d.ReasoningText)
 			idx := len(out.ToolEvents)
 			out.ToolEvents = append(out.ToolEvents, models.ToolEvent{
 				SourceFile:    path,
@@ -1227,17 +1222,26 @@ func deriveTarget(name string, args json.RawMessage) string {
 	return truncate(string(args), 64)
 }
 
-// reasoningProxy returns the plain reasoning text when present;
-// otherwise records a byte-count proxy for the encrypted opaque blob
-// (mirroring the codex encrypted-reasoning pattern).
-func reasoningProxy(text, opaque string) string {
-	if strings.TrimSpace(text) != "" {
-		return scrub.Truncate(text)
+// threadableReasoning returns the reasoning text that may ride the
+// successor event's PrecedingReasoning: `data.reasoningText` when the
+// model surfaced readable thinking, and NOTHING otherwise.
+//
+// B3 uniform placeholder rule (2026-07-31): an opaque/encrypted
+// reasoning blob is NOT content and is threaded nowhere. This helper
+// used to render `data.reasoningOpaque` as a byte-count proxy
+// ("[encrypted reasoning, N bytes]") mirroring codex's placeholder row;
+// codex's placeholders were retired along with its phantom reasoning
+// row, so copilot-cli's are too. An opaque-only assistant message
+// therefore contributes nothing anywhere — no action row, and no
+// `preceding_reasoning` on the assistant_text row that follows it. The
+// blob's LENGTH is deliberately not surfaced: it told the operator
+// nothing they could act on and read as if reasoning content had been
+// captured.
+func threadableReasoning(text string) string {
+	if strings.TrimSpace(text) == "" {
+		return ""
 	}
-	if opaque != "" {
-		return fmt.Sprintf("[encrypted reasoning, %d bytes]", len(opaque))
-	}
-	return ""
+	return scrub.Truncate(text)
 }
 
 func parseTimestamp(s string) time.Time {

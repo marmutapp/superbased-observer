@@ -1,0 +1,24 @@
+{
+  "name": "superbased",
+  "description": "SuperBased plugins for AI coding agents — local-first token, cost and cache observability.",
+  "owner": {
+    "name": "SuperBased"
+  },
+  "plugins": [
+    {
+      "name": "superbased",
+      "source": "./factory/superbased",
+      "description": "Token, cost and cache observability for Droid. Wires the SuperBased Observer MCP server. Requires the `observer` binary already on your PATH (npm i -g @superbased/observer, or pipx install superbased-observer) — this plugin is wiring only and installs no binary.",
+      "category": "observability",
+      "homepage": "https://superbased.app/",
+      "tags": [
+        "cost",
+        "cost-tracking",
+        "mcp",
+        "observability",
+        "tokens",
+        "usage"
+      ]
+    }
+  ]
+}

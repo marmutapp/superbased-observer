@@ -2,6 +2,7 @@ package openclaw
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -81,12 +82,16 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 	case base == "sessions.json":
 		return a.parseSessionsIndex(path, fromOffset)
 	case strings.HasSuffix(base, ".trajectory.jsonl"):
-		// The per-session `<id>.trajectory.jsonl` trace carries the
-		// ACCURATE token counts (model.completed events). The sibling
-		// plain `<id>.jsonl` message log is gateway-zeroed when a gateway
-		// backend is in use (model="gateway-injected", usage all 0 → the
-		// zero-guard in parseMessageLine skips it), so the trajectory is
-		// the sole real token source for those sessions.
+		// The per-session `<id>.trajectory.jsonl` trace carries an
+		// accurate per-call usage record (model.completed →
+		// data.promptCache.lastCallUsage) for the LAST model call of a
+		// run. The sibling plain `<id>.jsonl` message log carries the
+		// same provider-reported numbers for EVERY call — except where a
+		// gateway backend injected the turn (model="gateway-injected",
+		// usage all 0 → the zero-guard in parseMessageLine skips it),
+		// where the trajectory is the only real token source. The two
+		// overlap by construction, so parseTrajectoryJSONL suppresses a
+		// call the message log already covers. See doc.go §Tokens.
 		return a.parseTrajectoryJSONL(ctx, path, fromOffset)
 	default:
 		return a.parseSessionJSONL(ctx, path, fromOffset)
@@ -379,6 +384,18 @@ func (a *Adapter) parseSessionJSONL(ctx context.Context, path string, fromOffset
 		state.ProjectRoot = a.resolveProjectRoot(state.ProjectRoot, rootCache)
 	}
 	pending := map[string]int{}
+	// Lazily-read harness prompt preamble for this run (WP-T6 O2). Only a
+	// user message that already carries the "[Bootstrap pending]" marker
+	// pays for the sibling-trace read, and only once per parse call.
+	tracePrefix := ""
+	tracePrefixLoaded := false
+	bootstrapPrefix := func() string {
+		if !tracePrefixLoaded {
+			tracePrefixLoaded = true
+			tracePrefix = bootstrapPrefixFromTrace(path)
+		}
+		return tracePrefix
+	}
 	// seenSystemPrompts dedups ActionSystemPrompt rows by content hash.
 	// OpenClaw bootstrap-context:full events can be re-emitted on
 	// resume; same content → one row.
@@ -426,7 +443,7 @@ func (a *Adapter) parseSessionJSONL(ctx context.Context, path string, fromOffset
 			state.Provider = line.Provider
 			state.Model = line.ModelID
 		case "message":
-			a.parseMessageLine(path, line, lineNum, ts, &state, pending, &res)
+			a.parseMessageLine(path, line, lineNum, ts, &state, pending, bootstrapPrefix, &res)
 		case "custom":
 			// OpenClaw emits typed `custom` events for runtime
 			// notifications. customType="model-snapshot" is redundant
@@ -477,23 +494,45 @@ func (a *Adapter) parseSessionJSONL(ctx context.Context, path string, fromOffset
 // out, NOT folded into input), so it maps straight through with no
 // gross-vs-cached netting. data.usage is a running session total and is
 // deliberately ignored.
+//
+// SessionKey / WorkspaceDir are stamped on EVERY trajectory event by
+// OpenClaw itself (live traces 2026-07-31 carry
+// sessionKey="agent:main:explicit:wpt6probe" and
+// sessionKey="agent:main:main"). SessionKey is exactly the sessions.json
+// map key that applySessionAlias resolves for the message-log path, so it
+// is the grounded way to land both halves of one run on ONE observer
+// session id (WP-T6 finding O1).
+//
+// data.messagesSnapshot is the full message array as of completion; its
+// LAST usage-bearing assistant entry is the call lastCallUsage describes,
+// and its `timestamp` is the same epoch-ms value the message log records
+// as message.timestamp. That equality is the dedup join key — see
+// trajectoryCallTimestamp.
 type trajLine struct {
-	Type      string `json:"type"`
-	Timestamp string `json:"ts"`
-	SessionID string `json:"sessionId"`
-	RunID     string `json:"runId"`
-	Provider  string `json:"provider"`
-	ModelID   string `json:"modelId"`
-	Data      struct {
+	Type         string `json:"type"`
+	Timestamp    string `json:"ts"`
+	SessionID    string `json:"sessionId"`
+	SessionKey   string `json:"sessionKey"`
+	RunID        string `json:"runId"`
+	Provider     string `json:"provider"`
+	ModelID      string `json:"modelId"`
+	WorkspaceDir string `json:"workspaceDir"`
+	Data         struct {
 		PromptCache struct {
-			LastCallUsage struct {
-				Input      int64 `json:"input"`
-				Output     int64 `json:"output"`
-				CacheRead  int64 `json:"cacheRead"`
-				CacheWrite int64 `json:"cacheWrite"`
-			} `json:"lastCallUsage"`
+			LastCallUsage    tokenUsage `json:"lastCallUsage"`
+			LastCacheTouchAt int64      `json:"lastCacheTouchAt"`
 		} `json:"promptCache"`
+		MessagesSnapshot []trajSnapshotMessage `json:"messagesSnapshot"`
 	} `json:"data"`
+}
+
+// trajSnapshotMessage is the subset of a data.messagesSnapshot entry the
+// dedup join needs: which role it is, when it landed, and whether it
+// carries usage.
+type trajSnapshotMessage struct {
+	Role      string     `json:"role"`
+	Timestamp int64      `json:"timestamp"`
+	Usage     tokenUsage `json:"usage"`
 }
 
 // parseTrajectoryJSONL extracts accurate per-call token usage from a
@@ -521,6 +560,19 @@ func (a *Adapter) parseTrajectoryJSONL(ctx context.Context, path string, fromOff
 	rootCache := map[string]string{}
 	if state.ProjectRoot != "" && state.ProjectRoot != "[openclaw]" {
 		state.ProjectRoot = a.resolveProjectRoot(state.ProjectRoot, rootCache)
+	}
+	aliasCache := map[string]string{}
+	// Lazily-loaded set of message-log calls that already have a
+	// TokenEvent (see messageLogUsageTimestamps). Loaded at most once,
+	// and only if a usage-bearing model.completed actually shows up.
+	var covered map[int64]bool
+	coveredLoaded := false
+	coveredCalls := func() map[int64]bool {
+		if !coveredLoaded {
+			coveredLoaded = true
+			covered = messageLogUsageTimestamps(filepath.Join(filepath.Dir(path), fallbackSession+".jsonl"))
+		}
+		return covered
 	}
 
 	scanner := bufio.NewScanner(f)
@@ -550,15 +602,39 @@ func (a *Adapter) parseTrajectoryJSONL(ctx context.Context, path string, fromOff
 			continue
 		}
 		u := line.Data.PromptCache.LastCallUsage
-		if u.Input == 0 && u.Output == 0 && u.CacheRead == 0 && u.CacheWrite == 0 {
+		if !hasUsage(u) {
 			continue
 		}
-		sessionID := firstNonEmpty(line.SessionID, state.SessionID)
+		// WP-T6 O1 — one turn, one row. The message log records this very
+		// call's provider usage under its own (source_file,
+		// source_event_id) key, which UNIQUE() can never collapse against
+		// ours. Suppress here rather than there: the message log covers
+		// EVERY call of the run while a model.completed carries only the
+		// last one (1 event vs 5 rows on the 2026-07-31 live probe), so
+		// deferring the other way would drop 4 of 5 turns. The check reads
+		// the sibling file from DISK, so it does not depend on which of
+		// the two files the watcher happens to parse first.
+		callTS := trajectoryCallTimestamp(line)
+		if callTS > 0 && coveredCalls()[callTS] {
+			continue
+		}
+		sessionID := trajectorySessionID(path, line, state, fallbackSession, aliasCache)
+		projectRoot := state.ProjectRoot
+		if projectRoot == "" || projectRoot == "[openclaw]" {
+			if wd := strings.TrimSpace(line.WorkspaceDir); wd != "" {
+				projectRoot = a.resolveProjectRoot(wd, rootCache)
+			}
+		}
 		res.TokenEvents = append(res.TokenEvents, models.TokenEvent{
-			SourceFile:          path,
-			SourceEventID:       fmt.Sprintf("traj:%s:%d", sessionID, lineStart),
+			SourceFile: path,
+			// Keyed on the FILE stem, not the resolved session id: the
+			// stem is what `<sessionId>.trajectory.jsonl` is named after
+			// and never changes, so a rescan after the O1 alias fix
+			// MAX-upgrades the pre-fix row in place instead of inserting
+			// a second one under the new id.
+			SourceEventID:       fmt.Sprintf("traj:%s:%d", fallbackSession, lineStart),
 			SessionID:           sessionID,
-			ProjectRoot:         state.ProjectRoot,
+			ProjectRoot:         projectRoot,
 			Timestamp:           parseTimestamp(line.Timestamp),
 			Tool:                models.ToolOpenClaw,
 			Model:               line.ModelID,
@@ -577,6 +653,216 @@ func (a *Adapter) parseTrajectoryJSONL(ctx context.Context, path string, fromOff
 	return res, nil
 }
 
+// hasUsage is the ONE predicate deciding whether a usage record is worth a
+// TokenEvent. Both emit paths (message log + trajectory) and the dedup
+// coverage scan share it, so "the message log covers this call" can never
+// mean something different from "the message log emitted a row for it" —
+// notably gateway-injected turns (model="gateway-injected", every field 0)
+// are uncovered on both sides, leaving the trajectory as their sole source.
+func hasUsage(u tokenUsage) bool {
+	return u.Input != 0 || u.Output != 0 || u.CacheRead != 0 || u.CacheWrite != 0
+}
+
+// trajectoryCallTimestamp returns the epoch-ms timestamp of the single model
+// call that a `model.completed` event's promptCache.lastCallUsage describes.
+//
+// Grounded on the live 2026-07-31 traces: data.messagesSnapshot's last
+// usage-bearing assistant entry carries EXACTLY lastCallUsage's numbers and
+// a `timestamp` identical to the message log's message.timestamp for the same
+// message (1785498625318 on wpt6probe; 1782552263070 on the older
+// agent:main:main trace). data.promptCache.lastCacheTouchAt held the same
+// value on both traces and is the fallback for events that ship no snapshot.
+// Returns 0 when neither is available — callers then emit unconditionally
+// (better a duplicate than a silently dropped turn).
+func trajectoryCallTimestamp(line trajLine) int64 {
+	snap := line.Data.MessagesSnapshot
+	for i := len(snap) - 1; i >= 0; i-- {
+		if snap[i].Role == "assistant" && hasUsage(snap[i].Usage) && snap[i].Timestamp > 0 {
+			return snap[i].Timestamp
+		}
+	}
+	return line.Data.PromptCache.LastCacheTouchAt
+}
+
+// messageLogUsageTimestamps scans a sibling `<id>.jsonl` message log and
+// returns the message.timestamp of every assistant message that carries
+// usage — i.e. exactly the set of calls parseSessionJSONL emits a TokenEvent
+// for. A missing/unreadable/rotated log yields nil, which suppresses nothing.
+func messageLogUsageTimestamps(msgLogPath string) map[int64]bool {
+	f, err := os.Open(msgLogPath)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	covered := map[int64]bool{}
+	scanner := bufio.NewScanner(f)
+	const maxLine = 16 * 1024 * 1024
+	scanner.Buffer(make([]byte, 64*1024), maxLine)
+	for scanner.Scan() {
+		raw := scanner.Bytes()
+		if len(raw) == 0 {
+			continue
+		}
+		var line jsonlLine
+		if err := json.Unmarshal(raw, &line); err != nil {
+			continue
+		}
+		if line.Type != "message" || line.Message.Role != "assistant" {
+			continue
+		}
+		if line.Message.Timestamp > 0 && hasUsage(line.Message.Usage) {
+			covered[line.Message.Timestamp] = true
+		}
+	}
+	return covered
+}
+
+// trajectorySessionID resolves a trajectory event onto the SAME canonical
+// session id the message-log path produces, closing WP-T6 finding O1 (one
+// OpenClaw run landing as two observer sessions).
+//
+// Priority:
+//  1. the event's own `sessionKey` — OpenClaw stamps the sessions.json map
+//     key onto every trajectory event, which is precisely what
+//     lookupSessionAlias returns for the message log.
+//  2. a per-event `sessionId` that differs from the file stem, canonicalized
+//     through applySessionAlias — the SAME sessions.json owner, not a copy
+//     of the aliasing logic. Memoized per parse call.
+//  3. the file-level state, already aliased when the file was opened.
+func trajectorySessionID(path string, line trajLine, state sessionContext, fileStem string, cache map[string]string) string {
+	if key := strings.TrimSpace(line.SessionKey); key != "" {
+		return key
+	}
+	raw := strings.TrimSpace(line.SessionID)
+	if raw == "" || raw == fileStem {
+		return state.SessionID
+	}
+	if v, ok := cache[raw]; ok {
+		return v
+	}
+	alias := sessionContext{SessionID: raw}
+	applySessionAlias(path, &alias, raw)
+	cache[raw] = alias.SessionID
+	return alias.SessionID
+}
+
+// openclawBootstrapPrefixMarker is the first line of every harness bootstrap
+// preamble OpenClaw prepends to a user prompt.
+const openclawBootstrapPrefixMarker = "[Bootstrap pending]\n"
+
+// splitBootstrapPrompt separates OpenClaw's harness bootstrap preamble from
+// the operator's own words (WP-T6 finding O2). GROUNDED verbatim in
+// OpenClaw's own producer code, not a byte offset:
+//
+//	// dist/selection-*.js — embedded-runner prompt assembly
+//	if (userPromptPrefixText) effectivePrompt = `${userPromptPrefixText}\n\n${effectivePrompt}`;
+//
+//	// dist/system-prompt-*.js — buildAgentUserPromptPrefix
+//	return ["[Bootstrap pending]", ...buildFullBootstrapPromptLines({...})].join("\n");
+//	return ["[Bootstrap pending]", ...buildLimitedBootstrapPromptLines({...})].join("\n");
+//
+// The marker alone is only a PRE-FILTER. A human prompt that happens to open
+// with "[Bootstrap pending]" and contain a blank line would otherwise lose
+// its first paragraph to the marker+first-"\n\n" heuristic, so the boundary
+// is CORROBORATED against the run's own prefix string whenever tracePrefix
+// yields one: OpenClaw echoes the exact text it prepended into the sibling
+// trajectory as trace.metadata data.prompting.userPromptPrefixText (present
+// on both live 2026-07-31 traces). With that in hand the split point is not a
+// guess at all — the text must literally start with `prefix + "\n\n"`, and a
+// human prompt that merely mimics the preamble is left untouched.
+//
+// FALLBACK, stated honestly: when no trajectory sits beside the message log
+// (rotated away, OPENCLAW_TRAJECTORY=0, or a pre-metadata OpenClaw build) the
+// prefix is unavailable and the original heuristic stands — marker + FIRST
+// "\n\n". Both shipped prefix flavours are a "\n"-join of non-empty
+// single-sentence lines, so a real preamble provably contains no blank line
+// and that first join point is the harness's own; the residual false-positive
+// is exactly the mimicking human prompt, which only affects the 200-char
+// preview (RawToolInput always keeps the full text).
+//
+// Returns (humanPrompt, true) only when the marker is present, the boundary
+// is established, and something non-empty follows it; otherwise the caller
+// leaves the text untouched.
+func splitBootstrapPrompt(text string, tracePrefix func() string) (string, bool) {
+	if !strings.HasPrefix(text, openclawBootstrapPrefixMarker) {
+		return "", false
+	}
+	if tracePrefix != nil {
+		if prefix := tracePrefix(); prefix != "" {
+			join := prefix + "\n\n"
+			if !strings.HasPrefix(text, join) {
+				// The trace names the preamble this run actually
+				// prepended and this text does not carry it — a human
+				// prompt that only LOOKS like one. Leave it whole.
+				return "", false
+			}
+			human := strings.TrimSpace(text[len(join):])
+			if human == "" {
+				return "", false
+			}
+			return human, true
+		}
+	}
+	i := strings.Index(text, "\n\n")
+	if i < 0 {
+		return "", false
+	}
+	human := strings.TrimSpace(text[i+2:])
+	if human == "" {
+		return "", false
+	}
+	return human, true
+}
+
+// trajMetaLine is the sliver of a `trace.metadata` trajectory event that
+// carries the run's harness prompt preamble. Kept separate from trajLine so
+// scanning for it never unmarshals the event's very large sibling fields
+// (systemPrompt, skills, config).
+type trajMetaLine struct {
+	Type string `json:"type"`
+	Data struct {
+		Prompting struct {
+			UserPromptPrefixText string `json:"userPromptPrefixText"`
+		} `json:"prompting"`
+	} `json:"data"`
+}
+
+// bootstrapPrefixFromTrace returns the verbatim harness preamble OpenClaw
+// prepended to this run's user prompt, read from the sibling
+// `<stem>.trajectory.jsonl`'s `trace.metadata` event
+// (data.prompting.userPromptPrefixText — present on both live 2026-07-31
+// traces, emitted right after session.started). Returns "" when there is no
+// trajectory, no such event, or the field is empty; splitBootstrapPrompt then
+// falls back to its documented heuristic.
+func bootstrapPrefixFromTrace(msgLogPath string) string {
+	stem := strings.TrimSuffix(filepath.Base(msgLogPath), filepath.Ext(msgLogPath))
+	f, err := os.Open(filepath.Join(filepath.Dir(msgLogPath), stem+".trajectory.jsonl"))
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	const maxLine = 16 * 1024 * 1024
+	scanner.Buffer(make([]byte, 64*1024), maxLine)
+	for scanner.Scan() {
+		raw := scanner.Bytes()
+		if len(raw) == 0 || !bytes.Contains(raw, []byte(`"trace.metadata"`)) {
+			continue
+		}
+		var meta trajMetaLine
+		if err := json.Unmarshal(raw, &meta); err != nil {
+			continue
+		}
+		if meta.Type != "trace.metadata" {
+			continue
+		}
+		return meta.Data.Prompting.UserPromptPrefixText
+	}
+	return ""
+}
+
 func (a *Adapter) parseMessageLine(
 	sourceFile string,
 	line jsonlLine,
@@ -584,6 +870,7 @@ func (a *Adapter) parseMessageLine(
 	ts time.Time,
 	state *sessionContext,
 	pending map[string]int,
+	bootstrapPrefix func() string,
 	res *adapter.ParseResult,
 ) {
 	msg := line.Message
@@ -603,6 +890,18 @@ func (a *Adapter) parseMessageLine(
 		if text == "" {
 			return
 		}
+		// WP-T6 O2 — a bootstrap-pending run arrives as one text part:
+		// ~700 chars of harness preamble, then "\n\n", then the operator's
+		// prompt. Surfaces that read actions.target (dashboard timeline,
+		// prompt analytics) would otherwise show harness boilerplate.
+		// Preview on the human half; RawToolInput keeps the full text so
+		// the preamble is never lost. The boundary is corroborated against
+		// the run's own trace-declared preamble where available, so a
+		// human prompt that merely mimics one is not truncated.
+		preview := text
+		if human, ok := splitBootstrapPrompt(text, bootstrapPrefix); ok {
+			preview = human
+		}
 		res.ToolEvents = append(res.ToolEvents, models.ToolEvent{
 			SourceFile:         sourceFile,
 			SourceEventID:      firstNonEmpty(line.ID, fmt.Sprintf("user:L%d", lineNum)),
@@ -612,9 +911,9 @@ func (a *Adapter) parseMessageLine(
 			Model:              modelName(state),
 			Tool:               models.ToolOpenClaw,
 			ActionType:         models.ActionUserPrompt,
-			Target:             truncate(text, 200),
+			Target:             truncate(preview, 200),
 			Success:            true,
-			PrecedingReasoning: truncate(text, 200),
+			PrecedingReasoning: truncate(preview, 200),
 			RawToolName:        "message.user",
 			RawToolInput:       a.scrubber.String(text),
 			MessageID:          userMessageID(line.ID, lineNum),
@@ -624,43 +923,48 @@ func (a *Adapter) parseMessageLine(
 		// Track the most recent assistant text/thinking part so each tool
 		// call inherits the preamble that introduced it. Mirrors
 		// claudecode's per-turn reasoning capture and pi's
-		// `messageThinking`. When multiple tool calls share one preamble
-		// they all carry the same reasoning string — that's intentional.
+		// `messageThinking`.
+		//
+		// Threading semantics (SHARED-PREAMBLE, deliberately NOT the
+		// consumed-once grok default — preserved verbatim through the
+		// B3 convergence): when multiple tool calls share one preamble
+		// they ALL carry the same reasoning string, and a later
+		// text/thinking part replaces it for the calls that follow.
+		// Scope is one assistant message.
 		var preceding string
 		for partIdx, content := range msg.Content {
 			switch content.Type {
 			case "text", "thinking":
-				if t := strings.TrimSpace(content.Text); t != "" {
-					preceding = t
+				body := strings.TrimSpace(content.Text)
+				if body != "" {
+					preceding = body
 				}
 				// Per-text-part row — matches the cross-adapter
-				// convention. `text` parts emit an assistant_message row;
-				// `thinking` parts emit a standalone, visible reasoning row
-				// (previously dropped) so the model's chain-of-thought is
-				// in the timeline, not only in downstream PrecedingReasoning.
-				if body := strings.TrimSpace(content.Text); body != "" {
+				// convention. `text` parts emit an assistant_message row.
+				//
+				// `thinking` parts emit NOTHING (B3, 2026-07-31): they
+				// briefly minted a standalone `openclaw.reasoning`
+				// task_complete row, which is a phantom action for
+				// something the model never did. The chain-of-thought
+				// still reaches the timeline — it is the `preceding`
+				// preamble threaded onto this message's tool calls
+				// below (and, unchanged, every tool call that shares
+				// one preamble carries the same string).
+				if body != "" && content.Type == "text" {
 					preview := truncate(a.scrubber.String(body), 200)
-					action := models.ActionAssistantMessage
-					raw := "openclaw.assistant_text"
-					idPrefix := "asst"
-					if content.Type == "thinking" {
-						action = models.ActionTaskComplete
-						raw = "openclaw.reasoning"
-						idPrefix = "reasoning"
-					}
 					res.ToolEvents = append(res.ToolEvents, models.ToolEvent{
 						SourceFile:         sourceFile,
-						SourceEventID:      fmt.Sprintf("%s:%s:L%d:P%d:%s", idPrefix, firstNonEmpty(line.ID, "noid"), lineNum, partIdx, openclawShortHash(body)),
+						SourceEventID:      fmt.Sprintf("asst:%s:L%d:P%d:%s", firstNonEmpty(line.ID, "noid"), lineNum, partIdx, openclawShortHash(body)),
 						SessionID:          state.SessionID,
 						ProjectRoot:        state.ProjectRoot,
 						Timestamp:          ts,
 						Model:              modelName(state),
 						Tool:               models.ToolOpenClaw,
-						ActionType:         action,
+						ActionType:         models.ActionAssistantMessage,
 						Target:             preview,
 						Success:            true,
 						PrecedingReasoning: preview,
-						RawToolName:        raw,
+						RawToolName:        "openclaw.assistant_text",
 						ToolOutput:         a.scrubber.String(contentcap.Cap(body, contentcap.DefaultMaxBytes)),
 						MessageID:          assistantMessageID,
 					})
@@ -723,7 +1027,7 @@ func (a *Adapter) parseMessageLine(
 				MessageID:     assistantMessageID,
 			})
 		}
-		if msg.Usage.Input != 0 || msg.Usage.Output != 0 || msg.Usage.CacheRead != 0 || msg.Usage.CacheWrite != 0 {
+		if hasUsage(msg.Usage) {
 			res.TokenEvents = append(res.TokenEvents, models.TokenEvent{
 				SourceFile:          sourceFile,
 				SourceEventID:       firstNonEmpty("usage:"+line.ID, fmt.Sprintf("usage:L%d", lineNum)),
@@ -737,8 +1041,22 @@ func (a *Adapter) parseMessageLine(
 				CacheReadTokens:     msg.Usage.CacheRead,
 				CacheCreationTokens: msg.Usage.CacheWrite,
 				Source:              models.TokenSourceJSONL,
-				Reliability:         models.ReliabilityApproximate,
-				MessageID:           assistantMessageID,
+				// Provider-reported per-call usage, NOT a derivation —
+				// same tier as the trajectory's lastCallUsage. Grounded
+				// on the 2026-07-31 live capture: for the one call both
+				// files describe, the two records are byte-identical
+				// (368/542/14848/0), and the message log's five per-call
+				// records sum EXACTLY to the trajectory's session total
+				// data.usage (16139 in / 1076 out / 58368 cacheRead).
+				// They are the same usage object read at two points, so
+				// labelling one 'accurate' and its byte-identical twin
+				// 'approximate' was incoherent (WP-T6 O1). The message
+				// log's real limitation is COVERAGE, not precision:
+				// gateway-injected turns arrive all-zero and the
+				// hasUsage gate above drops them, which is exactly where
+				// the trajectory remains the only source.
+				Reliability: models.ReliabilityAccurate,
+				MessageID:   assistantMessageID,
 			})
 		}
 	case "toolResult":
@@ -807,7 +1125,13 @@ func lookupSessionAlias(path string, sessionID string) (sessionContext, bool) {
 	if err := json.Unmarshal(body, &idx); err != nil {
 		return sessionContext{}, false
 	}
+	// sessions.json's `sessionFile` only ever names the MESSAGE LOG. A
+	// `<id>.trajectory.jsonl` trace sits beside `<id>.jsonl`, so normalize
+	// the trace name onto its message-log sibling before comparing —
+	// otherwise the trajectory path can only ever match on the sessionId /
+	// map-key arms and loses the alias whenever those disagree.
 	base := filepath.Base(path)
+	base = strings.TrimSuffix(strings.TrimSuffix(base, ".jsonl"), ".trajectory") + ".jsonl"
 	for key, sess := range idx {
 		if filepath.Base(sess.SessionFile) == base || sess.SessionID == sessionID || key == sessionID {
 			return sessionContext{

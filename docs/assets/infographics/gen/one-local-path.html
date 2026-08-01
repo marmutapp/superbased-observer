@@ -1,0 +1,152 @@
+<!doctype html>
+<!-- Source for docs/assets/infographics/one-local-path.png (README hero).
+     Regenerate with: node docs/assets/infographics/gen/render.mjs
+     Counts baked here (29 adapters / 25 MCP tools) must match
+     internal/integration + the README MCP table — the same canonical
+     values website/tools/accuracy-check.mjs derives. Update on drift. -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  @font-face { font-family: 'Inter'; font-weight: 400; src: url('{{FONT_400}}') format('woff2'); }
+  @font-face { font-family: 'Inter'; font-weight: 500; src: url('{{FONT_500}}') format('woff2'); }
+  @font-face { font-family: 'Inter'; font-weight: 600; src: url('{{FONT_600}}') format('woff2'); }
+  @font-face { font-family: 'Inter'; font-weight: 700; src: url('{{FONT_700}}') format('woff2'); }
+  @font-face { font-family: 'Inter'; font-weight: 800; src: url('{{FONT_800}}') format('woff2'); }
+  :root {
+    --bg: #f7f9fd; --card: #ffffff; --line: #e2e8f4; --line-2: #cdd8ea;
+    --fg-0: #0b1526; --fg-1: #33415c; --fg-2: #64748d;
+    --accent: #2f5eec; --accent-soft: #eef3fe;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    width: 1672px; height: 941px; background: var(--bg);
+    font-family: Inter, -apple-system, "Segoe UI", Roboto, sans-serif;
+    color: var(--fg-0); overflow: hidden; padding: 42px 44px 0;
+  }
+  .lockup { display: flex; align-items: center; justify-content: center; gap: 12px; margin-bottom: 10px; }
+  .lockup img { height: 40px; }
+  h1 { text-align: center; font-size: 60px; font-weight: 800; letter-spacing: -0.02em; margin-bottom: 14px; }
+  .sub { text-align: center; font-size: 23px; color: var(--fg-2); margin-bottom: 42px; }
+  .sub b { color: var(--fg-1); font-weight: 600; }
+
+  .row { display: flex; align-items: stretch; gap: 0; margin-bottom: 40px; }
+  .col { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 22px; }
+  .col h3 { font-size: 15px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--fg-1); text-align: center; margin-bottom: 16px; }
+  .col h3 .count { color: var(--accent); }
+
+  .clients { width: 366px; display: flex; flex-direction: column; }
+  .tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; flex: 1; align-content: center; }
+  .tile { display: flex; align-items: center; gap: 10px; border: 1px solid var(--line); border-radius: 12px; padding: 14px 12px; font-size: 15.5px; font-weight: 600; white-space: nowrap; color: var(--fg-1); background: #fff; }
+  .tile .mono { width: 30px; height: 30px; border-radius: 8px; flex: none; display: flex; align-items: center; justify-content: center; font-size: 12.5px; font-weight: 800; color: #fff; }
+  .tile.more { justify-content: center; color: var(--accent); background: var(--accent-soft); border-color: #d8e3fb; font-weight: 700; }
+
+  .link { flex: none; width: 118px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; }
+  .link .cap { font-size: 14.5px; color: var(--fg-2); text-align: center; line-height: 1.35; }
+  .arrow { width: 92px; height: 2px; background: var(--line-2); position: relative; }
+  .arrow.dashed { background: repeating-linear-gradient(90deg, var(--line-2) 0 7px, transparent 7px 13px); }
+  .arrow::after { content: ""; position: absolute; right: -1px; top: -4px; border-left: 8px solid var(--line-2); border-top: 5px solid transparent; border-bottom: 5px solid transparent; }
+
+  .core { flex: 1; border: 2px solid var(--accent); border-radius: 20px; box-shadow: 0 18px 44px rgba(47,94,236,.10); padding: 24px 28px; }
+  .core .head { display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 6px; }
+  .core .head img { height: 36px; }
+  .core .tag { text-align: center; font-size: 14px; color: var(--fg-2); margin-bottom: 16px; }
+  .feat { display: flex; gap: 13px; padding: 13px 4px; border-top: 1px solid var(--line); }
+  .feat .ic { width: 40px; height: 40px; border-radius: 11px; background: var(--accent-soft); color: var(--accent); flex: none; display: flex; align-items: center; justify-content: center; font-size: 19px; }
+  .feat b { display: block; font-size: 18.5px; font-weight: 700; margin-bottom: 2px; }
+  .feat span { font-size: 15.5px; color: var(--fg-2); line-height: 1.35; }
+
+  .apis { width: 336px; }
+  .api { display: flex; align-items: center; gap: 12px; border: 1px solid var(--line); border-radius: 12px; padding: 13px 14px; font-size: 17px; font-weight: 600; color: var(--fg-1); margin-bottom: 10px; }
+  .api .mono { width: 32px; height: 32px; border-radius: 50%; flex: none; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 800; color: #fff; }
+  .apis .note { font-size: 13.5px; color: var(--fg-2); line-height: 1.4; margin-top: 4px; }
+
+  .steps { display: flex; align-items: center; gap: 18px; background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 30px 32px; margin-bottom: 34px; }
+  .step { flex: 1; display: flex; gap: 14px; align-items: flex-start; }
+  .step .ic { width: 46px; height: 46px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); flex: none; display: flex; align-items: center; justify-content: center; font-size: 21px; }
+  .step b { display: block; font-size: 19px; font-weight: 700; margin-bottom: 3px; }
+  .step span { font-size: 15px; color: var(--fg-2); line-height: 1.4; }
+  .chev { color: var(--line-2); font-size: 26px; font-weight: 700; }
+
+  .badges { display: flex; align-items: center; justify-content: center; gap: 0; }
+  .badge { display: flex; align-items: center; gap: 9px; font-size: 17.5px; font-weight: 600; color: var(--fg-1); padding: 0 26px; }
+  .badge + .badge { border-left: 1px solid var(--line-2); }
+  .badge .dot { color: var(--accent); font-size: 17px; }
+</style>
+</head>
+<body>
+  <div class="lockup"><img src="{{LOGO}}" alt="SuperBased"></div>
+  <h1>One local path for AI coding activity</h1>
+  <div class="sub">SuperBased captures local tool activity, normalizes usage into one model, and keeps the data <b>on your machine</b>.</div>
+
+  <div class="row">
+    <div class="col clients">
+      <h3>AI coding clients · <span class="count">29 adapters</span></h3>
+      <div class="tiles">
+        <div class="tile"><span class="mono" style="background:#d97747">CC</span>Claude Code</div>
+        <div class="tile"><span class="mono" style="background:#10a37f">CX</span>Codex</div>
+        <div class="tile"><span class="mono" style="background:#111827">CU</span>Cursor</div>
+        <div class="tile"><span class="mono" style="background:#4285f4">GM</span>Gemini CLI</div>
+        <div class="tile"><span class="mono" style="background:#24292f">CP</span>Copilot</div>
+        <div class="tile"><span class="mono" style="background:#7c5cf6">CL</span>Cline / Roo</div>
+        <div class="tile more" style="grid-column: 1 / -1">+ 23 more adapters</div>
+      </div>
+    </div>
+
+    <div class="link">
+      <div class="arrow"></div>
+      <div class="cap">Local session<br>logs &amp; events</div>
+    </div>
+
+    <div class="core">
+      <div class="head"><img src="{{LOGO}}" alt="SuperBased"></div>
+      <div class="tag">One daemon · watcher + proxy + dashboard · all local</div>
+      <div class="feat" style="border-top:none">
+        <div class="ic">▤</div>
+        <div><b>Captures sessions &amp; tool activity</b>
+        <span>Every supported client, normalized into one event model.</span></div>
+      </div>
+      <div class="feat">
+        <div class="ic">◎</div>
+        <div><b>Proxy-accurate tokens, cost &amp; cache</b>
+        <span>api_turns from the wire — exact spend and cache attribution, not estimates.</span></div>
+      </div>
+      <div class="feat">
+        <div class="ic">⇄</div>
+        <div><b>Optional compression &amp; model routing</b>
+        <span>Enable per tool, only when you want it.</span></div>
+      </div>
+    </div>
+
+    <div class="link">
+      <div class="arrow dashed"></div>
+      <div class="cap">Optional<br>(proxy mode)</div>
+    </div>
+
+    <div class="col apis">
+      <h3>Upstream APIs (optional)</h3>
+      <div class="api"><span class="mono" style="background:#c76d43">A</span>Anthropic</div>
+      <div class="api"><span class="mono" style="background:#10a37f">O</span>OpenAI</div>
+      <div class="api"><span class="mono" style="background:#4285f4">G</span>Gemini</div>
+      <div class="api"><span class="mono" style="background:#64748d">···</span>Compatible APIs</div>
+      <div class="note">Traffic is proxied only when you point a tool at the local proxy.</div>
+    </div>
+  </div>
+
+  <div class="steps">
+    <div class="step"><div class="ic">1</div><div><b>Normalize activity</b><span>Adapters parse client logs and hooks into a unified event model.</span></div></div>
+    <div class="chev">›</div>
+    <div class="step"><div class="ic">2</div><div><b>Store locally in SQLite</b><span>Sessions, actions, api_turns, tokens and file state in a fast local database.</span></div></div>
+    <div class="chev">›</div>
+    <div class="step"><div class="ic">3</div><div><b>Query via dashboard + MCP</b><span>Explore costs and sessions; 25 MCP tools serve intelligence back to your AI clients.</span></div></div>
+  </div>
+
+  <div class="badges">
+    <div class="badge"><span class="dot">◈</span>Local by design</div>
+    <div class="badge"><span class="dot">◈</span>Private &amp; secure</div>
+    <div class="badge"><span class="dot">◈</span>Real-time visibility</div>
+    <div class="badge"><span class="dot">◈</span>Searchable intelligence</div>
+    <div class="badge"><span class="dot">◈</span>Your data stays on your machine</div>
+  </div>
+</body>
+</html>

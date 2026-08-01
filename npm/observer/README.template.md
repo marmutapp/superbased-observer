@@ -38,6 +38,7 @@ the full two-plane explainer.
 
 - [Install](#install)
 - [Five-minute quickstart](#five-minute-quickstart)
+- [Zero-setup cost report: `observer usage`](#zero-setup-cost-report-observer-usage)
 - [Two planes, one binary](#two-planes-one-binary)
 - [Per-AI-client setup](#per-ai-client-setup)
 - [Architecture in detail](#architecture-in-detail)
@@ -102,6 +103,23 @@ the [main repo](https://github.com/superbasedapp/observer).
 
 
 ## Five-minute quickstart
+
+**No install at all, just a cost table:**
+
+```bash
+npx @superbased/observer            # a 30-day cost table, right now
+npx @superbased/observer usage      # the explicit, same-thing form
+```
+
+On a fresh machine with no SuperBased state yet, bare `npx
+@superbased/observer` scans each detected AI tool's own local session
+files into a throwaway temp database, prints one tool × model cost
+table, and deletes the database again — no daemon, no config written,
+no network call. See [Zero-setup cost report](#zero-setup-cost-report-observer-usage)
+below for what it does and doesn't do.
+
+**For the full local tool** — proxy-accurate tokens, live dashboard,
+conversation compression, cache tracking:
 
 ```bash
 # 1) Install.

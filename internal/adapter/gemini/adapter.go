@@ -2,6 +2,7 @@ package gemini
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -165,8 +166,19 @@ func projectHashFromPath(path string) string {
 // fallback chain documented in the package doc:
 //
 //  1. tool-call cwd from any captured turn (caller passes via cwdHint).
-//  2. ~/.gemini/history/<hash>/.git/config workplace path (best-effort).
-//  3. synthetic key "[gemini-cli:<hash>]".
+//  2. the CLI's own `.project_root` sidecar, under either
+//     ~/.gemini/tmp/<key>/ or ~/.gemini/history/<key>/ (plain text = the
+//     real cwd; both written by the live CLI).
+//  3. ~/.gemini/projects.json, whose {root: key} map inverts to the same
+//     answer — used only when the sidecar is missing/unreadable, and
+//     skipped when two roots share a key (ambiguous).
+//  4. ~/.gemini/history/<key>/.git/config worktree path (best-effort).
+//  5. synthetic key "[gemini-cli:<key>]".
+//
+// Tiers 2+3 exist because the live session JSONL carries NO cwd at all,
+// so tier 1 never fires and every gemini session used to land on the
+// synthetic key — unjoinable to a real repo (WP-T6 finding G1,
+// secondary).
 //
 // Returns the chosen root; never empty.
 func resolveProjectRoot(sessionPath, cwdHint string) string {
@@ -185,6 +197,9 @@ func resolveProjectRoot(sessionPath, cwdHint string) string {
 	}
 	hash := projectHashFromPath(sessionPath)
 	if hash != "" {
+		if root := readRecordedProjectRoot(sessionPath, hash); root != "" {
+			return root
+		}
 		if root := readShadowGitWorktree(sessionPath, hash); root != "" {
 			return root
 		}
@@ -193,26 +208,109 @@ func resolveProjectRoot(sessionPath, cwdHint string) string {
 	return "[gemini-cli]"
 }
 
+// readRecordedProjectRoot reads the project root the Gemini CLI itself
+// recorded for this project key, trying the `.project_root` sidecars
+// first and the projects.json reverse map second. Returns "" when
+// neither is present/usable.
+func readRecordedProjectRoot(sessionPath, key string) string {
+	home := geminiHomeFromSessionPath(sessionPath)
+	if home == "" || key == "" {
+		return ""
+	}
+	for _, sidecar := range []string{
+		filepath.Join(home, "tmp", key, ".project_root"),
+		filepath.Join(home, "history", key, ".project_root"),
+	} {
+		body, err := os.ReadFile(sidecar)
+		if err != nil {
+			continue
+		}
+		if root := resolveRecordedRoot(string(body)); root != "" {
+			return root
+		}
+	}
+	return resolveRecordedRoot(lookupProjectsJSON(filepath.Join(home, "projects.json"), key))
+}
+
+// lookupProjectsJSON inverts ~/.gemini/projects.json — which maps
+// {"<project root>": "<key>"} — back to the root for one key. Returns ""
+// when the file is missing/unparseable, when no entry matches, or when
+// TWO roots claim the same key: an ambiguous answer is worse than the
+// honest synthetic fallback.
+func lookupProjectsJSON(path, key string) string {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var doc struct {
+		Projects map[string]string `json:"projects"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return ""
+	}
+	var match string
+	for root, name := range doc.Projects {
+		if name != key {
+			continue
+		}
+		if match != "" && match != root {
+			return ""
+		}
+		match = root
+	}
+	return match
+}
+
+// resolveRecordedRoot normalizes a root the CLI recorded on disk and,
+// when that path actually exists on this host, promotes it to its git
+// root. The stat gate comes BEFORE git.Resolve deliberately: resolving a
+// path that isn't mounted here (a Windows-side session read from WSL,
+// say) would walk up from a non-existent directory. A recorded-but-
+// unmounted root is still returned verbatim — it is real information,
+// unlike the synthetic key.
+func resolveRecordedRoot(raw string) string {
+	p := pathnorm.Normalize(strings.TrimSpace(raw))
+	if p == "" {
+		return ""
+	}
+	if _, err := os.Stat(p); err != nil {
+		return p
+	}
+	if info, err := git.Resolve(p); err == nil {
+		return info.Root
+	}
+	return p
+}
+
+// geminiHomeFromSessionPath walks up from a session file to the
+// enclosing `.gemini` directory (handles cross-mount paths like
+// /mnt/c/Users/<u>/.gemini/...). Returns "" when the path isn't under
+// one.
+func geminiHomeFromSessionPath(sessionPath string) string {
+	cur := filepath.Dir(sessionPath)
+	for cur != "" && cur != filepath.Dir(cur) {
+		base := filepath.Base(cur)
+		if base == ".gemini" {
+			return cur
+		}
+		if base == "tmp" && filepath.Base(filepath.Dir(cur)) == ".gemini" {
+			return filepath.Dir(cur)
+		}
+		cur = filepath.Dir(cur)
+	}
+	if filepath.Base(cur) == ".gemini" {
+		return cur
+	}
+	return ""
+}
+
 // readShadowGitWorktree opens ~/.gemini/history/<hash>/.git/config and
 // looks for a `[core] worktree = ...` setting that points at the
 // original project root. Returns the resolved path or "" if not
 // present / unparseable. Tolerates missing dirs and config files.
 func readShadowGitWorktree(sessionPath, hash string) string {
-	// Walk up from the session path to find the .gemini/ directory
-	// (handles cross-mount paths like /mnt/c/Users/.../.gemini/...).
-	cur := filepath.Dir(sessionPath)
-	for cur != "" && cur != filepath.Dir(cur) {
-		base := filepath.Base(cur)
-		if base == ".gemini" {
-			break
-		}
-		if base == "tmp" && filepath.Base(filepath.Dir(cur)) == ".gemini" {
-			cur = filepath.Dir(cur)
-			break
-		}
-		cur = filepath.Dir(cur)
-	}
-	if filepath.Base(cur) != ".gemini" {
+	cur := geminiHomeFromSessionPath(sessionPath)
+	if cur == "" {
 		return ""
 	}
 	configPath := filepath.Join(cur, "history", hash, ".git", "config")

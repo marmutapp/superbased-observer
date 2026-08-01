@@ -15,6 +15,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/marmutapp/superbased-observer/internal/adapter"
+	"github.com/marmutapp/superbased-observer/internal/adapter/mirrorbase"
 	"github.com/marmutapp/superbased-observer/internal/contentcap"
 	"github.com/marmutapp/superbased-observer/internal/git"
 	"github.com/marmutapp/superbased-observer/internal/models"
@@ -95,11 +96,18 @@ func (a *CLIAdapter) ParseSessionFile(ctx context.Context, path string, fromOffs
 	defer database.Close()
 
 	rootCache := map[string]string{}
+	// Resolve reasoning -> successor assignment BEFORE any emitter runs,
+	// so the threading can't depend on loader order (see
+	// loadReasoningIndex). Reasoning parts are never rows of their own.
+	reasoning, err := a.loadReasoningIndex(ctx, database, fromOffset)
+	if err != nil {
+		return adapter.ParseResult{}, fmt.Errorf("kilocode.ParseSessionFile: reasoning index: %w", err)
+	}
 	prompts, err := a.loadUserPromptEvents(ctx, database, dbPath, fromOffset, rootCache)
 	if err != nil {
 		return adapter.ParseResult{}, fmt.Errorf("kilocode.ParseSessionFile: prompts: %w", err)
 	}
-	tools, err := a.loadToolEvents(ctx, database, dbPath, fromOffset, rootCache)
+	tools, err := a.loadToolEvents(ctx, database, dbPath, fromOffset, rootCache, reasoning)
 	if err != nil {
 		return adapter.ParseResult{}, fmt.Errorf("kilocode.ParseSessionFile: tools: %w", err)
 	}
@@ -107,17 +115,13 @@ func (a *CLIAdapter) ParseSessionFile(ctx context.Context, path string, fromOffs
 	if err != nil {
 		return adapter.ParseResult{}, fmt.Errorf("kilocode.ParseSessionFile: completions: %w", err)
 	}
-	assistantTexts, err := a.loadAssistantTextEvents(ctx, database, dbPath, fromOffset, rootCache)
+	assistantTexts, err := a.loadAssistantTextEvents(ctx, database, dbPath, fromOffset, rootCache, reasoning)
 	if err != nil {
 		return adapter.ParseResult{}, fmt.Errorf("kilocode.ParseSessionFile: assistant_text: %w", err)
 	}
 	subtasks, err := a.loadSubtaskEvents(ctx, database, dbPath, fromOffset, rootCache)
 	if err != nil {
 		return adapter.ParseResult{}, fmt.Errorf("kilocode.ParseSessionFile: subtasks: %w", err)
-	}
-	reasonings, err := a.loadReasoningEvents(ctx, database, dbPath, fromOffset, rootCache)
-	if err != nil {
-		return adapter.ParseResult{}, fmt.Errorf("kilocode.ParseSessionFile: reasoning: %w", err)
 	}
 	stepFinishes, err := a.loadStepFinishEvents(ctx, database, dbPath, fromOffset, rootCache)
 	if err != nil {
@@ -145,7 +149,6 @@ func (a *CLIAdapter) ParseSessionFile(ctx context.Context, path string, fromOffs
 	res.ToolEvents = append(res.ToolEvents, completions...)
 	res.ToolEvents = append(res.ToolEvents, assistantTexts...)
 	res.ToolEvents = append(res.ToolEvents, subtasks...)
-	res.ToolEvents = append(res.ToolEvents, reasonings...)
 	res.ToolEvents = append(res.ToolEvents, stepFinishes...)
 	res.ToolEvents = append(res.ToolEvents, todos...)
 	res.TokenEvents = append(res.TokenEvents, tokens...)
@@ -458,7 +461,74 @@ func (a *CLIAdapter) userPromptEvent(ctx context.Context, db *sql.DB, sourceFile
 	}, true, nil
 }
 
-func (a *CLIAdapter) loadToolEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string) ([]models.ToolEvent, error) {
+// reasoningIndex maps a part id to the chain-of-thought body that
+// immediately precedes that part inside the SAME message — the
+// assignment computed once by loadReasoningIndex, then read by the
+// per-row emitters.
+type reasoningIndex map[string]string
+
+// loadReasoningIndex resolves which successor part each `reasoning`
+// part belongs to, so the body can be threaded onto that successor's
+// PrecedingReasoning instead of minting a row of its own (B3
+// convergence — docs/plans/b3-reasoning-convergence-plan-2026-07-31.md
+// §1). Kept deliberately symmetric with the OpenCode adapter's function
+// of the same name (this adapter is a structural transposition of it);
+// semantics match grok's reference shape:
+//
+//   - CONSUMED-ONCE: a reasoning body is threaded onto exactly ONE
+//     successor — the first `tool` or `text` part after it.
+//   - LAST-WINS: consecutive reasoning parts with no successor between
+//     them collapse; the newest is the one threaded.
+//   - TURN BOUNDARY: the walk is partitioned by message id, so a
+//     thought can never leak past its own assistant turn.
+//
+// Computed in ONE ordered pass before any emitter runs, so the result
+// cannot depend on the order the loaders happen to run in. The window
+// is widened from the incremental `time_updated > ?` slice to every
+// part of the messages that slice touches, because a poll tick can land
+// between a reasoning part and its successor.
+func (a *CLIAdapter) loadReasoningIndex(ctx context.Context, db *sql.DB, fromOffset int64) (reasoningIndex, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT p.id, p.message_id, json_extract(p.data, '$.type'), COALESCE(json_extract(p.data, '$.text'), '')
+		  FROM part p
+		 WHERE p.message_id IN (SELECT message_id FROM part WHERE time_updated > ?)
+		   AND json_valid(p.data)
+		   AND json_extract(p.data, '$.type') IN ('reasoning', 'tool', 'text')
+		 ORDER BY p.message_id ASC, p.time_created ASC, p.id ASC`, fromOffset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	idx := reasoningIndex{}
+	var curMessage, pending string
+	for rows.Next() {
+		var partID, messageID, partType, text string
+		if err := rows.Scan(&partID, &messageID, &partType, &text); err != nil {
+			return nil, err
+		}
+		if messageID != curMessage {
+			curMessage, pending = messageID, ""
+		}
+		if partType == "reasoning" {
+			if body := strings.TrimSpace(text); body != "" {
+				pending = body
+			}
+			continue
+		}
+		if pending != "" {
+			idx[partID] = pending
+			pending = ""
+		}
+	}
+	return idx, rows.Err()
+}
+
+// threaded returns the reasoning body assigned to a part, or "" when
+// none was.
+func (r reasoningIndex) threaded(partID string) string { return r[partID] }
+
+func (a *CLIAdapter) loadToolEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string, reasoning reasoningIndex) ([]models.ToolEvent, error) {
 	sessDirs, err := a.loadSessionDirectories(ctx, db)
 	if err != nil {
 		return nil, err
@@ -482,7 +552,7 @@ func (a *CLIAdapter) loadToolEvents(ctx context.Context, db *sql.DB, sourceFile 
 		if err := rows.Scan(&row.ID, &row.MessageID, &row.SessionID, &row.TimeCreate, &row.TimeUpdate, &row.Data, &row.Message); err != nil {
 			return nil, err
 		}
-		ev, ok := a.toolEvent(sourceFile, row, sessDirs, rootCache)
+		ev, ok := a.toolEvent(sourceFile, row, sessDirs, rootCache, reasoning)
 		if ok {
 			out = append(out, ev)
 		}
@@ -490,7 +560,7 @@ func (a *CLIAdapter) loadToolEvents(ctx context.Context, db *sql.DB, sourceFile 
 	return out, rows.Err()
 }
 
-func (a *CLIAdapter) toolEvent(sourceFile string, row partRow, sessDirs map[string]kiloSessionDirectory, rootCache map[string]string) (models.ToolEvent, bool) {
+func (a *CLIAdapter) toolEvent(sourceFile string, row partRow, sessDirs map[string]kiloSessionDirectory, rootCache map[string]string, reasoning reasoningIndex) (models.ToolEvent, bool) {
 	var msg messageData
 	if err := json.Unmarshal([]byte(row.Message), &msg); err != nil {
 		return models.ToolEvent{}, false
@@ -523,9 +593,19 @@ func (a *CLIAdapter) toolEvent(sourceFile string, row partRow, sessDirs map[stri
 	if part.State.Time.Start > 0 && part.State.Time.End > part.State.Time.Start {
 		durationMs = part.State.Time.End - part.State.Time.Start
 	}
+	// PRECEDENCE: the chain-of-thought body assigned by
+	// loadReasoningIndex WINS over the part's own `title` and over the
+	// OpenRouter reasoning-detail metadata. The title is Kilo's one-line
+	// UI label for the call, not reasoning — it was only ever occupying
+	// this column because nothing better reached it. Both older sources
+	// stay as fallbacks, in their existing order, for calls in messages
+	// with no reasoning part.
 	preReason := strings.TrimSpace(part.State.Title)
 	if rd := firstOpenRouterReasoning(part); rd != "" && preReason == "" {
 		preReason = rd
+	}
+	if body := reasoning.threaded(row.ID); body != "" {
+		preReason = body
 	}
 	if a.scrubber != nil && preReason != "" {
 		preReason = a.scrubber.String(preReason)
@@ -628,7 +708,7 @@ func withStopReason(reason string) *models.ActionMetadata {
 	return &models.ActionMetadata{StopReason: reason}
 }
 
-func (a *CLIAdapter) loadAssistantTextEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string) ([]models.ToolEvent, error) {
+func (a *CLIAdapter) loadAssistantTextEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string, reasoning reasoningIndex) ([]models.ToolEvent, error) {
 	sessDirs, err := a.loadSessionDirectories(ctx, db)
 	if err != nil {
 		return nil, err
@@ -653,7 +733,7 @@ func (a *CLIAdapter) loadAssistantTextEvents(ctx context.Context, db *sql.DB, so
 		if err := rows.Scan(&row.ID, &row.MessageID, &row.SessionID, &row.TimeCreate, &row.TimeUpdate, &row.Data, &row.Message); err != nil {
 			return nil, err
 		}
-		ev, ok := a.assistantTextEvent(sourceFile, row, sessDirs, rootCache)
+		ev, ok := a.assistantTextEvent(sourceFile, row, sessDirs, rootCache, reasoning)
 		if ok {
 			out = append(out, ev)
 		}
@@ -661,7 +741,7 @@ func (a *CLIAdapter) loadAssistantTextEvents(ctx context.Context, db *sql.DB, so
 	return out, rows.Err()
 }
 
-func (a *CLIAdapter) assistantTextEvent(sourceFile string, row partRow, sessDirs map[string]kiloSessionDirectory, rootCache map[string]string) (models.ToolEvent, bool) {
+func (a *CLIAdapter) assistantTextEvent(sourceFile string, row partRow, sessDirs map[string]kiloSessionDirectory, rootCache map[string]string, reasoning reasoningIndex) (models.ToolEvent, bool) {
 	var msg messageData
 	if err := json.Unmarshal([]byte(row.Message), &msg); err != nil {
 		return models.ToolEvent{}, false
@@ -683,103 +763,32 @@ func (a *CLIAdapter) assistantTextEvent(sourceFile string, row partRow, sessDirs
 		preview = a.scrubber.String(preview)
 		output = a.scrubber.String(output)
 	}
+	// The chain-of-thought that preceded this text part wins over the
+	// legacy self-preview (the row's own body echoed into its reasoning
+	// column, which told a reader nothing).
+	preReason := preview
+	if rb := reasoning.threaded(row.ID); rb != "" {
+		preReason = truncate(rb, 200)
+		if a.scrubber != nil {
+			preReason = a.scrubber.String(preReason)
+		}
+	}
 	return models.ToolEvent{
-		SourceFile:         sourceFile,
-		SourceEventID:      "asst:" + row.ID,
-		SessionID:          row.SessionID,
-		ProjectRoot:        project,
-		Timestamp:          chooseTime(when, time.Time{}, 0),
-		Model:              model,
-		Tool:               models.ToolKiloCodeCLI,
-		ActionType:         models.ActionTaskComplete,
+		SourceFile:    sourceFile,
+		SourceEventID: "asst:" + row.ID,
+		SessionID:     row.SessionID,
+		ProjectRoot:   project,
+		Timestamp:     chooseTime(when, time.Time{}, 0),
+		Model:         model,
+		Tool:          models.ToolKiloCodeCLI,
+		// One row per `text` part — per-message assistant text, matching
+		// opencode (this adapter is a structural transposition of it).
+		// The turn terminus is the separate `assistant.stop` row above.
+		ActionType:         models.ActionAssistantMessage,
 		Target:             preview,
 		Success:            true,
-		PrecedingReasoning: preview,
+		PrecedingReasoning: preReason,
 		RawToolName:        "kilo-code-cli.assistant_text",
-		ToolOutput:         output,
-		MessageID:          row.MessageID,
-	}, true
-}
-
-// loadReasoningEvents surfaces Kilo `reasoning` parts as ToolEvents —
-// the model's visible chain-of-thought body. Mirrors the OpenCode
-// adapter's loadReasoningEvents one-for-one; only the RawToolName
-// prefix differs (kilo-code-cli vs opencode).
-func (a *CLIAdapter) loadReasoningEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string) ([]models.ToolEvent, error) {
-	sessDirs, err := a.loadSessionDirectories(ctx, db)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := db.QueryContext(ctx, `
-		SELECT p.id, p.message_id, p.session_id, p.time_created, p.time_updated, p.data, m.data
-		  FROM part p
-		  JOIN message m ON m.id = p.message_id
-		 WHERE p.time_updated > ?
-		   AND json_valid(p.data) AND json_valid(m.data)
-		   AND json_extract(p.data, '$.type') = 'reasoning'
-		 ORDER BY p.time_updated ASC, p.id ASC`, fromOffset)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []models.ToolEvent
-	for rows.Next() {
-		var row partRow
-		if err := rows.Scan(&row.ID, &row.MessageID, &row.SessionID, &row.TimeCreate, &row.TimeUpdate, &row.Data, &row.Message); err != nil {
-			return nil, err
-		}
-		ev, ok := a.reasoningEvent(sourceFile, row, sessDirs, rootCache)
-		if ok {
-			out = append(out, ev)
-		}
-	}
-	return out, rows.Err()
-}
-
-func (a *CLIAdapter) reasoningEvent(sourceFile string, row partRow, sessDirs map[string]kiloSessionDirectory, rootCache map[string]string) (models.ToolEvent, bool) {
-	var msg messageData
-	if err := json.Unmarshal([]byte(row.Message), &msg); err != nil {
-		return models.ToolEvent{}, false
-	}
-	var part reasoningPartData
-	if err := json.Unmarshal([]byte(row.Data), &part); err != nil {
-		return models.ToolEvent{}, false
-	}
-	body := strings.TrimSpace(part.Text)
-	if body == "" {
-		return models.ToolEvent{}, false
-	}
-	project := a.resolveProjectRoot(a.cwdFor(msg, sessDirs[row.SessionID]), rootCache)
-	model := firstNonEmpty(msg.ModelID, msg.Model.ModelID)
-	when := millisToTime(part.Time.Start)
-	if when.IsZero() {
-		when = millisToTime(row.TimeCreate)
-	}
-	var durationMs int64
-	if part.Time.Start > 0 && part.Time.End > part.Time.Start {
-		durationMs = part.Time.End - part.Time.Start
-	}
-	preview := truncate(body, 200)
-	output := contentcap.Cap(body, contentcap.DefaultMaxBytes)
-	if a.scrubber != nil {
-		preview = a.scrubber.String(preview)
-		output = a.scrubber.String(output)
-	}
-	return models.ToolEvent{
-		SourceFile:         sourceFile,
-		SourceEventID:      "reasoning:" + row.ID,
-		SessionID:          row.SessionID,
-		ProjectRoot:        project,
-		Timestamp:          chooseTime(when, time.Time{}, 0),
-		Model:              model,
-		Tool:               models.ToolKiloCodeCLI,
-		ActionType:         models.ActionTaskComplete,
-		Target:             preview,
-		Success:            true,
-		DurationMs:         durationMs,
-		PrecedingReasoning: preview,
-		RawToolName:        "kilo-code-cli.reasoning",
 		ToolOutput:         output,
 		MessageID:          row.MessageID,
 	}, true
@@ -846,12 +855,16 @@ func (a *CLIAdapter) stepFinishEvent(sourceFile string, row partRow, sessDirs ma
 		Timestamp:     chooseTime(when, time.Time{}, 0),
 		Model:         model,
 		Tool:          models.ToolKiloCodeCLI,
-		ActionType:    models.ActionUnknown,
-		Target:        firstNonEmpty(part.Reason, "step-finish"),
-		Success:       true,
-		RawToolName:   "kilo-code-cli.step_finish",
-		RawToolInput:  row.Data,
-		MessageID:     row.MessageID,
+		// tooltax/table.go:641 ratifies "kilo-code-cli.step_finish" as
+		// ActionHarnessCall (WP-T4; backfilled by migration 077) — this
+		// emit site must agree, or every NEW row drifts back to
+		// unknown (WP-T6 finding B4).
+		ActionType:   models.ActionHarnessCall,
+		Target:       firstNonEmpty(part.Reason, "step-finish"),
+		Success:      true,
+		RawToolName:  "kilo-code-cli.step_finish",
+		RawToolInput: row.Data,
+		MessageID:    row.MessageID,
 	}, true
 }
 
@@ -1126,17 +1139,18 @@ func openReadOnlyDB(path string) (*sql.DB, error) {
 // \\wsl.localhost\... on Windows) need a local mirror because
 // modernc.org/sqlite returns SQLITE_IOERR_SHORT_READ when the source
 // is actively being written across the mount boundary. Stages the
-// trio (.db + -wal + -shm) into a per-source cache dir.
+// trio (.db + -wal + -shm) into a per-source cache dir under
+// mirrorbase.Base().
 func stageMirrorIfForeign(srcDB string) (string, error) {
 	if !isForeignMountPath(srcDB) {
 		return srcDB, nil
 	}
-	cache, err := os.UserCacheDir()
-	if err != nil || cache == "" {
-		cache = os.TempDir()
+	base, err := mirrorbase.Base()
+	if err != nil || base == "" {
+		base = filepath.Join(os.TempDir(), "superbased-observer")
 	}
 	sum := sha256.Sum256([]byte(srcDB))
-	mirrorDir := filepath.Join(cache, "superbased-observer", "kilocode-mirror", hex.EncodeToString(sum[:8]))
+	mirrorDir := filepath.Join(base, "kilocode-mirror", hex.EncodeToString(sum[:8]))
 	if err := os.MkdirAll(mirrorDir, 0o700); err != nil {
 		return "", fmt.Errorf("mkdir mirror: %w", err)
 	}

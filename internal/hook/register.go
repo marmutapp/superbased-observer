@@ -2,11 +2,14 @@ package hook
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,6 +18,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
+	"github.com/marmutapp/superbased-observer/internal/claudeplugin"
 	"github.com/marmutapp/superbased-observer/internal/platform/crossmount"
 )
 
@@ -26,6 +30,29 @@ type RegistrationResult struct {
 	AlreadySet []string // events that already pointed at the observer (skipped)
 	DryRun     bool
 	Error      error
+
+	// Skipped reports that the registrar deliberately wrote nothing
+	// because the tool already carries observer's wiring through its own
+	// packaging surface — today, the Claude Code plugin, which declares
+	// the same hook events. Not an error: the user is already covered,
+	// and registering again would fire every event twice. SkipReason
+	// names the artifact that proved it. Both zero on every other path.
+	Skipped    bool
+	SkipReason string
+
+	// SkipAdvice is the operator-facing next step that goes with
+	// SkipReason. Empty means "the default plugin advice applies" (the
+	// printer supplies it), so the plugin skip path is unchanged; the
+	// cross-OS sandbox skip (see crossmount.AutoDetectSuppressed) sets it
+	// because the --force escape hatch deliberately does NOT apply there.
+	SkipAdvice string
+
+	// ProbeWarning is a NON-FATAL note: the plugin probe could not read
+	// a file it needed, so the registrar registered without being able
+	// to rule out a plugin already providing this wiring. Registration
+	// still happened (fail-open to wiring) — this is a reporting
+	// channel, never control flow. Empty on every conclusive path.
+	ProbeWarning string
 }
 
 // Options parameterize RegisterAll.
@@ -81,6 +108,13 @@ type Options struct {
 // Registry is the per-tool registration dispatcher.
 type Registry struct {
 	opts Options
+	// homeOverride is the caller-supplied Options.HomeDir VERBATIM, kept
+	// before NewRegistry defaults it to the real $HOME. Non-empty means
+	// "the caller pinned this registry's home", which switches OFF
+	// crossmount auto-detection for the cross-OS targets — see
+	// crossmount.AutoDetectSuppressed for the 2026-07-31 incident that
+	// makes this load-bearing.
+	homeOverride string
 }
 
 // NewRegistry returns a registry ready to install hooks.
@@ -88,6 +122,7 @@ func NewRegistry(opts Options) (*Registry, error) {
 	if opts.BinaryPath == "" {
 		return nil, errors.New("hook.NewRegistry: BinaryPath is required")
 	}
+	homeOverride := opts.HomeDir
 	if opts.HomeDir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -95,7 +130,7 @@ func NewRegistry(opts Options) (*Registry, error) {
 		}
 		opts.HomeDir = home
 	}
-	return &Registry{opts: opts}, nil
+	return &Registry{opts: opts, homeOverride: homeOverride}, nil
 }
 
 // Installed reports which supported tools appear to be installed, based on
@@ -144,6 +179,18 @@ func (r *Registry) detectWindowsClaudeHome() string {
 	return r.detectWindowsHome(r.opts.WindowsClaudeHome, ".claude")
 }
 
+// WindowsClaudeDir exposes the resolved Windows-side .claude directory
+// the claude-code-windows registration target writes into, or "" when
+// there is none. Exported so `observer doctor` can inspect the SAME
+// directory this registrar would write to, instead of re-deriving the
+// crossmount + ownership rules and drifting from them (one owner). Its
+// argument mirrors Options.WindowsClaudeHome: an explicit Windows USER
+// home override, or "" to auto-detect.
+func WindowsClaudeDir(override string) string {
+	r := &Registry{opts: Options{WindowsClaudeHome: override}}
+	return r.detectWindowsClaudeHome()
+}
+
 // detectWindowsCursorHome returns the resolved Windows-side .cursor
 // directory used by the cursor-windows registration target, or "" if
 // none. Honors Options.WindowsCursorHome when set; otherwise accepts an
@@ -169,6 +216,14 @@ func (r *Registry) detectWindowsCursorHome() string {
 //     Installed() (the honest floor: no behaviour change on a single-user
 //     machine where the name matches; a refusal to guess otherwise).
 func (r *Registry) detectWindowsHome(override, subdir string) string {
+	// Sandbox gate FIRST — before the override branch, because an override
+	// that points OUTSIDE the pinned home is exactly the escape hatch that
+	// re-opened this hole. See crossmount.AutoDetectSuppressed (incident
+	// 2026-07-31). Production never pins HomeDir, so this is false on every
+	// real path and a bare override still wins unconditionally.
+	if r.foreignAutoDetectSuppressed(override) {
+		return ""
+	}
 	if override != "" {
 		return filepath.Join(override, subdir)
 	}
@@ -194,6 +249,39 @@ func (r *Registry) detectWindowsHome(override, subdir string) string {
 func (r *Registry) dirExists(p string) bool {
 	fi, err := os.Stat(p)
 	return err == nil && fi.IsDir()
+}
+
+// foreignAutoDetectSuppressed reports whether this registry's caller pinned
+// HomeDir (a sandbox) without naming the Windows-side home for the target
+// being resolved. See crossmount.AutoDetectSuppressed for the rule and the
+// 2026-07-31 incident it exists to make structurally impossible.
+func (r *Registry) foreignAutoDetectSuppressed(override string) bool {
+	return crossmount.AutoDetectSuppressed(r.homeOverride, override)
+}
+
+// sandboxSkipResult fills res as a deliberate no-write for a cross-OS target
+// the sandbox gate suppressed. It is a SKIP, not an error: nothing is wrong
+// with the host — the caller pinned a home and either never said which
+// Windows-side home it wanted, or named one OUTSIDE that sandbox, so there is
+// no path this registry is allowed to touch. optionName is the Options field
+// that unlocks the target; its value must resolve INSIDE the pinned home.
+func (r *Registry) sandboxSkipResult(res *RegistrationResult, subdir, optionName, override string) {
+	res.Skipped = true
+	if override == "" {
+		res.SkipReason = fmt.Sprintf(
+			"HomeDir was pinned by the caller but no %s was given — cross-OS %s/ resolution is suppressed (incident 2026-07-31)",
+			optionName, subdir,
+		)
+	} else {
+		res.SkipReason = fmt.Sprintf(
+			"%s (%s) resolves OUTSIDE the pinned HomeDir (%s) — cross-OS %s/ resolution is suppressed (incident 2026-07-31)",
+			optionName, override, r.homeOverride, subdir,
+		)
+	}
+	res.SkipAdvice = fmt.Sprintf(
+		"nothing written; a sandboxed caller must set %s to a home UNDER its own HomeDir to wire this target (--force does not lift this).",
+		optionName,
+	)
 }
 
 // Register installs observer hooks into the config file for tool. Supported
@@ -285,7 +373,39 @@ func (r *Registry) registerClaudeCode() RegistrationResult {
 	path := filepath.Join(settingsDir, "settings.json")
 	res.ConfigPath = path
 
-	raw, err := os.ReadFile(path)
+	// Double-wiring guard: the Claude Code plugin declares exactly the
+	// events below, and Claude Code merges hook config from every source,
+	// so registering on top of an installed plugin fires each event
+	// twice. Skip instead. --force still writes, for the operator who
+	// wants both (e.g. mid-migration off the plugin).
+	//
+	// A skip needs AFFIRMATIVE evidence. When the probe could not read
+	// settings.json it reports Uncertain and we fall through to register:
+	// losing capture because a config file was corrupt would be a far
+	// worse failure than a doubled event. The read below hits the same
+	// file and surfaces the underlying error through res.Error.
+	pd := claudeplugin.DetectInClaudeDir(settingsDir)
+	if pd.Active && !r.opts.Force {
+		res.Skipped = true
+		res.SkipReason = pd.Reason()
+		return res
+	}
+	res.ProbeWarning = pd.Warning()
+
+	// Serialize observer's own writers of this file, THEN read — the
+	// snapshot we mutate has to be taken after the lock, or a
+	// concurrent observer's committed write is lost.
+	unlock, err := r.lockSettings(path)
+	if err != nil {
+		res.Error = fmt.Errorf("hook.registerClaudeCode: %w", err)
+		return res
+	}
+	defer unlock()
+
+	// Pin the write target now, before the read — see pinnedTarget (F6).
+	pinned := pinWriteTarget(path)
+
+	raw, err := readSettingsFile(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		res.Error = fmt.Errorf("hook.registerClaudeCode: read: %w", err)
 		return res
@@ -293,8 +413,9 @@ func (r *Registry) registerClaudeCode() RegistrationResult {
 	// Preserve unknown top-level fields via map[string]json.RawMessage.
 	settings := map[string]json.RawMessage{}
 	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &settings); err != nil {
-			res.Error = fmt.Errorf("hook.registerClaudeCode: parse %s: %w", path, err)
+		settings, err = decodeSettingsObject(path, raw)
+		if err != nil {
+			res.Error = fmt.Errorf("hook.registerClaudeCode: %w", err)
 			return res
 		}
 	}
@@ -374,7 +495,7 @@ func (r *Registry) registerClaudeCode() RegistrationResult {
 	if r.opts.DryRun {
 		return res
 	}
-	if err := writeJSONIndented(settingsDir, path, settings); err != nil {
+	if err := writeJSONIndented(settingsDir, pinned, settings); err != nil {
 		res.Error = err
 		return res
 	}
@@ -441,10 +562,25 @@ func (r *Registry) registerClaudeCodeWindows() RegistrationResult {
 
 	claudeDir := r.detectWindowsClaudeHome()
 	if claudeDir == "" {
+		if r.foreignAutoDetectSuppressed(r.opts.WindowsClaudeHome) {
+			r.sandboxSkipResult(&res, ".claude", "WindowsClaudeHome", r.opts.WindowsClaudeHome)
+			return res
+		}
 		res.Error = errors.New("hook.registerClaudeCodeWindows: no Windows-side .claude/ detected (set WindowsClaudeHome explicitly or run on a host where crossmount sees /mnt/c/Users/<u>/.claude/)")
 		return res
 	}
 	res.ConfigPath = filepath.Join(claudeDir, "settings.json")
+
+	// Same double-wiring guard as the native registrar, applied to the
+	// Windows-side .claude the cross-OS bridge writes into: that install
+	// keeps its own plugin state there. Same fail-open-to-wiring rule.
+	pdWin := claudeplugin.DetectInClaudeDir(claudeDir)
+	if pdWin.Active && !r.opts.Force {
+		res.Skipped = true
+		res.SkipReason = pdWin.Reason()
+		return res
+	}
+	res.ProbeWarning = pdWin.Warning()
 
 	distro := r.opts.WSLDistro
 	if distro == "" {
@@ -458,15 +594,26 @@ func (r *Registry) registerClaudeCodeWindows() RegistrationResult {
 	// docstring for the Git Bash path-translation rationale.
 	wrapperPrefix := fmt.Sprintf("MSYS_NO_PATHCONV=1 wsl.exe -d %s -- ", shellQuoteIfNeeded(distro))
 
-	raw, err := os.ReadFile(res.ConfigPath)
+	unlock, err := r.lockSettings(res.ConfigPath)
+	if err != nil {
+		res.Error = fmt.Errorf("hook.registerClaudeCodeWindows: %w", err)
+		return res
+	}
+	defer unlock()
+
+	// Pin the write target now, before the read — see pinnedTarget (F6).
+	pinned := pinWriteTarget(res.ConfigPath)
+
+	raw, err := readSettingsFile(res.ConfigPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		res.Error = fmt.Errorf("hook.registerClaudeCodeWindows: read: %w", err)
 		return res
 	}
 	settings := map[string]json.RawMessage{}
 	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &settings); err != nil {
-			res.Error = fmt.Errorf("hook.registerClaudeCodeWindows: parse %s: %w", res.ConfigPath, err)
+		settings, err = decodeSettingsObject(res.ConfigPath, raw)
+		if err != nil {
+			res.Error = fmt.Errorf("hook.registerClaudeCodeWindows: %w", err)
 			return res
 		}
 	}
@@ -517,7 +664,7 @@ func (r *Registry) registerClaudeCodeWindows() RegistrationResult {
 	if r.opts.DryRun {
 		return res
 	}
-	if err := writeJSONIndented(claudeDir, res.ConfigPath, settings); err != nil {
+	if err := writeJSONIndented(claudeDir, pinned, settings); err != nil {
 		res.Error = err
 		return res
 	}
@@ -568,6 +715,62 @@ func isObserverClaudeEntry(cmd string) bool {
 		return false
 	}
 	return true
+}
+
+// IsObserverClaudeCodeHookCommand reports whether cmd is an observer
+// `hook claude-code <event>` invocation, in either the native shape or
+// the wsl.exe cross-OS bridge shape this package writes.
+//
+// This is the STRICT counterpart of isObserverClaudeEntry. The two exist
+// for opposite reasons and must not be merged:
+//
+//   - isObserverClaudeEntry is deliberately loose (a bare
+//     ` hook claude-code ` substring test) because the REGISTRAR has to
+//     recognise its own stale entries in order to refresh them; a
+//     false negative there strands a user on an old binary forever.
+//   - this one is for REPORTING (the `claude-code.plugin` doctor probe),
+//     where a false POSITIVE is the harm: a third-party command such as
+//     `/opt/acme hook claude-code audit` would otherwise raise a
+//     double-wiring warning naming wiring observer never wrote.
+//
+// So this tokenizes and checks an allow-list: after stripping any
+// leading environment assignments and the `wsl.exe -d <distro> --`
+// bridge prefix, argv[0] must NAME an observer binary
+// (isObserverBinaryToken — basename `observer`/`superbased`, optional
+// `.exe`, optional `-suffix`) and be followed by exactly the tokens
+// `hook` `claude-code`.
+func IsObserverClaudeCodeHookCommand(cmd string) bool {
+	toks := stripHookCommandPrefix(splitCommandTokens(cmd))
+	if len(toks) < 3 {
+		return false
+	}
+	return isObserverBinaryToken(toks[0]) && toks[1] == "hook" && toks[2] == "claude-code"
+}
+
+// stripHookCommandPrefix removes the leading `KEY=VALUE` environment
+// assignments and, if present, the `wsl.exe -d <distro> --` bridge that
+// registerClaudeCodeWindows writes, returning the tokens of the command
+// actually executed. Returns nil when a bridge prefix is present but
+// malformed (no `--` separator), so a half-understood command is never
+// treated as ours.
+func stripHookCommandPrefix(toks []string) []string {
+	for len(toks) > 0 && strings.Contains(toks[0], "=") &&
+		!strings.ContainsAny(toks[0], `/\`) {
+		toks = toks[1:]
+	}
+	if len(toks) == 0 {
+		return nil
+	}
+	base := strings.ToLower(strings.TrimSuffix(commandBaseName(toks[0]), ".exe"))
+	if base != "wsl" {
+		return toks
+	}
+	for i, t := range toks {
+		if t == "--" {
+			return toks[i+1:]
+		}
+	}
+	return nil
 }
 
 // isObserverWindowsClaudeEntry recognises a hook command as one
@@ -681,15 +884,26 @@ func (r *Registry) registerCursor() RegistrationResult {
 	path := filepath.Join(cursorDir, "hooks.json")
 	res.ConfigPath = path
 
-	raw, err := os.ReadFile(path)
+	unlock, err := r.lockSettings(path)
+	if err != nil {
+		res.Error = fmt.Errorf("hook.registerCursor: %w", err)
+		return res
+	}
+	defer unlock()
+
+	// Pin the write target now, before the read — see pinnedTarget (F6).
+	pinned := pinWriteTarget(path)
+
+	raw, err := readSettingsFile(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		res.Error = fmt.Errorf("hook.registerCursor: read: %w", err)
 		return res
 	}
 	settings := map[string]json.RawMessage{}
 	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &settings); err != nil {
-			res.Error = fmt.Errorf("hook.registerCursor: parse: %w", err)
+		settings, err = decodeSettingsObject(path, raw)
+		if err != nil {
+			res.Error = fmt.Errorf("hook.registerCursor: %w", err)
 			return res
 		}
 	}
@@ -740,7 +954,7 @@ func (r *Registry) registerCursor() RegistrationResult {
 	if r.opts.DryRun {
 		return res
 	}
-	if err := writeJSONIndented(cursorDir, path, settings); err != nil {
+	if err := writeJSONIndented(cursorDir, pinned, settings); err != nil {
 		res.Error = err
 		return res
 	}
@@ -771,6 +985,10 @@ func (r *Registry) registerCursorWindows() RegistrationResult {
 
 	cursorDir := r.detectWindowsCursorHome()
 	if cursorDir == "" {
+		if r.foreignAutoDetectSuppressed(r.opts.WindowsCursorHome) {
+			r.sandboxSkipResult(&res, ".cursor", "WindowsCursorHome", r.opts.WindowsCursorHome)
+			return res
+		}
 		res.Error = errors.New("hook.registerCursorWindows: no Windows-side .cursor/ detected (set WindowsCursorHome explicitly or run on a host where crossmount sees /mnt/c/Users/<u>/.cursor/)")
 		return res
 	}
@@ -785,15 +1003,26 @@ func (r *Registry) registerCursorWindows() RegistrationResult {
 		return res
 	}
 
-	raw, err := os.ReadFile(res.ConfigPath)
+	unlock, err := r.lockSettings(res.ConfigPath)
+	if err != nil {
+		res.Error = fmt.Errorf("hook.registerCursorWindows: %w", err)
+		return res
+	}
+	defer unlock()
+
+	// Pin the write target now, before the read — see pinnedTarget (F6).
+	pinned := pinWriteTarget(res.ConfigPath)
+
+	raw, err := readSettingsFile(res.ConfigPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		res.Error = fmt.Errorf("hook.registerCursorWindows: read: %w", err)
 		return res
 	}
 	settings := map[string]json.RawMessage{}
 	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &settings); err != nil {
-			res.Error = fmt.Errorf("hook.registerCursorWindows: parse: %w", err)
+		settings, err = decodeSettingsObject(res.ConfigPath, raw)
+		if err != nil {
+			res.Error = fmt.Errorf("hook.registerCursorWindows: %w", err)
 			return res
 		}
 	}
@@ -850,7 +1079,7 @@ func (r *Registry) registerCursorWindows() RegistrationResult {
 	if r.opts.DryRun {
 		return res
 	}
-	if err := writeJSONIndented(cursorDir, res.ConfigPath, settings); err != nil {
+	if err := writeJSONIndented(cursorDir, pinned, settings); err != nil {
 		res.Error = err
 		return res
 	}
@@ -1097,9 +1326,425 @@ func hookEventArg(event string) string {
 	return event
 }
 
+// maxSettingsFileBytes caps how large a JSON settings/config file we are
+// willing to read into memory before patching it. A real
+// `settings.json` is kilobytes; anything past this is either a mistake
+// (a log accidentally redirected onto the path) or hostile, and reading
+// it unbounded would be a trivial memory-exhaustion foot-gun on a
+// process the user runs on their own machine. Over-cap files are
+// REFUSED (never truncated, never partially parsed) so we can't
+// silently rewrite a file we only half-understood.
+const maxSettingsFileBytes int64 = 5 << 20 // 5 MiB
+
+// readSettingsFile reads a JSON settings/config file with the
+// maxSettingsFileBytes guard applied via Stat BEFORE the read. Callers
+// keep their own os.ErrNotExist handling — a missing file returns the
+// wrapped fs.ErrNotExist from Stat, exactly as os.ReadFile would.
+func readSettingsFile(path string) ([]byte, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if fi.Size() > maxSettingsFileBytes {
+		return nil, fmt.Errorf("%s is %d bytes, over observer's %d-byte settings-file limit; refusing to read or modify it", path, fi.Size(), maxSettingsFileBytes)
+	}
+	return os.ReadFile(path)
+}
+
+// decodeSettingsObject decodes a settings/config file body into the
+// top-level-key-preserving map every registrar patches, refusing two
+// shapes that a plain json.Unmarshal accepts but that we cannot
+// round-trip honestly:
+//
+//   - An explicit JSON `null`. Unmarshalling null into a map sets the
+//     map to NIL (encoding/json's documented behaviour for maps,
+//     slices, pointers and interfaces), so the very next
+//     `settings[key] = ...` in a registrar PANICS with "assignment to
+//     entry in nil map". Treating null as `{}` would be the other
+//     obvious fix, but it isn't honest: an explicit null is not a
+//     settings object, and silently replacing it with our own object
+//     discards a deliberate (if odd) user statement about the file.
+//     Refuse and name the file.
+//   - Duplicate top-level keys. encoding/json keeps the LAST
+//     occurrence, so a read-modify-write silently collapses the file
+//     and destroys whichever duplicate the user's other tool was
+//     reading. Detected by token-walking the top level (json.Decoder)
+//     rather than by parsing into a map, which is exactly the
+//     information json.Unmarshal throws away.
+//
+// Error text keeps the existing `parse <path>: <json error>` shape for
+// genuinely malformed JSON so registrar error messages are unchanged.
+func decodeSettingsObject(path string, raw []byte) (map[string]json.RawMessage, error) {
+	settings := map[string]json.RawMessage{}
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if settings == nil {
+		return nil, fmt.Errorf("%s contains an explicit JSON null, not a settings object; refusing to modify it (replace its contents with {} or delete the file)", path)
+	}
+	if key, ok := duplicateTopLevelKey(raw); ok {
+		return nil, fmt.Errorf("%s has a duplicate top-level %q key; refusing to modify it because rewriting would silently keep only the last one (de-duplicate the file by hand first)", path, key)
+	}
+	return settings, nil
+}
+
+// duplicateTopLevelKey token-walks the top-level object of raw and
+// reports the first key that appears twice. Syntax errors are reported
+// as "no duplicate" — decodeSettingsObject has already surfaced them
+// through json.Unmarshal, and this helper's only job is the one thing
+// Unmarshal cannot tell us.
+func duplicateTopLevelKey(raw []byte) (string, bool) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		return "", false
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return "", false
+	}
+	seen := make(map[string]struct{})
+	for dec.More() {
+		kt, err := dec.Token()
+		if err != nil {
+			return "", false
+		}
+		key, ok := kt.(string)
+		if !ok {
+			return "", false
+		}
+		if _, dup := seen[key]; dup {
+			return key, true
+		}
+		seen[key] = struct{}{}
+		// Consume the value wholesale (any nesting) without decoding it.
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return "", false
+		}
+	}
+	return "", false
+}
+
+// settingsLockSuffix is appended to a settings/config path to form its
+// advisory lock file. Deliberately NOT ".lock" alone: the file sits
+// beside the real config in a directory the AI tool also reads, so the
+// name has to be unmistakably ours.
+const settingsLockSuffix = ".observer-lock"
+
+// settingsLockStale is how long a lock file may go untouched before a
+// waiting process treats it as abandoned (a crashed observer) and
+// breaks it. Registration is a sub-millisecond read-modify-write, so
+// anything this old is dead by definition.
+const settingsLockStale = 30 * time.Second
+
+// settingsLockTimeout bounds how long we wait for another observer
+// process to finish its read-modify-write before giving up with an
+// error rather than racing it.
+const settingsLockTimeout = 5 * time.Second
+
+// lockSettings acquires the advisory lock for a settings/config file
+// this Registry is about to read-modify-write, returning the releaser.
+// Dry runs never write, so they never lock (and never leave a lock
+// file behind in a directory a --dry-run must not touch).
+func (r *Registry) lockSettings(path string) (func(), error) {
+	if r.opts.DryRun {
+		return func() {}, nil
+	}
+	return lockSettingsFile(path)
+}
+
+// lockSettingsFile takes a cross-process advisory lock on path by
+// O_CREATE|O_EXCL-creating `<path>.observer-lock`, breaking locks older
+// than settingsLockStale, and giving up after settingsLockTimeout. The
+// O_EXCL sentinel (rather than flock/LockFileEx) is deliberate: it is
+// one code path on every OS this ships to, with no syscall build tags,
+// and matches internal/diag/lockfile.go's existing file-based
+// convention.
+//
+// FAIL-OPEN: any error other than "already exists" (a read-only
+// directory, an exotic filesystem that rejects O_EXCL) returns a no-op
+// releaser and no error — registration proceeds unserialized rather
+// than breaking on filesystems where the lock cannot be represented.
+// Losing serialization is strictly better than losing the ability to
+// register hooks at all.
+//
+// RESIDUAL, disclosed honestly: this serializes OBSERVER's own writers
+// against each other (two `observer init` runs, an init racing a
+// `observer start` auto-register). It cannot serialize us against
+// Claude Code / Cursor themselves — they write settings.json without
+// consulting any lock, so a genuinely concurrent edit by the AI tool
+// can still be lost. Closing that would need the tool's cooperation;
+// the atomic temp+rename below at least guarantees the file is never
+// observed half-written.
+func lockSettingsFile(path string) (func(), error) {
+	lockPath := path + settingsLockSuffix
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		return func() {}, nil // fail-open: see docstring
+	}
+	ownerID := lockOwnerToken()
+	deadline := time.Now().Add(settingsLockTimeout)
+	for {
+		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			_, _ = f.WriteString(ownerID)
+			_ = f.Close()
+			return func() { unlockSettingsFile(lockPath, ownerID) }, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return func() {}, nil // fail-open: see docstring
+		}
+		// Held by someone else. Break it if it looks abandoned —
+		// ownership-verified so a concurrent breaker can't win an ABA
+		// race against a legitimate new owner (see breakStaleLock).
+		// observeStaleLock pairs the mtime check and the content read
+		// through ONE open file description, so what we hand to
+		// breakStaleLock as "the specific lock instance we observed as
+		// stale" is exactly that — not a fresh read taken later, which
+		// would instead describe whatever happens to be at lockPath by
+		// the time breakStaleLock runs (possibly a legitimate new
+		// owner's lock, acquired in the gap between this check and the
+		// break).
+		if observed, stale := observeStaleLock(lockPath); stale {
+			breakStaleLock(lockPath, observed)
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out after %s waiting for %s (another observer process is writing %s; delete the lock file if no observer is running)", settingsLockTimeout, lockPath, path)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// lockOwnerToken returns a fresh, unique owner identity for a
+// newly-acquired settings lock, written verbatim as the lock file's
+// entire body: "pid=<pid> nonce=<hex> acquired=<RFC3339Nano>\n". The
+// pid+timestamp give a human inspecting a stray lock file the same
+// debugging context the previous "pid=%d acquired=%s" body gave; the
+// random nonce is what makes the returned string usable as a
+// compare-and-delete identity (F7) — two different acquisitions of
+// the SAME lock path, even by the same pid moments apart, get
+// different identities, so "does the file still hold this exact
+// string" is a reliable test for "is this still the lock instance I
+// created/observed".
+func lockOwnerToken() string {
+	return fmt.Sprintf("pid=%d nonce=%s acquired=%s\n", os.Getpid(), randomHex(16), time.Now().UTC().Format(time.RFC3339Nano))
+}
+
+// randomHex returns n random bytes hex-encoded. crypto/rand.Read is
+// documented to never fail on any platform Go supports; the
+// time-derived fallback only exists so a theoretical read error can't
+// turn a lock/quarantine helper into a panicking code path — it is
+// still unique-enough for a same-process, single-call-site use to
+// avoid a same-nanosecond collision.
+func randomHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
+// observeStaleLock pairs "is lockPath abandoned" with "what does it
+// currently contain" into a single atomic observation, by checking
+// mtime and reading content off the SAME open file description rather
+// than a separate os.Stat + a later os.ReadFile against the pathname.
+// Two syscalls issued against a pathname a moment apart can straddle
+// a concurrent unlock+relock (the file at that path is a different
+// inode by the second syscall); reading from the fd returned by Open
+// pins us to the exact inode that mtime was measured against. The
+// remaining pathname-level race — a different file existing at
+// lockPath by the time Open runs than whatever failed our O_EXCL
+// attempt moments earlier — is inherent to any check-then-act sequence
+// over a path and is what breakStaleLock's rename-and-reverify closes.
+func observeStaleLock(lockPath string) (content []byte, stale bool) {
+	f, err := os.Open(lockPath)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || time.Since(fi.ModTime()) <= settingsLockStale {
+		return nil, false
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, false
+	}
+	return data, true
+}
+
+// breakStaleLock attempts to remove a settings lock that
+// observeStaleLock has already confirmed looks abandoned, using an
+// ownership-verified rename-then-recheck protocol that closes F7's
+// ABA race: two contenders observing the same stale lock must not
+// both conclude they broke it, and neither may remove a lock that was
+// legitimately (re-)acquired between the staleness observation and
+// the break.
+//
+// observed is exactly what observeStaleLock captured — "the specific
+// lock instance we observed as stale" — NOT a fresh read taken here;
+// re-reading at break time would instead describe whatever happens to
+// occupy lockPath by the time this function runs, which could by then
+// be a brand new, legitimately-held lock.
+//
+//  1. Atomically rename lockPath to a unique quarantine path beside
+//     it. Rename only succeeds if a source still exists at that
+//     instant, so of any number of concurrent breakers racing the
+//     same stale lock, AT MOST ONE wins the rename — everyone else
+//     gets ENOENT and falls through having removed nothing (no
+//     double-break, no partial state).
+//  2. Read the quarantined file and compare its bytes to observed.
+//     Equal confirms the rename moved the SAME lock instance we
+//     originally observed as stale — lock files are write-once
+//     (created via O_EXCL, never rewritten in place, only unlinked on
+//     release), so identical content after an atomic rename can only
+//     mean nothing replaced it between our observation and our
+//     rename. Safe to discard for good.
+//  3. Unequal (or the source was already gone) means either another
+//     breaker won first, or the rename actually moved a DIFFERENT,
+//     freshly (and legitimately) acquired lock — the process we
+//     originally observed as stale must have cleanly unlocked
+//     (identity-verified by unlockSettingsFile) right as we moved to
+//     break it, and a new owner raced in before our rename executed.
+//     We did not "consume" anything that was ours to take;
+//     best-effort restore it — only when the path is free again,
+//     never clobbering whatever a still-newer owner may have created
+//     since — and log the near-miss rather than silently discarding a
+//     live lock.
+func breakStaleLock(lockPath string, observed []byte) {
+	quarantine := fmt.Sprintf("%s.broken-%d-%s", lockPath, os.Getpid(), randomHex(8))
+	if err := os.Rename(lockPath, quarantine); err != nil {
+		// Lost the race: someone else's break (or a legitimate
+		// unlock+recreate) already moved/removed the source first.
+		return
+	}
+	current, readErr := os.ReadFile(quarantine)
+	if readErr == nil && bytes.Equal(current, observed) {
+		// Confirmed: this was genuinely the same stale-lock instance
+		// we decided to break. Discard it for good.
+		_ = os.Remove(quarantine)
+		return
+	}
+	// We quarantined a lock we can't prove is the one we observed —
+	// almost certainly a legitimate new owner that raced in between
+	// our staleness read and our rename. Restore it if the path is
+	// free again so that owner's eventual unlock still finds its own
+	// lock; never overwrite whatever a still-newer owner has since
+	// created there.
+	if _, statErr := os.Lstat(lockPath); errors.Is(statErr, os.ErrNotExist) {
+		if renameErr := os.Rename(quarantine, lockPath); renameErr == nil {
+			slog.Default().Warn("hook: stale-lock break caught a live lock instead of an abandoned one; restored it", "lock_path", lockPath)
+			return
+		}
+	}
+	slog.Default().Warn("hook: stale-lock break caught a live lock instead of an abandoned one and could not restore it; its owner may need to retry", "lock_path", lockPath)
+	_ = os.Remove(quarantine)
+}
+
+// unlockSettingsFile releases a lock previously acquired by
+// lockSettingsFile, but only after verifying the lock file still
+// holds the exact identity string this holder wrote at acquisition
+// time — closing F7's second half. Without this, an unconditional
+// os.Remove here would delete a SUCCESSOR's lock out from under it
+// whenever this holder's own lock was (mistakenly or not) broken
+// while still held — e.g. a slow read-modify-write that ran past
+// settingsLockStale and got broken by a waiting contender, then
+// finished its work and called unlock believing it still owned the
+// file. A mismatch (or the file already being gone) means this holder
+// no longer owns the lock: log and skip, never remove.
+func unlockSettingsFile(lockPath, ownerID string) {
+	current, err := os.ReadFile(lockPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			slog.Default().Warn("hook: could not verify lock ownership before unlock", "lock_path", lockPath, "error", err)
+		}
+		return
+	}
+	if string(current) != ownerID {
+		slog.Default().Warn("hook: lock file no longer matches this holder's identity at unlock time; leaving it alone (owned by a successor)", "lock_path", lockPath)
+		return
+	}
+	_ = os.Remove(lockPath)
+}
+
+// pinnedTarget captures, at a single instant right after a settings
+// lock is acquired and BEFORE the file is read, which physical file a
+// write to `path` will land on — closing F6's symlink-retarget race.
+// Resolving the symlink target separately at write time (the old
+// resolveWriteTarget, called fresh inside writeJSONIndented /
+// atomicWriteFile) let a link retargeted between the read and the
+// write silently redirect a patch built from target A's content onto
+// target B. Callers now resolve ONCE via pinWriteTarget immediately
+// after locking, thread the same pinnedTarget through the read and
+// the write, and call verifyUnmoved() immediately before the final
+// rename so a link that moved during the read/build window is caught
+// and refused rather than clobbered.
+type pinnedTarget struct {
+	path      string // original path (possibly a symlink)
+	target    string // resolved file to actually read/write; == path when not a symlink
+	isSymlink bool
+	linkValue string // os.Readlink(path) at pin time; empty when !isSymlink
+}
+
+// pinWriteTarget resolves path's write target once. Must be called
+// while the caller holds path's advisory settings lock, before the
+// first read of the file the caller is about to patch.
+func pinWriteTarget(path string) pinnedTarget {
+	fi, err := os.Lstat(path)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		return pinnedTarget{path: path, target: path}
+	}
+	link, err := os.Readlink(path)
+	if err != nil {
+		return pinnedTarget{path: path, target: path}
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil || resolved == "" {
+		// Dangling link: same fallback the old resolveWriteTarget used
+		// (write through the link path itself).
+		return pinnedTarget{path: path, target: path, isSymlink: true, linkValue: link}
+	}
+	return pinnedTarget{path: path, target: resolved, isSymlink: true, linkValue: link}
+}
+
+// verifyUnmoved re-checks, immediately before the final rename, that
+// path is still the same symlink (or still a plain file) it was when
+// pinned. A mismatch means the link was retargeted (or a plain file
+// was replaced with a symlink, or vice versa) while this write was in
+// flight against the OLD target; refusing here is the only way to
+// avoid silently overwriting a file the caller never read.
+func (p pinnedTarget) verifyUnmoved() error {
+	fi, err := os.Lstat(p.path)
+	if err != nil {
+		if p.isSymlink {
+			return fmt.Errorf("%s: symlink disappeared while observer was preparing to write it; refusing to write (it may have been replaced)", p.path)
+		}
+		return nil
+	}
+	isLink := fi.Mode()&os.ModeSymlink != 0
+	if isLink != p.isSymlink {
+		return fmt.Errorf("%s: changed between read and write (symlink-ness changed); refusing to write — re-run to pick up the new state", p.path)
+	}
+	if !p.isSymlink {
+		return nil
+	}
+	link, err := os.Readlink(p.path)
+	if err != nil || link != p.linkValue {
+		return fmt.Errorf("%s: symlink was retargeted while observer was preparing to write it (was -> %s); refusing to write a patch built against the old target", p.path, p.linkValue)
+	}
+	return nil
+}
+
 // writeJSONIndented writes a map[string]json.RawMessage as stable-keyed,
 // 2-space-indented JSON. Creates the parent dir if missing.
-func writeJSONIndented(dir, path string, settings map[string]json.RawMessage) error {
+//
+// Callers own the advisory lock (see lockSettings) — this function must
+// never take it itself, or a caller that already holds it would
+// deadlock against its own O_EXCL sentinel.
+//
+// pinned must have been produced by pinWriteTarget against path, right
+// after the lock was acquired and before path was first read — see
+// pinnedTarget's doc comment for why (F6).
+func writeJSONIndented(dir string, pinned pinnedTarget, settings map[string]json.RawMessage) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("hook.write: mkdir: %w", err)
 	}
@@ -1117,11 +1762,24 @@ func writeJSONIndented(dir, path string, settings map[string]json.RawMessage) er
 		kk, _ := json.Marshal(k)
 		buf = append(buf, kk...)
 		buf = append(buf, ':', ' ')
-		// Re-indent the value for readability.
-		var tmp any
-		if err := json.Unmarshal(settings[k], &tmp); err == nil {
-			pretty, _ := json.MarshalIndent(tmp, "  ", "  ")
-			buf = append(buf, pretty...)
+		// Re-indent the value for readability — on the RAW bytes, never
+		// by decoding through `any`. Decoding a value we do not own and
+		// re-marshalling it is lossy in at least three ways that all
+		// silently corrupt a user's file: integers beyond 2^53 are
+		// mangled through float64 (9007199254740993 -> ...992), number
+		// formatting is rewritten (1.0 -> 1, 1e3 -> 1000), and `<`/`>`/`&`
+		// inside strings get \u-escaped. json.Indent is a pure
+		// whitespace transform, so every unrelated top-level key
+		// round-trips byte-identically.
+		//
+		// One deliberate cosmetic consequence: nested object keys keep
+		// their SOURCE order instead of being alphabetized by Go's map
+		// marshalling. Semantics are identical; the blocks we write
+		// ourselves ("hooks", "statusLine", ...) now serialize in
+		// struct-field order.
+		var pretty bytes.Buffer
+		if err := json.Indent(&pretty, settings[k], "  ", "  "); err == nil {
+			buf = append(buf, pretty.Bytes()...)
 		} else {
 			buf = append(buf, settings[k]...)
 		}
@@ -1132,15 +1790,165 @@ func writeJSONIndented(dir, path string, settings map[string]json.RawMessage) er
 	}
 	buf = append(buf, '}', '\n')
 
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, buf, 0o600); err != nil {
+	// Write through a UNIQUE temp file, not a fixed `<path>.tmp`: two
+	// observer processes patching the same settings.json would otherwise
+	// stomp each other's half-written temp file and rename a spliced
+	// body into place. Rename onto the symlink TARGET pinned at lock
+	// time when path is a link, so dotfile-managed setups keep their
+	// link.
+	target := pinned.target
+	tmpf, err := os.CreateTemp(filepath.Dir(target), filepath.Base(target)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("hook.write: temp: %w", err)
+	}
+	tmp := tmpf.Name()
+	if _, err := tmpf.Write(buf); err != nil {
+		_ = tmpf.Close()
+		_ = os.Remove(tmp)
 		return fmt.Errorf("hook.write: %w", err)
 	}
-	return os.Rename(tmp, path)
+	if err := tmpf.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("hook.write: %w", err)
+	}
+	// Re-verify immediately before the rename: the link must still
+	// resolve to the target this write was built against (F6).
+	if err := pinned.verifyUnmoved(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("hook.write: %w", err)
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("hook.write: rename: %w", err)
+	}
+	return nil
+}
+
+// atomicWriteFile writes data to path via a UNIQUE temp file — never a
+// fixed `<path>.tmp`, which two observer processes racing to patch the
+// same file would otherwise stomp: whichever opens second truncates
+// the first's still-open temp file out from under it (same inode, same
+// path, no O_EXCL), so the eventual rename can land a spliced/torn
+// body. Same rationale as writeJSONIndented's temp file, generalized
+// here so every fixed-name writer in this package (hook_checksums.json,
+// Codex's hooks.json and config.toml) can share one hardened
+// implementation instead of re-deriving it.
+//
+// Renames onto the SYMLINK TARGET pinned at lock time when path is a
+// symlink (pinWriteTarget), so a dotfile-managed config keeps its
+// link — matching writeJSONIndented's symlink stance.
+//
+// Callers that need cross-process serialization own the advisory lock
+// (see lockSettings) — this function never takes it itself, so a
+// caller already holding it can't deadlock against its own O_EXCL
+// sentinel.
+//
+// pinned must have been produced by pinWriteTarget against path, right
+// after the lock was acquired and before path was first read — see
+// pinnedTarget's doc comment for why (F6).
+func atomicWriteFile(pinned pinnedTarget, data []byte) error {
+	target := pinned.target
+	dir := filepath.Dir(target)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("hook.atomicWriteFile: mkdir: %w", err)
+	}
+	tmpf, err := os.CreateTemp(dir, filepath.Base(target)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("hook.atomicWriteFile: temp: %w", err)
+	}
+	tmp := tmpf.Name()
+	if _, err := tmpf.Write(data); err != nil {
+		_ = tmpf.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("hook.atomicWriteFile: write: %w", err)
+	}
+	if err := tmpf.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("hook.atomicWriteFile: close: %w", err)
+	}
+	// Re-verify immediately before the rename: the link must still
+	// resolve to the target this write was built against (F6).
+	if err := pinned.verifyUnmoved(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("hook.atomicWriteFile: %w", err)
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("hook.atomicWriteFile: rename: %w", err)
+	}
+	return nil
+}
+
+// removeEmptyConfigFile deletes path after a registrar has emptied a
+// config file's last observer-owned content (its last top-level key,
+// or the whole document). Honors the same symlink-preserving stance
+// as writeJSONIndented/atomicWriteFile: a settings.json a dotfile
+// manager maintains as a SYMLINK into a tracked repo must never be
+// silently os.Remove'd. Unlinking the symlink only unlinks the
+// dirent — the TARGET file (the one the AI tool, and any dotfile
+// repo, actually reads) survives untouched with its stale content
+// still in place, while the caller believes the removal succeeded.
+// Deleting the resolved TARGET instead would be just as dishonest in
+// the other direction: silently destroying a file this package does
+// not own, tracked or not, on the operator's behalf.
+//
+// So a symlinked config is REFUSED with an error naming the file —
+// the same "refuse and name it" stance readSettingsFile and
+// decodeSettingsObject already take for file shapes this package
+// cannot honestly rewrite. A missing file (already gone, or a race
+// with another remover) is not an error.
+//
+// expected is the exact byte content the caller read and decided was
+// empty of observer-owned content, captured BEFORE it made that
+// decision. Closing F5's check-then-delete TOCTOU: the caller holds
+// path's advisory settings lock across its whole
+// read-decide-write-or-delete window, but that lock only serializes
+// against OTHER observer processes — it does nothing against the AI
+// tool itself (or the user, or a dotfile-manager sync) replacing the
+// file with fresh content of its own between the caller's read and
+// this delete. Re-reading path's current bytes here, immediately
+// before the actual unlink, and refusing unless they still match
+// exactly what the caller decided to delete turns that window into a
+// safe no-op instead of a silent destructive race: whatever replaced
+// the file survives, and the caller's stale delete decision is
+// discarded instead of acted on.
+func removeEmptyConfigFile(path string, expected []byte) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symlink; refusing to delete it — unlinking it would silently detach it while its target file survives untouched, and deleting the target could destroy a file tracked elsewhere; remove it by hand if that's what you want", path)
+	}
+	current, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if !bytes.Equal(current, expected) {
+		return fmt.Errorf("%s changed since observer decided to delete it (likely written by the AI tool, or another process, in between); refusing to delete a file observer never actually read — re-run to make a fresh decision against the current content", path)
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // recordChecksum computes SHA256 of the config file and records it in the
 // checksums registry so `observer doctor` can detect drift.
+//
+// hook_checksums.json is shared by every registrar (claude-code,
+// cursor, codex, statusline, ...), so this takes its OWN advisory lock
+// on the checksums file — a claude-code registration and a cursor
+// registration each hold a DIFFERENT settings-file lock but must still
+// serialize here, or their concurrent read-modify-write of the shared
+// registry loses each other's entries (and, pre-atomic-write, could
+// splice their bodies together).
 func (r *Registry) recordChecksum(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -1158,6 +1966,15 @@ func (r *Registry) recordChecksum(path string) error {
 		csPath = filepath.Join(r.opts.HomeDir, ".observer", "hook_checksums.json")
 	}
 
+	unlock, err := r.lockSettings(csPath)
+	if err != nil {
+		return fmt.Errorf("hook.recordChecksum: %w", err)
+	}
+	defer unlock()
+
+	// Pin the write target now, before the read — see pinnedTarget (F6).
+	pinned := pinWriteTarget(csPath)
+
 	current := map[string]any{}
 	if raw, err := os.ReadFile(csPath); err == nil {
 		_ = json.Unmarshal(raw, &current)
@@ -1167,11 +1984,8 @@ func (r *Registry) recordChecksum(path string) error {
 	if err != nil {
 		return fmt.Errorf("hook.recordChecksum: marshal: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(csPath), 0o755); err != nil {
-		return fmt.Errorf("hook.recordChecksum: mkdir: %w", err)
-	}
-	if err := os.WriteFile(csPath, body, 0o600); err != nil {
-		return fmt.Errorf("hook.recordChecksum: write: %w", err)
+	if err := atomicWriteFile(pinned, body); err != nil {
+		return fmt.Errorf("hook.recordChecksum: %w", err)
 	}
 	return nil
 }
@@ -1357,7 +2171,17 @@ func (r *Registry) unregisterClaudeCode() UnregistrationResult {
 	path := filepath.Join(settingsDir, "settings.json")
 	res.ConfigPath = path
 
-	raw, err := os.ReadFile(path)
+	unlock, err := r.lockSettings(path)
+	if err != nil {
+		res.Error = fmt.Errorf("hook.unregisterClaudeCode: %w", err)
+		return res
+	}
+	defer unlock()
+
+	// Pin the write target now, before the read — see pinnedTarget (F6).
+	pinned := pinWriteTarget(path)
+
+	raw, err := readSettingsFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			res.Skipped = true
@@ -1367,9 +2191,9 @@ func (r *Registry) unregisterClaudeCode() UnregistrationResult {
 		return res
 	}
 
-	settings := map[string]json.RawMessage{}
-	if err := json.Unmarshal(raw, &settings); err != nil {
-		res.Error = fmt.Errorf("hook.unregisterClaudeCode: parse %s: %w", path, err)
+	settings, err := decodeSettingsObject(path, raw)
+	if err != nil {
+		res.Error = fmt.Errorf("hook.unregisterClaudeCode: %w", err)
 		return res
 	}
 	hooks := map[string][]claudeHookGroup{}
@@ -1434,12 +2258,12 @@ func (r *Registry) unregisterClaudeCode() UnregistrationResult {
 	}
 
 	if len(settings) == 0 {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := removeEmptyConfigFile(path, raw); err != nil {
 			res.Error = fmt.Errorf("hook.unregisterClaudeCode: remove empty %s: %w", path, err)
 			return res
 		}
 	} else {
-		if err := writeJSONIndented(settingsDir, path, settings); err != nil {
+		if err := writeJSONIndented(settingsDir, pinned, settings); err != nil {
 			res.Error = err
 			return res
 		}
@@ -1467,7 +2291,17 @@ func (r *Registry) unregisterClaudeCodeWindows() UnregistrationResult {
 	}
 	res.ConfigPath = filepath.Join(claudeDir, "settings.json")
 
-	raw, err := os.ReadFile(res.ConfigPath)
+	unlock, err := r.lockSettings(res.ConfigPath)
+	if err != nil {
+		res.Error = fmt.Errorf("hook.unregisterClaudeCodeWindows: %w", err)
+		return res
+	}
+	defer unlock()
+
+	// Pin the write target now, before the read — see pinnedTarget (F6).
+	pinned := pinWriteTarget(res.ConfigPath)
+
+	raw, err := readSettingsFile(res.ConfigPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			res.Skipped = true
@@ -1477,9 +2311,9 @@ func (r *Registry) unregisterClaudeCodeWindows() UnregistrationResult {
 		return res
 	}
 
-	settings := map[string]json.RawMessage{}
-	if err := json.Unmarshal(raw, &settings); err != nil {
-		res.Error = fmt.Errorf("hook.unregisterClaudeCodeWindows: parse %s: %w", res.ConfigPath, err)
+	settings, err := decodeSettingsObject(res.ConfigPath, raw)
+	if err != nil {
+		res.Error = fmt.Errorf("hook.unregisterClaudeCodeWindows: %w", err)
 		return res
 	}
 	hooks := map[string][]claudeHookGroup{}
@@ -1539,12 +2373,12 @@ func (r *Registry) unregisterClaudeCodeWindows() UnregistrationResult {
 	}
 
 	if len(settings) == 0 {
-		if err := os.Remove(res.ConfigPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := removeEmptyConfigFile(res.ConfigPath, raw); err != nil {
 			res.Error = fmt.Errorf("hook.unregisterClaudeCodeWindows: remove empty %s: %w", res.ConfigPath, err)
 			return res
 		}
 	} else {
-		if err := writeJSONIndented(claudeDir, res.ConfigPath, settings); err != nil {
+		if err := writeJSONIndented(claudeDir, pinned, settings); err != nil {
 			res.Error = err
 			return res
 		}
@@ -1586,7 +2420,17 @@ func (r *Registry) unregisterCursor() UnregistrationResult {
 	path := filepath.Join(cursorDir, "hooks.json")
 	res.ConfigPath = path
 
-	raw, err := os.ReadFile(path)
+	unlock, err := r.lockSettings(path)
+	if err != nil {
+		res.Error = fmt.Errorf("hook.unregisterCursor: %w", err)
+		return res
+	}
+	defer unlock()
+
+	// Pin the write target now, before the read — see pinnedTarget (F6).
+	pinned := pinWriteTarget(path)
+
+	raw, err := readSettingsFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			res.Skipped = true
@@ -1596,9 +2440,9 @@ func (r *Registry) unregisterCursor() UnregistrationResult {
 		return res
 	}
 
-	settings := map[string]json.RawMessage{}
-	if err := json.Unmarshal(raw, &settings); err != nil {
-		res.Error = fmt.Errorf("hook.unregisterCursor: parse: %w", err)
+	settings, err := decodeSettingsObject(path, raw)
+	if err != nil {
+		res.Error = fmt.Errorf("hook.unregisterCursor: %w", err)
 		return res
 	}
 	hooks := map[string][]cursorHookEntry{}
@@ -1676,12 +2520,12 @@ func (r *Registry) unregisterCursor() UnregistrationResult {
 		}
 	}
 	if len(settings) == 0 {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := removeEmptyConfigFile(path, raw); err != nil {
 			res.Error = fmt.Errorf("hook.unregisterCursor: remove %s: %w", path, err)
 			return res
 		}
 	} else {
-		if err := writeJSONIndented(cursorDir, path, settings); err != nil {
+		if err := writeJSONIndented(cursorDir, pinned, settings); err != nil {
 			res.Error = err
 			return res
 		}
@@ -1752,11 +2596,26 @@ func (r *Registry) checksumMatches(path string, data []byte) (bool, error) {
 // removeChecksum deletes path's entry from the checksums registry. When
 // the registry becomes empty it is removed entirely. Missing registry is
 // not an error.
+//
+// Takes the same per-checksums-file advisory lock as recordChecksum —
+// see that docstring for why a shared registry needs its own lock
+// independent of whatever settings-file lock the caller may be
+// holding.
 func (r *Registry) removeChecksum(path string) error {
 	csPath := r.opts.ChecksumsPath
 	if csPath == "" {
 		csPath = filepath.Join(r.opts.HomeDir, ".observer", "hook_checksums.json")
 	}
+
+	unlock, err := r.lockSettings(csPath)
+	if err != nil {
+		return fmt.Errorf("hook.removeChecksum: %w", err)
+	}
+	defer unlock()
+
+	// Pin the write target now, before the read — see pinnedTarget (F6).
+	pinned := pinWriteTarget(csPath)
+
 	raw, err := os.ReadFile(csPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -1779,8 +2638,8 @@ func (r *Registry) removeChecksum(path string) error {
 	if err != nil {
 		return fmt.Errorf("hook.removeChecksum: marshal: %w", err)
 	}
-	if err := os.WriteFile(csPath, body, 0o600); err != nil {
-		return fmt.Errorf("hook.removeChecksum: write: %w", err)
+	if err := atomicWriteFile(pinned, body); err != nil {
+		return fmt.Errorf("hook.removeChecksum: %w", err)
 	}
 	return nil
 }
@@ -1839,6 +2698,19 @@ func (r *Registry) registerCodex() RegistrationResult {
 	hooksPath := filepath.Join(dir, codexHooksFile)
 	res.ConfigPath = hooksPath
 
+	// Serialize observer's own writers of this file, THEN read — same
+	// contract as registerClaudeCode/registerCursor (see lockSettings).
+	// Codex's hooks.json previously took NO lock at all here.
+	unlock, err := r.lockSettings(hooksPath)
+	if err != nil {
+		res.Error = fmt.Errorf("hook.registerCodex: %w", err)
+		return res
+	}
+	defer unlock()
+
+	// Pin the write target now, before the read — see pinnedTarget (F6).
+	pinned := pinWriteTarget(hooksPath)
+
 	cfg, err := readCodexHooks(hooksPath)
 	if err != nil {
 		res.Error = err
@@ -1886,7 +2758,7 @@ func (r *Registry) registerCodex() RegistrationResult {
 		return res
 	}
 
-	if err := writeCodexHooks(dir, hooksPath, cfg); err != nil {
+	if err := writeCodexHooks(dir, pinned, cfg); err != nil {
 		res.Error = err
 		return res
 	}
@@ -1894,7 +2766,7 @@ func (r *Registry) registerCodex() RegistrationResult {
 		res.Error = err
 		return res
 	}
-	if err := ensureCodexHooksFeatureFlag(dir); err != nil {
+	if err := r.ensureCodexHooksFeatureFlag(dir); err != nil {
 		res.Error = err
 		return res
 	}
@@ -1906,6 +2778,16 @@ func (r *Registry) unregisterCodex() UnregistrationResult {
 	dir := filepath.Join(r.opts.HomeDir, ".codex")
 	hooksPath := filepath.Join(dir, codexHooksFile)
 	res.ConfigPath = hooksPath
+
+	unlock, err := r.lockSettings(hooksPath)
+	if err != nil {
+		res.Error = fmt.Errorf("hook.unregisterCodex: %w", err)
+		return res
+	}
+	defer unlock()
+
+	// Pin the write target now, before the read — see pinnedTarget (F6).
+	pinned := pinWriteTarget(hooksPath)
 
 	raw, err := os.ReadFile(hooksPath)
 	if err != nil {
@@ -1965,7 +2847,7 @@ func (r *Registry) unregisterCodex() UnregistrationResult {
 	// the user may have added their own entries we don't know about
 	// (kept-rows above already short-circuit if any non-observer entries
 	// remain).
-	if err := writeCodexHooks(dir, hooksPath, cfg); err != nil {
+	if err := writeCodexHooks(dir, pinned, cfg); err != nil {
 		res.Error = err
 		return res
 	}
@@ -2002,8 +2884,14 @@ func readCodexHooks(path string) (codexHooksConfig, error) {
 }
 
 // writeCodexHooks marshals cfg as 2-space-indented JSON with stable
-// event ordering. Creates the parent dir if missing.
-func writeCodexHooks(dir, path string, cfg codexHooksConfig) error {
+// event ordering. Creates the parent dir if missing. Callers own the
+// advisory lock (see lockSettings) — this function must never take it
+// itself, matching writeJSONIndented's contract.
+//
+// pinned must have been produced by pinWriteTarget against the hooks
+// file, right after the lock was acquired and before it was first
+// read — see pinnedTarget's doc comment for why (F6).
+func writeCodexHooks(dir string, pinned pinnedTarget, cfg codexHooksConfig) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("hook.writeCodexHooks: mkdir: %w", err)
 	}
@@ -2036,12 +2924,8 @@ func writeCodexHooks(dir, path string, cfg codexHooksConfig) error {
 	}
 	buf.WriteString("}\n}\n")
 
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, buf.Bytes(), 0o600); err != nil {
-		return fmt.Errorf("hook.writeCodexHooks: write: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("hook.writeCodexHooks: rename: %w", err)
+	if err := atomicWriteFile(pinned, buf.Bytes()); err != nil {
+		return fmt.Errorf("hook.writeCodexHooks: %w", err)
 	}
 	return nil
 }
@@ -2157,8 +3041,27 @@ func filterCodexGroups(groups []codexHookGroup) ([]codexHookGroup, int, int) {
 // This is a codex design limitation, not an observer bug. See
 // docs/codex-hook-capture.md for the maintainer's 2026-05-11
 // dogfood notes.
-func ensureCodexHooksFeatureFlag(dir string) error {
+// A method (not a free function) so it can take its own advisory lock
+// on config.toml — a DIFFERENT file than the hooks.json lock
+// registerCodex already holds for the rest of its body, so this is a
+// second, independent lockSettings/unlock pair, not a re-entrant one.
+func (r *Registry) ensureCodexHooksFeatureFlag(dir string) error {
 	path := filepath.Join(dir, "config.toml")
+
+	// Serialize observer's own writers of this file, THEN read — same
+	// contract as every other settings/config writer since WP9
+	// (lockSettings' docstring). config.toml previously took no lock
+	// and wrote through a FIXED `<path>.tmp`, so two concurrent
+	// `observer init --codex` runs could splice a torn config.toml.
+	unlock, err := r.lockSettings(path)
+	if err != nil {
+		return fmt.Errorf("hook.ensureCodexHooksFeatureFlag: %w", err)
+	}
+	defer unlock()
+
+	// Pin the write target now, before the read — see pinnedTarget (F6).
+	pinned := pinWriteTarget(path)
+
 	raw, err := os.ReadFile(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("hook.ensureCodexHooksFeatureFlag: read: %w", err)
@@ -2179,19 +3082,393 @@ func ensureCodexHooksFeatureFlag(dir string) error {
 	features["hooks"] = true
 	root["features"] = features
 
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("hook.ensureCodexHooksFeatureFlag: mkdir: %w", err)
-	}
 	var buf bytes.Buffer
 	if err := toml.NewEncoder(&buf).Encode(root); err != nil {
 		return fmt.Errorf("hook.ensureCodexHooksFeatureFlag: encode: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, buf.Bytes(), 0o600); err != nil {
-		return fmt.Errorf("hook.ensureCodexHooksFeatureFlag: write: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("hook.ensureCodexHooksFeatureFlag: rename: %w", err)
+	if err := atomicWriteFile(pinned, buf.Bytes()); err != nil {
+		return fmt.Errorf("hook.ensureCodexHooksFeatureFlag: %w", err)
 	}
 	return nil
+}
+
+// --- Statusline registration (docs/plans/observer-statusline-plan-2026-07-30.md §5.1) ---
+//
+// This is a NEW, independent registration surface — a sibling of the hook
+// registration above, not a variant of it. It patches a different
+// top-level key ("statusLine") in the exact same ~/.claude/settings.json
+// file that registerClaudeCode patches ("hooks"), using the identical
+// read-preserve-write map[string]json.RawMessage shape so unknown keys
+// (and the "hooks" key itself) survive byte-for-byte. registerClaudeCode
+// and every other existing function in this file are NOT modified by
+// this addition — only new sibling functions are added below, and the
+// entry points (RegisterClaudeCodeStatusline / UnregisterClaudeCodeStatusline)
+// are deliberately NOT wired into the tool-name-dispatched Register/
+// Unregister switches above, so those two functions also stay untouched.
+//
+// v1 scope is claude-code (native OS) ONLY — see
+// runStatuslineInit's doc comment in cmd/observer/init.go for the
+// cross-OS (WSL bridge) decision: a Windows-side Claude Code reached
+// only via crossmount is deliberately NOT bridged here (unlike hooks,
+// a statusLine command runs on every render tick, and a wsl.exe
+// subprocess spawn per tick risks the plan's <100ms budget); the
+// caller WARNs instead of silently doing nothing.
+
+// claudeStatuslineEntry is the shape written into settings.json's
+// top-level "statusLine" key: `{"type":"command","command":"<bin>
+// statusline","padding":0}`. Distinct from claudeHookGroup/
+// claudeHookCommand — the "statusLine" key is never merged with
+// "hooks" (CLAUDE.md #4: one owner per piece of state; this struct
+// owns exactly the "statusLine" value, nothing else in the file).
+type claudeStatuslineEntry struct {
+	Type    string `json:"type"`
+	Command string `json:"command"`
+	Padding int    `json:"padding"`
+}
+
+// isObserverStatuslineEntry recognises a "statusLine" command as one
+// previously written by ANY observer registrar. Unlike
+// isObserverClaudeEntry — whose ` hook claude-code ` signature is
+// observer-internal syntax nobody else writes — "statusline" is a
+// GENERIC word other statusline tools use as a subcommand, so a bare
+// substring test is not a safe ownership signal: `node /opt/acme
+// statusline --theme compact` would have been silently overwritten by
+// register (or uninstalled by unregister) as if it were ours.
+//
+// Ownership therefore requires BOTH halves of the command shape we
+// actually write (`<quoted-bin-path> statusline`):
+//
+//  1. the executable token's basename is an observer binary
+//     (isObserverBinaryToken), and
+//  2. the very next argument is exactly "statusline".
+//
+// Anything else — a foreign executable, "statusline" appearing only as
+// a later flag value, an unparseable command — is FOREIGN, which means
+// register blocks without --force and unregister leaves it alone.
+// Trailing arguments after "statusline" are tolerated so a future
+// flag-carrying variant of our own command still refreshes rather than
+// tripping the conflict guard.
+func isObserverStatuslineEntry(cmd string) bool {
+	toks := splitCommandTokens(cmd)
+	if len(toks) < 2 || toks[1] != "statusline" {
+		return false
+	}
+	return isObserverBinaryToken(toks[0])
+}
+
+// isObserverBinaryToken reports whether an executable token names an
+// observer binary, by basename. Accepts the plain names (`observer`,
+// `superbased`, with or without a `.exe` tail) plus the
+// `observer-<something>` / `superbased-<something>` family, because
+// real installs DO carry suffixed names (`observer-v1.8.3` from a
+// versioned download, `observer-hermes.exe`, a `/tmp/observer-A` A/B
+// build) and a path-shape-strict test would misclassify our own
+// earlier registration as foreign — the exact failure mode
+// isObserverClaudeEntry's content-heuristic exists to avoid (a stale
+// entry that can no longer be refreshed without --force).
+// Case-insensitive: Windows paths are.
+func isObserverBinaryToken(tok string) bool {
+	base := strings.ToLower(commandBaseName(tok))
+	base = strings.TrimSuffix(base, ".exe")
+	if base == "observer" || base == "superbased" {
+		return true
+	}
+	return strings.HasPrefix(base, "observer-") || strings.HasPrefix(base, "superbased-")
+}
+
+// commandBaseName returns the final path element of an executable
+// token, splitting on EITHER separator — the token may be a
+// forward-slash-normalized Windows path (see forwardSlashPath) or a
+// native backslash one, and filepath.Base only knows the host's
+// separator.
+func commandBaseName(tok string) string {
+	if i := strings.LastIndexAny(tok, `/\`); i >= 0 {
+		return tok[i+1:]
+	}
+	return tok
+}
+
+// splitCommandTokens splits a registered hook/statusline command string
+// into argv-ish tokens, honouring the quoting our own writers emit
+// (shellQuote's POSIX single quotes, including the close-escape-reopen
+// form it emits for an embedded quote character — see shellQuote) plus
+// double quotes and backslash escapes for
+// hand-written entries. Deliberately small: it exists to answer "what
+// is the executable, and what is its first argument", not to be a
+// shell. Unbalanced quotes simply yield whatever tokens were closed,
+// which the callers treat as ambiguous ⇒ foreign.
+func splitCommandTokens(cmd string) []string {
+	var (
+		toks    []string
+		cur     []byte
+		started bool
+		inSing  bool
+		inDoub  bool
+	)
+	flush := func() {
+		if started {
+			toks = append(toks, string(cur))
+			cur = cur[:0]
+			started = false
+		}
+	}
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+		switch {
+		case inSing:
+			if c == '\'' {
+				inSing = false
+				continue
+			}
+			cur = append(cur, c)
+		case inDoub:
+			if c == '"' {
+				inDoub = false
+				continue
+			}
+			if c == '\\' && i+1 < len(cmd) {
+				i++
+				cur = append(cur, cmd[i])
+				continue
+			}
+			cur = append(cur, c)
+		case c == '\'':
+			inSing, started = true, true
+		case c == '"':
+			inDoub, started = true, true
+		case c == '\\' && i+1 < len(cmd):
+			i++
+			cur = append(cur, cmd[i])
+			started = true
+		case c == ' ' || c == '\t':
+			flush()
+		default:
+			cur = append(cur, c)
+			started = true
+		}
+	}
+	flush()
+	return toks
+}
+
+// registerClaudeCodeStatusline installs (or refreshes) the
+// "statusLine" top-level key in ~/.claude/settings.json, wired to
+// `<binary> statusline`. Conflict discipline mirrors
+// hasConflictingClaudeHook: a foreign (non-observer) existing value
+// blocks without --force — more conservative here than for hooks,
+// because "statusLine" is a single, visible UI slot (unlike hooks,
+// which fan out across many named events with no single-slot
+// contention), so clobbering a user's own statusline silently would
+// be a materially worse experience than clobbering one hook event.
+// An observer-recognised entry (by isObserverStatuslineEntry)
+// refreshes silently on drift (binary path moved, quoting changed).
+// An entry that already matches byte-for-byte is reported via
+// AlreadySet and the file is NOT rewritten at all (idempotent
+// re-run — no needless mtime/checksum churn), mirroring how
+// registerClaudeCode's observerCmdMatches short-circuits per event.
+func (r *Registry) registerClaudeCodeStatusline() RegistrationResult {
+	res := RegistrationResult{Tool: "claude-code-statusline", DryRun: r.opts.DryRun}
+	settingsDir := filepath.Join(r.opts.HomeDir, ".claude")
+	path := filepath.Join(settingsDir, "settings.json")
+	res.ConfigPath = path
+
+	unlock, err := r.lockSettings(path)
+	if err != nil {
+		res.Error = fmt.Errorf("hook.registerClaudeCodeStatusline: %w", err)
+		return res
+	}
+	defer unlock()
+
+	// Pin the write target now, before the read — see pinnedTarget (F6).
+	pinned := pinWriteTarget(path)
+
+	raw, err := readSettingsFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		res.Error = fmt.Errorf("hook.registerClaudeCodeStatusline: read: %w", err)
+		return res
+	}
+	// Preserve unknown top-level fields (including "hooks") via
+	// map[string]json.RawMessage — identical shape to registerClaudeCode.
+	settings := map[string]json.RawMessage{}
+	if len(raw) > 0 {
+		settings, err = decodeSettingsObject(path, raw)
+		if err != nil {
+			res.Error = fmt.Errorf("hook.registerClaudeCodeStatusline: %w", err)
+			return res
+		}
+	}
+
+	// Same forward-slash + shell-quote binary-path handling the hook
+	// registrars use — see forwardSlashPath's docstring for the Git
+	// Bash / harness-wrapper rationale.
+	binPath := forwardSlashPath(r.opts.BinaryPath)
+	desired := claudeStatuslineEntry{
+		Type:    "command",
+		Command: shellQuoteIfNeeded(binPath) + " statusline",
+		Padding: 0,
+	}
+
+	if existing, ok := settings["statusLine"]; ok {
+		var cur claudeStatuslineEntry
+		parsed := json.Unmarshal(existing, &cur) == nil
+		switch {
+		case parsed && cur == desired:
+			res.AlreadySet = append(res.AlreadySet, "statusLine")
+			return res
+		case parsed && isObserverStatuslineEntry(cur.Command):
+			// Observer-owned but stale (binary path/quoting drifted) —
+			// silently refresh; fall through to overwrite below.
+		case r.opts.Force:
+			// Foreign (or unparseable) value, but the operator passed
+			// --force — fall through to overwrite below.
+		default:
+			shape := string(existing)
+			if parsed {
+				shape = cur.Command
+			}
+			res.Error = fmt.Errorf("hook.registerClaudeCodeStatusline: %s already has a non-observer \"statusLine\" command %q; pass --force to overwrite", path, shape)
+			return res
+		}
+	}
+
+	patched, err := json.Marshal(desired)
+	if err != nil {
+		res.Error = fmt.Errorf("hook.registerClaudeCodeStatusline: marshal: %w", err)
+		return res
+	}
+	settings["statusLine"] = patched
+	res.HooksAdded = append(res.HooksAdded, "statusLine")
+
+	if r.opts.DryRun {
+		return res
+	}
+	if err := writeJSONIndented(settingsDir, pinned, settings); err != nil {
+		res.Error = err
+		return res
+	}
+	if err := r.recordChecksum(path); err != nil {
+		res.Error = err
+		return res
+	}
+	return res
+}
+
+// unregisterClaudeCodeStatusline removes the "statusLine" top-level
+// key from ~/.claude/settings.json ENTIRELY (not blanked) — so a user
+// who opts out gets Claude Code's own default statusline back, not an
+// empty one. Only an entry recognised as observer-written (via
+// isObserverStatuslineEntry) is ever removed; a foreign/user-authored
+// "statusLine" is left untouched and reported via HooksKept, mirroring
+// how unregisterClaudeCode preserves non-observer hook entries without
+// requiring --force to do so (Force here gates ONLY the checksum-drift
+// guard below, exactly like the hook unregistrars).
+func (r *Registry) unregisterClaudeCodeStatusline() UnregistrationResult {
+	res := UnregistrationResult{Tool: "claude-code-statusline", DryRun: r.opts.DryRun}
+	settingsDir := filepath.Join(r.opts.HomeDir, ".claude")
+	path := filepath.Join(settingsDir, "settings.json")
+	res.ConfigPath = path
+
+	unlock, err := r.lockSettings(path)
+	if err != nil {
+		res.Error = fmt.Errorf("hook.unregisterClaudeCodeStatusline: %w", err)
+		return res
+	}
+	defer unlock()
+
+	// Pin the write target now, before the read — see pinnedTarget (F6).
+	pinned := pinWriteTarget(path)
+
+	raw, err := readSettingsFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			res.Skipped = true
+			return res
+		}
+		res.Error = fmt.Errorf("hook.unregisterClaudeCodeStatusline: read: %w", err)
+		return res
+	}
+
+	settings, err := decodeSettingsObject(path, raw)
+	if err != nil {
+		res.Error = fmt.Errorf("hook.unregisterClaudeCodeStatusline: %w", err)
+		return res
+	}
+
+	existing, ok := settings["statusLine"]
+	if !ok {
+		res.Skipped = true
+		return res
+	}
+	var cur claudeStatuslineEntry
+	if err := json.Unmarshal(existing, &cur); err != nil || !isObserverStatuslineEntry(cur.Command) {
+		// Foreign (or unparseable) "statusLine" — a user-authored
+		// statusline (or another tool's). Never removed by uninstall;
+		// no --force override for this case (only for checksum drift
+		// below), mirroring the hook unregistrars' HooksKept posture.
+		res.HooksKept = append(res.HooksKept, "statusLine")
+		res.Skipped = true
+		return res
+	}
+
+	// There is real work to do — verify the file hasn't drifted since
+	// we installed, so we don't clobber user edits made to OTHER keys
+	// in the same file. Passing --force bypasses the guard. Note the
+	// checksum registry tracks this whole FILE (not the "statusLine"
+	// key specifically) — the same coarse, file-granularity contract
+	// registerClaudeCode's recordChecksum already uses for "hooks".
+	match, err := r.checksumMatches(path, raw)
+	if err != nil {
+		res.Error = fmt.Errorf("hook.unregisterClaudeCodeStatusline: checksum: %w", err)
+		return res
+	}
+	res.ChecksumMatch = match
+	if !match && !r.opts.Force {
+		res.Error = fmt.Errorf("hook.unregisterClaudeCodeStatusline: %s has been modified since install (checksum mismatch); pass --force to remove anyway", path)
+		return res
+	}
+
+	delete(settings, "statusLine")
+	res.HooksRemoved = append(res.HooksRemoved, "statusLine")
+
+	if r.opts.DryRun {
+		return res
+	}
+
+	if len(settings) == 0 {
+		if err := removeEmptyConfigFile(path, raw); err != nil {
+			res.Error = fmt.Errorf("hook.unregisterClaudeCodeStatusline: remove empty %s: %w", path, err)
+			return res
+		}
+	} else {
+		if err := writeJSONIndented(settingsDir, pinned, settings); err != nil {
+			res.Error = err
+			return res
+		}
+	}
+	if err := r.removeChecksum(path); err != nil {
+		res.Error = err
+		return res
+	}
+	return res
+}
+
+// RegisterClaudeCodeStatusline is the exported entry point for the
+// statusline registration path. Deliberately NOT reached through the
+// tool-name-dispatched Register(tool string) switch above (adding a
+// case there would touch an existing function this WP must leave
+// byte-identical) — callers (cmd/observer/init.go's `observer init
+// --statusline`) call this directly instead. Opt-in only: never
+// called by `observer start`'s hook auto-register path, matching the
+// MCP/proxy-route precedent (CLAUDE.md's `observer start` invariant).
+func (r *Registry) RegisterClaudeCodeStatusline() RegistrationResult {
+	return r.registerClaudeCodeStatusline()
+}
+
+// UnregisterClaudeCodeStatusline is the exported entry point for
+// removing the statusline registration — the `observer init
+// --statusline --uninstall` path. See RegisterClaudeCodeStatusline's
+// doc comment for why this is a direct call rather than a Unregister
+// switch case.
+func (r *Registry) UnregisterClaudeCodeStatusline() UnregistrationResult {
+	return r.unregisterClaudeCodeStatusline()
 }

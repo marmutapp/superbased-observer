@@ -1,0 +1,47 @@
+{
+  "name": "@superbased/opencode-plugin",
+  "version": "1.28.0",
+  "description": "SuperBased Observer for OpenCode — registers the local observer MCP server (token, cost and cache observability). Requires the `observer` binary already on your PATH (npm i -g @superbased/observer, or pipx install superbased-observer) — this package is wiring only and installs no binary.",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "mcp",
+    "observability",
+    "cost",
+    "tokens"
+  ],
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Santosh Kathira",
+    "email": "contact@superbased.app",
+    "url": "https://superbased.app/"
+  },
+  "homepage": "https://superbased.app/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/superbasedapp/plugins.git",
+    "directory": "opencode"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.10",
+    "typescript": "^5.7.2"
+  }
+}

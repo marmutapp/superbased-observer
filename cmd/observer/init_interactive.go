@@ -308,6 +308,17 @@ func runInteractiveInit(out io.Writer, in io.Reader, opts interactiveInitOptions
 			switch {
 			case pre.Error != nil:
 				fmt.Fprintf(out, "  hooks: ✗ %v\n", pre.Error)
+			// Skipped is NOT "already set": nothing is in ConfigPath and
+			// nothing will be. Never offer a consent for a write the
+			// registrar would then decline — say what is actually true.
+			case pre.Skipped && pre.SkipAdvice != "":
+				// A skip with its OWN advice is not the plugin case (today:
+				// the cross-OS sandbox gate, where --force does not apply).
+				fmt.Fprintf(out, "  hooks: skipped — %s\n", pre.SkipReason)
+				fmt.Fprintf(out, "         %s\n", pre.SkipAdvice)
+			case pre.Skipped:
+				fmt.Fprintf(out, "  hooks: wired via the Claude Code plugin — %s\n", pre.SkipReason)
+				fmt.Fprintln(out, "         nothing to register; `observer init --force` would add a second copy.")
 			case len(pre.HooksAdded) == 0:
 				fmt.Fprintf(out, "  hooks: already set in %s\n", pre.ConfigPath)
 			default:
@@ -334,6 +345,15 @@ func runInteractiveInit(out io.Writer, in io.Reader, opts interactiveInitOptions
 			switch {
 			case pre.Error != nil:
 				fmt.Fprintf(out, "  mcp: ✗ %v\n", pre.Error)
+			// As above: a skipped preview must not become a consent item.
+			case pre.Skipped && pre.SkipAdvice != "":
+				// See the hooks branch: a self-described skip is not the
+				// plugin case.
+				fmt.Fprintf(out, "  mcp: skipped — %s\n", pre.SkipReason)
+				fmt.Fprintf(out, "       %s\n", pre.SkipAdvice)
+			case pre.Skipped:
+				fmt.Fprintf(out, "  mcp: wired via the Claude Code plugin — %s\n", pre.SkipReason)
+				fmt.Fprintln(out, "       nothing to register; a second copy would load the tool schema twice.")
 			case pre.AlreadySet:
 				fmt.Fprintf(out, "  mcp: already set in %s\n", pre.ConfigPath)
 			default:

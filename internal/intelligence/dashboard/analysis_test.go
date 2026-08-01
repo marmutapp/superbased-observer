@@ -546,6 +546,245 @@ func TestAnalysisHeadline_CacheSavings(t *testing.T) {
 	}
 }
 
+// TestAnalysisHeadline_CacheSavingsRecordedRows pins the 2026-07-30 fix
+// for the "recorded > 0 suppresses cache_savings" bug: before the fix,
+// any turn with a proxy/JSONL-populated cost_usd set rowAltCost ==
+// rowCost, so `rowAltCost > rowCost` could never fire and the turn
+// contributed exactly $0 to cache_savings regardless of how much
+// cache_read traffic it carried — a ~3× understatement on a real
+// corpus where proxy-recorded turns are the majority of spend.
+//
+// Three cases, table-driven:
+//
+//   - "recorded_priced": a proxy-recorded turn (cost_usd set to an
+//     arbitrary $5.00 — deliberately NOT the value the pricing table
+//     would compute, to prove the recorded total is preserved as
+//     ground truth) on a model the pricing table knows. Must now
+//     contribute the same $0.27 delta as the non-recorded case
+//     (100K cache_read tokens on claude-sonnet-4-6: 100K × ($3 input
+//     − $0.30 cache_read)/1M = $0.27), AND period cost_usd must still
+//     equal the recorded $5.00 exactly (never overridden by a modeled
+//     figure).
+//   - "recorded_unpriced": a proxy-recorded turn on a model with NO
+//     pricing-table entry. Must contribute exactly $0 — honesty
+//     requirement: never invent a counterfactual without a pricing
+//     basis.
+//   - "unrecorded_logtier": a non-recorded (token_usage / log-tier)
+//     turn with identical cache_read tokens on the same priced model.
+//     Already worked before the fix; pinned here to prove the fix left
+//     this path unchanged.
+func TestAnalysisHeadline_CacheSavingsRecordedRows(t *testing.T) {
+	cases := []struct {
+		name           string
+		model          string
+		recordedCost   float64 // 0 means "insert via token_usage, unrecorded"
+		wantSavingsUSD float64
+		wantPeriodCost float64 // 0 => don't assert (log-tier path computes its own)
+	}{
+		{
+			name:           "recorded_priced",
+			model:          "claude-sonnet-4-6",
+			recordedCost:   5.00,
+			wantSavingsUSD: 0.27,
+			wantPeriodCost: 5.00,
+		},
+		{
+			name:           "recorded_unpriced",
+			model:          "some-bogus-model-xyz",
+			recordedCost:   5.00,
+			wantSavingsUSD: 0,
+			wantPeriodCost: 5.00,
+		},
+		{
+			name:           "unrecorded_logtier",
+			model:          "claude-sonnet-4-6",
+			recordedCost:   0,
+			wantSavingsUSD: 0.27,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "d.db")
+			database, err := db.Open(context.Background(), db.Options{Path: path})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { database.Close() })
+			st := store.New(database)
+			root := t.TempDir()
+			if _, err := st.Ingest(context.Background(), []models.ToolEvent{{
+				SourceFile: "f", SourceEventID: "e1", SessionID: "sCSR",
+				ProjectRoot: root, Timestamp: time.Now().UTC().Add(-time.Hour),
+				Tool: models.ToolClaudeCode, ActionType: models.ActionReadFile,
+				Target: "a.go", Success: true,
+			}}, nil, store.IngestOptions{}); err != nil {
+				t.Fatal(err)
+			}
+
+			if tc.recordedCost > 0 {
+				if _, err := st.InsertAPITurn(context.Background(), models.APITurn{
+					SessionID: "sCSR", Provider: models.ProviderAnthropic,
+					Model: tc.model, CacheReadTokens: 100_000,
+					Timestamp: time.Now().UTC().Add(-24 * time.Hour),
+					RequestID: "msg_csr_" + tc.name,
+					CostUSD:   tc.recordedCost,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if _, err := st.InsertTokenEvents(context.Background(), []models.TokenEvent{{
+					SourceFile: "f.jsonl", SourceEventID: "e_csr_" + tc.name,
+					SessionID: "sCSR", ProjectRoot: root,
+					Timestamp: time.Now().UTC().Add(-24 * time.Hour),
+					Tool:      models.ToolClaudeCode, Model: tc.model,
+					CacheReadTokens: 100_000,
+					Source:          models.TokenSourceJSONL, Reliability: models.ReliabilityApproximate,
+				}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			server, err := New(Options{DB: database, DBPath: path})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := openHeadline(t, server, 7)
+			if got.CacheSavings.CacheReadTokens != 100_000 {
+				t.Errorf("cache_read_tokens: got %d want 100000", got.CacheSavings.CacheReadTokens)
+			}
+			if !approx(got.CacheSavings.USD, tc.wantSavingsUSD) {
+				t.Errorf("cache_savings.usd: got %v want %v", got.CacheSavings.USD, tc.wantSavingsUSD)
+			}
+			if tc.wantPeriodCost > 0 && !approx(got.Period.CostUSD, tc.wantPeriodCost) {
+				t.Errorf("period.cost_usd: got %v want %v (recorded total must be preserved)",
+					got.Period.CostUSD, tc.wantPeriodCost)
+			}
+		})
+	}
+}
+
+// TestAnalysisHeadline_LCSurchargeClampedToRecorded is the F5 regression
+// test (2026-07-30 adversarial review). A recorded row's rowStdCost =
+// recorded - (computedCost - computedStd) had no lower bound: when the
+// pricing table's modeled LC delta exceeds the row's own recorded
+// (authoritative) cost, rowStdCost went negative and the LC surcharge
+// tile reported a surcharge larger than the entire recorded spend — an
+// impossible number.
+//
+// One claude-sonnet-4-20250514 turn (Sonnet 4 with the 200K LC tier):
+// recorded=$0.10 (proxy ground truth, deliberately tiny — e.g. a
+// discounted lane), 1,000,000 input tokens (well over the 200K LC
+// threshold). Modeled LC delta at the pricing table's rates:
+// computedStd = 1,000,000 × $3/M = $3.00, computedCost (LC) =
+// 1,000,000 × $6/M = $6.00, delta = $3.00 — 30× the recorded cost.
+// The fix clamps the applied delta at `recorded`, so:
+//   - lc_surcharge_usd must be AT MOST $0.10 (never $3.00)
+//   - period.cost_usd (rowCost = recorded, untouched) stays $0.10
+//   - the clamp forces rowStdCost = recorded - min(delta, recorded) = 0,
+//     which is still >= 0 — the invariant under test.
+func TestAnalysisHeadline_LCSurchargeClampedToRecorded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "d.db")
+	database, err := db.Open(context.Background(), db.Options{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	st := store.New(database)
+	root := t.TempDir()
+	if _, err := st.Ingest(context.Background(), []models.ToolEvent{{
+		SourceFile: "f", SourceEventID: "e1", SessionID: "sClamp",
+		ProjectRoot: root, Timestamp: time.Now().UTC().Add(-time.Hour),
+		Tool: models.ToolClaudeCode, ActionType: models.ActionReadFile,
+		Target: "a.go", Success: true,
+	}}, nil, store.IngestOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.InsertAPITurn(context.Background(), models.APITurn{
+		SessionID: "sClamp", Provider: models.ProviderAnthropic,
+		Model: "claude-sonnet-4-20250514", InputTokens: 1_000_000,
+		Timestamp: time.Now().UTC().Add(-24 * time.Hour),
+		RequestID: "msg_clamp_lc", CostUSD: 0.10,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	server, err := New(Options{DB: database, DBPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := openHeadline(t, server, 7)
+	const recorded = 0.10
+	if got.HighContext.LCSurchargeUSD > recorded+1e-9 {
+		t.Errorf("lc_surcharge_usd: got %v, must be clamped to at most the recorded cost %v",
+			got.HighContext.LCSurchargeUSD, recorded)
+	}
+	if !approx(got.HighContext.LCSurchargeUSD, recorded) {
+		t.Errorf("lc_surcharge_usd: got %v want %v (clamped to the full recorded amount since the modeled delta $3.00 exceeds it)",
+			got.HighContext.LCSurchargeUSD, recorded)
+	}
+	if !approx(got.Period.CostUSD, recorded) {
+		t.Errorf("period.cost_usd must stay the recorded ground truth: got %v want %v",
+			got.Period.CostUSD, recorded)
+	}
+}
+
+// TestAnalysisHeadline_CacheSavingsFastTierPricedAtFastRate is the F6
+// regression test (2026-07-30 adversarial review) for
+// handleAnalysisHeadline. The headline query didn't select api_turns.fast
+// / token_usage.fast, so bundle.Fast was always false and cost.Compute
+// priced every counterfactual delta at standard rates — undercounting a
+// fast-tier turn's cache-savings delta by the FastMultiplier.
+//
+// One recorded claude-opus-4-8 turn (FastMultiplier=2), Fast=true,
+// 100,000 cache_read tokens, recorded cost $5.00 (ground truth,
+// unrelated to the counterfactual — only the delta matters here):
+//   - actual  = cache_read 100K × $0.50/M × fast(2)  = $0.10
+//   - alt     = input      100K × $5.00/M × fast(2)  = $1.00
+//   - delta   = alt - actual                          = $0.90
+//
+// Pre-fix (Fast always scanned as false) the same shapes price at
+// standard (non-fast) rates: actual=$0.05, alt=$0.50, delta=$0.45 — half
+// the correct value. cache_savings.usd must reflect the fast-priced
+// $0.90 delta, not the standard-priced $0.45.
+func TestAnalysisHeadline_CacheSavingsFastTierPricedAtFastRate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "d.db")
+	database, err := db.Open(context.Background(), db.Options{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	st := store.New(database)
+	root := t.TempDir()
+	if _, err := st.Ingest(context.Background(), []models.ToolEvent{{
+		SourceFile: "f", SourceEventID: "e1", SessionID: "sFastCS",
+		ProjectRoot: root, Timestamp: time.Now().UTC().Add(-time.Hour),
+		Tool: models.ToolClaudeCode, ActionType: models.ActionReadFile,
+		Target: "a.go", Success: true,
+	}}, nil, store.IngestOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.InsertAPITurn(context.Background(), models.APITurn{
+		SessionID: "sFastCS", Provider: models.ProviderAnthropic,
+		Model: "claude-opus-4-8", CacheReadTokens: 100_000, Fast: true,
+		Timestamp: time.Now().UTC().Add(-24 * time.Hour),
+		RequestID: "msg_fast_cs", CostUSD: 5.00,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	server, err := New(Options{DB: database, DBPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := openHeadline(t, server, 7)
+	const wantSavings = 0.90
+	if !approx(got.CacheSavings.USD, wantSavings) {
+		t.Errorf("cache_savings.usd: got %v want %v (fast-tier delta undercounted if bundle.Fast wasn't scanned)",
+			got.CacheSavings.USD, wantSavings)
+	}
+}
+
 // TestAnalysisHeadline_PerTurnDistribution pins mean + p95 across a
 // known cost distribution. Sample size is N=10 so the impl's
 // p95Idx = int(0.95*10 + 0.5) - 1 = 9 lands cleanly on the outlier
@@ -1826,8 +2065,15 @@ func TestAnalysisCacheSavingsTrend_EmptyReturnsNoPoints(t *testing.T) {
 // day with 100K cache_read each → savings = 2 × $0.27 = $0.54.
 // A separate Opus 4.7 turn next day with 50K cache_read at the Opus
 // rates (input $5/M, cache_read $0.50/M) → savings = 50K × ($5 − $0.50)/M = $0.225.
-// Recorded-cost rows are excluded so a third turn with CostUSD>0 is
-// silently dropped from the trend.
+//
+// A fourth turn on day B is proxy-recorded (CostUSD set) on Sonnet 4.6
+// with 1M cache_read tokens. Post-2026-07-30 fix, a recorded row still
+// contributes its priced counterfactual delta — 1,000,000 × ($3 −
+// $0.30)/1M = $2.70 — because the pricing table gives a basis to
+// decompose it even though the proxy's own total is opaque; only rows
+// on models with NO pricing entry are excluded. Day B total is
+// therefore 0.225 + 2.70 = 2.925, and day B's cache_read_tokens
+// includes the recorded row's 1M (50,000 + 1,000,000 = 1,050,000).
 func TestAnalysisCacheSavingsTrend_DailySavingsAttribution(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
 	database, err := db.Open(context.Background(), db.Options{Path: path})
@@ -1871,7 +2117,10 @@ func TestAnalysisCacheSavingsTrend_DailySavingsAttribution(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// Recorded-cost row — excluded from cache savings (can't decompose).
+	// Recorded-cost row — now DOES contribute its priced counterfactual
+	// delta (see the fix note above); the proxy's own $0.05 total is not
+	// used for the savings math, only as the "this row is recorded"
+	// signal that no longer suppresses attribution.
 	if _, err := st.InsertAPITurn(context.Background(), models.APITurn{
 		SessionID: "sCST", Provider: models.ProviderAnthropic,
 		Model: "claude-sonnet-4-6", CacheReadTokens: 1_000_000,
@@ -1896,12 +2145,72 @@ func TestAnalysisCacheSavingsTrend_DailySavingsAttribution(t *testing.T) {
 	if !approx(byDay[dayAKey], 0.54) {
 		t.Errorf("day A savings: got %v want 0.54", byDay[dayAKey])
 	}
-	if !approx(byDay[dayBKey], 0.225) {
-		t.Errorf("day B savings: got %v want 0.225", byDay[dayBKey])
+	if !approx(byDay[dayBKey], 2.925) {
+		t.Errorf("day B savings: got %v want 2.925 (0.225 opus + 2.70 recorded-row delta)", byDay[dayBKey])
 	}
-	if tokenByDay[dayBKey] != 50_000 {
-		t.Errorf("day B cache_read_tokens (recorded row excluded): got %d want 50000",
+	if tokenByDay[dayBKey] != 1_050_000 {
+		t.Errorf("day B cache_read_tokens (recorded row now included): got %d want 1050000",
 			tokenByDay[dayBKey])
+	}
+}
+
+// TestAnalysisCacheSavingsTrend_FastTierPricedAtFastRate is the F6
+// regression test (2026-07-30 adversarial review) for
+// handleAnalysisCacheSavingsTrend. Same defect as the headline tile: the
+// query didn't select the fast column, so every counterfactual delta
+// priced at standard rates regardless of the turn's actual fast-tier
+// status.
+//
+// One claude-opus-4-8 turn (FastMultiplier=2), Fast=true, 100,000
+// cache_read tokens:
+//   - actual = 100K × $0.50/M cache_read × fast(2) = $0.10
+//   - alt    = 100K × $5.00/M input      × fast(2) = $1.00
+//   - delta  = $0.90
+//
+// Pre-fix (fast never scanned) the same shapes price at standard rates:
+// actual=$0.05, alt=$0.50, delta=$0.45 — half the correct value.
+func TestAnalysisCacheSavingsTrend_FastTierPricedAtFastRate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "d.db")
+	database, err := db.Open(context.Background(), db.Options{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	st := store.New(database)
+	root := t.TempDir()
+	if _, err := st.Ingest(context.Background(), []models.ToolEvent{{
+		SourceFile: "f", SourceEventID: "e1", SessionID: "sFastCST",
+		ProjectRoot: root, Timestamp: time.Now().UTC().Add(-time.Hour),
+		Tool: models.ToolClaudeCode, ActionType: models.ActionReadFile,
+		Target: "a.go", Success: true,
+	}}, nil, store.IngestOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	day := time.Now().UTC().Add(-24 * time.Hour).Truncate(24 * time.Hour).Add(12 * time.Hour)
+	if _, err := st.InsertAPITurn(context.Background(), models.APITurn{
+		SessionID: "sFastCST", Provider: models.ProviderAnthropic,
+		Model: "claude-opus-4-8", CacheReadTokens: 100_000, Fast: true,
+		Timestamp: day, RequestID: "msg_fast_cst",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	server, err := New(Options{DB: database, DBPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := openCacheSavingsTrend(t, server, 7)
+	dayKey := day.Format("2006-01-02")
+	var savings float64
+	for _, p := range got.Points {
+		if p.Day == dayKey {
+			savings = p.SavingsUSD
+		}
+	}
+	const wantSavings = 0.90
+	if !approx(savings, wantSavings) {
+		t.Errorf("day savings: got %v want %v (fast-tier delta undercounted if fast wasn't scanned)",
+			savings, wantSavings)
 	}
 }
 

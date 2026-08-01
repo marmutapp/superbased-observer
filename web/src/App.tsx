@@ -12,6 +12,7 @@ import { Sidebar } from "@/components/Sidebar";
 import { TopBar } from "@/components/TopBar";
 import { RestartPendingBanner } from "@/components/RestartPendingBanner";
 import { DemoBanner } from "@/components/DemoBanner";
+import { AnnouncementBanner } from "@/components/AnnouncementBanner";
 import { BudgetBanner } from "@/components/BudgetBanner";
 import { FirstCaptureToast } from "@/components/FirstCaptureToast";
 import { ToastViewport } from "@/components/Toast";
@@ -245,6 +246,7 @@ export default function App() {
             <TopBar onHelp={openHelp} onMenu={() => setMobileNavOpen(true)} />
             <RestartPendingBanner />
             <DemoBanner />
+            <AnnouncementBanner />
             <BudgetBanner />
             <FirstCaptureToast />
             <ToastViewport />

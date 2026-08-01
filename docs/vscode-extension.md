@@ -48,7 +48,7 @@ and install via `code --install-extension <file>.vsix`.
 
 | Surface | Description |
 |---|---|
-| **Status bar** | Today's spend in the bottom-right (`$(graph) $313.85`), updated every 60 s. Click → open dashboard. Hover for delta vs yesterday, top model, burn rate, month projection. |
+| **Status bar** | Today's spend in the bottom-right (`$(graph) ▞ superbased $313.85`), updated every 60 s. Click → open dashboard. Hover for delta vs yesterday, top model, burn rate, month projection. The `▞ superbased` wordmark prefix is on by default; turn it off with `observer.statusBar.wordmark = false`. |
 | **Activity bar** | An `observer` view container with four `TreeView`s — **Today**, **Sessions**, **Discovery**, **Costs (7 d)**. Right-click any session row for **Open in Dashboard** / **Copy Session ID**. |
 | **Dashboard webview** | `SuperBased: Open Dashboard` opens the full React analytics SPA inside an editor tab. Same surface as the standalone `http://127.0.0.1:8081/` — Remote-SSH / Codespaces work via `portMapping`. |
 | **File-freshness decorations** | A small dot in the explorer next to files your AI tools touched in the last 24 h, with a Markdown hover showing last-read-by, edit count, stale re-read count, and the tools that touched it. |
@@ -84,6 +84,7 @@ Open the command palette (`Ctrl+Shift+P` / `⌘⇧P`) and search for
 | `observer.dashboard.port` | `8081` | Where the dashboard listens. |
 | `observer.proxy.port` | `8820` | Where the API proxy listens. |
 | `observer.statusBar.enabled` | `true` | Today-spend status bar item. |
+| `observer.statusBar.wordmark` | `true` | Show the `▞ superbased` wordmark prefix on the status bar's live-state text. |
 
 ## Binary management
 

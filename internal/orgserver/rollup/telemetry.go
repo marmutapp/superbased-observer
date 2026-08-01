@@ -29,7 +29,7 @@ import (
 //
 // Configured is false when no poller has populated any table in the window —
 // the honest "native telemetry not configured" empty state for the common case.
-func Telemetry(ctx context.Context, db *sql.DB, w Window, now time.Time) (TelemetryResult, error) {
+func Telemetry(ctx context.Context, db *sql.DB, w Window, now time.Time, copilotPerSeatPriceUSD float64) (TelemetryResult, error) {
 	sinceDay := now.UTC().AddDate(0, 0, -w.days()).Format("2006-01-02")
 	res := TelemetryResult{WindowDays: w.days(), Vendors: []VendorTelemetry{}}
 
@@ -41,7 +41,7 @@ func Telemetry(ctx context.Context, db *sql.DB, w Window, now time.Time) (Teleme
 	if err != nil {
 		return TelemetryResult{}, fmt.Errorf("rollup.Telemetry: codex: %w", err)
 	}
-	copilot, err := telemetryCopilot(ctx, db, sinceDay)
+	copilot, err := telemetryCopilot(ctx, db, sinceDay, copilotPerSeatPriceUSD)
 	if err != nil {
 		return TelemetryResult{}, fmt.Errorf("rollup.Telemetry: copilot: %w", err)
 	}
@@ -162,7 +162,7 @@ func telemetryCodex(ctx context.Context, db *sql.DB, sinceDay string) (*VendorTe
 // metrics (suggestions/acceptances/lines/chats); the point-in-time user gauges
 // (active_users/engaged_users) and the per-login active_seat marker are skipped
 // because summing them across days is misleading.
-func telemetryCopilot(ctx context.Context, db *sql.DB, sinceDay string) (*VendorTelemetry, error) {
+func telemetryCopilot(ctx context.Context, db *sql.DB, sinceDay string, perSeatPriceUSD float64) (*VendorTelemetry, error) {
 	days, last, err := telemetryMeta(ctx, db, "copilot_analytics_daily", sinceDay)
 	if err != nil || days == 0 {
 		return nil, err
@@ -195,7 +195,7 @@ func telemetryCopilot(ctx context.Context, db *sql.DB, sinceDay string) (*Vendor
 	v.CostUnit = costUnitLabel(overage, 0)
 	v.Engagement = engagementList(eng)
 	v.Surfaces = sortedKeys(surfaces)
-	if v.Seats, err = telemetryCopilotSeats(ctx, db, sinceDay); err != nil {
+	if v.Seats, err = telemetryCopilotSeats(ctx, db, sinceDay, perSeatPriceUSD); err != nil {
 		return nil, err
 	}
 	return v, nil
@@ -204,7 +204,7 @@ func telemetryCopilot(ctx context.Context, db *sql.DB, sinceDay string) (*Vendor
 // telemetryCopilotSeats reads the latest seat-breakdown snapshot in the window
 // (point-in-time — a monthly subscription, NOT additive across days). Returns
 // nil when no seat snapshot exists in the window.
-func telemetryCopilotSeats(ctx context.Context, db *sql.DB, sinceDay string) (*SeatStats, error) {
+func telemetryCopilotSeats(ctx context.Context, db *sql.DB, sinceDay string, perSeatPriceUSD float64) (*SeatStats, error) {
 	var maxDay string
 	err := db.QueryRowContext(ctx,
 		`SELECT COALESCE(MAX(day),'') FROM copilot_analytics_daily WHERE surface='seats' AND unit='seats' AND day >= ?`,
@@ -236,6 +236,12 @@ func telemetryCopilotSeats(ctx context.Context, db *sql.DB, sinceDay string) (*S
 		return nil, err
 	}
 	st.Utilization = fratio(st.Active, st.Total)
+	// Price the subscription. Left at zero (and omitted from JSON) when the
+	// plan price is unconfigured, so the surface never implies seats are free.
+	if perSeatPriceUSD > 0 {
+		st.PerSeatPriceUSD = perSeatPriceUSD
+		st.MonthlyUSD = st.Total * perSeatPriceUSD
+	}
 	return st, nil
 }
 

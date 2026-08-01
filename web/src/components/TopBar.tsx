@@ -6,7 +6,7 @@ import { useApi } from "@/lib/useApi";
 import { fmtDuration } from "@/lib/format";
 import { useTheme, type ThemeMode } from "@/lib/theme";
 import type { EnrolmentStatus, SetupClaude, StatusSnapshot } from "@/lib/types";
-import { isUpdateAvailable, useLatestVersion } from "@/lib/version";
+import { isUpdateAvailable, useUpdateCheck } from "@/lib/version";
 import { Tooltip } from "@/components/primitives";
 
 // `dashboard-refresh` is a window-level CustomEvent that useApi
@@ -230,11 +230,15 @@ function LastActivity({ iso }: { iso?: string }) {
 // the running daemon (per /api/status's version field) is behind the
 // latest @superbased/observer release on npm. Clicking opens the
 // GitHub release notes. Renders nothing on dev builds, when the
-// version field is empty, when the npm probe is still loading, or
-// when the install is already up-to-date — so the header is identical
-// to today's surface on the happy path.
+// version field is empty, when the install is already up-to-date, or
+// (as of the zero-network hardening pass) when no one has clicked
+// "Check for updates" yet in this tab (or a prior tab within the last
+// 6h) — so the header is identical to today's surface on the happy
+// path. This component NEVER triggers the npm fetch itself; it only
+// reads whatever useUpdateCheck() hydrated from cache. The clickable
+// check lives in Settings → Health.
 function UpdateAvailablePill({ current }: { current?: string }) {
-  const latest = useLatestVersion();
+  const { latest } = useUpdateCheck();
   if (!isUpdateAvailable(current, latest)) return null;
   const href = `https://github.com/superbasedapp/observer/releases/tag/v${latest}`;
   return (

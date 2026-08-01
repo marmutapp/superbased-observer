@@ -772,3 +772,44 @@ type RoutingPolicyDoc struct {
 	// agent on first receipt (enrolment-channel trust, §R19.1).
 	PublicKey string `json:"public_key"`
 }
+
+// OrgAnnouncementDoc is the rail-R3 org announcement document
+// (docs/plans/dashboard-announcements-banner-plan-2026-07-31.md §4).
+// It mirrors RoutingPolicyDoc field-for-field on purpose: the same
+// versioned + signed + TOFU-pinned distribution mechanism carries it,
+// and the agent verifies it with the same helper.
+//
+// The ONLY difference is what Body means. Here it is the plan §1
+// announcement JSON — either one object or an array of them — and an
+// EMPTY Body is the retraction: a published empty document is a valid,
+// signed, version-bumped instruction to show nothing. (Retraction has
+// to be a real published version, not a delete, because the agent's
+// monotonic-version short-circuit is what makes the poll cheap.)
+//
+// Nothing about this document is a remote control: it can only ever
+// put text in a dismissible banner. The node's [dashboard].
+// org_announcements switch silences it locally, and there is no
+// server-side toggle for that — same posture as share.full_content.
+type OrgAnnouncementDoc struct {
+	Version int64 `json:"version"`
+	// Body is the announcement JSON (a §1 object or an array of them).
+	// Empty means "retracted — show nothing".
+	Body string `json:"body"`
+	// BodyHash is hex(SHA-256(body)) — an integrity/dedup value for
+	// display. It is NOT what authorizes the document; see Signature.
+	BodyHash string `json:"body_hash"`
+	// Signature is base64(Ed25519 signature over
+	// AnnouncementSigningMessage(Version, Body)) made with the org
+	// server's distribution signing key — the SAME key that signs
+	// RoutingPolicyDoc (orgserver/routingpolicy.SigningKey).
+	//
+	// The signed message is domain-separated and version-bound, NOT the
+	// bare body: sharing one key across two rails is only safe if a
+	// signature minted for one cannot verify on the other, and a
+	// version-bumped replay of a captured document (an announcement, or
+	// an old retraction) must not be accepted by a node.
+	Signature string `json:"signature"`
+	// PublicKey is base64(Ed25519 public key) — TOFU-pinned by the
+	// agent on first receipt (enrolment-channel trust).
+	PublicKey string `json:"public_key"`
+}

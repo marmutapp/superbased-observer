@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/marmutapp/superbased-observer/internal/adapter/mirrorbase"
 	"github.com/marmutapp/superbased-observer/internal/platform/crossmount"
 )
 
@@ -40,7 +41,8 @@ var allHomesFunc = crossmount.AllHomes
 // `\\wsl.localhost\<distro>\…\sessions.db` would hit the same race
 // on a sufficiently loaded WSL writer).
 //
-// Mirror lives at `<UserCacheDir>/superbased-observer/clinecli-mirror/<hash>/`
+// Mirror lives at `mirrorbase.Base()/clinecli-mirror/<hash>/` — by
+// default `<UserCacheDir>/superbased-observer/clinecli-mirror/<hash>/`
 // where `<hash>` is the first 8 bytes of SHA-256(srcDB) hex-encoded.
 // Per-source so concurrent WSL + Windows installs don't trample each
 // other's mirrors.
@@ -48,12 +50,12 @@ func stageMirrorIfForeign(srcDB string) (string, error) {
 	if !isForeignMountPath(srcDB) {
 		return srcDB, nil
 	}
-	cache, err := os.UserCacheDir()
-	if err != nil || cache == "" {
-		cache = os.TempDir()
+	base, err := mirrorbase.Base()
+	if err != nil || base == "" {
+		base = filepath.Join(os.TempDir(), "superbased-observer")
 	}
 	sum := sha256.Sum256([]byte(srcDB))
-	mirrorDir := filepath.Join(cache, "superbased-observer", "clinecli-mirror", hex.EncodeToString(sum[:8]))
+	mirrorDir := filepath.Join(base, "clinecli-mirror", hex.EncodeToString(sum[:8]))
 	if err := os.MkdirAll(mirrorDir, 0o700); err != nil {
 		return "", fmt.Errorf("clinecli.stageMirror: mkdir %s: %w", mirrorDir, err)
 	}

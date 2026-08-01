@@ -23,6 +23,7 @@ import {
 } from "@/components/charts";
 import { ChartState } from "@/components/ChartState";
 import { BudgetCard } from "@/components/BudgetCard";
+import { HeroWordmark } from "@/components/HeroWordmark";
 import {
   useFilters,
   windowLabel,
@@ -93,7 +94,13 @@ export function CostPage() {
           as a 7th tile only when present (e.g. captured antigravity
           rows expose reasoning_tokens distinctly; Anthropic folds it
           into output and so this tile renders 0 / hidden there). */}
-      <div className={`grid grid-cols-2 gap-3 md:grid-cols-3 ${summary.reasoning > 0 ? "xl:grid-cols-7" : "xl:grid-cols-6"}`}>
+      <div
+        className={`relative grid grid-cols-2 gap-3 pb-4 md:grid-cols-3 ${(summary.reasoning ?? 0) > 0 ? "xl:grid-cols-7" : "xl:grid-cols-6"}`}
+      >
+        {/* Camera-ready pass (growth-review §4): this hero band is the
+            surface people screenshot for "what my AI coding actually
+            costs" posts — a subtle corner wordmark survives that crop. */}
+        <HeroWordmark />
         <StatCard
           label={`Total spend (${winLbl})`}
           helpId="metric.cost_usd"
@@ -155,7 +162,7 @@ export function CostPage() {
           spark={sparks.output}
           sparkColor="var(--tok-out)"
         />
-        {summary.reasoning > 0 && (
+        {(summary.reasoning ?? 0) > 0 && (
           <StatCard
             label="Reasoning"
             icon={<SparklesIcon />}
@@ -176,7 +183,7 @@ export function CostPage() {
           in panel header per design 1.13 / dC5. */}
       <ChartShell
         title="Cost by model"
-        sub={`Top ${models.data?.rows.length ?? 0} · per-bucket share, cost reliability, source · ${winLbl}`}
+        sub={`Top ${fmtInt(models.data?.rows.length)} · per-bucket share, cost reliability, source · ${winLbl}`}
         right={
           <div className="flex items-center gap-2">
             {(models.data?.fast_turn_count ?? 0) > 0 && (
@@ -351,24 +358,31 @@ function deriveSparks(ts?: CostTimeseries | null) {
   };
 }
 
+// Honesty rule (mirrors Overview.tsx's status.error / discover.data
+// pattern): a falsy `s` means "we don't have a resolved answer yet"
+// — either still loading or the query failed — never "the answer is
+// zero". Returning `undefined` fields here (instead of the old
+// all-zero object) lets fmtUSD/fmtInt/fmtCompact/fmtPct — which are
+// already null-safe, see lib/format.ts — render "—" for every tile
+// below rather than a confident "$0.00" while nothing has loaded.
+// Once `s` resolves, a genuine zero renders as a genuine zero.
 function summarize(s?: CostSummary | null) {
-  const z = {
-    input: 0,
-    output: 0,
-    cache_read: 0,
-    cache_creation: 0,
-    cache_creation_1h: 0,
-    reasoning: 0,
-    web_search_requests: 0,
-  };
   if (!s) {
     return {
-      cost: 0,
-      turns: 0,
-      tokens: z,
+      cost: undefined as number | undefined,
+      turns: undefined as number | undefined,
+      tokens: {
+        input: undefined as number | undefined,
+        output: undefined as number | undefined,
+        cache_read: undefined as number | undefined,
+        cache_creation: undefined as number | undefined,
+        cache_creation_1h: undefined as number | undefined,
+        reasoning: undefined as number | undefined,
+        web_search_requests: undefined as number | undefined,
+      },
       reliability: "",
-      cacheEfficacy: 0,
-      reasoning: 0,
+      cacheEfficacy: undefined as number | undefined,
+      reasoning: undefined as number | undefined,
     };
   }
   const t = s.total_tokens;

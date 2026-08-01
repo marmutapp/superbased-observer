@@ -596,3 +596,48 @@ func summarizeEvents(evs []models.ToolEvent) []string {
 	}
 	return out
 }
+
+// TestParseSessionFile_ThinkingMintsNoRowAndFansOut pins the B3
+// convergence for cowork (2026-07-31). A `thinking` content block used
+// to emit its own `cowork.reasoning` task_complete row AND accumulate
+// into the per-message reasoning buffer. The row is gone; the FAN-OUT
+// accumulate semantics are untouched — one thinking block precedes two
+// tool_use blocks in the same message and BOTH carry it.
+func TestParseSessionFile_ThinkingMintsNoRowAndFansOut(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	dir := filepath.Join(root, "cowork-zzzz", "dev-yyyy", "local_1111-2222-3333")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "audit.jsonl")
+	lines := []string{
+		`{"type":"system","subtype":"init","cwd":"/tmp/cowork-think","session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","tools":["Read","Bash"],"_audit_timestamp":"2026-07-31T10:00:00.000Z"}`,
+		`{"type":"user","uuid":"u-1","session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","message":{"role":"user","content":"do it"},"_audit_timestamp":"2026-07-31T10:00:01.000Z"}`,
+		`{"type":"assistant","uuid":"a-1","session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","message":{"id":"msg_think","role":"assistant","model":"claude-opus-4-6","content":[{"type":"thinking","thinking":"I should read the file, then list the dir."},{"type":"tool_use","id":"toolu_a","name":"Read","input":{"file_path":"/tmp/cowork-think/foo.go"}},{"type":"tool_use","id":"toolu_b","name":"Bash","input":{"command":"ls"}}]},"_audit_timestamp":"2026-07-31T10:00:02.000Z"}`,
+		"",
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := NewWithOptions(nil, root).ParseSessionFile(context.Background(), path, 0)
+	if err != nil {
+		t.Fatalf("ParseSessionFile: %v", err)
+	}
+	var threaded int
+	for _, ev := range res.ToolEvents {
+		if ev.RawToolName == "cowork.reasoning" {
+			t.Fatalf("cowork.reasoning row minted: %+v", ev)
+		}
+		if ev.SourceEventID == "toolu_a" || ev.SourceEventID == "toolu_b" {
+			if !strings.Contains(ev.PrecedingReasoning, "read the file, then list the dir") {
+				t.Errorf("%s PrecedingReasoning = %q, want the thinking text", ev.SourceEventID, ev.PrecedingReasoning)
+			}
+			threaded++
+		}
+	}
+	if threaded != 2 {
+		t.Fatalf("tool rows carrying the fanned-out reasoning = %d, want 2; events=%+v", threaded, res.ToolEvents)
+	}
+}

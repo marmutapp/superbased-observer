@@ -1,0 +1,34 @@
+name: Feedback & experience report
+description: Tell us how SuperBased is working for you — rough edges, surprises, wins. No bug required.
+title: "[Feedback]: "
+labels: ["feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This form is for open-ended feedback: things that felt rough,
+        things that surprised you (good or bad), workflows we should
+        understand better. If something is actually broken, the Bug
+        report form gets it triaged faster.
+  - type: textarea
+    id: feedback
+    attributes:
+      label: What's on your mind?
+      description: Anything — first-run impressions, a number that looked wrong, a workflow we made harder, a feature that earned its keep.
+    validations:
+      required: true
+  - type: input
+    id: tools
+    attributes:
+      label: Which AI coding tools do you use with it?
+      placeholder: e.g. Claude Code + Cursor
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`observer --version`"
+      placeholder: e.g. 1.28.0
+    validations:
+      required: false

@@ -1,0 +1,281 @@
+package dashboard
+
+// sessiontags.go — the session-classification API surface
+// (docs/plans/session-classification-tags-plan-2026-07-31.md §4):
+//
+//	GET  /api/sessions/tags          → vocabulary + per-tag cost/token rollup (V)
+//	POST /api/sessions/tags/manage   → rename / delete a tag globally (Execute)
+//	POST /api/session/<id>/tags      → per-session add/remove/favorite/note (Execute,
+//	                                   dispatched from handleSessionDetail's suffix
+//	                                   table + sessionSubRouteCapabilities)
+//
+// Execute (not Local) is deliberate: tagging from a phone during remote review
+// is a primary flow, and the Execute class already covers strictly more
+// powerful actions (/handoff, /launch, /resume). Annotation content is
+// user-authored review metadata, not machine-reaching config.
+//
+// All storage goes through the single internal/store/sessiontags.go seam.
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+	"sort"
+
+	"github.com/marmutapp/superbased-observer/internal/intelligence/cost"
+	"github.com/marmutapp/superbased-observer/internal/store"
+)
+
+// maxSessionTagFilters caps how many DISTINCT `tag=` filters one
+// GET /api/sessions request may carry (handleSessions). Each accepted tag
+// appends a correlated EXISTS subquery to the shared WHERE clause, which is
+// executed by the page query, the pagination COUNT and scored_count — so an
+// uncapped repeatable param lets one authenticated request cost an unbounded
+// amount of work. 8 is well past any real "filter by a few labels" use and far
+// below anything expensive; the per-session tag cap (store.MaxTagsPerSession,
+// 16) bounds what an AND-filter could ever usefully match anyway.
+const maxSessionTagFilters = 8
+
+// tagRollupRow is one row of the GET /api/sessions/tags response: a tag, how
+// many sessions carry it, and the summed cost/tokens of those sessions.
+type tagRollupRow struct {
+	Tag      string  `json:"tag"`
+	Sessions int     `json:"sessions"`
+	CostUSD  float64 `json:"cost_usd"`
+	Tokens   int64   `json:"tokens"`
+}
+
+// sessionTagsRequest is the POST /api/session/<id>/tags body. Favorite and Note
+// are POINTERS so an omitted (or null) field means "leave unchanged" — the star
+// toggle and the note editor write independently.
+type sessionTagsRequest struct {
+	Add      []string `json:"add"`
+	Remove   []string `json:"remove"`
+	Favorite *bool    `json:"favorite"`
+	Note     *string  `json:"note"`
+}
+
+// sessionTagsResponse is the post-mutation state of one session's
+// classification, echoed by POST /api/session/<id>/tags so the caller never has
+// to re-fetch.
+type sessionTagsResponse struct {
+	SessionID string   `json:"session_id"`
+	Tags      []string `json:"tags"`
+	Favorite  bool     `json:"favorite"`
+	Note      string   `json:"note"`
+}
+
+// tagsManageRequest is the POST /api/sessions/tags/manage body. Exactly one of
+// Rename / Delete must be set.
+type tagsManageRequest struct {
+	Rename *struct {
+		From string `json:"from"`
+		To   string `json:"to"`
+	} `json:"rename"`
+	Delete string `json:"delete"`
+}
+
+// tagRollup computes the per-tag session/cost/token rollup with ONE cost-engine
+// PASS (not one query per tag): every tagged session id is scoped into a
+// GroupBySession summary and the resulting rows are folded tag-wise in Go.
+//
+// The pass runs through cost.Engine.SessionRowsByID, which chunks the id set at
+// cost.MaxSessionIDsPerScope — a single IN list of every tagged session blows
+// SQLite's 32766 bind-variable ceiling once the vocabulary covers enough
+// sessions, and because the cost error is swallowed as an enrichment failure
+// (below) the symptom was silently ZEROED cost/token columns, not an error.
+//
+// Shared by the dashboard handler and (in spirit) `observer tags`; rows come
+// back sorted by cost desc, then session count desc, then tag asc.
+func (s *Server) tagRollup(r *http.Request) ([]tagRollupRow, error) {
+	st := store.New(s.db())
+	assignments, err := st.TagAssignments(r.Context())
+	if err != nil {
+		return nil, err
+	}
+	rows := []tagRollupRow{}
+	if len(assignments) == 0 {
+		return rows, nil
+	}
+	ids := make([]string, 0, len(assignments))
+	for id := range assignments {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	byID := map[string]cost.Row{}
+	if s.opts.CostEngine != nil {
+		priced, cErr := s.opts.CostEngine.SessionRowsByID(r.Context(), s.db(), cost.Options{
+			Days:   36500,
+			Source: cost.SourceAuto,
+		}, ids)
+		if cErr != nil {
+			// Cost is an ENRICHMENT of the vocabulary, not its substance —
+			// degrade to counts rather than failing the whole surface.
+			s.opts.Logger.Warn("sessions/tags: per-tag cost rollup failed", "err", cErr)
+		} else {
+			byID = priced
+		}
+	}
+
+	agg := map[string]*tagRollupRow{}
+	for _, id := range ids {
+		row, hasCost := byID[id]
+		for _, tag := range assignments[id] {
+			e, ok := agg[tag]
+			if !ok {
+				e = &tagRollupRow{Tag: tag}
+				agg[tag] = e
+			}
+			e.Sessions++
+			if hasCost {
+				e.CostUSD += row.CostUSD
+				e.Tokens += row.Tokens.Input + row.Tokens.Output +
+					row.Tokens.CacheRead + row.Tokens.CacheCreation
+			}
+		}
+	}
+	for _, e := range agg {
+		rows = append(rows, *e)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].CostUSD != rows[j].CostUSD {
+			return rows[i].CostUSD > rows[j].CostUSD
+		}
+		if rows[i].Sessions != rows[j].Sessions {
+			return rows[i].Sessions > rows[j].Sessions
+		}
+		return rows[i].Tag < rows[j].Tag
+	})
+	return rows, nil
+}
+
+// handleSessionsTags serves GET /api/sessions/tags — the tag vocabulary with
+// its per-tag session/cost/token rollup. Drives the Sessions page Tags panel
+// (analysis-by-label) and doubles as the TagEditor combobox vocabulary.
+func (s *Server) handleSessionsTags(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	rows, err := s.tagRollup(r)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{"tags": rows})
+}
+
+// handleSessionsTagsManage serves POST /api/sessions/tags/manage — vocabulary
+// management without a defs table: {"rename":{"from","to"}} merges the source
+// into the destination across every session; {"delete":"tag"} drops every
+// assignment. Responds {"affected": N} (assignment rows touched).
+func (s *Server) handleSessionsTagsManage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body tagsManageRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	hasRename := body.Rename != nil
+	hasDelete := body.Delete != ""
+	if hasRename == hasDelete {
+		http.Error(w, `body must carry exactly one of {"rename":{"from","to"}} or {"delete":"tag"}`, http.StatusBadRequest)
+		return
+	}
+
+	st := store.New(s.db())
+	var (
+		affected int64
+		err      error
+	)
+	if hasRename {
+		affected, err = st.RenameTag(r.Context(), body.Rename.From, body.Rename.To)
+	} else {
+		affected, err = st.DeleteTag(r.Context(), body.Delete)
+	}
+	if err != nil {
+		if errors.Is(err, store.ErrInvalidTag) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{"affected": affected})
+}
+
+// handleSessionTags serves POST /api/session/<id>/tags — the per-session
+// classification mutation. Body: {"add":[],"remove":[],"favorite":bool|null,
+// "note":string|null}; a null/absent favorite or note leaves that field
+// untouched. Responds with the session's resulting tags/favorite/note.
+func (s *Server) handleSessionTags(w http.ResponseWriter, r *http.Request, sessionID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if sessionID == "" {
+		http.Error(w, "missing session id", http.StatusBadRequest)
+		return
+	}
+	var body sessionTagsRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Validate EVERYTHING before the first write. The tag write and the
+	// annotation write are two store calls, so a body whose tags are valid but
+	// whose note is over-long would otherwise commit the tags and then 400 —
+	// a partial write indistinguishable, to the caller, from a total failure.
+	if err := store.ValidateClassificationInput(body.Add, body.Remove, body.Note); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	st := store.New(s.db())
+	if len(body.Add) > 0 || len(body.Remove) > 0 {
+		if err := st.MutateSessionTags(r.Context(), sessionID, body.Add, body.Remove); err != nil {
+			switch {
+			case errors.Is(err, store.ErrInvalidTag), errors.Is(err, store.ErrTooManyTags):
+				http.Error(w, err.Error(), http.StatusBadRequest)
+			default:
+				writeErr(w, err)
+			}
+			return
+		}
+	}
+	if body.Favorite != nil || body.Note != nil {
+		if err := st.SetSessionAnnotation(r.Context(), sessionID, body.Favorite, body.Note); err != nil {
+			if errors.Is(err, store.ErrNoteTooLong) {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			writeErr(w, err)
+			return
+		}
+	}
+
+	tags, err := st.SessionTags(r.Context(), sessionID)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if tags == nil {
+		tags = []string{}
+	}
+	annot, err := st.GetSessionAnnotation(r.Context(), sessionID)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, sessionTagsResponse{
+		SessionID: sessionID,
+		Tags:      tags,
+		Favorite:  annot.Favorite,
+		Note:      annot.Note,
+	})
+}

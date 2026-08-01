@@ -220,12 +220,14 @@ func TestMCPTargets(t *testing.T) {
 		format   MCPFormat
 		pathHint string
 	}{
-		"claude-code": {MCPServersJSON, ".claude.json"},
-		"cursor":      {MCPServersJSON, ".cursor/mcp.json"},
-		"codex":       {MCPCodexTOML, ".codex/config.toml"},
-		"hermes":      {MCPHermesYAML, ".hermes/config.yaml"},
-		"opencode":    {MCPOpenCodeJSON, ".config/opencode/opencode.json"},
-		"cline":       {MCPServersJSON, "<vscode>/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"},
+		"claude-code":  {MCPServersJSON, ".claude.json"},
+		"cursor":       {MCPServersJSON, ".cursor/mcp.json"},
+		"codex":        {MCPCodexTOML, ".codex/config.toml"},
+		"hermes":       {MCPHermesYAML, ".hermes/config.yaml"},
+		"opencode":     {MCPOpenCodeJSON, ".config/opencode/opencode.json"},
+		"cline":        {MCPServersJSON, "<vscode>/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"},
+		"droid":        {MCPServersJSON, ".factory/mcp.json"},
+		"command-code": {MCPServersJSON, ".commandcode/mcp.json"},
 	}
 	for _, c := range Capabilities() {
 		want, expect := wantImplemented[c.Tool]

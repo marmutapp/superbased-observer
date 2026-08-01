@@ -43,12 +43,26 @@ func ProvisionUser(ctx context.Context, db *sql.DB, email, displayName string) (
 
 // EnrolmentTokenInfo is one row of ListEnrolmentTokens. UsedAt is nil for
 // a token that hasn't been redeemed yet.
+//
+// MintedByEmail is the INVITER's address, empty for an unattributed mint
+// (the `observer-org invite` CLI, and every token minted before server
+// migration 023). Together with UsedAt it is the whole invite→enrolment
+// conversion read: it lives in the org's own DB and crosses no wire.
+//
+// When the inviter's org_members row is gone — SCIM deleted them, which
+// cascades — the field falls back to the RAW minted_by user id rather than
+// going blank. enrolment_tokens.minted_by is deliberately not a foreign key
+// precisely so the attribution survives the deprovision (migration 023); a
+// COALESCE that only looked at the joined email threw that away and made an
+// off-boarded inviter's outstanding tokens read as "nobody minted these".
+// The value is therefore an email OR an opaque id; render it as-is.
 type EnrolmentTokenInfo struct {
-	TokenID   string
-	UserEmail string
-	CreatedAt time.Time
-	ExpiresAt time.Time
-	UsedAt    *time.Time
+	TokenID       string
+	UserEmail     string
+	MintedByEmail string
+	CreatedAt     time.Time
+	ExpiresAt     time.Time
+	UsedAt        *time.Time
 }
 
 // Redeemed reports whether the token has been consumed.
@@ -64,9 +78,10 @@ func (e EnrolmentTokenInfo) Expired(now time.Time) bool { return now.After(e.Exp
 // non-secret token_id, owner, and lifecycle timestamps.
 func ListEnrolmentTokens(ctx context.Context, db *sql.DB) ([]EnrolmentTokenInfo, error) {
 	rows, err := db.QueryContext(ctx,
-		`SELECT et.id, m.email, et.created_at, et.expires_at, et.used_at
+		`SELECT et.id, m.email, COALESCE(inv.email, et.minted_by, ''), et.created_at, et.expires_at, et.used_at
 		   FROM enrolment_tokens et
 		   JOIN org_members m ON m.user_id = et.user_id
+		   LEFT JOIN org_members inv ON inv.user_id = et.minted_by
 		  ORDER BY et.created_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("api.ListEnrolmentTokens: %w", err)
@@ -80,7 +95,7 @@ func ListEnrolmentTokens(ctx context.Context, db *sql.DB) ([]EnrolmentTokenInfo,
 			created, expires string
 			used             sql.NullString
 		)
-		if err := rows.Scan(&info.TokenID, &info.UserEmail, &created, &expires, &used); err != nil {
+		if err := rows.Scan(&info.TokenID, &info.UserEmail, &info.MintedByEmail, &created, &expires, &used); err != nil {
 			return nil, fmt.Errorf("api.ListEnrolmentTokens: scan: %w", err)
 		}
 		info.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)

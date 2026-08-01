@@ -1,0 +1,28 @@
+{
+  "name": "superbased",
+  "owner": {
+    "name": "SuperBased",
+    "email": "contact@superbased.app",
+    "url": "https://superbased.app/"
+  },
+  "metadata": {
+    "description": "SuperBased plugins for AI coding agents — local-first token, cost and cache observability."
+  },
+  "plugins": [
+    {
+      "name": "superbased",
+      "source": "./qoder/superbased",
+      "description": "Token, cost and cache observability for Qoder. Wires the SuperBased Observer MCP server. Requires the `observer` binary already on your PATH (npm i -g @superbased/observer, or pipx install superbased-observer) — this plugin is wiring only and installs no binary.",
+      "category": "observability",
+      "homepage": "https://superbased.app/",
+      "tags": [
+        "cost",
+        "cost-tracking",
+        "mcp",
+        "observability",
+        "tokens",
+        "usage"
+      ]
+    }
+  ]
+}

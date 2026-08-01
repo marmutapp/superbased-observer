@@ -27,11 +27,28 @@ import (
 //     `high_context` (model-agnostic turn counts at 100K / 200K +
 //     attributed $) and `lc_surcharge_usd` retained as a sibling only
 //     for users on LC-eligible models.
-//  3. The old surcharge attribution silently dropped to $0 whenever
-//     `recorded > 0` (upstream proxy populated cost_usd), since we
-//     can't decompose recorded values into LC-vs-standard. We now
-//     surface `recorded_cost_share_pct` so users see how much of
-//     period cost is opaque to the attribution math.
+//  3. The old surcharge/savings attribution silently dropped to $0
+//     whenever `recorded > 0` (upstream proxy populated cost_usd),
+//     because rowStdCost/rowAltCost were set equal to rowCost — a
+//     row can never show a delta against itself. Since proxy-recorded
+//     turns are the majority of spend on a wired-up install, this
+//     under-reported cache_savings by ~3× on the operator's corpus
+//     (2026-07-30 audit). Fixed: when the pricing table has an entry
+//     for the model, we still keep `recorded` as the ACTUAL cost
+//     (never overridden — it's the ground truth), but derive the
+//     counterfactual/standard-rate DELTA from a same-bundle Compute()
+//     pair and apply that delta relative to `recorded`
+//     (rowAltCost = recorded + (computedAlt-computedCost) when
+//     positive; rowStdCost = recorded - (computedCost-computedStd)
+//     when positive). This decomposes recorded rows using the pricing
+//     table's *shape* (which tokens are discounted, which tier
+//     applies) without discarding the proxy's authoritative total.
+//     Only when the model has NO pricing entry do we fall back to
+//     the fully-opaque rowStdCost=rowAltCost=recorded (no invented
+//     counterfactual without a pricing basis). `recorded_cost_share_pct`
+//     still shows how much of period cost came from recorded rows, but
+//     it no longer implies those rows contribute zero to the LC/cache
+//     tiles.
 //
 // Tiles emitted in this version (subset; JS picks which to render):
 //
@@ -102,7 +119,7 @@ func (s *Server) handleAnalysisHeadline(w http.ResponseWriter, r *http.Request) 
 		       at.cache_creation_tokens, at.cache_creation_1h_tokens,
 		       0 AS reasoning_tokens,
 		       at.web_search_requests, at.timestamp,
-		       at.cost_usd
+		       at.cost_usd, at.fast
 		FROM api_turns at` + atJoins + `
 		WHERE at.timestamp >= ?` + atWhere + `
 		UNION ALL
@@ -110,7 +127,7 @@ func (s *Server) handleAnalysisHeadline(w http.ResponseWriter, r *http.Request) 
 		       tu.cache_creation_tokens, tu.cache_creation_1h_tokens,
 		       tu.reasoning_tokens,
 		       tu.web_search_requests, tu.timestamp,
-		       tu.estimated_cost_usd
+		       tu.estimated_cost_usd, tu.fast
 		FROM token_usage tu` + tuJoins + `
 		WHERE tu.timestamp >= ?` + tuWhere + `
 		  AND (tu.source_event_id IS NULL OR tu.source_event_id = ''
@@ -123,7 +140,8 @@ func (s *Server) handleAnalysisHeadline(w http.ResponseWriter, r *http.Request) 
 	       COALESCE(reasoning_tokens, 0),
 	       COALESCE(web_search_requests, 0),
 	       timestamp,
-	       COALESCE(cost_usd, 0)
+	       COALESCE(cost_usd, 0),
+	       COALESCE(fast, 0)
 	FROM combined`
 
 	args := []any{tsArg, tsArg}
@@ -157,30 +175,94 @@ func (s *Server) handleAnalysisHeadline(w http.ResponseWriter, r *http.Request) 
 			bundle   cost.TokenBundle
 			tsStr    string
 			recorded float64
+			fastInt  int
 		)
 		if err := rows.Scan(&model,
 			&bundle.Input, &bundle.Output,
 			&bundle.CacheRead, &bundle.CacheCreation, &bundle.CacheCreation1h,
 			&bundle.Reasoning,
 			&bundle.WebSearchRequests,
-			&tsStr, &recorded); err != nil {
+			&tsStr, &recorded, &fastInt); err != nil {
 			writeErr(w, err)
 			return
 		}
+		bundle.Fast = fastInt != 0
 		ts, _ := time.Parse(time.RFC3339Nano, tsStr)
 
-		// rowCost   — actual cost for this turn (LC-aware if applicable)
+		// rowCost   — actual cost for this turn (LC-aware if applicable).
+		//             Always `recorded` when the proxy/JSONL populated a
+		//             cost — that's the ground-truth observed spend and
+		//             is never overridden by a modeled figure.
 		// rowStdCost — what the turn would have cost at standard (non-LC) rates
 		// rowAltCost — counterfactual cost if cache_read tokens had been
 		//              raw input tokens (used for cache_savings_usd)
 		// modelHasLC — model has an LC tier defined in pricing
+		//
+		// For recorded rows we still need rowStdCost/rowAltCost to be
+		// genuine counterfactuals (not just `recorded` again), or the
+		// later `rowAltCost > rowCost` / `rowCost > rowStdCost` checks
+		// can never fire and cache_savings / lc_surcharge silently drop
+		// to $0 for every proxy-recorded turn. When the pricing table
+		// has an entry we price the SAME bundle twice (actual shape vs
+		// counterfactual shape) and apply the resulting delta relative
+		// to `recorded`, so the authoritative total is preserved while
+		// still surfacing the attribution. Without a pricing entry there
+		// is no basis for a counterfactual, so all three stay equal to
+		// `recorded` (today's behavior, unchanged).
+		//
+		// Both deltas are clamped so a modeled figure can never claim
+		// more than the row's own recorded spend. The pricing table is
+		// a MODEL, not the ground truth for this specific row — a
+		// discounted lane, a since-changed rate table, or any other
+		// drift between the table's assumed rates and what this row
+		// actually paid can make the modeled LC delta
+		// (computedCost-computedStd) exceed `recorded` itself. Left
+		// unclamped, rowStdCost = recorded - delta goes negative and the
+		// LC surcharge tile would report a surcharge larger than the
+		// row's entire recorded cost — an impossible, dishonest number.
+		// Clamping at zero means the attribution is capped at "this row
+		// cost $0 at standard rates" (i.e. the whole recorded amount is
+		// attributed to the LC premium) rather than reporting a
+		// fabricated negative-cost counterfactual. The cache-savings
+		// delta (rowAltCost = recorded + delta) can't go negative from
+		// addition alone since we only apply it when computedAlt >
+		// computedCost, but we clamp rowStdCost's delta the same way
+		// for symmetry and because a future pricing-table change could
+		// otherwise make the "always non-negative" assumption silently
+		// stop holding.
 		var rowCost, rowStdCost, rowAltCost float64
+		p, priced := s.opts.CostEngine.Lookup(model)
 		var modelHasLC bool
-		if recorded > 0 {
+		if priced && p.LongContextThreshold > 0 {
+			modelHasLC = true
+		}
+		switch {
+		case recorded > 0:
 			rowCost = recorded
 			rowStdCost = recorded
 			rowAltCost = recorded
-		} else if p, ok := s.opts.CostEngine.Lookup(model); ok {
+			if priced {
+				computedCost := cost.Compute(p, bundle)
+				computedStd := cost.Compute(stripLongContext(p), bundle)
+				if computedCost > computedStd {
+					lcDelta := computedCost - computedStd
+					if lcDelta > recorded {
+						lcDelta = recorded
+					}
+					rowStdCost = recorded - lcDelta
+				}
+				if bundle.CacheRead > 0 {
+					altBundle := bundle
+					altBundle.Input += bundle.CacheRead
+					altBundle.CacheRead = 0
+					computedAlt := cost.Compute(p, altBundle)
+					if computedAlt > computedCost {
+						cacheDelta := computedAlt - computedCost
+						rowAltCost = recorded + cacheDelta
+					}
+				}
+			}
+		case priced:
 			rowCost = cost.Compute(p, bundle)
 			rowStdCost = cost.Compute(stripLongContext(p), bundle)
 			if bundle.CacheRead > 0 {
@@ -190,9 +272,6 @@ func (s *Server) handleAnalysisHeadline(w http.ResponseWriter, r *http.Request) 
 				rowAltCost = cost.Compute(p, altBundle)
 			} else {
 				rowAltCost = rowCost
-			}
-			if p.LongContextThreshold > 0 {
-				modelHasLC = true
 			}
 		}
 
@@ -301,8 +380,10 @@ func (s *Server) handleAnalysisHeadline(w http.ResponseWriter, r *http.Request) 
 
 	// Recorded-share disclosure: % of period cost that came from upstream
 	// `recorded` paths (proxy / JSONL `estimated_cost_usd`). LC surcharge
-	// and cache_savings can't decompose these rows, so a high share
-	// signals the corresponding tiles are under-attributing.
+	// and cache_savings DO decompose these rows when the model has a
+	// pricing-table entry (see the rowStdCost/rowAltCost derivation
+	// above); a high share mainly signals that rows priced under an
+	// UNKNOWN model (no pricing entry) still contribute $0 to those tiles.
 	var recordedSharePct float64
 	if periodCost > 0 {
 		recordedSharePct = periodRecordedCost / periodCost * 100
@@ -1539,7 +1620,7 @@ func (s *Server) handleAnalysisCacheSavingsTrend(w http.ResponseWriter, r *http.
 		       at.cache_creation_tokens, at.cache_creation_1h_tokens,
 		       0 AS reasoning_tokens,
 		       at.web_search_requests, at.timestamp,
-		       at.cost_usd
+		       at.cost_usd, at.fast
 		FROM api_turns at` + atJoins + `
 		WHERE at.timestamp >= ?` + atWhere + `
 		UNION ALL
@@ -1547,7 +1628,7 @@ func (s *Server) handleAnalysisCacheSavingsTrend(w http.ResponseWriter, r *http.
 		       tu.cache_creation_tokens, tu.cache_creation_1h_tokens,
 		       tu.reasoning_tokens,
 		       tu.web_search_requests, tu.timestamp,
-		       tu.estimated_cost_usd
+		       tu.estimated_cost_usd, tu.fast
 		FROM token_usage tu` + tuJoins + `
 		WHERE tu.timestamp >= ?` + tuWhere + `
 		  AND (tu.source_event_id IS NULL OR tu.source_event_id = ''
@@ -1560,7 +1641,8 @@ func (s *Server) handleAnalysisCacheSavingsTrend(w http.ResponseWriter, r *http.
 	       COALESCE(reasoning_tokens, 0),
 	       COALESCE(web_search_requests, 0),
 	       timestamp,
-	       COALESCE(cost_usd, 0)
+	       COALESCE(cost_usd, 0),
+	       COALESCE(fast, 0)
 	FROM combined`
 
 	args := []any{tsArg, tsArg}
@@ -1587,26 +1669,41 @@ func (s *Server) handleAnalysisCacheSavingsTrend(w http.ResponseWriter, r *http.
 			bundle   cost.TokenBundle
 			tsStr    string
 			recorded float64
+			fastInt  int
 		)
 		if err := rows.Scan(&model,
 			&bundle.Input, &bundle.Output,
 			&bundle.CacheRead, &bundle.CacheCreation, &bundle.CacheCreation1h,
 			&bundle.Reasoning,
 			&bundle.WebSearchRequests,
-			&tsStr, &recorded); err != nil {
+			&tsStr, &recorded, &fastInt); err != nil {
 			writeErr(w, err)
 			return
 		}
+		bundle.Fast = fastInt != 0
 		if bundle.CacheRead <= 0 {
 			continue
 		}
 		ts, _ := time.Parse(time.RFC3339Nano, tsStr)
 
-		var savings float64
-		if recorded > 0 {
-			// Recorded rows can't be decomposed — savings opaque.
-			continue
-		}
+		// Same defect class as handleAnalysisHeadline's cache_savings tile
+		// (see the comment above that handler): skipping every recorded
+		// row here means proxy-tier turns — typically the majority of a
+		// wired-up install's traffic — never appear in the daily trend at
+		// all. Unlike the headline tile, this endpoint's output (SavingsUSD)
+		// is ALREADY a pure delta, not a total cost — there's no `recorded`
+		// actual to preserve as ground truth here, so once a pricing entry
+		// exists we can price the same bundle twice (actual shape vs the
+		// cache-read-as-input counterfactual shape) and report the delta
+		// directly, regardless of whether the proxy also recorded a cost
+		// for the row. Only when there's no pricing entry do we skip (no
+		// invented counterfactual without a pricing basis).
+		//
+		// bundle.Fast (scanned from the fast column, F6 fix) must be set
+		// BEFORE either Compute() call — the fast multiplier applies to
+		// both the actual and counterfactual price, so a fast-tier row's
+		// delta is itself computed at fast rates, not silently priced at
+		// standard rates.
 		p, ok := s.opts.CostEngine.Lookup(model)
 		if !ok {
 			continue
@@ -1616,6 +1713,7 @@ func (s *Server) handleAnalysisCacheSavingsTrend(w http.ResponseWriter, r *http.
 		alt.Input += bundle.CacheRead
 		alt.CacheRead = 0
 		altCost := cost.Compute(p, alt)
+		var savings float64
 		if altCost > actual {
 			savings = altCost - actual
 		}

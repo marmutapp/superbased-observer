@@ -203,7 +203,7 @@ func TestParseWindowsSession(t *testing.T) {
 		switch tools[i].ActionType {
 		case models.ActionAPIError:
 			apiErr = &tools[i]
-		case models.ActionUnknown:
+		case models.ActionUserPromptExpansion:
 			if tools[i].RawToolName == "qwen-code.slash_command" {
 				slash = &tools[i]
 			}
@@ -324,4 +324,158 @@ func actionTypes(evs []models.ToolEvent) []string {
 		out = append(out, e.ActionType)
 	}
 	return out
+}
+
+// TestToolResultCrossTickEmitsOutcomeUpdate pins the parser half of the
+// store outcome-update seam. A functionCall and its tool_result record
+// are separate JSONL lines; when a poll tick ends between them the call
+// row is already persisted optimistically successful and the next parse
+// window resumes with an empty pendingCall map. The outcome must leave
+// as an ActionOutcomeUpdate keyed by the same "tool:<callId>"
+// SourceEventID callEventID produced — the store's action upsert cannot
+// flip success / error_message, so a dropped update is a permanent lie.
+func TestToolResultCrossTickEmitsOutcomeUpdate(t *testing.T) {
+	const (
+		userLine = `{"sessionId":"s-xt","cwd":"/home/dev/proj","gitBranch":"main","uuid":"u0","timestamp":"2026-07-09T04:46:34.989Z","type":"user","message":{"role":"user","parts":[{"text":"run the tests"}]}}`
+		callLine = `{"sessionId":"s-xt","cwd":"/home/dev/proj","gitBranch":"main","uuid":"u1","parentUuid":"u0","timestamp":"2026-07-09T04:46:42.771Z","type":"assistant","model":"gpt-4o","message":{"role":"model","parts":[{"functionCall":{"id":"call_xt","name":"run_shell_command","args":{"command":"go test ./..."}}}]}}`
+	)
+
+	cases := []struct {
+		name         string
+		resultLine   string
+		wantID       string
+		wantKnown    bool
+		wantOK       bool
+		wantErrMsg   bool
+		wantNoOutput bool
+	}{
+		{
+			name:       "failed call",
+			resultLine: `{"sessionId":"s-xt","cwd":"/home/dev/proj","uuid":"u2","parentUuid":"u1","timestamp":"2026-07-09T04:46:43.000Z","type":"tool_result","message":{"role":"user","parts":[{"functionResponse":{"id":"call_xt","name":"run_shell_command","response":{"output":"--- FAIL: TestFoo\nexit status 1"}}}]},"toolCallResult":{"callId":"call_xt","status":"error","resultDisplay":"--- FAIL: TestFoo"}}`,
+			wantID:     "tool:call_xt",
+			wantKnown:  true,
+			wantOK:     false,
+			wantErrMsg: true,
+		},
+		{
+			name:       "successful call",
+			resultLine: `{"sessionId":"s-xt","cwd":"/home/dev/proj","uuid":"u2","parentUuid":"u1","timestamp":"2026-07-09T04:46:43.000Z","type":"tool_result","message":{"role":"user","parts":[{"functionResponse":{"id":"call_xt","name":"run_shell_command","response":{"output":"ok 12 tests"}}}]},"toolCallResult":{"callId":"call_xt","status":"success","resultDisplay":"ok 12 tests"}}`,
+			wantID:     "tool:call_xt",
+			wantKnown:  true,
+			wantOK:     true,
+		},
+		{
+			// A functionResponse without a toolCallResult carries no
+			// status. In-window that leaves Success untouched; the
+			// cross-tick update must say so rather than invent one —
+			// the persisted row may already be a telemetry-stamped
+			// failure.
+			name:       "status-less response carries no verdict",
+			resultLine: `{"sessionId":"s-xt","cwd":"/home/dev/proj","uuid":"u2","parentUuid":"u1","timestamp":"2026-07-09T04:46:43.000Z","type":"tool_result","message":{"role":"user","parts":[{"functionResponse":{"id":"call_xt","name":"run_shell_command","response":{"output":"partial output, no status"}}}]}}`,
+			wantID:     "tool:call_xt",
+			wantKnown:  false,
+		},
+		{
+			name:       "result with no call id is unkeyable and dropped",
+			resultLine: `{"sessionId":"s-xt","cwd":"/home/dev/proj","uuid":"u2","parentUuid":"u1","timestamp":"2026-07-09T04:46:43.000Z","type":"tool_result","message":{"role":"user","parts":[{"functionResponse":{"name":"run_shell_command","response":{"output":"orphan"}}}]}}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			projects := filepath.Join(root, ".qwen", "projects")
+			dst := filepath.Join(projects, "-home-dev-proj", "chats", "s.jsonl")
+			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			a := newTestAdapter(projects)
+
+			// Window 1: the transcript ends right after the functionCall.
+			if err := os.WriteFile(dst, []byte(userLine+"\n"+callLine+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			res1, err := a.ParseSessionFile(context.Background(), dst, 0)
+			if err != nil {
+				t.Fatalf("first parse: %v", err)
+			}
+			var call *models.ToolEvent
+			for i := range res1.ToolEvents {
+				if res1.ToolEvents[i].SourceEventID == "tool:call_xt" {
+					call = &res1.ToolEvents[i]
+				}
+			}
+			if call == nil {
+				t.Fatalf("first parse produced no tool:call_xt event: %+v", res1.ToolEvents)
+			}
+			if !call.Success {
+				t.Error("first parse: call should be optimistically successful")
+			}
+			if !call.OutcomePending {
+				t.Error("first parse: an unanswered call must be flagged OutcomePending, or the store files failure-context bookkeeping on an outcome nobody observed")
+			}
+			if len(res1.OutcomeUpdates) != 0 {
+				t.Errorf("first parse emitted %d outcome updates, want 0", len(res1.OutcomeUpdates))
+			}
+
+			// Window 2: the result lands, cursor resumes past the call.
+			if err := os.WriteFile(dst, []byte(userLine+"\n"+callLine+"\n"+tc.resultLine+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			res2, err := a.ParseSessionFile(context.Background(), dst, res1.NewOffset)
+			if err != nil {
+				t.Fatalf("second parse: %v", err)
+			}
+			if tc.wantID == "" {
+				if len(res2.OutcomeUpdates) != 0 {
+					t.Fatalf("unkeyable result produced %+v, want no updates", res2.OutcomeUpdates)
+				}
+				return
+			}
+
+			// The same transcript parsed WHOLE resolves the pair
+			// in-window, so nothing is left pending.
+			resFull, err := a.ParseSessionFile(context.Background(), dst, 0)
+			if err != nil {
+				t.Fatalf("full parse: %v", err)
+			}
+			var fullCall *models.ToolEvent
+			for i := range resFull.ToolEvents {
+				if resFull.ToolEvents[i].SourceEventID == "tool:call_xt" {
+					fullCall = &resFull.ToolEvents[i]
+				}
+			}
+			if fullCall == nil || fullCall.OutcomePending {
+				t.Errorf("in-window pairing left OutcomePending set: %+v", resFull.ToolEvents)
+			}
+			if len(res2.OutcomeUpdates) != 1 {
+				t.Fatalf("OutcomeUpdates: got %d want 1 (%+v)", len(res2.OutcomeUpdates), res2.OutcomeUpdates)
+			}
+			up := res2.OutcomeUpdates[0]
+			if up.SourceFile != dst {
+				t.Errorf("SourceFile = %q, want %q", up.SourceFile, dst)
+			}
+			if up.SourceEventID != tc.wantID {
+				t.Errorf("SourceEventID = %q, want %q", up.SourceEventID, tc.wantID)
+			}
+			if up.SuccessKnown != tc.wantKnown {
+				t.Errorf("SuccessKnown = %v, want %v (a status-less response is not a verdict)", up.SuccessKnown, tc.wantKnown)
+			}
+			if up.Success != tc.wantOK {
+				t.Errorf("Success = %v, want %v", up.Success, tc.wantOK)
+			}
+			if tc.wantErrMsg && up.ErrorMessage == "" {
+				t.Error("ErrorMessage empty on a status=error result")
+			}
+			if !tc.wantErrMsg && up.ErrorMessage != "" {
+				t.Errorf("ErrorMessage = %q on a clean result, want empty", up.ErrorMessage)
+			}
+			if up.ToolOutput == "" {
+				t.Error("ToolOutput empty, want the result body")
+			}
+			if up.DurationMs != 0 {
+				t.Errorf("DurationMs = %d, want 0 (the call lived in the prior window)", up.DurationMs)
+			}
+		})
+	}
 }

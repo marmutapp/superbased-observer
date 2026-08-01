@@ -1851,3 +1851,112 @@ func TestParseEventsJSONL_MCPEnrichment_StripsServerPrefix(t *testing.T) {
 		t.Errorf("RawToolName = %q, want %q (must not double-prefix)", row.RawToolName, want)
 	}
 }
+
+// TestParseEventsJSONL_ReasoningNeverMintsAnAction is the B3 regression
+// pin: an assistant.message's reasoningText / reasoningOpaque produce NO
+// action row (they briefly minted a `cline-cli`-shaped
+// `<tool>.reasoning` task_complete). Readable reasoningText rides the
+// sibling assistant_text row's PrecedingReasoning; an OPAQUE-ONLY
+// message threads NOTHING (the uniform placeholder rule — an encrypted
+// blob is not content, matching codex).
+func TestParseEventsJSONL_ReasoningNeverMintsAnAction(t *testing.T) {
+	cases := []struct {
+		name          string
+		reasoningAttr string
+		wantThreaded  string
+	}{
+		{
+			name:          "readable text threads",
+			reasoningAttr: `"reasoningText":"THREADED_REASONING",`,
+			wantThreaded:  "THREADED_REASONING",
+		},
+		{
+			// The dominant live shape on models that return encrypted
+			// reasoning: only `reasoningOpaque` is present. Pre-fix this
+			// threaded "[encrypted reasoning, 40 bytes]".
+			name:          "opaque-only threads nothing",
+			reasoningAttr: `"reasoningOpaque":"0123456789abcdef0123456789abcdef01234567",`,
+			wantThreaded:  "",
+		},
+		{
+			// Both present: the readable text wins, the blob is ignored.
+			name:          "readable text wins over opaque",
+			reasoningAttr: `"reasoningText":"THREADED_REASONING","reasoningOpaque":"0123456789abcdef0123456789abcdef01234567",`,
+			wantThreaded:  "THREADED_REASONING",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			uuid := "11111111-2222-3333-4444-555555555555"
+			ssRoot := filepath.Join(dir, ".copilot", "session-state")
+			sessDir := filepath.Join(ssRoot, uuid)
+			if err := os.MkdirAll(sessDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			evt := filepath.Join(sessDir, "events.jsonl")
+			body := strings.Join([]string{
+				`{"type":"session.start","data":{"sessionId":"` + uuid + `","copilotVersion":"1.0.48","selectedModel":"gpt-5-mini","context":{"cwd":` + jsonStr(t, dir) + `,"gitRoot":` + jsonStr(t, dir) + `,"branch":"main"}},"id":"e1","timestamp":"2026-05-17T09:28:27.909Z","parentId":null}`,
+				`{"type":"user.message","data":{"content":"do the thing"},"id":"e2","timestamp":"2026-05-17T09:28:38.300Z","parentId":"e1"}`,
+				`{"type":"assistant.message","data":{"messageId":"m1","model":"gpt-5-mini","content":"Here is your answer.",` + c.reasoningAttr + `"interactionId":"i1","turnId":"0"},"id":"e3","timestamp":"2026-05-17T09:28:46.000Z","parentId":"e2"}`,
+			}, "\n") + "\n"
+			if err := os.WriteFile(evt, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			a := NewWithOptions(nil, ssRoot)
+			res, err := a.ParseSessionFile(context.Background(), evt, 0)
+			if err != nil {
+				t.Fatalf("ParseSessionFile: %v", err)
+			}
+			var assistantRows int
+			for _, ev := range res.ToolEvents {
+				if strings.Contains(strings.ToLower(ev.RawToolName), "reasoning") {
+					t.Fatalf("reasoning-named action row emitted: raw=%q %+v", ev.RawToolName, ev)
+				}
+				if ev.Target == "THREADED_REASONING" || ev.ToolOutput == "THREADED_REASONING" {
+					t.Fatalf("reasoning body surfaced as action content: %+v", ev)
+				}
+				// No surface may carry the opaque blob, its byte count,
+				// or a placeholder standing in for it.
+				for _, field := range []string{ev.Target, ev.ToolOutput, ev.RawToolInput, ev.PrecedingReasoning} {
+					if strings.Contains(strings.ToLower(field), "encrypted reasoning") ||
+						strings.Contains(field, "0123456789abcdef") {
+						t.Fatalf("opaque reasoning placeholder/blob surfaced in %q: %+v", field, ev)
+					}
+				}
+				if ev.RawToolName != models.ToolCopilotCLI+".assistant_text" {
+					continue
+				}
+				assistantRows++
+				if ev.PrecedingReasoning != c.wantThreaded {
+					t.Errorf("assistant_text PrecedingReasoning = %q, want %q",
+						ev.PrecedingReasoning, c.wantThreaded)
+				}
+			}
+			if assistantRows != 1 {
+				t.Fatalf("assistant_text rows = %d, want 1: %+v", assistantRows, res.ToolEvents)
+			}
+		})
+	}
+}
+
+// TestThreadableReasoning covers the helper's contract directly: only
+// readable reasoningText is threadable; an opaque blob yields "" no
+// matter its size (B3 uniform placeholder rule).
+func TestThreadableReasoning(t *testing.T) {
+	cases := []struct {
+		name, text, want string
+	}{
+		{"plain text", "I should look at the file.", "I should look at the file."},
+		{"whitespace-only is empty", "   \n\t ", ""},
+		{"absent is empty", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := threadableReasoning(c.text); got != c.want {
+				t.Errorf("threadableReasoning(%q) = %q, want %q", c.text, got, c.want)
+			}
+		})
+	}
+}

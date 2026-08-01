@@ -1,5 +1,14 @@
 import { useEffect, useState } from "react";
 import { fmtUSD } from "@/lib/format";
+import { shareOrCopy } from "@/lib/share";
+import {
+  getOrCreateUsageAnchor,
+  readUsageAnchor,
+  writeUsageAnchor,
+  type UsageAnchor,
+} from "@/lib/usageAnchor";
+import { HeroWordmark } from "@/components/HeroWordmark";
+import { StarPrompt } from "@/components/StarPrompt";
 
 // MilestonesCard — delight moment D-4 (usability arc P5.6 / review
 // §9.3): small once-each milestone cards on Overview. Three
@@ -24,8 +33,17 @@ import { fmtUSD } from "@/lib/format";
 //     is the whole moment.
 //   - zero steady-state traffic: the all-time savings fetch runs
 //     only while the saved10 milestone is still undecided.
+//
+// Growth-review §4 upgrade (2026-07-30): each brag moment now also
+// carries a share/copy action (same shareOrCopy plumbing as
+// CommunityCard — native share sheet → clipboard → new tab; nothing
+// auto-posted) alongside the unchanged dismiss control, plus a small
+// corner wordmark so a raw screenshot of the celebratory bar still
+// carries attribution. This card also mounts the lazygit-style
+// once-only StarPrompt, reusing the same "one week of usage" anchor
+// this file already writes (see lib/usageAnchor.ts) so the star nudge
+// needs no new signal.
 
-const ANCHOR_KEY = "sb_milestones_anchor";
 const FLAG = (k: string) => `sb_milestone_${k}`;
 
 // An install first seen with this many sessions (or more) is treated
@@ -33,8 +51,6 @@ const FLAG = (k: string) => `sb_milestone_${k}`;
 // week milestone retires silently rather than firing months late.
 const FRESH_INSTALL_MAX_SESSIONS = 50;
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
-
-type Anchor = { at: string; sessions: number; saved_at_anchor?: number };
 
 function lsGet(key: string): string | null {
   try {
@@ -60,21 +76,17 @@ function retire(key: string) {
   lsSet(FLAG(key), "1");
 }
 
-// readAnchor returns the stored anchor, creating it (and silently
-// retiring already-crossed milestones) on first sight of data.
-function readAnchor(sessions: number): Anchor {
-  const raw = lsGet(ANCHOR_KEY);
-  if (raw) {
-    try {
-      return JSON.parse(raw) as Anchor;
-    } catch {
-      // fall through to a fresh anchor
-    }
+// readAnchor returns the stored usage anchor (shared with StarPrompt
+// via lib/usageAnchor.ts), creating it on first sight of data and —
+// ONLY at that creation moment — silently retiring already-crossed
+// milestones.
+function readAnchor(sessions: number): UsageAnchor {
+  const preexisting = readUsageAnchor();
+  const anchor = getOrCreateUsageAnchor(sessions);
+  if (!preexisting) {
+    if (sessions >= 100) retire("sessions100");
+    if (sessions >= FRESH_INSTALL_MAX_SESSIONS) retire("week");
   }
-  const anchor: Anchor = { at: new Date().toISOString(), sessions };
-  lsSet(ANCHOR_KEY, JSON.stringify(anchor));
-  if (sessions >= 100) retire("sessions100");
-  if (sessions >= FRESH_INSTALL_MAX_SESSIONS) retire("week");
   return anchor;
 }
 
@@ -97,6 +109,19 @@ export function MilestonesCard({ sessions }: { sessions: number | null }) {
   const [visible, setVisible] = useState<string | null>(null);
   // null = fetch pending or not needed; number = all-time $ saved.
   const [savedUSD, setSavedUSD] = useState<number | null>(null);
+  const [shareState, setShareState] = useState<"idle" | "done">("idle");
+
+  // Anchor create+retire pass runs synchronously during render — NOT
+  // in an effect. Effects run bottom-up post-commit, so an
+  // effect-based pass here previously let the freshly-mounted
+  // StarPrompt fallback's own read race ahead and observe/create the
+  // anchor first, skipping the retire-already-crossed-milestones step
+  // on established installs (a stale "100 sessions" celebration long
+  // after the fact). readAnchor only retires on the anchor's FIRST
+  // creation, so calling it here on every render (including React
+  // StrictMode's double-render) is idempotent and harmless.
+  const anchor =
+    sessions != null && sessions > 0 ? readAnchor(sessions) : null;
 
   // All-time compression savings — fetched once per mount, and only
   // while saved10 is still undecided.
@@ -122,15 +147,14 @@ export function MilestonesCard({ sessions }: { sessions: number | null }) {
   // Eligibility pass — runs whenever the inputs settle. Priority
   // order is the plan's: $10 saved, then 100 sessions, then the week.
   useEffect(() => {
-    if (sessions == null || sessions === 0) return;
-    const anchor = readAnchor(sessions);
+    if (sessions == null || sessions === 0 || !anchor) return;
 
     if (savedUSD != null && !fired("saved10")) {
       // First time we can see savings: record the baseline so a
       // crossing BEFORE we watched retires and one AFTER fires.
       if (anchor.saved_at_anchor == null) {
         anchor.saved_at_anchor = savedUSD;
-        lsSet(ANCHOR_KEY, JSON.stringify(anchor));
+        writeUsageAnchor(anchor);
         if (savedUSD >= 10) retire("saved10");
       } else if (savedUSD >= 10 && anchor.saved_at_anchor < 10) {
         setVisible("saved10");
@@ -149,7 +173,12 @@ export function MilestonesCard({ sessions }: { sessions: number | null }) {
     }
   }, [sessions, savedUSD]);
 
-  if (!visible || fired(visible)) return null;
+  // No milestone due right now: fall through to the (independently
+  // gated, once-only) star prompt rather than rendering nothing —
+  // it uses the same usage anchor this file maintains.
+  if (!visible || fired(visible)) {
+    return <StarPrompt sessions={sessions} />;
+  }
   const copy = COPY[visible];
   // saved10 fires once all-time savings cross the $10 threshold, but
   // the figure we SHOW must be the live total — not the literal "$10"
@@ -166,12 +195,28 @@ export function MilestonesCard({ sessions }: { sessions: number | null }) {
     visible === "saved10" && savedUSD != null
       ? `Compression has paid for its config: ${fmtUSD(savedUSD)} saved so far.`
       : copy.text;
+  // Share text states the milestone plainly + the site — same honesty
+  // gate as CommunityCard (quantified only from a real figure already
+  // shown on-screen; no compression %-savings framing).
+  const shareText =
+    visible === "saved10" && savedUSD != null
+      ? `SuperBased has saved me ${fmtUSD(savedUSD)} in AI coding costs so far — superbased.app`
+      : visible === "sessions100"
+        ? "100 AI coding sessions tracked with SuperBased — superbased.app"
+        : "One full week of AI coding sessions tracked with SuperBased — superbased.app";
   const dismiss = () => {
     retire(visible);
     setVisible(null);
   };
+  const share = async () => {
+    const result = await shareOrCopy(shareText);
+    if (result === "copied") {
+      setShareState("done");
+      window.setTimeout(() => setShareState("idle"), 2000);
+    }
+  };
   return (
-    <section className="flex items-center gap-3 rounded-3 border border-[#F4A024]/35 bg-bg-2 px-4 py-2.5">
+    <section className="relative flex items-center gap-3 rounded-3 border border-[#F4A024]/35 bg-bg-2 px-4 py-2.5">
       <span
         aria-hidden
         className="inline-block h-2.5 w-2.5 shrink-0 rounded-full bg-[#F4A024]"
@@ -180,6 +225,14 @@ export function MilestonesCard({ sessions }: { sessions: number | null }) {
         {chip}
       </span>
       <span className="min-w-0 flex-1 text-[12px] text-fg-2">{text}</span>
+      <HeroWordmark variant="inline" className="hidden shrink-0 sm:inline" />
+      <button
+        type="button"
+        onClick={share}
+        className="shrink-0 text-[11px] font-medium text-accent hover:text-accent-strong"
+      >
+        {shareState === "done" ? "Copied ✓" : "Share"}
+      </button>
       <button
         type="button"
         onClick={dismiss}

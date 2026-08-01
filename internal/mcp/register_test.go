@@ -436,6 +436,238 @@ func TestRegistrar_InstalledDetectsOpenCode(t *testing.T) {
 	}
 }
 
+// TestRegistrar_InstalledDetectsDroid pins the droid probe: a
+// t.TempDir()-rooted ~/.factory present is enough for Installed() to
+// report "droid" — mirrors TestRegistrar_InstalledDetectsOpenCode. Never
+// touches the real ~/.factory.
+func TestRegistrar_InstalledDetectsDroid(t *testing.T) {
+	r, home := newRegistrar(t, false)
+	if err := os.MkdirAll(filepath.Join(home, ".factory"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, g := range r.Installed() {
+		if g == "droid" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("droid not detected: %v", r.Installed())
+	}
+}
+
+// TestRegistrar_DroidJSON pins droid's MCP write: the shared
+// {"mcpServers":{command,args}} JSON shape at ~/.factory/mcp.json,
+// mirroring claude-code/cursor. Existing sibling servers and other
+// top-level keys survive registration, and Unregister cleanly removes only
+// the observer entry.
+func TestRegistrar_DroidJSON(t *testing.T) {
+	r, home := newRegistrar(t, false)
+	want := filepath.Join(home, ".factory", "mcp.json")
+
+	// Pre-seed with another MCP server + an unrelated top-level key we
+	// must not clobber.
+	prior := `{
+  "someOtherKey": {"shown": true},
+  "mcpServers": {
+    "other-server": {"command": "/opt/other", "args": ["serve"]}
+  }
+}`
+	if err := os.MkdirAll(filepath.Dir(want), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(want, []byte(prior), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := r.Register("droid")
+	if res.Error != nil {
+		t.Fatalf("Register: %v", res.Error)
+	}
+	if !res.Added {
+		t.Errorf("expected Added=true: %+v", res)
+	}
+	if res.ConfigPath != want {
+		t.Errorf("ConfigPath: %s want %s", res.ConfigPath, want)
+	}
+
+	body, err := os.ReadFile(want)
+	if err != nil {
+		t.Fatalf("file not written: %v", err)
+	}
+	var top map[string]any
+	if err := json.Unmarshal(body, &top); err != nil {
+		t.Fatalf("parse: %v: %s", err, body)
+	}
+	if _, ok := top["someOtherKey"]; !ok {
+		t.Error("someOtherKey was clobbered")
+	}
+	servers := top["mcpServers"].(map[string]any)
+	if _, ok := servers["other-server"]; !ok {
+		t.Errorf("other-server lost: %v", servers)
+	}
+	entry, ok := servers[ServerName].(map[string]any)
+	if !ok {
+		t.Fatalf("our server missing: %v", servers)
+	}
+	if entry["command"] != "/usr/local/bin/observer" {
+		t.Errorf("command: %v", entry["command"])
+	}
+	args := entry["args"].([]any)
+	if len(args) != 1 || args[0] != "serve" {
+		t.Errorf("args: %v", args)
+	}
+
+	// Idempotent re-register.
+	res2 := r.Register("droid")
+	if res2.Error != nil {
+		t.Fatalf("re-register: %v", res2.Error)
+	}
+	if !res2.AlreadySet {
+		t.Errorf("expected AlreadySet on re-register: %+v", res2)
+	}
+
+	// Unregister removes only observer's entry.
+	ures := r.Unregister("droid")
+	if ures.Error != nil {
+		t.Fatalf("Unregister: %v", ures.Error)
+	}
+	if !ures.Removed {
+		t.Errorf("expected Removed=true: %+v", ures)
+	}
+	body, err = os.ReadFile(want)
+	if err != nil {
+		t.Fatalf("file removed unexpectedly: %v", err)
+	}
+	top = map[string]any{}
+	if err := json.Unmarshal(body, &top); err != nil {
+		t.Fatalf("parse after unregister: %v: %s", err, body)
+	}
+	servers = top["mcpServers"].(map[string]any)
+	if _, ok := servers[ServerName]; ok {
+		t.Errorf("observer entry still present after Unregister: %v", servers)
+	}
+	if _, ok := servers["other-server"]; !ok {
+		t.Errorf("other-server lost after Unregister: %v", servers)
+	}
+}
+
+// TestRegistrar_InstalledDetectsCommandCode pins the command-code probe: a
+// t.TempDir()-rooted ~/.commandcode present is enough for Installed() to
+// report "command-code" — mirrors TestRegistrar_InstalledDetectsDroid.
+// Never touches the real ~/.commandcode.
+func TestRegistrar_InstalledDetectsCommandCode(t *testing.T) {
+	r, home := newRegistrar(t, false)
+	if err := os.MkdirAll(filepath.Join(home, ".commandcode"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, g := range r.Installed() {
+		if g == "command-code" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("command-code not detected: %v", r.Installed())
+	}
+}
+
+// TestRegistrar_CommandCodeJSON pins command-code's MCP write: the shared
+// {"mcpServers":{command,args}} JSON shape at ~/.commandcode/mcp.json,
+// mirroring claude-code/cursor/droid. Existing sibling servers and other
+// top-level keys survive registration, and Unregister cleanly removes only
+// the observer entry.
+func TestRegistrar_CommandCodeJSON(t *testing.T) {
+	r, home := newRegistrar(t, false)
+	want := filepath.Join(home, ".commandcode", "mcp.json")
+
+	// Pre-seed with another MCP server + an unrelated top-level key we
+	// must not clobber.
+	prior := `{
+  "someOtherKey": {"shown": true},
+  "mcpServers": {
+    "other-server": {"command": "/opt/other", "args": ["serve"]}
+  }
+}`
+	if err := os.MkdirAll(filepath.Dir(want), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(want, []byte(prior), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := r.Register("command-code")
+	if res.Error != nil {
+		t.Fatalf("Register: %v", res.Error)
+	}
+	if !res.Added {
+		t.Errorf("expected Added=true: %+v", res)
+	}
+	if res.ConfigPath != want {
+		t.Errorf("ConfigPath: %s want %s", res.ConfigPath, want)
+	}
+
+	body, err := os.ReadFile(want)
+	if err != nil {
+		t.Fatalf("file not written: %v", err)
+	}
+	var top map[string]any
+	if err := json.Unmarshal(body, &top); err != nil {
+		t.Fatalf("parse: %v: %s", err, body)
+	}
+	if _, ok := top["someOtherKey"]; !ok {
+		t.Error("someOtherKey was clobbered")
+	}
+	servers := top["mcpServers"].(map[string]any)
+	if _, ok := servers["other-server"]; !ok {
+		t.Errorf("other-server lost: %v", servers)
+	}
+	entry, ok := servers[ServerName].(map[string]any)
+	if !ok {
+		t.Fatalf("our server missing: %v", servers)
+	}
+	if entry["command"] != "/usr/local/bin/observer" {
+		t.Errorf("command: %v", entry["command"])
+	}
+	args := entry["args"].([]any)
+	if len(args) != 1 || args[0] != "serve" {
+		t.Errorf("args: %v", args)
+	}
+
+	// Idempotent re-register.
+	res2 := r.Register("command-code")
+	if res2.Error != nil {
+		t.Fatalf("re-register: %v", res2.Error)
+	}
+	if !res2.AlreadySet {
+		t.Errorf("expected AlreadySet on re-register: %+v", res2)
+	}
+
+	// Unregister removes only observer's entry.
+	ures := r.Unregister("command-code")
+	if ures.Error != nil {
+		t.Fatalf("Unregister: %v", ures.Error)
+	}
+	if !ures.Removed {
+		t.Errorf("expected Removed=true: %+v", ures)
+	}
+	body, err = os.ReadFile(want)
+	if err != nil {
+		t.Fatalf("file removed unexpectedly: %v", err)
+	}
+	top = map[string]any{}
+	if err := json.Unmarshal(body, &top); err != nil {
+		t.Fatalf("parse after unregister: %v: %s", err, body)
+	}
+	servers = top["mcpServers"].(map[string]any)
+	if _, ok := servers[ServerName]; ok {
+		t.Errorf("observer entry still present after Unregister: %v", servers)
+	}
+	if _, ok := servers["other-server"]; !ok {
+		t.Errorf("other-server lost after Unregister: %v", servers)
+	}
+}
+
 // TestRegistrar_ClineNativeJSON pins the native (same-OS) Cline MCP write:
 // VS Code globalStorage cline_mcp_settings.json in the standard
 // {"mcpServers":{command,args}} shape, created under the daemon's home.
@@ -470,10 +702,17 @@ func TestRegistrar_ClineNativeJSON(t *testing.T) {
 // wsl.exe bridge command into a Windows VS Code globalStorage path, resolved
 // via WindowsClineHome (so the test doesn't depend on crossmount/`/mnt/c`).
 func TestRegistrar_ClineWindowsBridge(t *testing.T) {
-	winHome := t.TempDir()
+	// The Windows home must live UNDER the pinned HomeDir: once a caller
+	// sandboxes its home, an override outside it is refused (containment half
+	// of crossmount.AutoDetectSuppressed — the 2026-07-31 follow-up round).
+	home := t.TempDir()
+	winHome := filepath.Join(home, "mnt", "c", "Users", "tester")
+	if err := os.MkdirAll(winHome, 0o755); err != nil {
+		t.Fatalf("mkdir win home: %v", err)
+	}
 	r, err := NewRegistrar(RegisterOptions{
 		BinaryPath:       "/home/u/.local/bin/observer",
-		HomeDir:          t.TempDir(),
+		HomeDir:          home,
 		WindowsClineHome: winHome,
 		WSLDistro:        "Ubuntu",
 	})
@@ -524,10 +763,15 @@ func TestRegistrar_ClineWindowsBridge(t *testing.T) {
 // distro can't be resolved (no WSLDistro and no $WSL_DISTRO_NAME).
 func TestRegistrar_ClineWindowsNoDistro(t *testing.T) {
 	t.Setenv("WSL_DISTRO_NAME", "")
+	noDistroHome := t.TempDir()
+	noDistroWin := filepath.Join(noDistroHome, "winhome") // contained, per the gate
+	if err := os.MkdirAll(noDistroWin, 0o755); err != nil {
+		t.Fatalf("mkdir win home: %v", err)
+	}
 	r, _ := NewRegistrar(RegisterOptions{
 		BinaryPath:       "/x/observer",
-		HomeDir:          t.TempDir(),
-		WindowsClineHome: t.TempDir(),
+		HomeDir:          noDistroHome,
+		WindowsClineHome: noDistroWin,
 	})
 	res := r.Register("cline-windows")
 	if res.Error == nil || !strings.Contains(res.Error.Error(), "distro") {

@@ -143,9 +143,29 @@ export function OverviewPage() {
             </span>
           }
           sub={
-            status.data?.last_action_at
-              ? `last activity ${relativeTime(status.data.last_action_at)}`
-              : "no activity yet"
+            // Honesty rule: "no activity yet" is a CLAIM about a loaded,
+            // empty database — it must never render off an unresolved
+            // /api/status. That endpoint is a whole-DB scan the SPA polls
+            // from three places at once, so on a large corpus `status.data`
+            // is legitimately null for the first several seconds of a page
+            // load (and again on any aborted poll). Falling through to the
+            // empty-state copy there told a busy install it had never been
+            // used. Only a RESOLVED response gets to make the claim; while
+            // the request is in flight, or when it failed outright, the
+            // subtitle stays neutral.
+            // ERROR FIRST, before any use of retained data. useApi keeps the
+            // last good payload across a failed refetch, so checking
+            // `status.data` first would keep printing "last activity 4m ago"
+            // — or, from a stale-empty payload, "no activity yet" — while the
+            // endpoint is actually failing, which is a stronger claim than
+            // the page can support at that moment.
+            status.error
+              ? "activity unavailable"
+              : status.data?.last_action_at
+                ? `last activity ${relativeTime(status.data.last_action_at)}`
+                : status.data
+                  ? "no activity yet"
+                  : "—"
           }
           spark={kpis.actionsSpark}
           sparkColor="var(--accent)"

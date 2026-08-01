@@ -92,7 +92,7 @@ func TestParseReadonlyFixture(t *testing.T) {
 	if got := countActions(tools, models.ActionUserPrompt); got != 3 {
 		t.Errorf("user prompts = %d, want 3", got)
 	}
-	if got := countActions(tools, models.ActionTaskComplete); got != 2 {
+	if got := countActions(tools, models.ActionAssistantMessage); got != 2 {
 		t.Errorf("assistant texts = %d, want 2", got)
 	}
 	if len(tokens) != 2 {

@@ -1,0 +1,12 @@
+{
+  "name": "superbased",
+  "version": "1.28.0",
+  "mcpServers": {
+    "observer": {
+      "command": "observer",
+      "args": [
+        "serve"
+      ]
+    }
+  }
+}

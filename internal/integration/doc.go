@@ -24,6 +24,31 @@
 //     internal/diag.routableTools proxy-route table; nothing else should
 //     re-declare per-tool integration capabilities.
 //
+// # What a row is keyed on
+//
+// A registry row is keyed on ADAPTER IDENTITY — one row per entry in
+// internal/adapter/defaults.Adapters(), pinned in both directions by
+// registry_coverage_test.go (TestRegistryCoversEveryRegisteredAdapter /
+// TestRegistryHasNoOrphanRows) and a third time by
+// tests/invariant/adapter_registry_sync_test.go.
+//
+// That is deliberately NOT the same key space as the `sessions.tool`
+// column, because an adapter may re-tag its events per-file: the cline
+// adapter watches both the Cline and the Roo Code VS Code task dirs and
+// picks the emitted Tool from the enclosing extension directory, so
+// "roo-code" is a real tool VALUE with no adapter of its own. Such a tool
+// gets tooltax vocabulary rows (tooltax is keyed on the emitted column,
+// which is what Resolve is handed at read time) but NO capability row —
+// every cell would be either zero or copied from the host adapter, and
+// copying would break the registry's honesty rule that a zero value means
+// "no grounded capability", never an inferred one. Contrast kilo-code,
+// which DOES get a row: kilocode.NewLegacy() is a registered adapter with
+// its own Name() and watch roots, even though it wraps the same parser.
+//
+// The gap between the two key spaces is enumerated and reasoned in
+// registry_coverage_test.go::registryRowlessTaxonomyTools, so a future
+// re-tagged tool that silently lacks a row fails loudly.
+//
 // The registry is filled incrementally across the adapter-coverage-parity
 // phases (docs/plans/adapter-coverage-parity-plan-2026-06-26.md): Phase 0
 // seeds the proxy-route capability (migrated from routableTools); later

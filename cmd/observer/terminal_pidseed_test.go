@@ -434,6 +434,11 @@ func TestTerminalPidSeederEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
+	// Registered AFTER the mgr.Shutdown cleanup so it runs BEFORE it (LIFO):
+	// the PTY must be released before Shutdown waits on the goroutines reading
+	// it. Belt-and-braces alongside Kill/Close — this holds even if a future
+	// terminate() path stops calling either.
+	t.Cleanup(sp.release)
 	if pid, ok := mgr.PIDForHandle(handle); !ok || pid != 31337 {
 		t.Fatalf("PIDForHandle = (%d,%v), want (31337,true)", pid, ok)
 	}
@@ -481,7 +486,7 @@ type pidSpawnerStub struct {
 
 func (s *pidSpawnerStub) Spawn(termsession.Spec) (termsession.PTY, error) {
 	s.done = make(chan struct{})
-	return &stubPTY{pid: s.pid, done: s.done}, nil
+	return &stubPTY{pid: s.pid, done: s.done, release: s.release}, nil
 }
 
 func (s *pidSpawnerStub) release() { s.once.Do(func() { close(s.done) }) }
@@ -489,6 +494,9 @@ func (s *pidSpawnerStub) release() { s.once.Do(func() { close(s.done) }) }
 type stubPTY struct {
 	pid  int
 	done chan struct{}
+	// release unblocks the parked Read/Wait. It is the spawner's own
+	// single-shot release, so Kill-then-Close cannot double-close.
+	release func()
 }
 
 func (p *stubPTY) Pid() int { return p.pid }
@@ -500,7 +508,16 @@ func (p *stubPTY) Read([]byte) (int, error) {
 func (p *stubPTY) Write(b []byte) (int, error) { return len(b), nil }
 func (p *stubPTY) Resize(_, _ uint16) error    { return nil }
 func (p *stubPTY) Wait() (int, error)          { <-p.done; return 0, nil }
-func (p *stubPTY) Kill() error                 { return nil }
-func (p *stubPTY) Close() error                { return nil }
+
+// Kill and Close unblock the parked Read/Wait, the way a real PTY does. A
+// stub that accepts Close and leaves its reader parked does not model a
+// PTY, and the cost of that is not cosmetic: Manager.Shutdown ends in an
+// unbounded m.wg.Wait(), so any t.Fatal between Create and release() parks
+// the cleanup forever. On the 2026-08-01 cache-cleared sweep that turned
+// ONE flaked assertion into a 40m cmd/observer timeout which starved ~340
+// parallel tests in the same package — the whole package reported FAIL
+// having actually run almost none of it.
+func (p *stubPTY) Kill() error  { p.release(); return nil }
+func (p *stubPTY) Close() error { p.release(); return nil }
 
 var errClosedStub = errors.New("stub pty closed")

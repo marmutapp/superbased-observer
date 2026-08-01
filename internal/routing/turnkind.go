@@ -56,9 +56,34 @@ var (
 	}
 	// housekeepingActions are administrative turn enders (Aider's
 	// weak-model class lives on these plus vcs commands).
+	//
+	// assistant_message is listed alongside task_complete to PRESERVE
+	// classification semantics across the WP-T6/B2 sweep, not to widen
+	// them: the assistant-text emit sites that used to write
+	// task_complete now write assistant_message, so a turn whose last
+	// action is plain assistant text classified TurnHousekeeping before
+	// the sweep and must still classify TurnHousekeeping after it.
+	// Without this row the same turn would silently fall through to
+	// edit_in_flight / read-only / unknown and quietly re-attribute
+	// §R8.3 turn kinds — and therefore the Model Value Report's
+	// model × turn_kind grouping — across all of history.
+	//
+	// These are literals, not a tooltax lookup, deliberately. Both
+	// members live in tooltax CategoryMeta, but so do ~25 other action
+	// types (session_start, notification, unknown, …), and deriving the
+	// set from category membership would turn almost every turn into
+	// housekeeping. The tooltax delegation is REFUSED here for the same
+	// reason WP-T1 refused the policy delegation: the category is a
+	// display/aggregation axis, not this rule's predicate. What IS
+	// pinned cross-package is the invariant that actually matters —
+	// TestHousekeepingActionsAreMetaCategory (turnkind_test.go) asserts
+	// every member resolves to tooltax.CategoryMeta and that
+	// task_complete and assistant_message share one category, so the
+	// sweep is provably category-neutral.
 	housekeepingActions = map[string]bool{
-		models.ActionTodoUpdate:   true,
-		models.ActionTaskComplete: true,
+		models.ActionTodoUpdate:       true,
+		models.ActionTaskComplete:     true,
+		models.ActionAssistantMessage: true,
 	}
 	// testCommandClasses are the run_command classes that mark a
 	// build/test/lint loop.

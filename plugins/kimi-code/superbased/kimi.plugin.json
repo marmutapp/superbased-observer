@@ -1,0 +1,30 @@
+{
+  "name": "superbased",
+  "version": "1.28.0",
+  "description": "Token, cost and cache observability for Kimi Code. Wires the SuperBased Observer MCP server. Requires the `observer` binary already on your PATH (npm i -g @superbased/observer, or pipx install superbased-observer) — this plugin is wiring only and installs no binary.",
+  "keywords": [
+    "cost",
+    "cost-tracking",
+    "mcp",
+    "observability",
+    "tokens",
+    "usage"
+  ],
+  "homepage": "https://superbased.app/",
+  "license": "Apache-2.0",
+  "interface": {
+    "displayName": "SuperBased Observer",
+    "shortDescription": "Local-first token, cost and cache observability",
+    "longDescription": "Query your own coding-agent history from inside Kimi Code: per-session token and cost totals, cache behaviour, project patterns and past tool output. All data stays in a local SQLite database. Requires the `observer` binary already on your PATH.",
+    "developerName": "SuperBased",
+    "websiteURL": "https://superbased.app/"
+  },
+  "mcpServers": {
+    "observer": {
+      "command": "observer",
+      "args": [
+        "serve"
+      ]
+    }
+  }
+}

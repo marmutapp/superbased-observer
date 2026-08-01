@@ -174,8 +174,11 @@ func (m *rawMessage) contentBlocks() []rawBlock {
 // and `-` removed) so both snake_case (the native spelling) and any
 // camelCase variant resolve to the same row.
 //
-// GROUNDED (observed in live Phase-0 capture): read_file,
-// read_directory. Everything else is a DEFENSIVE entry covering the
+// GROUNDED (observed in live capture): read_file, read_directory,
+// shell_command — Command Code's only shell/run tool (WP-T6 live probe
+// finding B1, 2026-07-31; it previously fell to unknown because the
+// name normalizes to "shellcommand", distinct from "runshellcommand").
+// Everything else is a DEFENSIVE entry covering the
 // conventional OpenAI-compat agent vocabulary — Command Code's slash
 // commands (/worktree, /plan, /review, /mcp, /skills) imply a much
 // richer runtime tool surface than the two calls the Phase-0 capture
@@ -186,6 +189,7 @@ var actionMap = map[string]string{
 	// grounded
 	"readfile":      models.ActionReadFile,
 	"readdirectory": models.ActionSearchFiles,
+	"shellcommand":  models.ActionRunCommand,
 	// defensive — read
 	"read":          models.ActionReadFile,
 	"viewfile":      models.ActionReadFile,

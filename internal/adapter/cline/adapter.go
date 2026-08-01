@@ -320,11 +320,21 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 				if txt == "" {
 					continue
 				}
+				// REASONING SEMANTICS (B3 convergence, 2026-07-31): the
+				// thinking block is accumulated into the per-message
+				// `reasoning` buffer and reaches the timeline ONLY as
+				// PrecedingReasoning on the tool_use rows that follow it
+				// within this message (FAN-OUT: blocks are ordered
+				// thinking-then-tool_use, and one thinking block can
+				// precede several tool calls — each carries it). It is
+				// deliberately NOT emitted as a standalone task_complete
+				// row: a reasoning block is not an action, and the phantom
+				// rows polluted every action aggregate (see
+				// docs/plans/b3-reasoning-convergence-plan-2026-07-31.md §1).
+				// This holds for every retag of this parser (cline /
+				// roo-code / kilo-code legacy) — the raw name was
+				// toolID-derived, so all three minted the class.
 				reasoning = appendReasoning(reasoning, txt)
-				// Emit the reasoning as a first-class, visible timeline row
-				// (matches kilocode/opencode/codex), not only as downstream
-				// PrecedingReasoning.
-				res.ToolEvents = append(res.ToolEvents, a.reasoningEvent(path, toolID, sessionID, projectRoot, gitBranch, model, ts, i, blockIdx, txt))
 			case "tool_use":
 				evt := a.toolUseEvent(path, toolID, sessionID, projectRoot, gitBranch, model, ts, block)
 				if reasoning != "" {
@@ -472,38 +482,6 @@ func (a *Adapter) imageEvent(
 		Success:       true,
 		RawToolName:   toolID + ".image",
 		MessageID:     fmt.Sprintf("%s:image:%s:%d:%d", toolID, sessionID, msgIdx, blockIdx),
-	}
-}
-
-// reasoningEvent emits a standalone reasoning row for a thinking /
-// redacted_thinking block on an assistant message, making the model's
-// chain-of-thought visible in the action timeline (matches kilocode /
-// opencode / codex). Content-derivable SourceEventID dedupes re-parses.
-func (a *Adapter) reasoningEvent(
-	sourceFile, toolID, sessionID, projectRoot, gitBranch, model string,
-	ts time.Time,
-	msgIdx, blockIdx int,
-	thinking string,
-) models.ToolEvent {
-	scrubbed := a.scrubber.String(thinking)
-	preview := truncate(scrubbed, 200)
-	hash := shortHash(thinking)
-	return models.ToolEvent{
-		SourceFile:         sourceFile,
-		SourceEventID:      fmt.Sprintf("%s:reasoning:%s:%d:%d:%s", toolID, sessionID, msgIdx, blockIdx, hash),
-		SessionID:          sessionID,
-		ProjectRoot:        projectRoot,
-		Timestamp:          ts,
-		GitBranch:          gitBranch,
-		Model:              model,
-		Tool:               toolID,
-		ActionType:         models.ActionTaskComplete,
-		Target:             preview,
-		Success:            true,
-		PrecedingReasoning: preview,
-		RawToolName:        toolID + ".reasoning",
-		ToolOutput:         a.scrubber.String(contentcap.Cap(thinking, contentcap.DefaultMaxBytes)),
-		MessageID:          toolID + ":reasoning:" + hash,
 	}
 }
 

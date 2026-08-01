@@ -74,6 +74,9 @@ type Watcher struct {
 	// maxFileBytes skips parsing files larger than this (DoS guard). Zero
 	// disables the cap. See Options.MaxFileBytes.
 	maxFileBytes int64
+	// skipModifiedBefore gates the historic scan's WalkDir callback.
+	// See Options.SkipModifiedBefore.
+	skipModifiedBefore time.Time
 }
 
 // Options configures New.
@@ -106,6 +109,21 @@ type Options struct {
 	// a watch root driving the daemon into unbounded allocation. Zero (or
 	// negative) disables the cap. Wired from [watcher].max_file_bytes.
 	MaxFileBytes int64
+	// SkipModifiedBefore, when non-zero, makes the historic scan (Scan /
+	// Rescan) skip any session file whose mtime is strictly before this
+	// instant — a file whose last write predates the window cannot
+	// contain any in-window rows, so parsing it is pure waste. This is
+	// honored ONLY in scan()'s WalkDir callback, using the fs.DirEntry
+	// the walk already handed us (no extra os.Stat on the hit path) for
+	// a regular file; a symlink entry costs one extra os.Stat to reach
+	// the TARGET's mtime, since processFile follows safe symlinks and
+	// parses the target, not the link. The continuous Watch()/fsnotify/
+	// poller path is untouched — a live
+	// write always bumps mtime to "now", so the filter would never fire
+	// there anyway, and Watch's own initial Scan call still benefits.
+	// The zero value (time.Time{}) changes nothing: every file is
+	// processed exactly as before this field existed.
+	SkipModifiedBefore time.Time
 }
 
 // New returns a watcher. Reasonable zero defaults apply.
@@ -131,17 +149,18 @@ func New(s *store.Store, r *adapter.Registry, opts Options) *Watcher {
 	// non-positive values as "always allow", so a single deduper
 	// instance covers both branches.
 	return &Watcher{
-		store:           s,
-		registry:        r,
-		logger:          opts.Logger,
-		nativePredicate: opts.NativePredicate,
-		allow:           opts.Allow,
-		debounce:        opts.Debounce,
-		pollInterval:    pollInterval,
-		classifier:      opts.Classifier,
-		indexer:         opts.Indexer,
-		warningDedup:    newWarningDeduper(warningTTL),
-		maxFileBytes:    opts.MaxFileBytes,
+		store:              s,
+		registry:           r,
+		logger:             opts.Logger,
+		nativePredicate:    opts.NativePredicate,
+		allow:              opts.Allow,
+		debounce:           opts.Debounce,
+		pollInterval:       pollInterval,
+		classifier:         opts.Classifier,
+		indexer:            opts.Indexer,
+		warningDedup:       newWarningDeduper(warningTTL),
+		maxFileBytes:       opts.MaxFileBytes,
+		skipModifiedBefore: opts.SkipModifiedBefore,
 	}
 }
 
@@ -199,6 +218,32 @@ func (w *Watcher) scan(ctx context.Context, forceFromZero bool) (ScanResult, err
 				}
 				if !a.IsSessionFile(path) {
 					return nil
+				}
+				if !w.skipModifiedBefore.IsZero() {
+					// A file whose last write predates the window
+					// cannot contain any in-window rows — skip it
+					// without ever opening it. Use the fs.DirEntry
+					// info the walk already fetched (no extra
+					// os.Stat on the hit path) — EXCEPT for a
+					// symlink: WalkDir's DirEntry is built from
+					// Lstat, so d.Info() reports the LINK's own
+					// mtime, while processFile follows safe symlinks
+					// and parses the TARGET. An old symlink pointing
+					// at a freshly-updated session file must not be
+					// skipped on the link's stale mtime, so for a
+					// symlink entry we os.Stat(path) instead, which
+					// follows the link to the target's mtime. If
+					// either stat errors (e.g. a raced deletion or a
+					// broken symlink), fall through and let
+					// processFile's own os.Stat/open handle it —
+					// fail-open, never fail-skip.
+					info, infoErr := d.Info()
+					if infoErr == nil && d.Type()&fs.ModeSymlink != 0 {
+						info, infoErr = os.Stat(path)
+					}
+					if infoErr == nil && info.ModTime().Before(w.skipModifiedBefore) {
+						return nil
+					}
 				}
 				if err := w.processFile(ctx, a, path, forceFromZero); err != nil {
 					res.Errors++
@@ -482,6 +527,7 @@ func (w *Watcher) processFile(ctx context.Context, a adapter.Adapter, path strin
 		CacheObservations:   res.CacheObservations,
 		SessionProcessSeeds: res.SessionProcessSeeds,
 		SessionLineages:     res.SessionLineages,
+		OutcomeUpdates:      res.OutcomeUpdates,
 	}); err != nil {
 		return err
 	}

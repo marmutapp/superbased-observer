@@ -37,7 +37,7 @@ func TestParseSessionFile_CLIRichActions(t *testing.T) {
 		"read":                         models.ActionReadFile,
 		"write":                        models.ActionWriteFile,
 		"websearch":                    models.ActionWebSearch,
-		"kilo-code-cli.assistant_text": models.ActionTaskComplete,
+		"kilo-code-cli.assistant_text": models.ActionAssistantMessage,
 		"assistant.stop":               models.ActionTaskComplete,
 	}
 	gotRawNames := map[string]string{}
@@ -169,11 +169,14 @@ func TestParseSessionFile_CLIStepFinishEmitsToolEventNoTokenEvent(t *testing.T) 
 	}
 }
 
-// TestParseSessionFile_CLIReasoningPartEmitsRow pins the reasoning-
-// part wiring. The model's chain-of-thought lands as a single
-// ActionTaskComplete row with RawToolName=kilo-code-cli.reasoning and
-// the body in ToolOutput.
-func TestParseSessionFile_CLIReasoningPartEmitsRow(t *testing.T) {
+// TestParseSessionFile_CLIReasoningThreadsAndMintsNoRow is the B3
+// successor of TestParseSessionFile_CLIReasoningPartEmitsRow
+// (2026-07-31). The chain-of-thought used to land as its own
+// `kilo-code-cli.reasoning` task_complete row; it now mints NO row and
+// is threaded onto the successor part's PrecedingReasoning, beating the
+// part's `title` (Kilo's one-line UI label, never reasoning). Kept
+// symmetric with the OpenCode adapter's test of the same shape.
+func TestParseSessionFile_CLIReasoningThreadsAndMintsNoRow(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "kilo.db")
 	setupKiloDBWithReasoning(t, path)
@@ -182,27 +185,27 @@ func TestParseSessionFile_CLIReasoningPartEmitsRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseSessionFile: %v", err)
 	}
-	var rsng []models.ToolEvent
+	byRaw := map[string]models.ToolEvent{}
 	for _, ev := range res.ToolEvents {
 		if ev.RawToolName == "kilo-code-cli.reasoning" {
-			rsng = append(rsng, ev)
+			t.Fatalf("kilo-code-cli.reasoning row minted: %+v", ev)
 		}
+		byRaw[ev.RawToolName] = ev
 	}
-	if len(rsng) != 1 {
-		t.Fatalf("kilo-code-cli.reasoning rows: got %d want 1", len(rsng))
+	tool, ok := byRaw["bash"]
+	if !ok {
+		t.Fatalf("no tool row; events=%+v", res.ToolEvents)
 	}
-	ev := rsng[0]
-	if ev.ToolOutput != "The user wants me to delete hello.py." {
-		t.Errorf("ToolOutput = %q", ev.ToolOutput)
+	if tool.PrecedingReasoning != "The user wants me to delete hello.py." {
+		t.Errorf("tool PrecedingReasoning = %q, want the reasoning body (beating the title %q)",
+			tool.PrecedingReasoning, "Run rm")
 	}
-	if ev.DurationMs != 1200 {
-		t.Errorf("DurationMs = %d, want 1200", ev.DurationMs)
+	asst, ok := byRaw["kilo-code-cli.assistant_text"]
+	if !ok {
+		t.Fatalf("no assistant_text row; events=%+v", res.ToolEvents)
 	}
-	if ev.MessageID != "msg_asst" {
-		t.Errorf("MessageID = %q, want msg_asst", ev.MessageID)
-	}
-	if ev.SourceEventID != "reasoning:prt_reasoning" {
-		t.Errorf("SourceEventID = %q, want reasoning:prt_reasoning", ev.SourceEventID)
+	if asst.PrecedingReasoning != "Second thought, the newer one." {
+		t.Errorf("assistant_text PrecedingReasoning = %q, want the LAST reasoning before it", asst.PrecedingReasoning)
 	}
 }
 
@@ -685,7 +688,11 @@ func setupKiloDBWithReasoning(t *testing.T, path string) {
 		`INSERT INTO message(id, session_id, time_created, time_updated, data) VALUES
 			('msg_asst', 'ses_1', 2000, 5000, '{"role":"assistant","agent":"code","modelID":"kilo-auto/free","providerID":"kilo","path":{"cwd":"/tmp/kilo-test"},"time":{"created":2000,"completed":5000},"finish":"stop"}')`,
 		`INSERT INTO part(id, message_id, session_id, time_created, time_updated, data) VALUES
-			('prt_reasoning', 'msg_asst', 'ses_1', 3000, 4200, '{"type":"reasoning","text":"The user wants me to delete hello.py.","time":{"start":3000,"end":4200}}')`,
+			('prt_reasoning', 'msg_asst', 'ses_1', 3000, 4200, '{"type":"reasoning","text":"The user wants me to delete hello.py.","time":{"start":3000,"end":4200}}'),
+			('prt_tool', 'msg_asst', 'ses_1', 4300, 4400, '{"type":"tool","tool":"bash","callID":"c1","state":{"status":"completed","input":{"command":"rm hello.py"},"output":"ok","title":"Run rm","time":{"start":4300,"end":4400}}}'),
+			('prt_reasoning_2', 'msg_asst', 'ses_1', 4500, 4600, '{"type":"reasoning","text":"First thought, superseded.","time":{"start":4500,"end":4600}}'),
+			('prt_reasoning_3', 'msg_asst', 'ses_1', 4700, 4800, '{"type":"reasoning","text":"Second thought, the newer one.","time":{"start":4700,"end":4800}}'),
+			('prt_text', 'msg_asst', 'ses_1', 4900, 4950, '{"type":"text","text":"Deleted."}')`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {

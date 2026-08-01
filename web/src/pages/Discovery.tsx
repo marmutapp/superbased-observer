@@ -116,7 +116,7 @@ export function DiscoveryPage() {
           label="Affected files"
           icon={<LayersIcon />}
           loading={data.loading}
-          value={fmtInt(data.data?.stale_total ?? 0)}
+          value={fmtInt(data.data?.stale_total)}
           sub="distinct files with stale re-reads"
         />
         <StatCard
@@ -136,7 +136,7 @@ export function DiscoveryPage() {
       {/* Stale re-reads */}
       <ChartShell
         title="Top files re-read"
-        sub={`Same-session reads where the prior read became stale (file changed in between). Top ${data.data?.stale_total ?? 0} files in window.`}
+        sub={`Same-session reads where the prior read became stale (file changed in between). Top ${fmtInt(data.data?.stale_total)} files in window.`}
         right={
           data.data && data.data.stale_total > 0 ? (
             <Pagination
@@ -164,7 +164,7 @@ export function DiscoveryPage() {
       {/* Repeated commands */}
       <ChartShell
         title="Repeated commands"
-        sub={`Commands run multiple times within a project. ${data.data?.repeated_total ?? 0} groups in window.`}
+        sub={`Commands run multiple times within a project. ${fmtInt(data.data?.repeated_total)} groups in window.`}
         right={
           data.data && data.data.repeated_total > 0 ? (
             <Pagination

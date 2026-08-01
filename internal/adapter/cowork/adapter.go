@@ -19,6 +19,7 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/models"
 	"github.com/marmutapp/superbased-observer/internal/platform/crossmount"
 	"github.com/marmutapp/superbased-observer/internal/scrub"
+	"github.com/marmutapp/superbased-observer/internal/tooltax"
 )
 
 // Adapter parses Claude Cowork audit logs at
@@ -130,54 +131,38 @@ func (a *Adapter) IsSessionFile(path string) bool {
 
 // actionMap translates Cowork tool names — which mirror Claude Code's
 // CLI tool surface plus a few Cowork-specific additions — to the
-// normalized action taxonomy. Names not listed get ActionUnknown and
-// keep their raw name in RawToolName.
+// normalized action taxonomy. It is READ OUT of internal/tooltax, the
+// one owner of the cross-adapter tool vocabulary (WP-T3 of
+// docs/plans/tool-taxonomy-standardization-plan-2026-07-31.md). Names
+// with no row get ActionUnknown and keep their raw name in
+// RawToolName.
 //
-// The `mcp__*` entries are MCP-flavored Cowork extensions that surface
-// in the live tool roster (system.init.tools[]). `mcp__workspace__bash`
-// is semantically equivalent to the built-in `Bash` tool, just routed
-// through the workspace MCP server; `mcp__workspace__web_fetch` is the
-// MCP twin of `WebFetch`. The remaining mcp__* names are server-side
-// helpers (cowork directory / present_files / visualize widgets) that
-// don't map to a single primitive action — they land as `mcp_call`.
-// `Skill` and `ToolSearch` are Anthropic-platform-level tools (skills
-// + deferred-tool loader); both surface as mcp_call.
-var actionMap = map[string]string{
-	"Read":                                  models.ActionReadFile,
-	"Write":                                 models.ActionWriteFile,
-	"Edit":                                  models.ActionEditFile,
-	"NotebookEdit":                          models.ActionEditFile,
-	"Bash":                                  models.ActionRunCommand,
-	"mcp__workspace__bash":                  models.ActionRunCommand,
-	"PowerShell":                            models.ActionRunCommand,
-	"powershell":                            models.ActionRunCommand,
-	"pwsh":                                  models.ActionRunCommand,
-	"cmd":                                   models.ActionRunCommand,
-	"cmd.exe":                               models.ActionRunCommand,
-	"sh":                                    models.ActionRunCommand,
-	"Grep":                                  models.ActionSearchText,
-	"Glob":                                  models.ActionSearchFiles,
-	"WebSearch":                             models.ActionWebSearch,
-	"WebFetch":                              models.ActionWebFetch,
-	"mcp__workspace__web_fetch":             models.ActionWebFetch,
-	"Agent":                                 models.ActionSpawnSubagent,
-	"Task":                                  models.ActionSpawnSubagent,
-	"TaskOutput":                            models.ActionTodoUpdate,
-	"TaskStop":                              models.ActionTodoUpdate,
-	"TaskCreate":                            models.ActionTodoUpdate,
-	"TaskUpdate":                            models.ActionTodoUpdate,
-	"TaskList":                              models.ActionTodoUpdate,
-	"TaskGet":                               models.ActionTodoUpdate,
-	"TodoWrite":                             models.ActionTodoUpdate,
-	"AskUserQuestion":                       models.ActionAskUser,
-	"Skill":                                 models.ActionMCPCall,
-	"ToolSearch":                            models.ActionMCPCall,
-	"mcp__cowork__request_cowork_directory": models.ActionMCPCall,
-	"mcp__cowork__present_files":            models.ActionMCPCall,
-	"mcp__cowork__allow_cowork_file_delete": models.ActionMCPCall,
-	"mcp__visualize__show_widget":           models.ActionMCPCall,
-	"mcp__visualize__read_me":               models.ActionMCPCall,
-}
+// Cowork's SEMANTIC REMAPS are preserved verbatim as cowork-specific
+// tooltax rows — they are deliberate adapter semantics, not drift, and
+// they intentionally differ from the claude-code rows for the same
+// native names:
+//
+//   - `mcp__workspace__bash` is semantically equivalent to the built-in
+//     `Bash` tool, just routed through the workspace MCP server, so it
+//     is run_command rather than mcp_call; `mcp__workspace__web_fetch`
+//     is the MCP twin of `WebFetch`.
+//   - The remaining `mcp__*` names are server-side helpers (cowork
+//     directory / present_files / visualize widgets) that don't map to
+//     a single primitive action — they land as `mcp_call`.
+//   - `Skill` and `ToolSearch` are Anthropic-platform-level tools
+//     (skills + deferred-tool loader); on THIS adapter both surface as
+//     mcp_call, where claude-code maps them to skill_invoke /
+//     tool_search.
+//
+// tooltax.For returns LITERAL rows only, so an unlisted `mcp__*` name
+// is still resolved by the models.IsMCPToolName fallback in the
+// tool_use branch — unchanged behaviour.
+//
+// TestActionMapPreservesPreTooltaxFixture pins every pre-conversion
+// pair as still present and unchanged (including every semantic
+// remap); TestActionMapTooltaxAdditions pins the intended additions so
+// an unreviewed one is loud.
+var actionMap = tooltax.For(models.ToolCowork)
 
 // nativeTools is the set of Cowork tools that are first-class agent
 // actions (not Bash shell wrappers). Used by IsNativeTool to set the
@@ -781,28 +766,17 @@ func (a *Adapter) handleAssistant(
 			if th == "" {
 				continue
 			}
+			// REASONING SEMANTICS (B3 convergence, 2026-07-31): the
+			// thinking block is accumulated into the per-message
+			// reasoning buffer and reaches the timeline ONLY as
+			// PrecedingReasoning on the tool_use rows that follow it in
+			// this message (FAN-OUT accumulate — see lastReasoning below;
+			// one thinking block can precede several tool calls and each
+			// carries it). It is deliberately NOT emitted as a standalone
+			// task_complete row: a reasoning block is not an action, and
+			// the phantom rows polluted every action aggregate (see
+			// docs/plans/b3-reasoning-convergence-plan-2026-07-31.md §1).
 			*reasoning = appendCapped(*reasoning, th, 20)
-			// Emit the thinking as a standalone, visible reasoning row
-			// (matches cline/gemini/kilocode/opencode/codex), not only as
-			// downstream PrecedingReasoning.
-			thPreview := truncate(a.scrubber.String(th), 200)
-			res.ToolEvents = append(res.ToolEvents, models.ToolEvent{
-				SourceFile:         path,
-				SourceEventID:      fmt.Sprintf("%s:reasoning:%d", rec.UUID, blockIdx),
-				SessionID:          sessionID,
-				ProjectRoot:        projectRoot,
-				Timestamp:          ts,
-				Tool:               models.ToolCowork,
-				Model:              msg.Model,
-				ActionType:         models.ActionTaskComplete,
-				Target:             thPreview,
-				Success:            true,
-				PrecedingReasoning: thPreview,
-				RawToolName:        "cowork.reasoning",
-				ToolOutput:         a.scrubber.String(contentcap.Cap(th, contentcap.DefaultMaxBytes)),
-				MessageID:          firstNonEmpty(msg.ID, "asst:"+rec.UUID),
-				IsSidechain:        isSidechain,
-			})
 
 		case "tool_use":
 			rawInput := string(b.Input)

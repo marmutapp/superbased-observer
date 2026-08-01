@@ -19,6 +19,9 @@ import { CopyOnClick } from "@/components/CopyOnClick";
 import { DataTable, Pagination } from "@/components/DataTable";
 import { ChartState } from "@/components/ChartState";
 import { SessionDetailPanel } from "@/components/SessionDetailPanel";
+import { TagPill } from "@/components/TagPill";
+import { FavoriteStar, TagEditor } from "@/components/TagEditor";
+import { postSessionTags } from "@/lib/api";
 import { useFilters, windowDaysApprox, windowParams } from "@/lib/filters";
 import { useApi } from "@/lib/useApi";
 import {
@@ -33,6 +36,8 @@ import type {
   SessionRow,
   SessionsCalendarResponse,
   SessionsResponse,
+  TagRollup,
+  TagRollupResponse,
 } from "@/lib/types";
 import {
   activeFilterCount,
@@ -121,8 +126,28 @@ export function SessionsPage() {
   }, [filters]);
   const drawerCount = activeFilterCount(filters);
 
+  // Session classification (docs/plans/session-classification-tags-plan-2026-07-31.md).
+  // tagFilters + favoriteOnly are SERVER-side params, deliberately NOT part of
+  // the drawer's client-side applyFilters: that path only sees the loaded page,
+  // so a tag filter there would silently hide matching sessions on other pages.
+  // Nothing is persisted — the server owns tags/favorites, and the filter is a
+  // transient view choice.
+  const [tagFilters, setTagFilters] = useState<string[]>([]);
+  const [favoriteOnly, setFavoriteOnly] = useState(false);
+  const tagKey = tagFilters.join(",");
+  // annotations holds per-session optimistic overrides for the three
+  // classification fields, merged over the fetched rows. Each entry is
+  // replaced by the server's post-mutation truth on success and reverted on
+  // failure, so it never drifts from the backend.
+  const [annotations, setAnnotations] = useState<
+    Record<string, { tags?: string[]; favorite?: boolean; has_note?: boolean }>
+  >({});
+  const addTagFilter = (tag: string) => {
+    setTagFilters((cur) => (cur.includes(tag) ? cur : [...cur, tag]));
+  };
+
   // Reset page when filters change (incl. picked calendar day).
-  const filterKey = `${win}|${tool}|${project}|${pickedDay ?? ""}|${sortBy}|${sortDir}`;
+  const filterKey = `${win}|${tool}|${project}|${pickedDay ?? ""}|${sortBy}|${sortDir}|${tagKey}|${favoriteOnly}`;
   const lastKey = useMemo(() => filterKey, [filterKey]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useMemo(() => setPage(1), [lastKey]);
@@ -139,8 +164,22 @@ export function SessionsPage() {
       to_date: pickedDay ?? undefined,
       sort_by: sortBy,
       sort_dir: sortDir,
+      // Repeated `tag=` params (AND semantics, server-side) + favorite=1.
+      tag: tagFilters.length > 0 ? tagFilters : undefined,
+      favorite: favoriteOnly ? 1 : undefined,
     },
-    [page, win, customRange, tool, project, pickedDay, sortBy, sortDir],
+    [
+      page,
+      win,
+      customRange,
+      tool,
+      project,
+      pickedDay,
+      sortBy,
+      sortDir,
+      tagKey,
+      favoriteOnly,
+    ],
     // Live-capture refresh: 5s while the tab is visible. Lets fresh
     // Antigravity-CLI .pb files (and any other in-progress session)
     // appear without requiring the operator to manually reload.
@@ -209,7 +248,66 @@ export function SessionsPage() {
     return s;
   }, [live.data]);
 
-  const rows = sessions.data?.rows ?? [];
+  // Tag vocabulary + per-tag rollup. Drives the Tags panel and is reloaded
+  // after every classification mutation so counts/cost stay honest.
+  const tagRollup = useApi<TagRollupResponse>("/api/sessions/tags", undefined, []);
+
+  const rawRows = sessions.data?.rows ?? [];
+  // SERVER TRUTH WINS ON EVERY FETCH. The optimistic override map is a bridge
+  // across exactly one gap — between a classification POST and the next
+  // /api/sessions response — and is dropped WHOLESALE the moment a fresh page
+  // lands. Without this the map was write-only: a tag added from the CLI or a
+  // second device could never appear on a row that had ever been touched here,
+  // and a POST whose response failed AFTER the server had already committed
+  // left the reverted (wrong) value pinned forever.
+  //
+  // sessions.data changes identity only when the payload actually differs
+  // (useApi's byte-identical guard), so idle 5s polls don't churn state — and a
+  // byte-identical response carries no new server truth to adopt anyway.
+  useEffect(() => {
+    if (sessions.data == null) return;
+    setAnnotations((cur) => (Object.keys(cur).length === 0 ? cur : {}));
+  }, [sessions.data]);
+
+  // Merge optimistic annotations over the fetched page.
+  const rows = useMemo(
+    () =>
+      rawRows.map((r) => {
+        const a = annotations[r.id];
+        return a ? { ...r, ...a } : r;
+      }),
+    // rawRows identity is stable between polls thanks to useApi's
+    // byte-identical guard, so this only recomputes on real change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [sessions.data, annotations],
+  );
+
+  // patchAnnotation records an optimistic (or server-confirmed) override.
+  const patchAnnotation = (
+    id: string,
+    patch: { tags?: string[]; favorite?: boolean; has_note?: boolean },
+  ) => {
+    setAnnotations((cur) => ({ ...cur, [id]: { ...cur[id], ...patch } }));
+  };
+
+  // toggleFavorite flips the star optimistically, then reconciles against the
+  // server's reply; a failed POST reverts to the pre-click value.
+  const toggleFavorite = async (row: SessionRow) => {
+    const before = row.favorite === true;
+    patchAnnotation(row.id, { favorite: !before });
+    try {
+      const r = await postSessionTags(row.id, { favorite: !before });
+      patchAnnotation(row.id, {
+        favorite: r.favorite,
+        tags: r.tags,
+        has_note: (r.note ?? "") !== "",
+      });
+      tagRollup.reload();
+    } catch {
+      patchAnnotation(row.id, { favorite: before });
+    }
+  };
+
   const query = localQuery || globalQuery;
   const filtered = useMemo(() => {
     let out = rows;
@@ -292,9 +390,39 @@ export function SessionsPage() {
     return c;
   }, [filters]);
 
+  // Classification chips are SEPARATE from drawerChips: these clear
+  // server-side params (tag=/favorite=), not the drawer's page-local state.
+  const classificationChips = useMemo<FilterChip[]>(() => {
+    const c: FilterChip[] = [];
+    if (favoriteOnly) {
+      c.push({
+        label: "★ favorites",
+        title: "Show all sessions again",
+        onClear: () => setFavoriteOnly(false),
+      });
+    }
+    for (const t of tagFilters) {
+      c.push({
+        label: `tag: ${t}`,
+        title: `Stop filtering by "${t}"`,
+        onClear: () => setTagFilters((cur) => cur.filter((x) => x !== t)),
+      });
+    }
+    return c;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [favoriteOnly, tagKey]);
+
   const showScoring = (sessions.data?.scored_count ?? 0) > 0;
   const columns = useMemo<ColumnDef<SessionRow, unknown>[]>(
-    () => buildColumns(showScoring, liveSet, activeSet, setWatch),
+    () =>
+      buildColumns(showScoring, liveSet, activeSet, setWatch, {
+        onToggleFavorite: (r) => void toggleFavorite(r),
+        onTagClick: addTagFilter,
+        onTagsChange: (id, tags) => {
+          patchAnnotation(id, { tags });
+          tagRollup.reload();
+        },
+      }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [showScoring, liveSet, activeSet],
   );
@@ -319,6 +447,12 @@ export function SessionsPage() {
       />
       {!showScoring && sessions.data && <ScoringHintBanner />}
 
+      <TagsRollupPanel
+        rows={tagRollup.data?.tags ?? []}
+        active={tagFilters}
+        onPick={addTagFilter}
+      />
+
       <ChartShell
         title={
           <span className="flex items-baseline gap-2">
@@ -338,6 +472,26 @@ export function SessionsPage() {
               onChange={(e) => setLocalQuery(e.target.value)}
               className="h-7 w-[240px] rounded-2 border border-line-2 bg-bg-2 px-2 font-mono text-[11px] text-fg-1 placeholder:text-fg-4 focus:border-accent focus:outline-none"
             />
+            <Tooltip
+              content={
+                favoriteOnly
+                  ? "Showing favorited sessions only — click to show all"
+                  : "Show only sessions you starred (server-side filter, all pages)"
+              }
+            >
+              <button
+                type="button"
+                aria-pressed={favoriteOnly}
+                onClick={() => setFavoriteOnly((v) => !v)}
+                className={
+                  favoriteOnly
+                    ? "inline-flex items-center gap-1.5 rounded-2 border border-warn/50 bg-warn-soft px-2.5 py-1 text-[11px] text-warn"
+                    : "inline-flex items-center gap-1.5 rounded-2 border border-line-2 bg-bg-2 px-2.5 py-1 text-[11px] text-fg-2 hover:bg-bg-3"
+                }
+              >
+                ★ Favorites
+              </button>
+            </Tooltip>
             <Tooltip
               content={
                 drawerCount > 0
@@ -376,7 +530,9 @@ export function SessionsPage() {
           </div>
         }
       >
-        {(pickedDay || drawerChips.length > 0) && (
+        {(pickedDay ||
+          drawerChips.length > 0 ||
+          classificationChips.length > 0) && (
           <ActiveFilterChips
             className="mb-3"
             chips={[
@@ -388,11 +544,14 @@ export function SessionsPage() {
                     } as FilterChip,
                   ]
                 : []),
+              ...classificationChips,
               ...drawerChips,
             ]}
             onClearAll={() => {
               setPickedDay(null);
               setFilters(EMPTY_FILTERS);
+              setTagFilters([]);
+              setFavoriteOnly(false);
             }}
           />
         )}
@@ -467,6 +626,18 @@ export function SessionsPage() {
         watch={watch}
         onClose={() => setSelected(null)}
         onOpenSession={(id) => setSelected(id)}
+        onFilterTag={(tag) => {
+          addTagFilter(tag);
+          setSelected(null);
+        }}
+        onAnnotationChange={(id, next) => {
+          patchAnnotation(id, {
+            tags: next.tags,
+            favorite: next.favorite,
+            has_note: (next.note ?? "") !== "",
+          });
+          tagRollup.reload();
+        }}
       />
 
       <SessionsFiltersDrawer
@@ -505,6 +676,81 @@ function durationLabel(d: SessionFilters["duration"]): string {
     default:
       return "any";
   }
+}
+
+// TagsRollupPanel — the v1 per-label analysis surface (plan §5): one row per
+// tag with its session count and cost, click-through = filter the list to
+// that tag. Renders NOTHING until the operator has tagged something, so an
+// untouched dashboard gains no empty furniture.
+function TagsRollupPanel({
+  rows,
+  active,
+  onPick,
+}: {
+  rows: TagRollup[];
+  active: string[];
+  onPick: (tag: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  if (rows.length === 0) return null;
+  const sorted = [...rows].sort(
+    (a, b) => b.cost_usd - a.cost_usd || b.sessions - a.sessions,
+  );
+  const shown = expanded ? sorted : sorted.slice(0, 8);
+  const totalCost = sorted.reduce((a, r) => a + r.cost_usd, 0);
+  return (
+    <section className="rounded-3 border border-line-2 bg-bg-2 p-3">
+      <header className="mb-2 flex items-baseline justify-between gap-2">
+        <h3 className="text-[11px] font-semibold uppercase tracking-[0.06em] text-fg-3">
+          Tags
+        </h3>
+        <span className="font-mono text-[10.5px] text-fg-3">
+          {fmtInt(sorted.length)} label{sorted.length === 1 ? "" : "s"} ·{" "}
+          <span className="text-fg-1">{fmtUSD(totalCost)}</span>
+        </span>
+      </header>
+      <div className="flex flex-wrap gap-1.5">
+        {shown.map((r) => {
+          const on = active.includes(r.tag);
+          return (
+            <Tooltip
+              key={r.tag}
+              content={`${fmtInt(r.sessions)} session${r.sessions === 1 ? "" : "s"} · ${fmtUSD(r.cost_usd)} · ${fmtCompact(r.tokens)} tokens`}
+            >
+              <button
+                type="button"
+                onClick={() => onPick(r.tag)}
+                aria-pressed={on}
+                className={
+                  "inline-flex items-center gap-1.5 rounded-2 border px-1.5 py-1 transition-colors " +
+                  (on
+                    ? "border-accent bg-accent-soft"
+                    : "border-line-2 bg-bg-1 hover:bg-bg-3")
+                }
+              >
+                <TagPill tag={r.tag} />
+                <span className="font-mono text-[10px] tabular-nums text-fg-3">
+                  {fmtInt(r.sessions)}
+                </span>
+                <span className="font-mono text-[10px] tabular-nums text-fg-2">
+                  {fmtUSD(r.cost_usd)}
+                </span>
+              </button>
+            </Tooltip>
+          );
+        })}
+        {sorted.length > shown.length && (
+          <button
+            type="button"
+            onClick={() => setExpanded(true)}
+            className="rounded-2 border border-line-2 bg-bg-1 px-2 py-1 text-[10.5px] text-fg-3 hover:bg-bg-3 hover:text-fg-1"
+          >
+            +{sorted.length - shown.length} more
+          </button>
+        )}
+      </div>
+    </section>
+  );
 }
 
 function ScoringHintBanner() {
@@ -726,17 +972,43 @@ function nextDay(d: Date): Date {
   return out;
 }
 
+// TagsCtx bundles the classification callbacks the table cells need. Passed
+// as one object so buildColumns doesn't grow a fourth positional callback.
+type TagsCtx = {
+  onToggleFavorite: (row: SessionRow) => void;
+  onTagClick: (tag: string) => void;
+  onTagsChange: (sessionId: string, tags: string[]) => void;
+};
+
+// MAX_ROW_TAGS caps how many pills a row shows before collapsing the rest
+// into a "+n" affordance — three keeps the column from eating the table.
+const MAX_ROW_TAGS = 3;
+
 function buildColumns(
   showScoring: boolean,
   liveSet: Set<string>,
   activeSet: Set<string>,
   onWatch: (id: string) => void,
+  tagsCtx: TagsCtx,
 ): ColumnDef<SessionRow, unknown>[] {
   // Column order matches design/page-sessions.jsx exactly:
   // Session / Tool / Project / Model(s) / Started / Elapsed / Actions /
   // Sub / Input / Cache R / Cache W / Output / API $ / Tool $ / Total $
   // Reliability and scoring (optional) come after.
   const cols: ColumnDef<SessionRow, unknown>[] = [
+    {
+      // Favorite star. Server-sortable (sort_by=favorite) so "starred first"
+      // orders the WHOLE filtered set, not the loaded page.
+      id: "favorite",
+      header: () => <span title="Favorites">★</span>,
+      accessorFn: (r) => (r.favorite ? 1 : 0),
+      cell: ({ row }) => (
+        <FavoriteStar
+          favorite={row.original.favorite === true}
+          onToggle={() => tagsCtx.onToggleFavorite(row.original)}
+        />
+      ),
+    },
     {
       id: "session",
       header: () => <>Session<HelpInd id="column.sessions.id" /></>,
@@ -808,6 +1080,55 @@ function buildColumns(
         ) : (
           <Pill>none</Pill>
         ),
+    },
+    {
+      // Tags: up to MAX_ROW_TAGS pills + a "+n" overflow, followed by the
+      // editor trigger. Clicking a pill filters the list to that tag
+      // (server-side); clicking the trigger opens the popover editor.
+      id: "tags",
+      header: () => <>Tags</>,
+      enableSorting: false,
+      cell: ({ row }) => {
+        const tags = row.original.tags ?? [];
+        const shown = tags.slice(0, MAX_ROW_TAGS);
+        const hidden = tags.slice(MAX_ROW_TAGS);
+        return (
+          <span className="flex max-w-[240px] flex-wrap items-center gap-1">
+            {shown.map((t) => (
+              <TagPill key={t} tag={t} onClick={tagsCtx.onTagClick} />
+            ))}
+            {hidden.length > 0 && (
+              <Tooltip content={hidden.join(", ")}>
+                <span
+                  tabIndex={0}
+                  className="cursor-help font-mono text-[10px] text-fg-3 focus:outline-none"
+                >
+                  +{hidden.length}
+                </span>
+              </Tooltip>
+            )}
+            {row.original.has_note && (
+              <Tooltip content="This session has a note — open it to read.">
+                <span
+                  tabIndex={0}
+                  aria-label="has note"
+                  className="cursor-help text-[10px] text-fg-3 focus:outline-none"
+                >
+                  ✎
+                </span>
+              </Tooltip>
+            )}
+            <TagEditor
+              sessionId={row.original.id}
+              tags={tags}
+              label={tags.length > 0 ? "edit" : "+ tag"}
+              onTagsChange={(next) =>
+                tagsCtx.onTagsChange(row.original.id, next)
+              }
+            />
+          </span>
+        );
+      },
     },
     {
       id: "models",

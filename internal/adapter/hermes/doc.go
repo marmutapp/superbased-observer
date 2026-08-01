@@ -44,6 +44,18 @@
 //     reasoning_tokens). Per-message granularity is also available via
 //     messages.token_count but is less precise.
 //
+// Reasoning emission (B3, 2026-07-31): messages.reasoning /
+// reasoning_content mint NO action row. The chain-of-thought is threaded
+// onto the next event the batch emits as PrecedingReasoning — the
+// message's first tool call, else its assistant-text row — under
+// grok-style semantics: consumed-once, last-wins, discarded at a
+// role='user' turn boundary, and never crossing a session id (one
+// state.db interleaves every session). The 200-char preview convention
+// the retired `hermes.reasoning` row used is applied at the flush site,
+// scrubbed there. Capture is deliberately NOT hook-gated (the retired
+// row was): threading adds no row, so there is no hook/SQLite duplicate
+// to suppress. See reasoningThread in parse.go.
+//
 // Tier 1 (accurate) proxy routing is a v2 follow-up — Hermes accepts a
 // custom inference.base_url per provider in ~/.hermes/config.yaml, so
 // pointing it at the observer proxy would work, but the wiring is

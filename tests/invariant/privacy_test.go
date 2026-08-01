@@ -618,6 +618,17 @@ var forbiddenCacheTables = []string{
 	// operator's personal screen arrangement, meaningless and unwanted
 	// off-node. No paired orgserver migration, by design.
 	"workspace_layouts",
+	// The org-announcement CACHE (migration 076, rail R3 of
+	// docs/plans/dashboard-announcements-banner-plan-2026-07-31.md §4)
+	// is NODE-LOCAL and must stay that way for a reason specific to
+	// this feature: the rail is ONE-WAY by design. Pushing the cached
+	// document (or its version) back would tell the server which of its
+	// own announcements this node holds — a read receipt, which plan §6
+	// rules out as telemetry. The banner has no acknowledgment wire and
+	// must never grow one by accident; the row is also RECEIVED state,
+	// like org_routing_policies above, so round-tripping it is pure
+	// noise even setting the receipt problem aside.
+	"org_announcements",
 	// Code-intelligence tables (internal/codeintel, migrations 050+,
 	// docs/codeintel/) are NODE-LOCAL: they hold a project's source
 	// paths, symbol names, signatures, import specifiers, and the
@@ -751,6 +762,25 @@ var forbiddenCacheTables = []string{
 	// allow-list neither is in. Same posture as remote_audit / limit_snapshots.
 	"remote_sessions",
 	"remote_session_state",
+
+	// Session classification (migration 075,
+	// docs/plans/session-classification-tags-plan-2026-07-31.md §1). Tag names
+	// and notes are the SAME PRIVACY CLASS as sessions.git_branch, which was
+	// gated off the org wire on 2026-07-02 (security review M2) precisely
+	// because free-text labels a developer authors encode client names,
+	// codenames and ticket ids. A tag vocabulary is that failure mode by
+	// construction ("acme-migration", "PROJ-1421", "junk"), and the note field
+	// is unbounded prose about why a run mattered.
+	//
+	// Both tables are therefore NODE-LOCAL under EVERY share mode — including
+	// admin_managed, which flips content-bearing columns raw for the other
+	// surfaces. There is no share key for them and no paired orgserver
+	// migration, by design; an org-shared taxonomy would need an explicit new
+	// [org_client.share] key plus its own privacy review (plan §0, deferred).
+	// session_tags additionally carries the end-to-end pin below
+	// (TestSessionClassificationPinnedOutOfPush).
+	"session_tags",
+	"session_annotations",
 }
 
 // TestRemoteAuditTablePinnedOutOfPush pins the remote-access audit log
@@ -889,6 +919,104 @@ func TestTerminalRunTablesPinnedOutOfPush(t *testing.T) {
 	}
 	if bytes.Contains(raw, []byte(secTermRun)) {
 		t.Error("terminal_run content leaked into the push payload — the tables must never be pushed")
+	}
+}
+
+// TestSessionClassificationPinnedOutOfPush pins the session-classification
+// tables (migration 075, plan §1) out of the org-push wire two ways: (1) both
+// table names are in the forbidden-name sentinel set (so
+// TestSelectUnpushedSinceExcludesCacheTables fails the build if either ever
+// appears as a string literal in orgpush.go), and (2) an end-to-end assertion
+// that a seeded tag AND a seeded note never cross the wire — even under
+// full_content, the maximum disclosure surface. The rows carry no *_hash
+// counterpart because they are never pushed at all.
+//
+// PROOF SCOPE — what this test does and does not establish. It proves absence
+// from the CURRENT SelectUnpushedSince payload (one seeded canary tag + note on
+// a session the push actually visits, marshalled and byte-searched) and it
+// proves the source-level sentinel covers both table names inside orgpush.go.
+// It does NOT prove the tables are unreachable by any future egress path: a new
+// wire-building query added ELSEWHERE — a second push seam, an export handler,
+// an org-side pull — would not be caught here. That case is held by CONVENTION,
+// not by this test: the single-SQL-seam rule (CLAUDE.md "Teams / org-server
+// invariants" — SelectUnpushedSince is the only place wire rows are built) plus
+// the review requirement that any new content-bearing wire column be gated at
+// that seam AND added to the sentinel set. Widening egress therefore requires
+// touching the one file this test watches; a reviewer who accepts a second seam
+// has stepped outside what any of these invariants can see.
+func TestSessionClassificationPinnedOutOfPush(t *testing.T) {
+	// (1) both names pinned in the sentinel set.
+	for _, name := range []string{"session_tags", "session_annotations"} {
+		found := false
+		for _, n := range forbiddenCacheTables {
+			if n == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("%s is not in forbiddenCacheTables — the source-level sentinel is missing", name)
+		}
+	}
+
+	// (2) end-to-end: a seeded tag + note never ride the wire. The tag must
+	// survive NormalizeTag's charset, so the canary is lowercase/hyphenated —
+	// exactly the shape a real client codename would take.
+	const (
+		secTag  = "secret-sessiontag-obstreperous-zz"
+		secNote = "SECRET_SESSIONNOTE_obstreperous_zz"
+	)
+	ctx := context.Background()
+	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "agent.db")})
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	st := store.New(database)
+	seed(ctx, t, st)
+
+	// Tag a session that DOES ride the wire, so the exclusion is proven for a
+	// row the push actually visits — not merely for an orphan id.
+	if err := st.MutateSessionTags(ctx, "sess-cc-1", []string{secTag}, nil); err != nil {
+		t.Fatalf("MutateSessionTags: %v", err)
+	}
+	fav := true
+	note := secNote
+	if err := st.SetSessionAnnotation(ctx, "sess-cc-1", &fav, &note); err != nil {
+		t.Fatalf("SetSessionAnnotation: %v", err)
+	}
+
+	// Full-content = maximum surface; the classification tables must STILL be
+	// absent.
+	batch, err := st.SelectUnpushedSince(ctx, store.PushCursor{}, 1<<20, "org-1", "dev@x",
+		store.ShareOptions{FullContent: true}, store.ScopeOptions{})
+	if err != nil {
+		t.Fatalf("SelectUnpushedSince: %v", err)
+	}
+	raw, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatalf("marshal batch: %v", err)
+	}
+	if bytes.Contains(raw, []byte(secTag)) {
+		t.Error("session_tags content leaked into the push payload — the table must never be pushed")
+	}
+	if bytes.Contains(raw, []byte(secNote)) {
+		t.Error("session_annotations note leaked into the push payload — the table must never be pushed")
+	}
+
+	// The same must hold under admin_managed, which deliberately flips the
+	// OTHER content-bearing columns raw (CLAUDE.md native-console carve-out).
+	batch, err = st.SelectUnpushedSince(ctx, store.PushCursor{}, 1<<20, "org-1", "dev@x",
+		store.ShareOptions{AdminManaged: true}, store.ScopeOptions{})
+	if err != nil {
+		t.Fatalf("SelectUnpushedSince(admin_managed): %v", err)
+	}
+	raw, err = json.Marshal(batch)
+	if err != nil {
+		t.Fatalf("marshal admin_managed batch: %v", err)
+	}
+	if bytes.Contains(raw, []byte(secTag)) || bytes.Contains(raw, []byte(secNote)) {
+		t.Error("session classification leaked under admin_managed — the tables are node-local under EVERY share mode")
 	}
 }
 

@@ -377,13 +377,18 @@ func TestParseClineImageAttachment(t *testing.T) {
 	}
 }
 
+// TestParseClineReasoning pins the B3-converged behaviour (2026-07-31):
+// a `thinking` block mints NO `<tool>.reasoning` row and instead reaches
+// the timeline as PrecedingReasoning on the tool_use rows that follow it
+// in the same message (fan-out semantics, unchanged).
 func TestParseClineReasoning(t *testing.T) {
 	t.Parallel()
 	body := `[
 	  {"role":"assistant","ts":1,"content":[
 	    {"type":"thinking","thinking":"Let me think about this carefully."},
 	    {"type":"text","text":"Here is my answer."},
-	    {"type":"tool_use","id":"t1","name":"read_file","input":{"path":"x.go"}}
+	    {"type":"tool_use","id":"t1","name":"read_file","input":{"path":"x.go"}},
+	    {"type":"tool_use","id":"t2","name":"list_files","input":{"path":"."}}
 	  ]}
 	]`
 	dir := filepath.Join(t.TempDir(), "tasks", "r1")
@@ -399,29 +404,69 @@ func TestParseClineReasoning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseSessionFile: %v", err)
 	}
-	var reasoningRow, toolRow *models.ToolEvent
+	var threaded int
 	for i := range res.ToolEvents {
-		switch res.ToolEvents[i].RawToolName {
-		case "cline.reasoning":
-			reasoningRow = &res.ToolEvents[i]
-		case "":
-			// tool_use rows have no RawToolName override here
+		ev := &res.ToolEvents[i]
+		if strings.HasSuffix(ev.RawToolName, ".reasoning") {
+			t.Fatalf("reasoning row minted: %+v", ev)
 		}
-		if res.ToolEvents[i].ActionType == models.ActionReadFile {
-			toolRow = &res.ToolEvents[i]
+		if ev.ActionType == models.ActionReadFile || ev.ActionType == models.ActionSearchFiles {
+			if !strings.Contains(ev.PrecedingReasoning, "think about this carefully") {
+				t.Errorf("%s PrecedingReasoning = %q, want the thinking text", ev.ActionType, ev.PrecedingReasoning)
+			}
+			threaded++
 		}
 	}
-	if reasoningRow == nil {
-		t.Fatal("no cline.reasoning row emitted for thinking block")
+	// FAN-OUT: one thinking block, two tool calls, both carry it.
+	if threaded != 2 {
+		t.Fatalf("expected both tool rows to carry the reasoning; got %d (%+v)", threaded, res.ToolEvents)
 	}
-	if !strings.Contains(reasoningRow.ToolOutput, "think about this carefully") {
-		t.Errorf("reasoning row body: %q", reasoningRow.ToolOutput)
+}
+
+// TestParseRetaggedReasoningMintsNoRow pins that the row-suppression
+// holds for the RETAGS of this parser too, not just for cline. The raw
+// name was built by string concat from the resolved toolID
+// (`toolID + ".reasoning"`), so roo-code and legacy kilo-code minted the
+// same phantom class through the same site — a name-literal-only guard
+// would miss all three.
+func TestParseRetaggedReasoningMintsNoRow(t *testing.T) {
+	t.Parallel()
+	body := `[
+	  {"role":"assistant","ts":1,"content":[
+	    {"type":"thinking","thinking":"Roo is thinking."},
+	    {"type":"tool_use","id":"t1","name":"read_file","input":{"path":"x.go"}}
+	  ]}
+	]`
+	dir := filepath.Join(t.TempDir(), "rooveterinaryinc.roo-cline", "tasks", "roo-1")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if toolRow == nil {
-		t.Fatal("no read_file tool row")
+	path := filepath.Join(dir, "api_conversation_history.json")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(toolRow.PrecedingReasoning, "think about this carefully") {
-		t.Errorf("tool PrecedingReasoning = %q, want the thinking text", toolRow.PrecedingReasoning)
+	res, err := New().ParseSessionFile(context.Background(), path, 0)
+	if err != nil {
+		t.Fatalf("ParseSessionFile: %v", err)
+	}
+	var tool *models.ToolEvent
+	for i := range res.ToolEvents {
+		ev := &res.ToolEvents[i]
+		if ev.Tool != models.ToolRooCode {
+			t.Fatalf("row not retagged: %+v", ev)
+		}
+		if strings.HasSuffix(ev.RawToolName, ".reasoning") {
+			t.Fatalf("roo-code reasoning row minted: %+v", ev)
+		}
+		if ev.ActionType == models.ActionReadFile {
+			tool = ev
+		}
+	}
+	if tool == nil {
+		t.Fatalf("no read_file row; events=%+v", res.ToolEvents)
+	}
+	if !strings.Contains(tool.PrecedingReasoning, "Roo is thinking.") {
+		t.Errorf("roo-code tool PrecedingReasoning = %q", tool.PrecedingReasoning)
 	}
 }
 

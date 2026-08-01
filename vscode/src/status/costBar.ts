@@ -11,6 +11,7 @@ import * as vscode from 'vscode';
 import type { DaemonManager } from '../daemon';
 import type { HeadlineResponse } from '../api/types';
 import { output } from '../output';
+import { buildHeadlineText } from './costBar-internals';
 
 const POLL_MS = 60_000;
 const FIRST_PROBE_DELAY_MS = 1_000;
@@ -81,7 +82,10 @@ export function createCostStatusBar(
 
 function renderHeadline(item: vscode.StatusBarItem, data: HeadlineResponse): void {
   const spend = data.period?.cost_usd ?? 0;
-  item.text = `$(graph) ${formatUSD(spend)}`;
+  const wordmarkEnabled = vscode.workspace
+    .getConfiguration('observer')
+    .get<boolean>('statusBar.wordmark', true);
+  item.text = buildHeadlineText(spend, wordmarkEnabled);
   item.tooltip = buildTooltip(data);
   item.backgroundColor = undefined;
 }

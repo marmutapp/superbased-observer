@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "observer": {
+      "command": "observer",
+      "args": [
+        "serve"
+      ]
+    }
+  }
+}
