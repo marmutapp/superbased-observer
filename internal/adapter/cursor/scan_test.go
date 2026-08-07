@@ -8,10 +8,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 
 	"github.com/marmutapp/superbased-observer/internal/models"
+	"github.com/marmutapp/superbased-observer/internal/platform/crossmount"
 	"github.com/marmutapp/superbased-observer/internal/platform/protowire"
 )
 
@@ -45,6 +47,380 @@ func TestDecodeProjectSlug(t *testing.T) {
 				t.Fatalf("DecodeProjectSlug(%q) = %q, want %q", tc.slug, got, tc.want)
 			}
 		})
+	}
+}
+
+// fakeFS builds the stat/readFile seams of a projectRootResolver from
+// a set of existing directories and a map of file bodies. It records
+// every path stat() was asked about so tests can assert the paths that
+// reached the filesystem were already translated. The `exists` entries
+// are given in RAW (pre-translation) form and are registered under
+// their translated spelling — which is exactly the property under
+// test: the resolver must translate BEFORE it stats.
+type fakeFS struct {
+	dirs     map[string]bool
+	files    map[string]string
+	statPath []string
+}
+
+func newFakeFS(exists []string, files map[string]string) *fakeFS {
+	f := &fakeFS{dirs: map[string]bool{}, files: map[string]string{}}
+	for _, d := range exists {
+		f.dirs[crossmount.TranslateForeignPath(d)] = true
+	}
+	for k, v := range files {
+		f.files[k] = v
+	}
+	return f
+}
+
+func (f *fakeFS) stat(p string) (os.FileInfo, error) {
+	f.statPath = append(f.statPath, p)
+	if f.dirs[p] {
+		return fakeDirInfo{}, nil
+	}
+	return nil, os.ErrNotExist
+}
+
+func (f *fakeFS) readFile(p string) ([]byte, error) {
+	body, ok := f.files[p]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return []byte(body), nil
+}
+
+func (f *fakeFS) resolver() projectRootResolver {
+	// translate is deliberately left nil: these tests exercise the
+	// REAL crossmount.TranslateForeignPath, so the C:\ → /mnt/c/
+	// rewrite is proven end-to-end rather than simulated.
+	return projectRootResolver{stat: f.stat, readFile: f.readFile}
+}
+
+type fakeDirInfo struct{}
+
+func (fakeDirInfo) Name() string       { return "" }
+func (fakeDirInfo) Size() int64        { return 0 }
+func (fakeDirInfo) Mode() os.FileMode  { return os.ModeDir | 0o755 }
+func (fakeDirInfo) ModTime() time.Time { return time.Time{} }
+func (fakeDirInfo) IsDir() bool        { return true }
+func (fakeDirInfo) Sys() any           { return nil }
+
+// TestResolveProjectRoot pins the fixed watcher-side project-root
+// resolution: `.workspace-trusted` first, then the stat-gated
+// hyphen/underscore candidate expansion, then the pre-fix naive
+// decode — all of it routed through crossmount.TranslateForeignPath so
+// a Windows-side Cursor observed from WSL lands on a `/mnt/c/...` root
+// that actually stats (the F4 defect in
+// docs/audits/cursor-windows-capture-diagnosis-2026-08-07.md §2.5).
+//
+// The first two cases are the two real slugs observed live on
+// 2026-08-07: both decoded to directories that do not exist, splitting
+// project identity and killing git detection.
+func TestResolveProjectRoot(t *testing.T) {
+	const trustedName = "/.workspace-trusted"
+	tests := map[string]struct {
+		slug string
+		// exists lists RAW paths (pre-translation) that the fake fs
+		// should report as existing directories.
+		exists []string
+		// trusted is the verbatim `.workspace-trusted` body, "" for
+		// "the file is absent" (the common case — Cursor only writes
+		// it for workspaces the user explicitly trusted).
+		trusted string
+		// want is the RAW expected root; the assertion compares
+		// against its translated form so the test is platform-correct.
+		want string
+	}{
+		// Live slug #1: real dir is C:\programsx\model_pricing.
+		"windows underscore variant wins over naive split": {
+			slug:   "c-programsx-model-pricing",
+			exists: []string{`C:\programsx\model_pricing`},
+			want:   `C:\programsx\model_pricing`,
+		},
+		// Live slug #2: real repo is /home/marmutapp/superbased-observer.
+		"posix hyphen rejoin wins over naive split": {
+			slug:   "home-marmutapp-superbased-observer",
+			exists: []string{"/home/marmutapp/superbased-observer"},
+			want:   "/home/marmutapp/superbased-observer",
+		},
+		"windows hyphen rejoin": {
+			slug:   "c-programsx-superbased-observer",
+			exists: []string{`C:\programsx\superbased-observer`},
+			want:   `C:\programsx\superbased-observer`,
+		},
+		"naive decode wins when it stats": {
+			slug:   "c-programsx-model-pricing",
+			exists: []string{`C:\programsx\model\pricing`, `C:\programsx\model_pricing`},
+			want:   `C:\programsx\model\pricing`,
+		},
+		"nothing stats falls back to the naive decode, translated": {
+			slug: "c-programsx-model-pricing",
+			want: `C:\programsx\model\pricing`,
+		},
+		"posix nothing stats falls back to the naive decode": {
+			slug: "home-marmutapp-superbased-observer",
+			want: "/home/marmutapp/superbased/observer",
+		},
+		"two ambiguous joints": {
+			slug:   "c-programsx-my-repo-sub-dir",
+			exists: []string{`C:\programsx\my-repo\sub_dir`},
+			want:   `C:\programsx\my-repo\sub_dir`,
+		},
+		"workspace-trusted beats a stat-able naive decode": {
+			slug:    "c-programsx-model-pricing",
+			exists:  []string{`C:\programsx\model\pricing`, `C:\programsx\model_pricing`},
+			trusted: `{"trustedAt":"2026-05-24T19:58:52.653Z","workspacePath":"C:\\programsx\\model_pricing"}`,
+			want:    `C:\programsx\model_pricing`,
+		},
+		"workspace-trusted that does not stat yields to a stat-able candidate": {
+			slug:    "c-programsx-model-pricing",
+			exists:  []string{`C:\programsx\model_pricing`},
+			trusted: `{"workspacePath":"D:\\moved\\away"}`,
+			want:    `C:\programsx\model_pricing`,
+		},
+		"workspace-trusted still beats the naive decode when nothing stats": {
+			slug:    "c-programsx-model-pricing",
+			trusted: `{"workspacePath":"D:\\moved\\away"}`,
+			want:    `D:\moved\away`,
+		},
+		"malformed workspace-trusted falls through silently": {
+			slug:    "c-programsx-model-pricing",
+			exists:  []string{`C:\programsx\model_pricing`},
+			trusted: "not json at all",
+			want:    `C:\programsx\model_pricing`,
+		},
+		"empty workspacePath falls through silently": {
+			slug:    "c-programsx-model-pricing",
+			exists:  []string{`C:\programsx\model_pricing`},
+			trusted: `{"trustedAt":"2026-05-24T19:58:52.653Z"}`,
+			want:    `C:\programsx\model_pricing`,
+		},
+		"drive root only": {
+			slug: "c",
+			want: `C:\`,
+		},
+		"posix single segment": {
+			slug: "home",
+			want: "/home",
+		},
+		"underscore already literal in the slug is preserved": {
+			slug:   "c-users-auzy_-projects-myrepo",
+			exists: []string{`C:\users\auzy_\projects\myrepo`},
+			want:   `C:\users\auzy_\projects\myrepo`,
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			projectDir := "/home/u/.cursor/projects/" + tc.slug
+			files := map[string]string{}
+			if tc.trusted != "" {
+				files[projectDir+trustedName] = tc.trusted
+			}
+			fs := newFakeFS(tc.exists, files)
+			a := (&Adapter{}).withRootResolver(fs.resolver())
+			transcript := projectDir + "/agent-transcripts/abc/abc.jsonl"
+
+			got := a.resolveProjectRoot(transcript)
+			want := crossmount.TranslateForeignPath(tc.want)
+			if got != want {
+				t.Fatalf("resolveProjectRoot(%q) = %q, want %q", transcript, got, want)
+			}
+
+			// Every path that reached stat() must already be in the
+			// host's canonical form — i.e. translation happened
+			// BEFORE the stat-gate, which is what makes the gate
+			// meaningful and what keeps a raw `C:\…` string from ever
+			// reaching a downstream git.Resolve
+			// (docs/new-adapter-checklist.md §3.7).
+			for _, p := range fs.statPath {
+				if canonical := crossmount.TranslateForeignPath(p); canonical != p {
+					t.Errorf("stat() saw untranslated path %q (canonical form is %q)", p, canonical)
+				}
+			}
+		})
+	}
+}
+
+// TestResolveProjectRootNoSlug pins the "not a transcript path" guard:
+// no projects/<slug>/ component means no root, and the caller emits
+// the empty-project-root warning rather than a fabricated path.
+func TestResolveProjectRootNoSlug(t *testing.T) {
+	a := &Adapter{}
+	if got := a.resolveProjectRoot("/home/u/somewhere/else.jsonl"); got != "" {
+		t.Fatalf("resolveProjectRoot(non-transcript) = %q, want \"\"", got)
+	}
+}
+
+// TestResolveProjectRootReadsRealWorkspaceTrusted exercises the DEFAULT
+// (uninjected) seams against a real temp filesystem, proving the
+// production path reads `.workspace-trusted` and stats the workspace
+// with the real os.* calls. The slug is deliberately garbage so the
+// only way to the right answer is the trusted file.
+//
+// The file's shape is verbatim what a live Cursor 3.14.27 install
+// writes (Windows AND WSL side, checked 2026-08-07); the sibling
+// repo.json holds only `{"id":"<uuid>"}` and is never consulted.
+func TestResolveProjectRootReadsRealWorkspaceTrusted(t *testing.T) {
+	base := t.TempDir()
+	realWS := filepath.Join(base, "actualrepo")
+	if err := os.MkdirAll(realWS, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	projectDir := filepath.Join(base, ".cursor", "projects", "nonexistent-slug-abcdef")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(map[string]string{
+		"trustedAt":     "2026-05-24T19:58:52.653Z",
+		"workspacePath": realWS,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, ".workspace-trusted"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The sibling repo.json is path-free; its presence must not change
+	// anything.
+	if err := os.WriteFile(filepath.Join(projectDir, "repo.json"),
+		[]byte(`{"id":"81aa2a9c-c38e-48f2-a8c9-e83a1af770b6"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &Adapter{}
+	transcript := filepath.Join(projectDir, "agent-transcripts", "abc", "abc.jsonl")
+	want := crossmount.TranslateForeignPath(realWS)
+	if got := a.resolveProjectRoot(transcript); got != want {
+		t.Fatalf("resolveProjectRoot = %q, want the .workspace-trusted path %q", got, want)
+	}
+	// Second call must hit the memo and return the same answer.
+	if got := a.resolveProjectRoot(transcript); got != want {
+		t.Fatalf("cached resolveProjectRoot = %q, want %q", got, want)
+	}
+}
+
+// TestProjectRootCandidates pins the candidate ORDER (naive decode
+// first — so a slug that already decodes correctly behaves exactly as
+// it did before the expansion existed — then the rejoins, rightmost
+// joint first, `-` before `_`) and the combinatorial bound.
+func TestProjectRootCandidates(t *testing.T) {
+	t.Run("windows order", func(t *testing.T) {
+		got := projectRootCandidates("c-programsx-model-pricing")
+		want := []string{
+			`C:\programsx\model\pricing`,
+			`C:\programsx\model-pricing`,
+			`C:\programsx\model_pricing`,
+			`C:\programsx-model\pricing`,
+			`C:\programsx_model\pricing`,
+			`C:\programsx-model-pricing`,
+			`C:\programsx-model_pricing`,
+			`C:\programsx_model-pricing`,
+			`C:\programsx_model_pricing`,
+		}
+		if len(got) != len(want) {
+			t.Fatalf("candidates = %d (%q), want %d", len(got), got, len(want))
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("candidate[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("posix order", func(t *testing.T) {
+		got := projectRootCandidates("home-marmutapp-superbased-observer")
+		want := []string{
+			"/home/marmutapp/superbased/observer",
+			"/home/marmutapp/superbased-observer",
+			"/home/marmutapp/superbased_observer",
+			"/home/marmutapp-superbased/observer",
+		}
+		if len(got) < len(want) {
+			t.Fatalf("candidates = %q, want at least %d entries", got, len(want))
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("candidate[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("single segment slugs have exactly one candidate", func(t *testing.T) {
+		for _, slug := range []string{"c", "home"} {
+			if got := projectRootCandidates(slug); len(got) != 1 || got[0] != DecodeProjectSlug(slug) {
+				t.Errorf("projectRootCandidates(%q) = %q, want [%q]", slug, got, DecodeProjectSlug(slug))
+			}
+		}
+	})
+
+	t.Run("empty slug", func(t *testing.T) {
+		if got := projectRootCandidates(""); got != nil {
+			t.Errorf("projectRootCandidates(\"\") = %q, want nil", got)
+		}
+	})
+
+	t.Run("bounded for a pathologically long slug", func(t *testing.T) {
+		parts := make([]string, 200)
+		for i := range parts {
+			parts[i] = "seg"
+		}
+		got := projectRootCandidates("home-" + strings.Join(parts, "-"))
+		if len(got) > maxRootCandidates {
+			t.Fatalf("candidates = %d, want <= %d", len(got), maxRootCandidates)
+		}
+		if got[0] != DecodeProjectSlug("home-"+strings.Join(parts, "-")) {
+			t.Errorf("candidate[0] = %q, want the naive decode", got[0])
+		}
+	})
+}
+
+// TestParseSessionFileResolvesRealWorkspaceRoot is the end-to-end
+// regression for the F4 defect: the observed Windows slug
+// `c-programsx-model-pricing` must land every emitted event on the
+// real, stat-able `/mnt/c/programsx/model_pricing`-shaped root rather
+// than the phantom `C:\programsx\model\pricing` the pre-fix decoder
+// produced. This is the value that reaches store.Ingest and, from
+// there, downstream git resolution — so it is the boundary the
+// "translate + stat-gate before git.Resolve" rule applies to.
+func TestParseSessionFileResolvesRealWorkspaceRoot(t *testing.T) {
+	dir := t.TempDir()
+	convID := "80dfaf13-1b3b-4775-b2c6-ec234fa61b1a"
+	slug := "c-programsx-model-pricing"
+	transcriptDir := filepath.Join(dir, "projects", slug, "agent-transcripts", convID)
+	if err := os.MkdirAll(transcriptDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transcript := filepath.Join(transcriptDir, convID+".jsonl")
+	body := `{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"path":"main.go"}}]}}` + "\n"
+	if err := os.WriteFile(transcript, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fs := newFakeFS([]string{`C:\programsx\model_pricing`}, nil)
+	// The transcript itself must stat for real (ParseSessionFile calls
+	// os.Stat directly for size/mtime); only the root-resolution seams
+	// are faked.
+	a := (&Adapter{}).withRootResolver(fs.resolver())
+
+	res, err := a.ParseSessionFile(context.Background(), transcript, 0)
+	if err != nil {
+		t.Fatalf("ParseSessionFile: %v", err)
+	}
+	if len(res.ToolEvents) == 0 {
+		t.Fatalf("no events emitted")
+	}
+	want := crossmount.TranslateForeignPath(`C:\programsx\model_pricing`)
+	for i, ev := range res.ToolEvents {
+		if ev.ProjectRoot != want {
+			t.Errorf("event[%d] ProjectRoot = %q, want %q", i, ev.ProjectRoot, want)
+		}
+		if strings.Contains(ev.ProjectRoot, `\`) && crossmount.TranslateForeignPath(ev.ProjectRoot) != ev.ProjectRoot {
+			t.Errorf("event[%d] ProjectRoot %q is not canonical for this host", i, ev.ProjectRoot)
+		}
+	}
+	if len(res.Warnings) != 0 {
+		t.Errorf("unexpected warnings: %q", res.Warnings)
 	}
 }
 
@@ -228,8 +604,16 @@ func TestParseSessionFile(t *testing.T) {
 		if ev.SourceFile != transcript {
 			t.Errorf("event SourceFile = %q want %q", ev.SourceFile, transcript)
 		}
-		if ev.ProjectRoot != `C:\programsx\marmutmain` {
-			t.Errorf("event ProjectRoot = %q want C:\\programsx\\marmutmain", ev.ProjectRoot)
+		// The watcher path now canonicalises foreign-OS roots the same
+		// way the hook path's normalizeWorkspaceRoot does, so a
+		// Windows slug lands as /mnt/c/... on a Linux/WSL observer and
+		// stays C:\... on native Windows. Assert through the same
+		// translator rather than a hard-coded shape so the expectation
+		// is platform-correct (and host-independent: the naive decode
+		// and the stat-gated candidate agree for this slug either way).
+		wantRoot := crossmount.TranslateForeignPath(`C:\programsx\marmutmain`)
+		if ev.ProjectRoot != wantRoot {
+			t.Errorf("event ProjectRoot = %q want %q", ev.ProjectRoot, wantRoot)
 		}
 	}
 	// Emission order within a turn: text part first, then tool_use parts

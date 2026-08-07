@@ -88,7 +88,7 @@ can't give you, in order of how much they matter:
    rollup server ships only hashed metadata by default; raw content
    ships only when **the node** opts in, never a remote admin toggle.
    Full details: [`PRIVACY.md`](PRIVACY.md).
-3. **One capture layer, every tool you actually use.** 29 adapters —
+3. **One capture layer, every tool you actually use.** 31 adapters —
    Claude Code, Codex, Cursor, Cline + Cline CLI, GitHub Copilot +
    Copilot CLI, Gemini CLI, OpenCode, Google Antigravity, Cowork,
    Hermes Agent, Kilo Code, Aider, Goose, Devin, Qoder, Crush, Grok,
@@ -960,7 +960,7 @@ your client through the proxy — the one-click button path in the
 
 ```
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│ Claude Code  │     │    Cursor    │     │    Codex     │    ... 29 adapters total
+│ Claude Code  │     │    Cursor    │     │    Codex     │    ... 31 adapters total
 └──────┬───────┘     └──────┬───────┘     └──────┬───────┘
        │ JSONL              │ hook events        │ rollout files
        ▼                    ▼                    ▼

@@ -30,8 +30,9 @@ const (
 	// FormatWSLMnt — input was already a canonical /mnt/<drive>/...
 	// path (no rewrite applied, just classified).
 	FormatWSLMnt
-	// FormatWindowsDrive — input looked like `C:\foo`, `C:/foo`, or
-	// `c:\foo` and was rewritten to /mnt/c/foo on non-Windows.
+	// FormatWindowsDrive — input looked like `C:\foo`, `C:/foo`,
+	// `c:\foo`, or the URI fsPath spelling `/c:/foo`, and was
+	// rewritten to /mnt/c/foo on non-Windows.
 	FormatWindowsDrive
 	// FormatGitBashDrive — input started with `/c/`, `/d/`, etc.
 	// (Git Bash drive prefix) and was rewritten to /mnt/c/, /mnt/d/,
@@ -177,6 +178,23 @@ func NormalizeWithFormat(p string) (string, Format) {
 
 	// Layer 7 — Windows drive-letter absolute → /mnt/<drive>/...
 	// on non-Windows.
+	//
+	// 7a. Strip the spurious leading slash a URI fsPath carries in
+	// front of the drive letter (`/c:/foo`). This is the same slash
+	// decodeFileURIPath already removes inside a `file://` URI; it
+	// also reaches us bare, because VS Code / Cursor hook payloads
+	// hand out `Uri.fsPath`-shaped roots directly. Stripping it here
+	// makes `/c:/programsx/foo` land on the SAME canonical
+	// `/mnt/c/programsx/foo` as `C:\programsx\foo` and
+	// `/mnt/c/programsx/foo`, instead of splitting project identity
+	// across two spellings of one directory. The extra
+	// looksLikeWindowsDriveAbsolute guard makes the strip
+	// all-or-nothing: we never leave a half-transformed path behind
+	// (it is redundant given the regex, and kept as a cheap
+	// invariant).
+	if stripped, ok := stripURIDriveSlash(p); ok && looksLikeWindowsDriveAbsolute(stripped) {
+		p = stripped
+	}
 	if looksLikeWindowsDriveAbsolute(p) {
 		p = windowsToWSLMnt(p)
 		if format == FormatUnknown {
@@ -348,6 +366,37 @@ func rewriteGitBashDrive(p string) (string, bool) {
 	}
 	drive := strings.ToLower(string(p[1]))
 	return "/mnt/" + drive + p[2:], true
+}
+
+// uriDriveSlashRE matches a leading `/` followed by a drive-letter
+// absolute path — `/c:/foo`, `/C:/foo`, `/c:\foo`. Anchored, exactly
+// one ASCII letter, a literal colon, then a separator, so the shapes
+// that merely LOOK similar never match: `/cache/foo` (letter run > 1,
+// no colon), `/c/foo` (Git Bash — owned by layer 6), bare `/c`,
+// `/c:` with no separator, `/cc:/foo`, `/1:/foo`, `//c:/foo`.
+//
+// Detection is deliberately LEXICAL. filepath.IsAbs is host-only —
+// on a Linux/WSL host `C:\foo` reads as a relative path — so a
+// host-aware predicate would silently stop recognising foreign shapes
+// depending on where observer runs.
+var uriDriveSlashRE = regexp.MustCompile(`^/[A-Za-z]:[\\/]`)
+
+// stripURIDriveSlash removes the leading slash of a `/<drive>:/...`
+// URI fsPath so the drive-letter layer can claim it. Returns the
+// input and false when the shape doesn't match.
+//
+// Host-independent by design: it is a spelling fix, not an OS
+// translation, so it runs on Windows too (where `/c:/foo` becomes the
+// natively-usable `c:/foo` and windowsToWSLMnt then passes it
+// through). No distinct Format is reported — the result IS a Windows
+// drive path and is classified FormatWindowsDrive, mirroring how the
+// identical slash-strip inside decodeFileURIPath reports the format
+// of its OUTER layer rather than minting one of its own.
+func stripURIDriveSlash(p string) (string, bool) {
+	if !uriDriveSlashRE.MatchString(p) {
+		return p, false
+	}
+	return p[1:], true
 }
 
 // looksLikeWindowsDriveAbsolute reports whether p starts with a

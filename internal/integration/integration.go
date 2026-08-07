@@ -1354,9 +1354,31 @@ var registry = map[string]Capability{
 		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "kimi", IDMechanism: "flag:--session"},
 		// AuthEnv zero: kimi-code reads its key from [providers.*] in
 		// ~/.kimi-code/config.toml — file auth, no grounded runtime key env.
-		// Binary resolution. Unix launcher resolves "kimi". No grounded
-		// install channel yet (research pending) → Installs nil, Windows nil.
-		Binary: &BinaryResolveSpec{Names: BinaryNames{Unix: []string{"kimi"}}},
+		// Binary resolution + grounded installs. Unix launcher resolves
+		// "kimi". Grounded 2026-08-07 against Moonshot AI's own getting-
+		// started page (moonshotai.github.io/kimi-code/en/guides/
+		// getting-started.html) — npm `@moonshot-ai/kimi-code` (registry-
+		// confirmed: registry.npmjs.org/@moonshot-ai/kimi-code returns 200
+		// with published versions) + the official install script, whose
+		// body was fetched live and self-identifies as the "kimi-code
+		// installer for macOS and Linux" (cdn.kimi.com, redirected from the
+		// documented code.kimi.com URL) + its Windows PowerShell twin.
+		Binary: &BinaryResolveSpec{
+			// npm JS bin: Windows install lays down a `.cmd` shim (+
+			// .ps1/POSIX-shell forms), never an `.exe` — see the
+			// command-code row's Binary comment for the long-form
+			// rationale.
+			Names: BinaryNames{
+				Unix:    []string{"kimi"},
+				Windows: []string{"kimi.cmd", "kimi"},
+			},
+			Installs: []InstallHint{
+				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "@moonshot-ai/kimi-code"}, Display: "npm install -g @moonshot-ai/kimi-code"},
+				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash"}, Display: "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash"},
+				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash"}, Display: "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash"},
+				{OS: "windows", Channel: "script", Argv: []string{"powershell", "-Command", "irm https://code.kimi.com/kimi-code/install.ps1 | iex"}, Display: "irm https://code.kimi.com/kimi-code/install.ps1 | iex"},
+			},
+		},
 	},
 	"crush": {
 		Tool:       "crush",
@@ -2052,12 +2074,26 @@ var registry = map[string]Capability{
 		// cmd/observer/resume_launcher_test.go, not a live resume (no paid
 		// turn was run).
 		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "muse", IDMechanism: "subcommand:resume"},
-		// Binary: Names.Unix populated (required for a launchable tool);
-		// Installs stays an EMPTY slice per the honesty rule — muse ships
-		// from lookaside.facebook.com behind an auth.meta.com device
-		// login, and no safe scriptable install command has been grounded
-		// for that channel.
-		Binary: &BinaryResolveSpec{Names: BinaryNames{Unix: []string{"muse"}}},
+		// Binary: Names.Unix populated (required for a launchable tool).
+		// Installs GROUNDED 2026-08-07: the self-updating ~/.local/bin/muse
+		// launcher itself is behind auth.meta.com device login (still true,
+		// per docs/muse-adapter.md), but Meta separately publishes an
+		// unauthenticated bootstrap script at dev.meta.ai — fetched live
+		// here, its body is a real bash script (`command_name="muse"`,
+		// installs into `${MUSE_INSTALL_DIR:-$HOME/.local/bin}`, pulls
+		// `https://api.meta.ai/muse-launcher.sh`) that matches this
+		// registry's own grounded knowledge of the install layout exactly,
+		// and two independent outlets (9to5mac's launch coverage; a
+		// layer3labs how-to citing Meta's own product page) quote the same
+		// command. No Windows build exists (docs/muse-adapter.md), so
+		// linux/darwin only — Names.Windows stays nil.
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{Unix: []string{"muse"}},
+			Installs: []InstallHint{
+				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://dev.meta.ai/install.sh | bash"}, Display: "curl -fsSL https://dev.meta.ai/install.sh | bash"},
+				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://dev.meta.ai/install.sh | bash"}, Display: "curl -fsSL https://dev.meta.ai/install.sh | bash"},
+			},
+		},
 	},
 	"prime-agent": {
 		Tool: "prime-agent",
@@ -2145,13 +2181,27 @@ var registry = map[string]Capability{
 		// cmd/observer/resume_launcher_test.go, not a live resume (no
 		// paid turn was run).
 		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "prime-agent", IDMechanism: "flag:--resume"},
-		// Binary: Names.Unix populated (required for a launchable tool);
-		// npm package `prime-agent` is a grounded install channel
-		// (`npm ls -g` confirmed the live install as `prime-agent@0.7.0`).
+		// Binary: Names.Unix populated (required for a launchable tool).
+		// CORRECTED 2026-08-07: the prior row here claimed an `npm install
+		// -g prime-agent` channel on the strength of `npm ls -g` showing
+		// the live install as `prime-agent@0.7.0` — but that reflects HOW
+		// the vendor installer lays the package down locally, not a public
+		// registry entry. `registry.npmjs.org/prime-agent` returns 404 (no
+		// such package has ever been published), reproduced live via both
+		// `npm view prime-agent` and a direct registry GET on 2026-08-07 —
+		// so the old hint would 404 for any operator who ran it. The
+		// project's actual, grounded public channel is the installer script
+		// named in its own README (github.com/PrimeIntellect-ai/prime-agent)
+		// and in docs/plans/prime-agent-adapter-plan-2026-08-06.md: it
+		// downloads a versioned release, verifies its SHA-256 checksum, and
+		// installs the `prime-agent` command. No Windows build is
+		// documented (README leads with Linux/macOS) → Names.Windows stays
+		// nil.
 		Binary: &BinaryResolveSpec{
 			Names: BinaryNames{Unix: []string{"prime-agent"}},
 			Installs: []InstallHint{
-				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "prime-agent"}, Display: "npm install -g prime-agent"},
+				{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"}, Display: "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"},
+				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"}, Display: "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"},
 			},
 		},
 	},

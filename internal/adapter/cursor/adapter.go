@@ -53,16 +53,23 @@ import (
 // docstring rationalized away these two events as "fires on every
 // text/thought delta, low marginal value because the JSONL transcript
 // walker delivers the same content on stop." Both halves of that
-// reasoning are stale on modern Cursor (3.4.x):
-//   - The agent-transcripts/<conv>.jsonl files that
-//     BuildStopTranscriptEvents walks are no longer written to disk;
-//     Cursor moved conversation storage into
-//     User/globalStorage/state.vscdb. The hook payload still names a
-//     transcript_path but the file doesn't materialize. The walker is
-//     dead-code on current builds.
+// reasoning were wrong for the builds measured in 2026-05:
+//   - On the Cursor 3.4.20 install captured in the 2026-05-21 audit,
+//     no agent-transcripts/<conv>.jsonl materialised for the hook's
+//     transcript_path, so BuildStopTranscriptEvents had nothing to
+//     walk. Do NOT read that as "Cursor stopped writing transcripts":
+//     the walker is very much alive on Cursor 3.14.27, where the
+//     `.cursor/projects/<slug>/agent-transcripts/<conv>/<conv>.jsonl`
+//     files ARE written and are the ONLY thing capturing Windows-IDE
+//     Cursor activity today (grounded 2026-08-07, see
+//     docs/audits/cursor-windows-capture-diagnosis-2026-08-07.md §1
+//     Path A / §2.8). What those files still do NOT carry is usage:
+//     every line is `{"message","role"}` — no `usage`, no `model` —
+//     which is why tokens remain hook-only. Treat transcript
+//     presence as version- and surface-dependent, never as settled.
 //   - Captured live payloads show finalized blocks (single text, single
 //     duration_ms per thought/response), not per-token deltas. The
-//     overhead concern was wrong for current Cursor.
+//     overhead concern was wrong for the builds measured.
 //
 // So afterAgentThought is now CAPTURED (it was skipped entirely
 // pre-v1.6.18) — though as of the 2026-07-31 B3 convergence it mints no
@@ -383,8 +390,9 @@ func BuildEvent(eventName string, body []byte, sc *scrub.Scrubber) (models.ToolE
 		return models.ToolEvent{}, false, nil
 	case EventAfterAgentThought:
 		// Finalized assistant thinking block. text is the full prose
-		// (no per-token deltas — Cursor 3.4+ emits one event per
-		// finalized thought, not one per fragment).
+		// (no per-token deltas — on the builds captured live, 3.4.20
+		// and 3.9.16, Cursor emits one event per finalized thought,
+		// not one per fragment; unverified on 3.14.x).
 		//
 		// REASONING SEMANTICS (B3 convergence, 2026-07-31): this event
 		// mints NO row. A thought is not an action; the row it used to
@@ -630,20 +638,30 @@ func deriveAfterSuccess(raw rawHookPayload) bool {
 }
 
 // BuildStopTokenEvent maps Cursor's `stop` hook payload to a normalized
-// TokenEvent. Retained for older Cursor builds that still fire `stop`;
-// Cursor 3.4+ routes per-generation usage through afterAgentResponse
-// instead (see BuildResponseTokenEvent). Both share buildTokenEvent.
+// TokenEvent. Retained for Cursor builds that fire `stop`; on the
+// builds captured live (3.4.20, 3.9.16) per-generation usage arrived
+// on afterAgentResponse instead (see BuildResponseTokenEvent). Both
+// share buildTokenEvent and dedup against each other, so registering
+// BOTH is the safe posture on an unmeasured build — which 3.14.x
+// currently is (docs/audits/cursor-windows-capture-diagnosis-2026-08-07.md
+// §2.6, probe P4).
 func BuildStopTokenEvent(body []byte) (models.TokenEvent, bool, error) {
 	return buildTokenEvent(body)
 }
 
 // BuildResponseTokenEvent maps Cursor's `afterAgentResponse` payload to a
-// normalized TokenEvent. Cursor 3.4+ STOPPED firing `stop`;
-// afterAgentResponse carries the IDENTICAL per-generation usage fields
+// normalized TokenEvent. On the builds captured live (3.4.20 in the
+// 2026-05-21 audit, 3.9.16 in the last cursor-stop-debug.jsonl lines)
+// `stop` was not observed to fire, while afterAgentResponse carried
+// the IDENTICAL per-generation usage fields
 // (input_tokens / output_tokens / cache_read_tokens / cache_write_tokens,
-// model, generation_id — verified by live capture, see
-// TestBuildEvent_AfterAgentResponse), so this is now the PRIMARY cursor
-// token path. It shares the (source_file, source_event_id) identity with
+// model, generation_id — see TestBuildEvent_AfterAgentResponse), which
+// is why this is the PRIMARY cursor token path. Whether 3.14.x still
+// emits this payload shape — or fires hooks at all — is UNVERIFIED
+// (docs/audits/cursor-windows-capture-diagnosis-2026-08-07.md §2.6);
+// no cursor token_usage row has landed since 2026-05-24, so do not
+// treat "afterAgentResponse works" as a standing fact.
+// It shares the (source_file, source_event_id) identity with
 // the stop path via buildTokenEvent, so a generation seen on BOTH events
 // dedups to a single token_usage row (UNIQUE(source_file, source_event_id)
 // + the (tool, session_id, message_id) guard) instead of double-counting.
@@ -1139,15 +1157,35 @@ func decodeWorkspaceRoot(raw json.RawMessage) string {
 // matches how the rest of observer represents paths on the host.
 //
 // Cursor-agent on Windows (the CLI) sends workspace_roots as a raw
-// Windows backslash path, e.g. `C:\programsx\superbased-observer`.
-// Stored verbatim that's not stat-able from a WSL observer and lands
-// under a non-canonical project root distinct from the `/mnt/c/...`
-// form pathnorm produces everywhere else (verified against session
-// 90dd2512, 2026-05-24). Route through crossmount.TranslateForeignPath
-// (a thin wrapper over pathnorm.Normalize) so `C:\...` and `file://`
-// URIs canonicalize to `/mnt/c/...`. No-op for already-native Linux
-// paths and for the IDE's `/c:/...` forward-slash form (pathnorm
-// leaves that untouched, so existing IDE rows don't fragment).
+// Windows backslash path, e.g. `C:\programsx\superbased-observer`;
+// the IDE sends the `Uri.fsPath` spelling `/c:/programsx/...`. Stored
+// verbatim neither is stat-able from a WSL observer, and neither
+// matches the `/mnt/c/...` form pathnorm produces everywhere else
+// (verified against session 90dd2512, 2026-05-24). Route through
+// crossmount.TranslateForeignPath (a thin wrapper over
+// pathnorm.Normalize) so `C:\...`, `/c:/...` and `file://` URIs all
+// canonicalize to `/mnt/c/...`. No-op for already-native Linux paths.
+//
+// The pre-2026-08-07 rationale here — "leave `/c:/...` alone so
+// existing IDE rows don't fragment" — is INVERTED, and was already
+// only half-true (it described a pathnorm gap as a deliberate
+// choice). Two changes flipped it:
+//
+//   - F4 (commit 82372dca) made the watcher path emit canonical
+//     `/mnt/c/...` roots via resolveProjectRoot (scan.go). Leaving
+//     the hook path on `/c:/...` is now precisely what fragments a
+//     project: one directory, two project rows.
+//   - pathnorm layer 7a now strips the URI fsPath leading slash, so
+//     this function converges the hook path onto the watcher's form
+//     with no cursor-local special-casing.
+//
+// Hence NO behaviour change is needed here: the delegation was
+// already correct, and inherits the fix. Pinned by
+// TestNormalizeWorkspaceRoot_CanonicalizesWindowsShapes.
+//
+// Historic rows written before this landed keep their `/c:/...`
+// roots until a re-parse (`observer scan --force`) — the fix is on
+// the write path only, per the "measure by RE-PARSING" rule.
 func normalizeWorkspaceRoot(p string) string {
 	if p == "" {
 		return ""

@@ -28,6 +28,7 @@ OAPI         := $(GO) tool oapi-codegen
         track-build verify-track-build \
         plugins-build verify-plugins-build \
         taxonomy-build verify-taxonomy-build verify-taxonomy-ts \
+        tool-count-build verify-tool-count-build \
         taxonomy-migration-build verify-taxonomy-migration \
         assistant-migration-build verify-assistant-migration \
         reasoning-migration-build verify-reasoning-migration \
@@ -301,6 +302,30 @@ taxonomy-build:
 # build-into-temp pattern.
 verify-taxonomy-build:
 	@scripts/verify-taxonomy-build.sh
+
+# ---------------------------------------------------------------
+# Machine-readable adapter-count manifest (website/tools/
+# tool-count-manifest.json). tools/toolcountgen reads
+# internal/integration.Tools() (the one-owner adapter capability
+# registry) plus an explicit, documented editorial-fold table (antigravity
+# and browserchat fold their multiple registry rows to 1 adapter each;
+# kilo-code is explicitly NOT folded, per CLAUDE.md's own Platform-
+# adapters line) and emits the resulting adapter count + per-family
+# breakdown. website/tools/accuracy-check.mjs reads this manifest and
+# cross-checks it against CLAUDE.md's own "Platform adapters (N)" prose
+# line — the two must agree, or the check fails. Run after a registry row
+# is added/removed/renamed. See tools/toolcountgen's package doc comment
+# for the full fold reasoning.
+# ---------------------------------------------------------------
+tool-count-build:
+	$(GO) run ./tools/toolcountgen
+
+# Drift gate for the generated manifest: regenerates into a scratch dir
+# and byte-diffs against the committed file. Fails if the registry moved
+# without a matching `make tool-count-build` + commit. Never mutates the
+# working tree. Mirrors verify-taxonomy-build's build-into-temp pattern.
+verify-tool-count-build:
+	@scripts/verify-tool-count-build.sh
 
 # Cross-language parity gate: compiles the REAL web/src/lib/actions.ts
 # (esbuild, from web/node_modules) and runs it against the generated

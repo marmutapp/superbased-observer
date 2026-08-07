@@ -373,9 +373,12 @@ const (
 	// operator-settable BYOK endpoint and no proxy lane today.
 	ToolMuse = "muse"
 	// ToolPrimeAgent is Prime Intellect's Prime Agent CLI ("prime-agent";
-	// npm `prime-agent`, also installed by
-	// app.primeintellect.ai/prime-agent/install.sh). A HARD FORK of
-	// pi-mono — it still carries the inherited `@earendil-works/pi-*`
+	// installed via curl -fsSL https://app.primeintellect.ai/prime-agent/
+	// install.sh | sh — NOT a published npm package: the on-disk install is
+	// npm-package-SHAPED (`npm ls -g` reports it as `prime-agent@0.7.0`)
+	// but registry.npmjs.org/prime-agent 404s; see the integration
+	// registry's Binary comment on this row, corrected 2026-08-07). A HARD
+	// FORK of pi-mono — it still carries the inherited `@earendil-works/pi-*`
 	// package identifiers and a `piConfig` manifest key — so its session
 	// ENVELOPE is recognisably pi-shaped, but it is NOT a rebadge of
 	// ToolPi: the data home is ~/.prime/agent (not ~/.pi/agent), sessions

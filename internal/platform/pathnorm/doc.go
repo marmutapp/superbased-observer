@@ -34,7 +34,11 @@
 //  6. Rewrite Git Bash drive prefix (`/c/`, `/d/`, etc.) to
 //     `/mnt/c/`, `/mnt/d/`, etc. on non-Windows hosts.
 //  7. Rewrite Windows drive-letter absolute (`C:\foo`, `C:/foo`,
-//     `c:\foo`) to `/mnt/c/foo` on non-Windows hosts.
+//     `c:\foo`) to `/mnt/c/foo` on non-Windows hosts. A leading slash
+//     in front of the drive letter (`/c:/foo` — the `Uri.fsPath`
+//     spelling VS Code / Cursor emit) is stripped first so that shape
+//     canonicalises to the SAME `/mnt/c/foo`; without it one
+//     directory splits into two project identities.
 //  8. Expand `~/` and `~` to $HOME on POSIX hosts (NOT `~user/`,
 //     NOT environment variables — too unsafe).
 //  9. Classify the result for the returned Format value.

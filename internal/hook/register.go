@@ -858,14 +858,21 @@ func hasConflictingClaudeHook(groups []claudeHookGroup) bool {
 // the per-tool before* hooks miss) plus three paired-after observers
 // registered no-row pending update-in-place: postToolUse,
 // afterShellExecution, afterMCPExecution. Tier 4 (v1.6.18) adds
-// afterAgentThought + afterAgentResponse: Cursor 3.4+ stopped writing
-// agent-transcripts/*.jsonl files (the JSONL walker BuildStopTranscriptEvents
-// relied on as a fallback for finalized assistant prose is now
-// dead-code), and live-captured payloads confirmed the events fire
+// afterAgentThought + afterAgentResponse: on Cursor 3.4.20-3.9.16 (the
+// versions live-confirmed at the time) agent-transcripts/*.jsonl writing
+// had stopped, so the JSONL walker BuildStopTranscriptEvents relied on
+// as a fallback for finalized assistant prose was believed dead-code;
+// live-captured payloads on those versions confirmed the events fire
 // once-per-finalized-block (not per-token-delta as the v1.4.45
-// docstring claimed). See internal/adapter/cursor/adapter.go for the
-// full rationale. Tab events (beforeTabFileRead, afterTabFileEdit)
-// remain out of scope.
+// docstring claimed). CORRECTION (2026-08-07, see
+// docs/audits/cursor-windows-capture-diagnosis-2026-08-07.md): on
+// Cursor 3.14.27 agent-transcripts/*.jsonl writing is back — it is
+// currently the ONLY thing capturing Windows-IDE Cursor activity, so
+// the JSONL walker is live again, not dead-code, on that version.
+// Whether 3.14.27 still fires afterAgentResponse with usage fields is
+// unverified (see that audit's probe P2/P3). See
+// internal/adapter/cursor/adapter.go for the full rationale. Tab
+// events (beforeTabFileRead, afterTabFileEdit) remain out of scope.
 var cursorEvents = []string{
 	"beforeSubmitPrompt", "beforeShellExecution", "afterFileEdit", "beforeMCPExecution", "stop",
 	"beforeReadFile", "postToolUseFailure", "sessionStart", "sessionEnd",
@@ -1058,8 +1065,11 @@ func (r *Registry) registerCursorWindows() RegistrationResult {
 		// binary path it points at. This matters across upgrades,
 		// distro changes, or smoke-test artifacts: the binary path
 		// changes but the entry is still ours and should be refreshed,
-		// not treated as a foreign conflict.
-		hooks[event] = filterStaleObserverWindowsCursorEntries(hooks[event], cmd)
+		// not treated as a foreign conflict. filterStaleObserverWindowsCursorEntries
+		// ALSO drops dangling one-off observer debug shims (see
+		// isDanglingObserverWindowsCursorShim) that never carried the
+		// canonical " hook cursor " signature.
+		hooks[event] = filterStaleObserverWindowsCursorEntries(hooks[event], cmd, event, r.opts.ConfigPath)
 		if !r.opts.Force && hasNonObserverWindowsCursorEntry(hooks[event]) {
 			res.Error = fmt.Errorf("hook.registerCursorWindows: event %s already has a non-observer hook; pass --force to overwrite", event)
 			return res
@@ -1111,15 +1121,70 @@ func isObserverWindowsCursorEntry(cmd string) bool {
 	return false
 }
 
+// isDanglingObserverWindowsCursorShim recognises a stale
+// observer-authored debug artifact for the Windows-Cursor bridge
+// that does NOT carry the canonical " hook cursor " signature
+// isObserverWindowsCursorEntry looks for — e.g. a one-off tee/debug
+// wrapper (`wsl.exe -d <distro> -- /tmp/cursor-tee-shim.sh <event>
+// --config '<ours>'`) left behind by a prior observer debugging
+// session. It is recognised as ours ONLY when ALL three hold, so a
+// genuinely user-authored PowerShell/cmd.exe hook is never
+// misclassified as stale and silently dropped:
+//
+//   - cmd invokes via the wsl.exe cross-OS bridge shape (with or
+//     without the legacy MSYS_NO_PATHCONV=1 prefix);
+//   - cmd's --config argument points at THIS registrar's own config
+//     file (configPath, threaded from Options.ConfigPath) — an empty
+//     configPath never matches anything, since without it we can't
+//     attribute authorship at all;
+//   - cmd names event as a bare argument token.
+//
+// See docs/audits/cursor-windows-capture-diagnosis-2026-08-07.md §4
+// F2: a dead /tmp/cursor-tee-shim.sh entry (the shim itself long
+// gone — /tmp is cleared on WSL restart) permanently blocked
+// auto-register by tripping hasNonObserverWindowsCursorEntry on
+// every `observer start`, because it started with `wsl.exe ` but
+// never contained ` hook cursor `.
+func isDanglingObserverWindowsCursorShim(cmd, event, configPath string) bool {
+	if configPath == "" {
+		return false
+	}
+	if !strings.HasPrefix(cmd, "wsl.exe ") && !strings.HasPrefix(cmd, "MSYS_NO_PATHCONV=1 wsl.exe ") {
+		return false
+	}
+	if !strings.Contains(cmd, "--config "+shellQuote(configPath)) {
+		return false
+	}
+	return commandArgsInclude(cmd, event)
+}
+
+// commandArgsInclude reports whether cmd contains token as a bare,
+// whitespace-delimited argument (optionally single- or
+// double-quoted). Splitting on whitespace is safe here: it is only
+// ever called with cursorEvents members (identifiers with no
+// internal whitespace), so a quoted value elsewhere in cmd (e.g. a
+// --config path) can never be mistaken for a match.
+func commandArgsInclude(cmd, token string) bool {
+	for _, f := range strings.Fields(cmd) {
+		if strings.Trim(f, `'"`) == token {
+			return true
+		}
+	}
+	return false
+}
+
 // filterStaleObserverWindowsCursorEntries drops any
-// observer-recognised stale entry that doesn't match `want`. Used
-// by the cursor-windows registrar to clear prior registrations
-// before appending the canonical command. Non-observer entries pass
-// through untouched so the conflict check below can flag them.
-func filterStaleObserverWindowsCursorEntries(entries []cursorHookEntry, want string) []cursorHookEntry {
+// observer-recognised stale entry that doesn't match `want`,
+// including dangling debug shims for this event
+// (isDanglingObserverWindowsCursorShim). Used by the cursor-windows
+// registrar to clear prior registrations before appending the
+// canonical command. Non-observer entries pass through untouched so
+// the conflict check below can flag them.
+func filterStaleObserverWindowsCursorEntries(entries []cursorHookEntry, want, event, configPath string) []cursorHookEntry {
 	out := make([]cursorHookEntry, 0, len(entries))
 	for _, e := range entries {
-		if isObserverWindowsCursorEntry(e.Command) && e.Command != want {
+		isOurs := isObserverWindowsCursorEntry(e.Command) || isDanglingObserverWindowsCursorShim(e.Command, event, configPath)
+		if isOurs && e.Command != want {
 			continue
 		}
 		out = append(out, e)
@@ -1986,6 +2051,75 @@ func (r *Registry) recordChecksum(path string) error {
 	}
 	if err := atomicWriteFile(pinned, body); err != nil {
 		return fmt.Errorf("hook.recordChecksum: %w", err)
+	}
+	return nil
+}
+
+// RecordAutoRegisterResult persists the outcome of an auto-register
+// attempt against configPath into hook_checksums.json, independent of
+// whether the registrar actually wrote configPath. Callers (the
+// `observer start` auto-register loop) call it after every
+// Register() invocation, success or failure, so a stuck registration
+// — e.g. a stale non-observer entry blocking the Windows-Cursor
+// bridge — is inspectable later via hook_checksums.json instead of
+// living only as a stderr line on a long-running daemon nobody
+// happens to be watching (see
+// docs/audits/cursor-windows-capture-diagnosis-2026-08-07.md §4 F3).
+//
+// A successful Register() already calls recordChecksum, which writes
+// "sha256"/"registered"/"binary_path" for configPath; this ADDS
+// last_result ("ok" or "error"), last_error (present only on
+// failure), and last_checked_at to that SAME entry, preserving
+// whatever else is already there — so hook_checksums.json stays
+// backward compatible for any reader that only knows the original
+// three keys. When Register() never got far enough to write anything
+// (every attempt so far has failed), this still creates a minimal
+// entry so the failure is visible.
+//
+// regErr is the RegistrationResult.Error from Register(); nil means
+// success. configPath == "" is a no-op (nothing to key the entry on).
+func (r *Registry) RecordAutoRegisterResult(configPath string, regErr error) error {
+	if configPath == "" {
+		return nil
+	}
+	csPath := r.opts.ChecksumsPath
+	if csPath == "" {
+		csPath = filepath.Join(r.opts.HomeDir, ".observer", "hook_checksums.json")
+	}
+
+	unlock, err := r.lockSettings(csPath)
+	if err != nil {
+		return fmt.Errorf("hook.RecordAutoRegisterResult: %w", err)
+	}
+	defer unlock()
+
+	// Pin the write target now, before the read — see pinnedTarget (F6).
+	pinned := pinWriteTarget(csPath)
+
+	current := map[string]map[string]any{}
+	if raw, err := os.ReadFile(csPath); err == nil {
+		_ = json.Unmarshal(raw, &current)
+	}
+	entry := current[configPath]
+	if entry == nil {
+		entry = map[string]any{}
+	}
+	entry["last_checked_at"] = time.Now().UTC().Format(time.RFC3339)
+	if regErr != nil {
+		entry["last_result"] = "error"
+		entry["last_error"] = regErr.Error()
+	} else {
+		entry["last_result"] = "ok"
+		delete(entry, "last_error")
+	}
+	current[configPath] = entry
+
+	body, err := json.MarshalIndent(current, "", "  ")
+	if err != nil {
+		return fmt.Errorf("hook.RecordAutoRegisterResult: marshal: %w", err)
+	}
+	if err := atomicWriteFile(pinned, body); err != nil {
+		return fmt.Errorf("hook.RecordAutoRegisterResult: %w", err)
 	}
 	return nil
 }

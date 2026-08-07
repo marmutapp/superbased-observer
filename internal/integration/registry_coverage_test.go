@@ -619,6 +619,43 @@ func TestBinarySpecHonesty(t *testing.T) {
 	}
 }
 
+// TestGuidedInstallGapClosed pins the 2026-08-07 fix (parity plan §15.6a):
+// muse, prime-agent, and kimi-code each carry at least one grounded
+// InstallHint. This is a regression guard specifically for the class of miss
+// that produced the gap — a launchable adapter landing with `Binary.Names`
+// set but `Installs` left nil "for later" (never caught by
+// TestEveryLaunchableToolHasBinarySpec, which only requires the Names) — plus
+// a targeted check on prime-agent that its hint is not the fabricated
+// `npm install -g prime-agent` command this test would have caught: that
+// package was never published to the public npm registry
+// (registry.npmjs.org/prime-agent 404s), even though the tool's local
+// install is npm-package-SHAPED. See the new-adapter-checklist §3.6 "npm ls
+// -g-proves-a-local-shape trap" for the general caution this leaves behind.
+func TestGuidedInstallGapClosed(t *testing.T) {
+	for _, tool := range []string{"muse", "prime-agent", "kimi-code"} {
+		c, ok := integration.For(tool)
+		if !ok {
+			t.Fatalf("adapter %q has no registry row", tool)
+		}
+		if c.Binary == nil {
+			t.Fatalf("adapter %q: Binary is nil", tool)
+		}
+		if len(c.Binary.Installs) == 0 {
+			t.Errorf("adapter %q: Installs is empty — the guided-install gap has regressed", tool)
+		}
+	}
+
+	primeAgent, ok := integration.For("prime-agent")
+	if !ok {
+		t.Fatal("prime-agent has no registry row")
+	}
+	for i, h := range primeAgent.Binary.Installs {
+		if h.Channel == "npm" {
+			t.Errorf("prime-agent: Installs[%d] uses Channel %q — prime-agent has never been published to the public npm registry (registry.npmjs.org/prime-agent 404s); the grounded channel is the vendor's install script", i, h.Channel)
+		}
+	}
+}
+
 // authEnvClosureOwnedKeys are the launcher-closure-owned routing/profile env
 // keys that AuthEnv must never carry — they are forwarded by the tool-specific
 // attach closures (claudeAttachEnv / codexAttachEnv) or the proxy-route seam,

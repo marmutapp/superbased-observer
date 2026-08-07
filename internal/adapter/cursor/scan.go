@@ -2,10 +2,12 @@ package cursor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/marmutapp/superbased-observer/internal/adapter"
@@ -52,6 +54,20 @@ type Adapter struct {
 	scrubber  *scrub.Scrubber
 	roots     []string
 	hookCheck SessionHookChecker
+
+	// rootRes carries the injectable filesystem seams used to turn a
+	// projects/<slug>/ directory into a real, stat-able workspace
+	// root. The zero value is valid — every seam falls back to the
+	// real implementation (see projectRootResolver) so `&Adapter{}`
+	// literals keep working.
+	rootRes projectRootResolver
+	// rootCache memoizes projects/<slug>/ dir → resolved workspace
+	// root. ONLY exact (stat-confirmed) resolutions are cached:
+	// caching a fallback would pin a wrong root forever if the
+	// workspace directory appears later (mount comes up, repo is
+	// cloned). Keyed on the slug dir, so two conversations under the
+	// same workspace share one resolution.
+	rootCache sync.Map
 }
 
 // New returns an Adapter with platform-default cross-mount roots.
@@ -192,7 +208,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 		return res, nil
 	}
 	slug := projectSlugFromPath(path)
-	projectRoot := DecodeProjectSlug(slug)
+	projectRoot := a.resolveProjectRoot(path)
 	if projectRoot == "" {
 		res.Warnings = append(res.Warnings,
 			fmt.Sprintf("cursor: cannot decode project slug %q for %s — emitting events with empty project_root", slug, path))
@@ -287,7 +303,7 @@ func (a *Adapter) parseStoreDBFile(path string, fromOffset int64) (adapter.Parse
 	// the workspace, so resolve it from the sibling transcript's slug —
 	// giving these rows the exact same project attribution as the
 	// session's activity rows.
-	projectRoot := projectRootForStoreDB(path, convID)
+	projectRoot := a.projectRootForStoreDB(path, convID)
 	if store.SystemPrompt != "" {
 		res.ToolEvents = append(res.ToolEvents,
 			a.systemPromptEvent(store.SystemPrompt, convID, projectRoot, path, ts))
@@ -309,12 +325,12 @@ func convIDFromStoreDBPath(path string) string {
 
 // projectRootForStoreDB resolves the workspace path for a store.db by
 // finding the sibling agent-transcript for the same conversation (under
-// .cursor/projects/<slug>/agent-transcripts/<conv>/) and decoding its
-// slug. This reuses the exact path the activity rows use, so the
+// .cursor/projects/<slug>/agent-transcripts/<conv>/) and resolving its
+// slug through the same resolver the activity rows use, so the
 // system-prompt / prompt-budget rows group under the same project.
 // Returns "" when no sibling transcript exists (rare — the session row
 // then keeps whatever project the hook/transcript already set).
-func projectRootForStoreDB(storeDBPath, convID string) string {
+func (a *Adapter) projectRootForStoreDB(storeDBPath, convID string) string {
 	norm := strings.ReplaceAll(storeDBPath, `\`, "/")
 	idx := strings.Index(strings.ToLower(norm), "/.cursor/")
 	if idx < 0 {
@@ -327,7 +343,7 @@ func projectRootForStoreDB(storeDBPath, convID string) string {
 	if err != nil || len(matches) == 0 {
 		return ""
 	}
-	return DecodeProjectSlug(projectSlugFromPath(matches[0]))
+	return a.resolveProjectRoot(matches[0])
 }
 
 // systemPromptEvent builds an ActionSystemPrompt row for the
@@ -415,6 +431,315 @@ func (a *Adapter) promptSectionEvent(sec promptSection, convID, projectRoot, sou
 	}, true
 }
 
+// workspaceTrustedFile is the sibling marker Cursor writes into
+// `.cursor/projects/<slug>/` the first time the user trusts a
+// workspace. It is the ONLY artefact under projects/<slug>/ that
+// carries the authoritative, un-slugified workspace path:
+//
+//	{"trustedAt":"2026-05-24T19:58:52.653Z",
+//	 "workspacePath":"C:\\programsx\\superbased-observer"}
+//
+// The sibling repo.json carries ONLY an opaque `{"id":"<uuid>"}` with
+// no path at all, so it is deliberately never consulted (verified
+// against a live Cursor 3.14.27 install on both the Windows and the
+// WSL side, 2026-08-07).
+//
+// It is present on trusted workspaces only — several live slug dirs
+// have no `.workspace-trusted` — which is why the stat-gated
+// candidate expansion below is still the workhorse and this file is
+// an accuracy upgrade, not a replacement.
+const workspaceTrustedFile = ".workspace-trusted"
+
+// maxAmbiguousJoints bounds how many slug joints the candidate
+// expansion is allowed to reinterpret as a literal `-`/`_` rather
+// than a path separator. Every observed miss needs exactly one
+// (`model-pricing` ← `model_pricing`, `superbased-observer`); two
+// gives headroom for e.g. `my-repo/sub_dir` without the search
+// becoming exponential (3^joints unbounded).
+const maxAmbiguousJoints = 2
+
+// maxRootCandidates hard-caps the number of paths the expansion will
+// stat, independent of slug length. With maxAmbiguousJoints=2 a slug
+// with j joints produces 1 + 2j + 2j(j-1) candidates, so this cap
+// only bites past ~11 path components.
+const maxRootCandidates = 256
+
+// projectRootResolver bundles the filesystem seams used to turn a
+// Cursor project slug into a real workspace root. House style: the
+// I/O is injected so the decode logic is testable without touching
+// the host filesystem. The zero value is valid — each accessor falls
+// back to the real implementation — so `&Adapter{}` literals and
+// tests that don't care keep working unchanged.
+type projectRootResolver struct {
+	stat      func(string) (os.FileInfo, error)
+	readFile  func(string) ([]byte, error)
+	translate func(string) string
+}
+
+func (r projectRootResolver) doStat(p string) (os.FileInfo, error) {
+	if r.stat == nil {
+		return os.Stat(p)
+	}
+	return r.stat(p)
+}
+
+func (r projectRootResolver) doReadFile(p string) ([]byte, error) {
+	if r.readFile == nil {
+		return os.ReadFile(p)
+	}
+	return r.readFile(p)
+}
+
+func (r projectRootResolver) doTranslate(p string) string {
+	if p == "" {
+		return ""
+	}
+	if r.translate == nil {
+		return crossmount.TranslateForeignPath(p)
+	}
+	return r.translate(p)
+}
+
+// dirExists reports whether p names an existing directory through the
+// injected stat seam.
+func (r projectRootResolver) dirExists(p string) bool {
+	if p == "" {
+		return false
+	}
+	fi, err := r.doStat(p)
+	return err == nil && fi.IsDir()
+}
+
+// withRootResolver overrides the filesystem seams used for project-root
+// resolution. Test-only; production callers get the real filesystem via
+// the zero value.
+func (a *Adapter) withRootResolver(r projectRootResolver) *Adapter {
+	a.rootRes = r
+	a.rootCache = sync.Map{}
+	return a
+}
+
+// resolveProjectRoot turns a transcript path
+// (`…/.cursor/projects/<slug>/agent-transcripts/<conv>/<conv>.jsonl`)
+// into the workspace root the events should be filed under.
+//
+// This is the watcher-path counterpart of the hook path's
+// normalizeWorkspaceRoot (adapter.go): the returned root is ALWAYS
+// routed through crossmount.TranslateForeignPath, so a Windows-side
+// Cursor observed from a WSL daemon yields `/mnt/c/...` rather than a
+// raw `C:\...` string that neither stats nor matches the shape every
+// other observer path produces. Per
+// docs/new-adapter-checklist.md §3.7 the translation + stat-gate must
+// happen HERE, before the root reaches the store (and any downstream
+// git resolution): an untranslated `C:\…` would be treated as a
+// relative path and CWD-prefixed with the observer's own repo.
+//
+// Resolution order:
+//  1. the slug dir's `.workspace-trusted` workspacePath, when it stats;
+//  2. the first stat-able slug candidate (naive decode first, then the
+//     hyphen/underscore re-joins — see projectRootCandidates);
+//  3. the `.workspace-trusted` path even though it doesn't stat (it is
+//     still exact, just not present on this host);
+//  4. the naive decode, translated — i.e. pre-fix behaviour, so
+//     off-host parses and fixtures are unchanged.
+//
+// Only outcomes 1 and 2 are memoized.
+func (a *Adapter) resolveProjectRoot(transcriptPath string) string {
+	slug := projectSlugFromPath(transcriptPath)
+	if slug == "" {
+		return ""
+	}
+	projectDir := projectDirFromPath(transcriptPath)
+	if projectDir != "" {
+		if cached, ok := a.rootCache.Load(projectDir); ok {
+			return cached.(string)
+		}
+	}
+	root, exact := a.rootRes.resolve(projectDir, slug)
+	if exact && projectDir != "" {
+		a.rootCache.Store(projectDir, root)
+	}
+	return root
+}
+
+// resolve implements the ordering documented on
+// Adapter.resolveProjectRoot. exact reports whether the returned root
+// was confirmed to exist on disk.
+func (r projectRootResolver) resolve(projectDir, slug string) (root string, exact bool) {
+	var authoritative string
+	if projectDir != "" {
+		if p := r.trustedWorkspacePath(projectDir); p != "" {
+			authoritative = r.doTranslate(p)
+			if r.dirExists(authoritative) {
+				return authoritative, true
+			}
+		}
+	}
+	for _, cand := range projectRootCandidates(slug) {
+		if translated := r.doTranslate(cand); r.dirExists(translated) {
+			return translated, true
+		}
+	}
+	if authoritative != "" {
+		return authoritative, false
+	}
+	return r.doTranslate(DecodeProjectSlug(slug)), false
+}
+
+// trustedWorkspacePath reads `<projectDir>/.workspace-trusted` and
+// returns its workspacePath field. Returns "" when the file is
+// absent, unreadable, not JSON, or carries no path — every failure is
+// a silent fall-through to the slug heuristic, never an error.
+func (r projectRootResolver) trustedWorkspacePath(projectDir string) string {
+	body, err := r.doReadFile(projectDir + "/" + workspaceTrustedFile)
+	if err != nil || len(body) == 0 {
+		return ""
+	}
+	var doc struct {
+		WorkspacePath string `json:"workspacePath"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(doc.WorkspacePath)
+}
+
+// projectDirFromPath returns the `…/projects/<slug>` directory of a
+// transcript path, forward-slash normalised (Go accepts `/` separators
+// on every supported OS). Returns "" when the path isn't shaped like a
+// Cursor transcript.
+func projectDirFromPath(path string) string {
+	norm := strings.ReplaceAll(path, `\`, "/")
+	idx := strings.Index(norm, "/projects/")
+	if idx < 0 {
+		return ""
+	}
+	head := idx + len("/projects/")
+	end := strings.Index(norm[head:], "/")
+	if end < 0 {
+		return ""
+	}
+	return norm[:head+end]
+}
+
+// projectRootCandidates returns the ordered set of workspace paths a
+// Cursor project slug could have been produced from, most-likely
+// first. The caller stat-gates them and takes the first that exists.
+//
+// Cursor's slug encoding collapses the path separator AND any literal
+// `-`/`_` inside a component down to the same `-`, so
+// `c-programsx-model-pricing` is a valid encoding of all of
+// `C:\programsx\model\pricing`, `C:\programsx\model-pricing` and
+// `C:\programsx\model_pricing` (the real directory is the last one).
+// The naive all-separators decode is emitted first — when it stats,
+// behaviour is exactly what it was before this expansion existed —
+// followed by the re-joins, rightmost joint first (greedy longest
+// trailing component, which is where repo names like
+// `superbased-observer` and `model_pricing` actually sit), and `-`
+// before `_` at each joint (the slug's own character wins ties).
+//
+// The search is bounded by maxAmbiguousJoints and maxRootCandidates;
+// a Windows drive letter is never merged with the first component.
+func projectRootCandidates(slug string) []string {
+	if slug == "" {
+		return nil
+	}
+	parts := strings.Split(slug, "-")
+	prefix, sep := "/", "/"
+	segs := parts
+	if len(parts[0]) == 1 {
+		prefix = strings.ToUpper(parts[0]) + `:\`
+		sep = `\`
+		segs = parts[1:]
+	}
+	if len(segs) == 0 {
+		return []string{prefix}
+	}
+	naive := prefix + strings.Join(segs, sep)
+	out := []string{naive}
+	joints := len(segs) - 1
+	if joints == 0 {
+		return out
+	}
+	seen := map[string]bool{naive: true}
+	for k := 1; k <= maxAmbiguousJoints && k <= joints && len(out) < maxRootCandidates; k++ {
+		for _, combo := range jointCombinations(joints, k, maxRootCandidates) {
+			for mask := 0; mask < 1<<k; mask++ {
+				if len(out) >= maxRootCandidates {
+					return out
+				}
+				cand := joinSegments(prefix, sep, segs, combo, mask)
+				if !seen[cand] {
+					seen[cand] = true
+					out = append(out, cand)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// joinSegments renders one candidate: segs joined by sep, except at
+// the joint indices in combo where a literal `-` (mask bit clear) or
+// `_` (mask bit set) is emitted instead. Joint i sits between segs[i]
+// and segs[i+1].
+func joinSegments(prefix, sep string, segs []string, combo []int, mask int) string {
+	merged := make(map[int]byte, len(combo))
+	for j, idx := range combo {
+		if mask&(1<<j) == 0 {
+			merged[idx] = '-'
+		} else {
+			merged[idx] = '_'
+		}
+	}
+	var b strings.Builder
+	b.WriteString(prefix)
+	b.WriteString(segs[0])
+	for i := 1; i < len(segs); i++ {
+		if c, ok := merged[i-1]; ok {
+			b.WriteByte(c)
+		} else {
+			b.WriteString(sep)
+		}
+		b.WriteString(segs[i])
+	}
+	return b.String()
+}
+
+// jointCombinations enumerates every k-sized subset of the joint
+// indices [0,n), highest index first so the rightmost (deepest) joints
+// are probed before the leftmost ones. Generation stops once limit
+// combinations have been produced, keeping a pathologically long slug
+// from allocating a large combination set the caller would discard.
+func jointCombinations(n, k, limit int) [][]int {
+	if k <= 0 || k > n {
+		return nil
+	}
+	out := make([][]int, 0, 8)
+	cur := make([]int, 0, k)
+	var rec func(hi int)
+	rec = func(hi int) {
+		if len(out) >= limit {
+			return
+		}
+		if len(cur) == k {
+			out = append(out, append([]int(nil), cur...))
+			return
+		}
+		need := k - len(cur)
+		for i := hi; i >= need-1; i-- {
+			if len(out) >= limit {
+				return
+			}
+			cur = append(cur, i)
+			rec(i - 1)
+			cur = cur[:len(cur)-1]
+		}
+	}
+	rec(n - 1)
+	return out
+}
+
 // DecodeProjectSlug reverses Cursor's projects/<slug>/ encoding into
 // a workspace path string. Cursor encodes a Windows-style path like
 // `C:\programsx\marmutmain` as `c-programsx-marmutmain`: drive letter
@@ -422,10 +747,18 @@ func (a *Adapter) promptSectionEvent(sec promptSection, convID, projectRoot, sou
 // paths get encoded without a leading drive letter, e.g.
 // `/home/user/repo` → `home-user-repo`.
 //
-// The encoding is LOSSY when a path component contains a literal `-`
-// (Cursor presumably has a separate escape; observed corpora to date
-// don't exercise this case, so the decoder treats `-` as a separator
-// universally). Returns "" for an empty slug.
+// The encoding is LOSSY: Cursor collapses the path separator and any
+// literal `-`/`_` inside a component onto the same `-`, so this
+// function ALWAYS reads every `-` as a separator. It is the pure,
+// filesystem-free, worst-case decode — the naive candidate. Callers
+// that want the real workspace root should use
+// Adapter.resolveProjectRoot, which consults `.workspace-trusted`,
+// stat-gates the projectRootCandidates expansion, and translates
+// foreign-OS paths; this function stays as the never-fails fallback
+// (and as the first candidate that expansion tries). It performs NO
+// path translation: a Windows slug decodes to a raw `C:\…` string.
+//
+// Returns "" for an empty slug.
 //
 // Heuristic for Windows-vs-POSIX:
 //   - First segment exactly 1 char → treat as Windows drive letter,

@@ -430,6 +430,69 @@ func TestBuildStopTokenEvent_WindowsCLIWorkspaceRoot(t *testing.T) {
 	}
 }
 
+// TestNormalizeWorkspaceRoot_CanonicalizesWindowsShapes pins the
+// post-F4 project-identity contract on the HOOK path. Cursor emits a
+// Windows workspace root in three spellings depending on surface and
+// era — the CLI's raw `C:\...`, the IDE's `Uri.fsPath` `/c:/...`, and
+// (on a WSL-side install) an already-native POSIX path. F4 made the
+// WATCHER path (scan.go resolveProjectRoot) emit canonical
+// `/mnt/c/...`; if the hook path leaves `/c:/...` alone, one
+// directory becomes two project rows. All Windows spellings must
+// converge here.
+func TestNormalizeWorkspaceRoot_CanonicalizesWindowsShapes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("/mnt/<drive> canonicalization is a WSL-daemon-observing-a-Windows-mount behavior")
+	}
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"cursor-agent CLI backslash", `C:\programsx\marmutmain`, "/mnt/c/programsx/marmutmain"},
+		{"IDE Uri.fsPath lowercase drive", "/c:/programsx/marmutmain", "/mnt/c/programsx/marmutmain"},
+		{"IDE Uri.fsPath uppercase drive", "/C:/programsx/marmutmain", "/mnt/c/programsx/marmutmain"},
+		{"already canonical", "/mnt/c/programsx/marmutmain", "/mnt/c/programsx/marmutmain"},
+		{"file URI", "file:///c:/programsx/marmutmain", "/mnt/c/programsx/marmutmain"},
+		// Native WSL-side cursor-agent: untouched.
+		{"native linux root", "/home/marmutapp/superbased-observer", "/home/marmutapp/superbased-observer"},
+		// A Linux directory that merely starts like a drive letter
+		// must never be rewritten.
+		{"linux /cache root", "/cache/projects/foo", "/cache/projects/foo"},
+		{"empty", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := normalizeWorkspaceRoot(c.in); got != c.want {
+				t.Errorf("normalizeWorkspaceRoot(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+// TestNormalizeWorkspaceRoot_HookMatchesWatcher is the cross-path
+// convergence assertion stated end-to-end: the hook path's root for a
+// Windows workspace must equal the watcher path's root for the same
+// workspace. Before the pathnorm `/c:` strip, the left side was
+// `/c:/programsx/model_pricing` and the right side (post-F4)
+// `/mnt/c/programsx/model_pricing` — the live split reported in
+// docs/audits/cursor-windows-capture-diagnosis-2026-08-07.md §2.5.
+func TestNormalizeWorkspaceRoot_HookMatchesWatcher(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("/mnt/<drive> canonicalization is a WSL-daemon-observing-a-Windows-mount behavior")
+	}
+	const workspace = `C:\programsx\model_pricing`
+	hookRoot := normalizeWorkspaceRoot("/c:/programsx/model_pricing")
+	// The watcher path resolves through the same translate seam once
+	// .workspace-trusted supplies the authoritative Windows path.
+	watcherRoot := projectRootResolver{}.doTranslate(workspace)
+	if hookRoot != watcherRoot {
+		t.Fatalf("hook root %q != watcher root %q — project identity is split", hookRoot, watcherRoot)
+	}
+	if hookRoot != "/mnt/c/programsx/model_pricing" {
+		t.Errorf("converged root = %q, want /mnt/c/programsx/model_pricing", hookRoot)
+	}
+}
+
 func TestBuildStopTranscriptEvents(t *testing.T) {
 	dir := t.TempDir()
 	transcript := filepath.Join(dir, "session.jsonl")

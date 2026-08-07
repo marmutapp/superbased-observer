@@ -973,6 +973,18 @@ func announceDashboardReady(ctx context.Context, w io.Writer, listenAddr, url st
 // is a clear signal that the user (or a different tool) put it
 // there, and silently overwriting that on every observer start would
 // be far worse than not auto-registering.
+//
+// A failure gets the same loud startup-WARN treatment
+// diag.DetectCrossEnvSiblingDBs gets above (a "WARN " line on
+// stderr naming the tool, the target file, the error, and a
+// remediation hint) — this used to be a bare stderr line easy to
+// miss on a long-running daemon whose stdout/stderr nobody reads,
+// which is exactly how the Windows-Cursor bridge registration
+// silently stayed broken for a month (see
+// docs/audits/cursor-windows-capture-diagnosis-2026-08-07.md §4 F3).
+// Every outcome — success or failure — is also persisted into
+// hook_checksums.json via RecordAutoRegisterResult so it's
+// inspectable later, not just at the moment this ran.
 func autoRegisterHooks(stdout, stderr io.Writer, configPath string) {
 	binary, err := absoluteBinaryPath()
 	if err != nil {
@@ -994,15 +1006,39 @@ func autoRegisterHooks(stdout, stderr io.Writer, configPath string) {
 			continue
 		}
 		res := reg.Register(tool)
+		if res.ConfigPath != "" {
+			if perr := reg.RecordAutoRegisterResult(res.ConfigPath, res.Error); perr != nil {
+				fmt.Fprintf(stderr, "auto-register %s: failed to persist result to hook_checksums.json: %v\n", tool, perr)
+			}
+		}
 		switch {
 		case res.Error != nil:
 			fmt.Fprintf(stderr,
-				"auto-register %s: %v (run `observer init --force` to overwrite)\n",
-				tool, res.Error)
+				"WARN auto-register %s: %s: %v — %s\n",
+				tool, res.ConfigPath, res.Error, autoRegisterRemediation(tool))
 		case len(res.HooksAdded) > 0:
 			fmt.Fprintf(stdout,
 				"auto-register %s: installed %d hook(s) at %s\n",
 				tool, len(res.HooksAdded), res.ConfigPath)
 		}
 	}
+}
+
+// autoRegisterRemediation returns a one-line, tool-specific fix
+// suggestion for an autoRegisterHooks failure WARN. Table-driven
+// rather than a growing if/else ladder (CLAUDE.md module-boundary
+// discipline #5); the tool strings are exactly hook.Registry's
+// Installed()/Register() vocabulary.
+func autoRegisterRemediation(tool string) string {
+	initFlags := map[string]string{
+		"claude-code":         "--claude-code",
+		"claude-code-windows": "--claude-code",
+		"cursor":              "--cursor",
+		"cursor-windows":      "--cursor",
+		"codex":               "--codex",
+	}
+	if flag, ok := initFlags[tool]; ok {
+		return fmt.Sprintf("run: observer init %s --force (or clear the conflicting hooks entry by hand)", flag)
+	}
+	return "run: observer init --force (or clear the conflicting hooks entry by hand)"
 }

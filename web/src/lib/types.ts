@@ -2087,8 +2087,22 @@ export type CostPricing = {
   web_search_per_request?: number;
 };
 
+// DatedCostPricing is one rate period in a model's historical rate
+// timeline — `cost.DatedPricing` on the wire: a `cost.Pricing` (see
+// CostPricing above) plus the `effective_from` instant the rate took
+// hold. The zero value ("0001-01-01T00:00:00Z", Go's time.Time zero)
+// means "since forever" — the oldest period in a timeline.
+export type DatedCostPricing = CostPricing & {
+  effective_from: string;
+};
+
 export type PricingDefaultsResponse = {
   defaults: Record<string, CostPricing>;
+  // The baked-in HISTORICAL rate timelines, keyed like `defaults`.
+  // Only present for models whose price actually changed — absent or
+  // empty on a stock build with no dated entries. See
+  // internal/intelligence/cost/dated.go.
+  dated_defaults?: Record<string, DatedCostPricing[]>;
 };
 
 export function costPricingToConfig(p: CostPricing): ModelPricing {

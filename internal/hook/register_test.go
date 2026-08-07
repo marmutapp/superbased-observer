@@ -1162,6 +1162,385 @@ func TestRegisterCursorWindowsIdempotent(t *testing.T) {
 	}
 }
 
+// TestIsDanglingObserverWindowsCursorShim table-tests the narrowed
+// predicate (F2, docs/audits/cursor-windows-capture-diagnosis-2026-08-07.md
+// §4) in isolation: it must recognise the operator's exact stale
+// /tmp/cursor-tee-shim.sh entry as ours, but refuse to classify a
+// merely wsl.exe-shaped foreign command (missing our config path, or
+// missing the event token) as observer-owned.
+func TestIsDanglingObserverWindowsCursorShim(t *testing.T) {
+	t.Parallel()
+	const ourConfig = "/home/marmutapp/.observer/config.toml"
+	cases := []struct {
+		name       string
+		cmd        string
+		event      string
+		configPath string
+		want       bool
+	}{
+		{
+			name:       "operator's exact stale tee-shim entry",
+			cmd:        `wsl.exe -d Ubuntu-20.04 -- /tmp/cursor-tee-shim.sh afterAgentResponse --config '/home/marmutapp/.observer/config.toml'`,
+			event:      "afterAgentResponse",
+			configPath: ourConfig,
+			want:       true,
+		},
+		{
+			name:       "wsl.exe shape but different event named",
+			cmd:        `wsl.exe -d Ubuntu-20.04 -- /tmp/cursor-tee-shim.sh stop --config '/home/marmutapp/.observer/config.toml'`,
+			event:      "afterAgentResponse",
+			configPath: ourConfig,
+			want:       false,
+		},
+		{
+			name:       "wsl.exe shape but a DIFFERENT config path",
+			cmd:        `wsl.exe -d Ubuntu-20.04 -- /tmp/some-other-tool.sh afterAgentResponse --config '/home/someone/else/config.toml'`,
+			event:      "afterAgentResponse",
+			configPath: ourConfig,
+			want:       false,
+		},
+		{
+			name:       "wsl.exe shape, no --config at all",
+			cmd:        `wsl.exe -d Ubuntu-20.04 -- /some/other/script.sh afterAgentResponse`,
+			event:      "afterAgentResponse",
+			configPath: ourConfig,
+			want:       false,
+		},
+		{
+			name:       "not wsl.exe-shaped at all (real user hook)",
+			cmd:        `powershell.exe -File C:\me\myhook.ps1`,
+			event:      "afterAgentResponse",
+			configPath: ourConfig,
+			want:       false,
+		},
+		{
+			name:       "registrar has no ConfigPath configured — never attributable",
+			cmd:        `wsl.exe -d Ubuntu-20.04 -- /tmp/cursor-tee-shim.sh afterAgentResponse --config '/home/marmutapp/.observer/config.toml'`,
+			event:      "afterAgentResponse",
+			configPath: "",
+			want:       false,
+		},
+		{
+			name:       "legacy MSYS-prefixed shape also recognised",
+			cmd:        `MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu-20.04 -- /tmp/cursor-tee-shim.sh stop --config '/home/marmutapp/.observer/config.toml'`,
+			event:      "stop",
+			configPath: ourConfig,
+			want:       true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isDanglingObserverWindowsCursorShim(c.cmd, c.event, c.configPath); got != c.want {
+				t.Errorf("isDanglingObserverWindowsCursorShim(%q, %q, %q) = %v want %v", c.cmd, c.event, c.configPath, got, c.want)
+			}
+		})
+	}
+}
+
+// TestRegisterCursorWindowsSelfHealsStaleTeeShim is the F2 confirming
+// evidence: the operator's EXACT stale hooks.json shape — every
+// cursorEvents entry carrying BOTH the dead /tmp/cursor-tee-shim.sh
+// debug entry AND the legacy MSYS_NO_PATHCONV=1-prefixed entry — must
+// now self-heal under Force:false. Before F2 this aborted every
+// event with "already has a non-observer hook" because
+// isObserverWindowsCursorEntry didn't recognise the tee-shim shape.
+// See docs/audits/cursor-windows-capture-diagnosis-2026-08-07.md §2.2/§4 F2.
+func TestRegisterCursorWindowsSelfHealsStaleTeeShim(t *testing.T) {
+	t.Parallel()
+	wslHome := t.TempDir()
+	winHome := nestedWinHome(t, wslHome) // must live UNDER the pinned HomeDir
+	cursorDir := filepath.Join(winHome, ".cursor")
+	if err := os.MkdirAll(cursorDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	const ourConfig = "/home/marmutapp/.observer/config.toml"
+	hooks := map[string][]cursorHookEntry{}
+	for _, event := range cursorEvents {
+		hooks[event] = []cursorHookEntry{
+			{Command: fmt.Sprintf(
+				`wsl.exe -d Ubuntu-20.04 -- /tmp/cursor-tee-shim.sh %s --config '%s'`,
+				event, ourConfig,
+			)},
+			{Command: fmt.Sprintf(
+				`MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu-20.04 -- /home/marmutapp/superbased-observer/bin/observer hook cursor %s`,
+				event,
+			)},
+		}
+	}
+	body, err := json.Marshal(map[string]any{"version": 1, "hooks": hooks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hooksPath := filepath.Join(cursorDir, "hooks.json")
+	if err := os.WriteFile(hooksPath, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := NewRegistry(Options{
+		BinaryPath:        "/home/marmutapp/superbased-observer/bin/observer",
+		HomeDir:           wslHome,
+		ChecksumsPath:     filepath.Join(wslHome, ".observer", "hook_checksums.json"),
+		WindowsCursorHome: winHome,
+		WSLDistro:         "Ubuntu-20.04",
+		ConfigPath:        ourConfig,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res := r.Register("cursor-windows")
+	if res.Error != nil {
+		t.Fatalf("Register (Force=false) on the exact stale operator file: %v", res.Error)
+	}
+	if len(res.HooksAdded) != len(cursorEvents) {
+		t.Errorf("HooksAdded = %d want %d (%v)", len(res.HooksAdded), len(cursorEvents), res.HooksAdded)
+	}
+
+	written, err := os.ReadFile(hooksPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(written, &settings); err != nil {
+		t.Fatalf("not valid JSON: %v\n%s", err, written)
+	}
+	hooksBlock, ok := settings["hooks"].(map[string]any)
+	if !ok {
+		t.Fatal("hooks block missing")
+	}
+	for _, event := range cursorEvents {
+		entries, ok := hooksBlock[event].([]any)
+		if !ok {
+			t.Errorf("event %s missing", event)
+			continue
+		}
+		if len(entries) != 1 {
+			t.Errorf("event %s has %d entries, want exactly 1 (self-heal should have dropped both stale entries): %v", event, len(entries), entries)
+			continue
+		}
+		first, _ := entries[0].(map[string]any)
+		cmd, _ := first["command"].(string)
+		wantPrefix := "wsl.exe -d Ubuntu-20.04 -- /home/marmutapp/superbased-observer/bin/observer hook cursor " + event
+		if !strings.HasPrefix(cmd, wantPrefix) {
+			t.Errorf("event %s cmd = %q want prefix %q", event, cmd, wantPrefix)
+		}
+		if strings.Contains(cmd, "cursor-tee-shim") {
+			t.Errorf("event %s: dead tee-shim entry survived self-heal: %q", event, cmd)
+		}
+	}
+}
+
+// TestRegisterCursorWindowsSelfHealPreservesGenuineForeignEntry pins
+// the safety half of F2: a mixed file where one event ALSO carries a
+// real user-authored hook (not wsl.exe-shaped, not ours by any
+// predicate) must still refuse that event without --force — the
+// narrowed self-heal predicate must never widen far enough to
+// swallow a genuine foreign entry.
+func TestRegisterCursorWindowsSelfHealPreservesGenuineForeignEntry(t *testing.T) {
+	t.Parallel()
+	wslHome := t.TempDir()
+	winHome := nestedWinHome(t, wslHome) // must live UNDER the pinned HomeDir
+	cursorDir := filepath.Join(winHome, ".cursor")
+	if err := os.MkdirAll(cursorDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	const ourConfig = "/home/marmutapp/.observer/config.toml"
+	hooks := map[string][]cursorHookEntry{}
+	for _, event := range cursorEvents {
+		hooks[event] = []cursorHookEntry{
+			{Command: fmt.Sprintf(
+				`wsl.exe -d Ubuntu-20.04 -- /tmp/cursor-tee-shim.sh %s --config '%s'`,
+				event, ourConfig,
+			)},
+		}
+	}
+	// A real user-authored hook on ONE event, alongside the stale shim.
+	hooks["beforeSubmitPrompt"] = append(hooks["beforeSubmitPrompt"], cursorHookEntry{
+		Command: `powershell.exe -File C:\me\myhook.ps1`,
+	})
+	body, err := json.Marshal(map[string]any{"version": 1, "hooks": hooks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hooksPath := filepath.Join(cursorDir, "hooks.json")
+	if err := os.WriteFile(hooksPath, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := NewRegistry(Options{
+		BinaryPath:        "/home/marmutapp/superbased-observer/bin/observer",
+		HomeDir:           wslHome,
+		ChecksumsPath:     filepath.Join(wslHome, ".observer", "hook_checksums.json"),
+		WindowsCursorHome: winHome,
+		WSLDistro:         "Ubuntu-20.04",
+		ConfigPath:        ourConfig,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res := r.Register("cursor-windows")
+	if res.Error == nil {
+		t.Fatal("expected error: beforeSubmitPrompt still carries a genuine foreign entry, self-heal must not silently overwrite it")
+	}
+	if !strings.Contains(res.Error.Error(), "non-observer") {
+		t.Errorf("error message = %q want it to mention 'non-observer'", res.Error)
+	}
+	if !strings.Contains(res.Error.Error(), "beforeSubmitPrompt") {
+		t.Errorf("error message = %q want it to name the offending event beforeSubmitPrompt", res.Error)
+	}
+
+	// Nothing should have been written — registerCursorWindows returns
+	// before writing on the first conflicting event. Round-trip through
+	// JSON (rather than a raw substring match) since json.Marshal
+	// escapes the Windows path's backslashes.
+	written, err := os.ReadFile(hooksPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(written, &settings); err != nil {
+		t.Fatalf("not valid JSON: %v\n%s", err, written)
+	}
+	hooksBlock, _ := settings["hooks"].(map[string]any)
+	entries, _ := hooksBlock["beforeSubmitPrompt"].([]any)
+	var foundForeign bool
+	for _, e := range entries {
+		m, _ := e.(map[string]any)
+		if cmd, _ := m["command"].(string); cmd == `powershell.exe -File C:\me\myhook.ps1` {
+			foundForeign = true
+		}
+	}
+	if !foundForeign {
+		t.Errorf("genuine foreign entry must be preserved on disk after a failed register attempt; beforeSubmitPrompt entries = %v", entries)
+	}
+}
+
+// TestRecordAutoRegisterResult pins the F3 persistence contract:
+// last_result/last_error land in hook_checksums.json for BOTH
+// outcomes, an existing entry's sha256/registered/binary_path keys
+// (written by a prior recordChecksum call) survive untouched, and a
+// later success clears a previously-recorded last_error. See
+// docs/audits/cursor-windows-capture-diagnosis-2026-08-07.md §4 F3.
+func TestRecordAutoRegisterResult(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	csPath := filepath.Join(home, ".observer", "hook_checksums.json")
+	r, err := NewRegistry(Options{
+		BinaryPath:    "/opt/observer/bin/observer",
+		HomeDir:       home,
+		ChecksumsPath: csPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const target = "/mnt/c/Users/tester/.cursor/hooks.json"
+
+	// A prior successful write already recorded sha256/registered/
+	// binary_path for this path (simulate recordChecksum's shape
+	// directly rather than depending on it, to keep this test
+	// focused on RecordAutoRegisterResult's own contract).
+	seed := map[string]map[string]any{
+		target: {
+			"sha256":      "deadbeef",
+			"registered":  "2026-08-01T00:00:00Z",
+			"binary_path": "/opt/observer/bin/observer",
+		},
+	}
+	seedBody, err := json.Marshal(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(csPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(csPath, seedBody, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	readEntry := func() map[string]any {
+		t.Helper()
+		body, err := os.ReadFile(csPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]map[string]any
+		if err := json.Unmarshal(body, &m); err != nil {
+			t.Fatalf("not valid JSON: %v\n%s", err, body)
+		}
+		entry, ok := m[target]
+		if !ok {
+			t.Fatalf("no entry for %s in %s", target, body)
+		}
+		return entry
+	}
+
+	// Failure path.
+	regErr := errors.New("event afterAgentResponse already has a non-observer hook; pass --force to overwrite")
+	if err := r.RecordAutoRegisterResult(target, regErr); err != nil {
+		t.Fatalf("RecordAutoRegisterResult (failure): %v", err)
+	}
+	entry := readEntry()
+	if entry["last_result"] != "error" {
+		t.Errorf("last_result = %v want %q", entry["last_result"], "error")
+	}
+	if entry["last_error"] != regErr.Error() {
+		t.Errorf("last_error = %v want %q", entry["last_error"], regErr.Error())
+	}
+	if entry["last_checked_at"] == nil || entry["last_checked_at"] == "" {
+		t.Error("last_checked_at not set")
+	}
+	// Pre-existing keys from the earlier recordChecksum-shaped write
+	// must survive untouched.
+	if entry["sha256"] != "deadbeef" {
+		t.Errorf("sha256 = %v, pre-existing key was clobbered", entry["sha256"])
+	}
+	if entry["registered"] != "2026-08-01T00:00:00Z" {
+		t.Errorf("registered = %v, pre-existing key was clobbered", entry["registered"])
+	}
+
+	// Success path afterwards must clear last_error, not just leave it stale.
+	if err := r.RecordAutoRegisterResult(target, nil); err != nil {
+		t.Fatalf("RecordAutoRegisterResult (success): %v", err)
+	}
+	entry = readEntry()
+	if entry["last_result"] != "ok" {
+		t.Errorf("last_result = %v want %q", entry["last_result"], "ok")
+	}
+	if _, hasErr := entry["last_error"]; hasErr {
+		t.Errorf("last_error still present after a successful re-register: %v", entry["last_error"])
+	}
+	if entry["sha256"] != "deadbeef" {
+		t.Errorf("sha256 = %v, pre-existing key was clobbered on the success path", entry["sha256"])
+	}
+}
+
+// TestRecordAutoRegisterResultEmptyPathNoop guards against writing a
+// bogus "" key into hook_checksums.json when a registration attempt
+// never got far enough to produce a ConfigPath.
+func TestRecordAutoRegisterResultEmptyPathNoop(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	r, err := NewRegistry(Options{
+		BinaryPath:    "/opt/observer/bin/observer",
+		HomeDir:       home,
+		ChecksumsPath: filepath.Join(home, ".observer", "hook_checksums.json"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.RecordAutoRegisterResult("", errors.New("boom")); err != nil {
+		t.Fatalf("RecordAutoRegisterResult(\"\", ...) = %v want nil", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".observer", "hook_checksums.json")); !os.IsNotExist(err) {
+		t.Errorf("expected no hook_checksums.json to be written, stat err = %v", err)
+	}
+}
+
 // TestShellQuoteEscapesSingleQuotes pins the shell-quoting helper so
 // pathological config paths (with embedded ' or spaces) don't break
 // the bash -c invocation Claude Code uses to run the hook command.

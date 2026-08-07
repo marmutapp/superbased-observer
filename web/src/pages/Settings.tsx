@@ -48,6 +48,7 @@ import type {
   BackfillStatusResponse,
   ConfigResponse,
   CostPricing,
+  DatedCostPricing,
   MCPValueResponse,
   ModelPricing,
   PricingDefaultsResponse,
@@ -884,6 +885,14 @@ function PricingSection({
   const [save, setSave] = useState<{
     state: "idle" | "saving" | "ok" | "err";
     message?: string;
+    // Advisory problems the cost engine found while rebuilding the
+    // dated-pricing table on this save — a malformed
+    // [intelligence.pricing.dated] row that was skipped, or a dated
+    // timeline whose newest entry disagrees with the flat rate just
+    // saved. The save still succeeded (pricing never fails closed on
+    // these); this is how the operator finds out an override was
+    // silently ignored. See cost.Engine.PricingWarnings.
+    warnings?: string[];
   }>({ state: "idle" });
 
   // Seed local edits from server config when it loads.
@@ -908,7 +917,7 @@ function PricingSection({
     if (!config) return;
     setSave({ state: "saving" });
     try {
-      const res = await fetchJSON<{ saved: boolean }>(
+      const res = await fetchJSON<{ saved: boolean; warnings?: string[] }>(
         "/api/config/pricing",
         undefined,
         {
@@ -918,7 +927,11 @@ function PricingSection({
         },
       );
       if (!res.saved) throw new Error("server did not confirm save");
-      setSave({ state: "ok", message: "Saved · cost engine reloaded" });
+      setSave({
+        state: "ok",
+        message: "Saved · cost engine reloaded",
+        warnings: res.warnings,
+      });
       onReload();
     } catch (e) {
       setSave({
@@ -1007,6 +1020,9 @@ function PricingSection({
         empty={false}
         height={120}
       >
+        {save.warnings && save.warnings.length > 0 && (
+          <PricingWarningsBanner warnings={save.warnings} />
+        )}
         {modelKeys.length === 0 ? (
           <div className="rounded-2 border border-dashed border-line-2 bg-bg-3/40 px-4 py-3 text-[12px] text-fg-3">
             No overrides defined. The cost engine is using its baked-in
@@ -1047,6 +1063,7 @@ function PricingSection({
             {defaults.data && (
               <DefaultsTable
                 defaults={defaults.data.defaults}
+                dated={defaults.data.dated_defaults}
                 onAdd={addOverride}
                 existing={new Set(modelKeys)}
               />
@@ -1055,6 +1072,39 @@ function PricingSection({
         </details>
       </ChartState>
     </ChartShell>
+  );
+}
+
+// PricingWarningsBanner surfaces advisory problems the cost engine found
+// while rebuilding the dated-pricing table on the last save — pricing
+// never fails closed on these, so the save above still succeeded; this
+// is the only way the operator learns an override was silently ignored
+// (a malformed [intelligence.pricing.dated] row, or a dated timeline
+// whose newest entry no longer matches the flat rate they just saved).
+function PricingWarningsBanner({ warnings }: { warnings: string[] }) {
+  return (
+    <div className="mb-4 flex items-start gap-3 rounded-3 border border-warn/30 bg-warn-soft/60 px-4 py-2.5 text-[11.5px]">
+      <span className="mt-0.5 grid h-4 w-4 shrink-0 place-items-center rounded-full border border-warn/40 text-warn">
+        !
+      </span>
+      <div className="min-w-0 flex-1 text-fg-2">
+        <b className="text-fg-1">
+          Saved, but the dated-rate table has {warnings.length === 1 ? "a problem" : `${warnings.length} problems`}.
+        </b>{" "}
+        Historical costs may be right while today&apos;s are wrong — check{" "}
+        <code className="rounded-1 border border-line-3 bg-bg-3 px-1.5 py-0.5 font-mono text-[11px] text-fg-1">
+          [intelligence.pricing.dated]
+        </code>{" "}
+        in config.toml.
+        <ul className="mt-1.5 list-disc space-y-0.5 pl-4">
+          {warnings.map((w, i) => (
+            <li key={i} className="text-fg-3">
+              {w}
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
   );
 }
 
@@ -1149,10 +1199,15 @@ function PricingTable({
 
 function DefaultsTable({
   defaults,
+  dated,
   existing,
   onAdd,
 }: {
   defaults: Record<string, CostPricing>;
+  // Baked-in historical rate timelines, keyed like `defaults`. Only
+  // models whose price actually changed appear here — most models
+  // have no entry, meaning "this rate has been flat since forever."
+  dated?: Record<string, DatedCostPricing[]>;
   existing: Set<string>;
   onAdd: (key: string) => void;
 }) {
@@ -1192,7 +1247,14 @@ function DefaultsTable({
                   key={k}
                   className="border-b border-line-1 last:border-b-0"
                 >
-                  <td className="py-1 pl-2 font-mono text-fg-1">{k}</td>
+                  <td className="py-1 pl-2 font-mono text-fg-1">
+                    <span className="inline-flex items-center gap-1.5">
+                      {k}
+                      {dated?.[k] && dated[k].length > 0 && (
+                        <RateHistoryBadge periods={dated[k]} />
+                      )}
+                    </span>
+                  </td>
                   <td className="py-1 text-right font-mono text-fg-2 tabular-nums">
                     {fmtUSD(p.input, true)}
                   </td>
@@ -1223,6 +1285,62 @@ function DefaultsTable({
       </div>
     </>
   );
+}
+
+// RateHistoryBadge marks a baked-in default whose price actually changed
+// over time (a `dated_defaults` entry) so the defaults table never
+// implies a flat single rate for a model the cost engine is in fact
+// pricing on a timeline. Hover/focus shows every period, oldest first.
+function RateHistoryBadge({ periods }: { periods: DatedCostPricing[] }) {
+  const sorted = useMemo(
+    () =>
+      [...periods].sort((a, b) =>
+        a.effective_from.localeCompare(b.effective_from),
+      ),
+    [periods],
+  );
+  const content = (
+    <div className="max-w-[280px] text-left">
+      <div className="mb-1 font-medium text-fg-1">
+        Rate changed over time
+      </div>
+      <div className="space-y-1">
+        {sorted.map((p, i) => (
+          <div
+            key={i}
+            className="flex items-baseline justify-between gap-3 font-mono text-[10.5px]"
+          >
+            <span className="text-fg-3">{fmtEffectiveFrom(p.effective_from)}</span>
+            <span className="text-fg-1 tabular-nums">
+              {fmtUSD(p.input, true)} in / {fmtUSD(p.output, true)} out
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+  return (
+    <Tooltip content={content} maxWidth={320}>
+      <span
+        tabIndex={0}
+        aria-label={`Rate history — ${sorted.length} period${sorted.length === 1 ? "" : "s"}`}
+        className="inline-grid h-4 w-4 shrink-0 cursor-help place-items-center rounded-full border border-line-3 text-fg-3 hover:border-accent/50 hover:text-accent focus:outline-none"
+      >
+        <ClockIcon size={9} />
+      </span>
+    </Tooltip>
+  );
+}
+
+// fmtEffectiveFrom renders a DatedCostPricing.effective_from instant as
+// a short date, or "since forever" for Go's time.Time zero value
+// ("0001-01-01T00:00:00Z") — the idiomatic way the cost engine spells
+// the oldest, open-ended period of a rate timeline.
+function fmtEffectiveFrom(iso: string): string {
+  if (!iso || iso.startsWith("0001-01-01")) return "since forever";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
 }
 
 // ============================================================ Backfill

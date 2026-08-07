@@ -4,6 +4,41 @@ All notable changes to SuperBased Observer are documented here.
 
 ## [Unreleased]
 
+## [1.30.0] — 2026-08-08
+
+### Fixed
+
+- **fix(cursor): Cursor-on-Windows capture restored end to end.** The
+  hook bridge had been dead since 2026-07-05 behind stale tee-shim
+  entries; auto-register now self-heals that file shape (loud WARN +
+  remediation on failure, `last_result`/`last_error` persisted to
+  `hook_checksums.json`), the watcher resolves project roots from
+  `.workspace-trusted` with stat-gated candidate expansion, and hook
+  payloads carrying the IDE's `Uri.fsPath` spelling (`/c:/…`) now
+  land on the same canonical `/mnt/c/…` root as the watcher's rows —
+  one project identity instead of up to six spellings of one
+  directory.
+- **fix(pathnorm): the `/c:/` URI-fsPath drive spelling folds into the
+  Windows-drive layer.** Anchored lexical detection (never
+  `filepath.IsAbs`, which is host-dependent); non-drive lookalikes
+  (`/cache/…`, `/cc:/…`, bare `/c:`) are pinned untouched. Hook ==
+  watcher convergence is enforced by test.
+
+### Changed
+
+- **Tool count synced to 31 everywhere, from one generated manifest.**
+  `tools/toolcountgen` derives the editorial adapter count from the
+  integration registry (fold rules explicit and tested); the website
+  hero badge, docs, READMEs, npm and VS Code Marketplace descriptions,
+  and the extension walkthrough all read 31 now, and the accuracy
+  checker fails on bare "N tools"/"N integrations" drift, on
+  registry↔prose disagreement, and on the distribution surfaces that
+  previously sat outside its scan root.
+- **Version-scoped the stale "Cursor 3.4+ stopped writing transcripts"
+  claims.** True on 3.4.20–3.9.16 where it was measured; on 3.14.27
+  the transcript walker is live again and currently the sole
+  Windows-IDE capture path.
+
 ## [1.29.0] — 2026-08-07
 
 ### Added
