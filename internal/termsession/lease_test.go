@@ -85,6 +85,23 @@ func TestSetupSessionRefusesRemoteWriter(t *testing.T) {
 	}
 }
 
+// TestShellSessionAllowsRemoteWriter proves a SpecShell session is NOT
+// local-writer-only — unlike SpecSetup, a plain shell behaves like a normal
+// SpecAgent session for writer-lease purposes: a paired remote principal with
+// a valid handle-bound grant can acquire it. Deliberately the mirror-image
+// assertion of TestSetupSessionRefusesRemoteWriter.
+func TestShellSessionAllowsRemoteWriter(t *testing.T) {
+	sp := &fakeSpawner{}
+	m := newTestManager(t, sp, time.Now)
+	tok, err := m.Create(Spec{Kind: SpecShell, ShellArgv: []string{"/bin/bash"}})
+	if err != nil {
+		t.Fatalf("create shell session: %v", err)
+	}
+	if _, rerr := m.AcquireWriterRemote(tok, remoteGrant(t, tok, "device-x")); rerr != nil {
+		t.Fatalf("remote acquire on shell session: got %v, want nil", rerr)
+	}
+}
+
 // TestSetupSpecValidation proves Create requires a non-empty SetupArgv for a
 // SpecSetup session and never demands BinPath/Subcommand for it.
 func TestSetupSpecValidation(t *testing.T) {

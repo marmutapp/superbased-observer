@@ -16,6 +16,14 @@ import { Tooltip, TooltipSpan } from "@/components/primitives";
 // this whole file as binary, hiding every change from diff review.
 const CUSTOM_ROOT = "\u0000custom";
 
+// SHELL_TOOL is the reserved pseudo-tool sentinel for a fresh PLAIN SHELL
+// launch (must match internal/termsvc.ShellTool = "shell" verbatim). It is
+// deliberately never a member of launchable_tools (the capability registry) —
+// this dialog adds it client-side as its own option, gated by the SEPARATE
+// [terminal.launch].allow_shell opt-in (shell_enabled from GET
+// /api/terminal/sessions), not the AI-tool allow-list.
+const SHELL_TOOL = "shell";
+
 // shortenPath renders an absolute root as ".../parent/leaf" for the option
 // label (the full path rides along as the option title). Mirrors the
 // FilterBar project-picker convention so the two surfaces read the same.
@@ -89,6 +97,10 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
   // from GET /api/terminal/sessions. Used verbatim to mark which roots a fresh
   // launch will actually accept (empty = deny-all: only the agent's default cwd).
   const [allowedRoots, setAllowedRoots] = useState<string[]>([]);
+  // shell_enabled from GET /api/terminal/sessions — the SEPARATE
+  // [terminal.launch].allow_shell opt-in that gates the Shell option below,
+  // independent of allow_fresh_agent / allowed_tools.
+  const [shellEnabled, setShellEnabled] = useState(false);
   const [rootSel, setRootSel] = useState("");
   const [customRoot, setCustomRoot] = useState("");
   const [busy, setBusy] = useState(false);
@@ -109,6 +121,7 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
     fetchJSON<{
       launchable_tools?: string[];
       allowed_project_roots?: string[];
+      shell_enabled?: boolean;
     }>("/api/terminal/sessions")
       .then((d) => {
         if (cancelled) return;
@@ -116,6 +129,7 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
         setTools(list);
         if (list.length > 0) setTool(list[0]);
         setAllowedRoots(d.allowed_project_roots ?? []);
+        setShellEnabled(d.shell_enabled ?? false);
       })
       .catch(() => {
         /* seam disabled — the submit will surface the honest error */
@@ -142,7 +156,10 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
   // changes. A 501 (seam disabled on an older daemon) or any other error clears
   // the strip silently — the launch itself stays the authority.
   useEffect(() => {
-    if (!tool) {
+    // The shell pseudo-tool is never in the capability registry the preflight
+    // seam resolves against — skip the fetch and clear any stale AI-tool
+    // verdict rather than let it 404/error into a confusing strip.
+    if (!tool || tool === SHELL_TOOL) {
       setPreflight(null);
       return;
     }
@@ -337,6 +354,22 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
               {t}
             </option>
           ))}
+          {/* Native <option> — title= stays (React tooltip can't render inside
+              the browser-owned select popup). Shell is a reserved pseudo-tool,
+              never a member of `tools` (the capability registry) — gated by
+              its own SEPARATE [terminal.launch].allow_shell opt-in instead of
+              the AI-tool allow-list. */}
+          <option
+            value={SHELL_TOOL}
+            disabled={!shellEnabled}
+            title={
+              shellEnabled
+                ? "Start a plain shell ($SHELL, or bash/sh as a fallback) — no AI tool involved."
+                : "Not enabled — turn on [terminal.launch].allow_shell in Terminals → launch policy"
+            }
+          >
+            Shell {shellEnabled ? "" : "(disabled)"}
+          </option>
         </select>
 
         <label

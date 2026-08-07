@@ -72,6 +72,35 @@ func (a *API) handleAdmissionCheck(w http.ResponseWriter, r *http.Request) {
 	a.writeJSON(w, resp)
 }
 
+// handleAdmissionTest DRY-RUNS one request against the live policy and records
+// NOTHING (Persist:false) — the HTTP peer of `observer obs admission test`, for
+// the dashboard policy tester. It still runs the judge (so it does spend judge
+// tokens on a judged criterion — an owner action, hence CapabilityLocal), and
+// the response's EnforceDecision previews what enforce mode WOULD decide even
+// while the node is in observe. Distinct from handleAdmissionCheck, which
+// persists the shadow verdict.
+func (a *API) handleAdmissionTest(w http.ResponseWriter, r *http.Request) {
+	if a.admission == nil {
+		http.Error(w, "admission not enabled", http.StatusNotFound)
+		return
+	}
+	var req admissionCheckRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		http.Error(w, "bad request body", http.StatusBadRequest)
+		return
+	}
+	resp := a.admission.Check(r.Context(), obs.AdmissionCheck{
+		Text:      req.Text,
+		Tenant:    req.Tenant,
+		User:      req.User,
+		Session:   req.Session,
+		TraceID:   req.TraceID,
+		RequestID: req.RequestID,
+		Persist:   false,
+	})
+	a.writeJSON(w, resp)
+}
+
 // admissionStatusResponse is the /api/obs/admission/status payload.
 type admissionStatusResponse struct {
 	Enabled       bool           `json:"enabled"`

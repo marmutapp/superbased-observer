@@ -162,6 +162,54 @@ func TestTagCmdGrammar(t *testing.T) {
 	}
 }
 
+// TestTagCmdRating pins the --rating flag: 1-10 sets and shows "N/10", --json
+// round-trips it, a mutation that omits --rating LEAVES the score unchanged
+// (Changed-based pointer semantics — `--rating 0` clears, an absent flag does
+// not), and out-of-range is rejected before any write.
+func TestTagCmdRating(t *testing.T) {
+	cfg := newTagCLIFixture(t)
+
+	out, err := runTagCmd(t, "zzz", "--rating", "8", "--config", cfg)
+	if err != nil {
+		t.Fatalf("set rating: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "rating: 8/10") {
+		t.Fatalf("rating not shown in text output: %q", out)
+	}
+
+	// A tag-only mutation (no --rating flag) must leave the rating untouched.
+	out, err = runTagCmd(t, "zzz", "+keep", "--config", cfg, "--json")
+	if err != nil {
+		t.Fatalf("tag add: %v\n%s", err, out)
+	}
+	var res struct {
+		Rating int `json:"rating"`
+	}
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("decode --json %q: %v", out, err)
+	}
+	if res.Rating != 8 {
+		t.Fatalf("rating changed by an unrelated mutation: %d, want 8", res.Rating)
+	}
+
+	// --rating 0 clears it.
+	out, err = runTagCmd(t, "zzz", "--rating", "0", "--config", cfg, "--json")
+	if err != nil {
+		t.Fatalf("clear rating: %v\n%s", err, out)
+	}
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("decode --json %q: %v", out, err)
+	}
+	if res.Rating != 0 {
+		t.Fatalf("rating not cleared: %d, want 0", res.Rating)
+	}
+
+	// Out-of-range is rejected (pre-flight, before any write).
+	if _, err := runTagCmd(t, "zzz", "--rating", "11", "--config", cfg); err == nil {
+		t.Fatal("--rating 11 accepted; want the store's range error")
+	}
+}
+
 // TestTagCmdPrefixResolution pins unique-prefix resolution and the ambiguity
 // error listing the candidates.
 func TestTagCmdPrefixResolution(t *testing.T) {

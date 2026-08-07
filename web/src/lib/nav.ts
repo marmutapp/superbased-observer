@@ -6,6 +6,7 @@ export type NavIcon =
   | "actions"
   | "security"
   | "egress"
+  | "policies"
   | "cost"
   | "analysis"
   | "tools"
@@ -72,6 +73,7 @@ export const NAV_GROUPS: NavGroup[] = [
     id: "configure",
     label: "Configure",
     items: [
+      { id: "policies", label: "Policies", path: "/policies", icon: "policies" },
       { id: "privacy", label: "Privacy", path: "/privacy", icon: "privacy" },
       { id: "terminals", label: "Terminals", path: "/terminals", icon: "tools" },
       { id: "remote", label: "Remote", path: "/remote", icon: "remote" },

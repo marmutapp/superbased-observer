@@ -45,24 +45,28 @@ type tagRollupRow struct {
 	Tokens   int64   `json:"tokens"`
 }
 
-// sessionTagsRequest is the POST /api/session/<id>/tags body. Favorite and Note
-// are POINTERS so an omitted (or null) field means "leave unchanged" — the star
-// toggle and the note editor write independently.
+// sessionTagsRequest is the POST /api/session/<id>/tags body. Favorite, Note
+// and Rating are POINTERS so an omitted (or null) field means "leave unchanged"
+// — the star toggle, the note editor and the rating control each write
+// independently. Rating 0 clears (unrated); 1-10 is a score.
 type sessionTagsRequest struct {
 	Add      []string `json:"add"`
 	Remove   []string `json:"remove"`
 	Favorite *bool    `json:"favorite"`
 	Note     *string  `json:"note"`
+	Rating   *int     `json:"rating"`
 }
 
 // sessionTagsResponse is the post-mutation state of one session's
 // classification, echoed by POST /api/session/<id>/tags so the caller never has
-// to re-fetch.
+// to re-fetch. Rating carries omitempty so an unrated session emits the
+// byte-identical payload it did before ratings existed.
 type sessionTagsResponse struct {
 	SessionID string   `json:"session_id"`
 	Tags      []string `json:"tags"`
 	Favorite  bool     `json:"favorite"`
 	Note      string   `json:"note"`
+	Rating    int      `json:"rating,omitempty"`
 }
 
 // tagsManageRequest is the POST /api/sessions/tags/manage body. Exactly one of
@@ -231,7 +235,7 @@ func (s *Server) handleSessionTags(w http.ResponseWriter, r *http.Request, sessi
 	// annotation write are two store calls, so a body whose tags are valid but
 	// whose note is over-long would otherwise commit the tags and then 400 —
 	// a partial write indistinguishable, to the caller, from a total failure.
-	if err := store.ValidateClassificationInput(body.Add, body.Remove, body.Note); err != nil {
+	if err := store.ValidateClassificationInput(body.Add, body.Remove, body.Note, body.Rating); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -248,9 +252,9 @@ func (s *Server) handleSessionTags(w http.ResponseWriter, r *http.Request, sessi
 			return
 		}
 	}
-	if body.Favorite != nil || body.Note != nil {
-		if err := st.SetSessionAnnotation(r.Context(), sessionID, body.Favorite, body.Note); err != nil {
-			if errors.Is(err, store.ErrNoteTooLong) {
+	if body.Favorite != nil || body.Note != nil || body.Rating != nil {
+		if err := st.SetSessionAnnotation(r.Context(), sessionID, body.Favorite, body.Note, body.Rating); err != nil {
+			if errors.Is(err, store.ErrNoteTooLong) || errors.Is(err, store.ErrInvalidRating) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
@@ -277,5 +281,6 @@ func (s *Server) handleSessionTags(w http.ResponseWriter, r *http.Request, sessi
 		Tags:      tags,
 		Favorite:  annot.Favorite,
 		Note:      annot.Note,
+		Rating:    annot.Rating,
 	})
 }

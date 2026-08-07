@@ -862,7 +862,17 @@ func (a *Adapter) parseSessionFile(ctx context.Context, path string, fromOffset 
 		ctxState.ServiceTier = tier
 	}
 	rootCache := map[string]string{}
-	pending := map[string]int{}            // call_id → res.ToolEvents index
+	pending := map[string]int{} // call_id → res.ToolEvents index
+	// patchInvocations is the SECONDARY index that lets a patch_apply_end
+	// find its own invocation row when the call_id join cannot: modern
+	// Codex runs apply_patch from inside an `exec` custom_tool_call, and
+	// the executor stamps its own `exec-<uuid>` id while the response_item
+	// carries `call_<hash>` — different namespaces, so pending[] misses by
+	// construction. Without this, BOTH rows survive and the same patch is
+	// counted twice (measured over 333 July rollouts: 838 invocation rows
+	// vs 2,445 executor rows, with 57 rollouts carrying both).
+	// Keyed by turn, ordered oldest-first — see claimPatchInvocation.
+	patchInvocations := map[string][]patchInvocation{}
 	lastInputByID := map[string]int64{}    // legacy gross-cumulative input tracker; preserved for the unused branch in case a fixture still drives it (see lastNetInputByID below for the net-cumulative variant the active math uses)
 	lastNetInputByID := map[string]int64{} // tracks (gross_input - cached_input) cumulative per session so the per-turn delta we store excludes the cached portion (Anthropic-shape convention, see cost engine TokenBundle docstring)
 	turnModels := map[string]string{}
@@ -1581,9 +1591,32 @@ func (a *Adapter) parseSessionFile(ctx context.Context, path string, fromOffset 
 				}
 				projectRoot := a.resolveProjectRoot(ctxState.Cwd, rootCache)
 				preceding := agentMessages[firstNonEmpty(pa.TurnID, ctxState.TurnID)]
+				turnKey := firstNonEmpty(pa.TurnID, ctxState.TurnID)
+				claimedIdx, claimed := -1, false
 				if idx, ok := pending[pa.CallID]; ok && idx < len(res.ToolEvents) {
-					mergePatchApplyIntoPending(&res.ToolEvents[idx], a, pa, projectRoot)
+					claimedIdx, claimed = idx, true
 					delete(pending, pa.CallID)
+					// The id join won, but this row may ALSO be sitting in
+					// the fallback queue. Drop it there or a later
+					// patch_apply_end could claim an already-merged row.
+					dropPatchInvocation(patchInvocations, idx)
+				} else if cand, ok := claimPatchInvocation(patchInvocations, turnKey, changesFileSet(pa.Changes)); ok && cand.idx < len(res.ToolEvents) {
+					// The call_id join missed (the exec-uuid namespace).
+					// Merging into the invocation row instead of emitting a
+					// second one is what keeps ONE row per patch, and with
+					// it one authored-byte count.
+					claimedIdx, claimed = cand.idx, true
+					// Symmetric to dropPatchInvocation above: this row is
+					// no longer claimable by ANY route, so retire its
+					// pending entry too. Without this, a later
+					// patch_apply_end that DOES carry the call_hash would
+					// merge the same row a second time.
+					if cand.callID != "" {
+						delete(pending, cand.callID)
+					}
+				}
+				if claimed {
+					mergePatchApplyIntoPending(&res.ToolEvents[claimedIdx], a, pa, projectRoot)
 				} else {
 					evt := a.buildPatchApplyStandaloneEvent(path, ctxState, projectRoot, ts, pa, lineNum, preceding)
 					if evt.Model == "" {
@@ -1888,7 +1921,7 @@ func (a *Adapter) parseSessionFile(ctx context.Context, path string, fromOffset 
 				}
 				projectRoot := a.resolveProjectRoot(ctxState.Cwd, rootCache)
 				preceding := agentMessages[ctxState.TurnID]
-				evt := a.buildCustomToolCallEvent(path, callID, ctxState, projectRoot, ts, rc, preceding)
+				evt, patchText := a.buildCustomToolCallEvent(path, callID, ctxState, projectRoot, ts, rc, preceding)
 				if evt.Model == "" {
 					if turnID := assistantTurnID(""); turnID != "" {
 						evt.Model = modelForTurn(turnID)
@@ -1898,6 +1931,16 @@ func (a *Adapter) parseSessionFile(ctx context.Context, path string, fromOffset 
 					}
 				}
 				pending[callID] = len(res.ToolEvents)
+				// Register the invocation for the id-less fallback join.
+				// Both sides key on the turn the row itself carries
+				// (MessageID), so the queue can never be keyed one way and
+				// read another.
+				if patchText != "" && evt.ActionType == models.ActionEditFile {
+					if files := patchFileSet(patchText, ctxState.Cwd); len(files) > 0 {
+						patchInvocations[evt.MessageID] = append(patchInvocations[evt.MessageID],
+							patchInvocation{idx: len(res.ToolEvents), callID: callID, files: files})
+					}
+				}
 				res.ToolEvents = append(res.ToolEvents, withEffort(evt))
 			case "custom_tool_call_output":
 				var ro responseItemCustomToolCallOutput
@@ -2231,7 +2274,7 @@ func (a *Adapter) buildCustomToolCallEvent(
 	ts time.Time,
 	rc responseItemCustomToolCall,
 	preceding string,
-) models.ToolEvent {
+) (models.ToolEvent, string) {
 	name, target, patchText, provablyNoCall := a.resolveCustomToolCall(rc)
 
 	actionType, ok := actionMap[name]
@@ -2282,7 +2325,7 @@ func (a *Adapter) buildCustomToolCallEvent(
 		RawToolInput:       a.scrubber.String(rc.Input),
 		ContentBytes:       customToolCallAuthoredBytes(actionType, rc, target, patchText),
 		MessageID:          sess.TurnID,
-	}
+	}, patchText
 }
 
 // resolveCustomToolCall turns a custom_tool_call payload into (native
@@ -2392,6 +2435,18 @@ func mergePatchApplyIntoPending(row *models.ToolEvent, a *Adapter, pa patchApply
 	row.ToolOutput = a.scrubber.String(output)
 	row.ErrorMessage = errorIfFailed(pa.Success, output)
 	row.RawToolName = "patch_apply_end"
+	// The executor's count wins where it exists, because for an `add` it
+	// is the EXACT file content while the patch-text measure drops every
+	// line terminator (a 29-byte file counts 26 from its `+` lines).
+	//
+	// KNOWN LIMITATION, unquantified: a MIXED envelope (one `add` plus
+	// one `update`) therefore reports only the add — the update carries
+	// no `content`, so its `+` lines are lost from the merged row. The
+	// honest fix is not to special-case this here but to make the
+	// patch-text measure exact by counting line terminators, after which
+	// it covers every change kind and can simply win outright. That
+	// moves ContentBytes on every codex patch row, so it is a separate
+	// decision, not a side effect of collapsing the duplicate row.
 	if n := authoredBytesFromPatchChanges(pa.Changes); n > 0 {
 		row.ContentBytes = n
 	}
@@ -2763,6 +2818,160 @@ func applyPatchTarget(patch string) string {
 		}
 	}
 	return ""
+}
+
+// patchInvocation is one unclaimed apply_patch custom_tool_call row,
+// held so a later patch_apply_end that cannot join on call_id can still
+// merge into it instead of emitting a duplicate row. `files` is the set
+// of paths the invocation's own patch text declares.
+type patchInvocation struct {
+	idx int
+	// callID is carried so a FALLBACK claim can invalidate this row's
+	// pending[] entry too. Claimability is otherwise represented in two
+	// places — pending and this queue — and invalidating only one leaves
+	// the mirror of the bug dropPatchInvocation closes: a later
+	// patch_apply_end that DOES carry the call_hash would merge a row the
+	// fallback already merged.
+	callID string
+	files  map[string]struct{}
+}
+
+// patchFileSet extracts the set of paths an apply_patch envelope
+// touches, from its `*** Add/Update/Delete/Move File:` headers. This is
+// the invocation side of the pairing guard in claimPatchInvocation.
+//
+// A RELATIVE header is resolved against `base` (the session cwd) before
+// cleaning, because the executor always reports ABSOLUTE paths — a bare
+// `*** Update File: main.go` could otherwise never equal
+// `/repo/main.go`, and the guard would abstain on a real shape rather
+// than a doubtful one. Resolution is pure lexical joining, never a
+// filesystem lookup. With no base to resolve against, a relative header
+// is still emitted cleaned, so it simply fails to match and falls back
+// to the standalone row.
+func patchFileSet(patch, base string) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, line := range strings.Split(patch, "\n") {
+		line = strings.TrimSpace(line)
+		const prefix = "*** "
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		rest := line[len(prefix):]
+		for _, header := range []string{"Add File:", "Update File:", "Delete File:", "Move File:"} {
+			if strings.HasPrefix(rest, header) {
+				if p := strings.TrimSpace(rest[len(header):]); p != "" {
+					if !isAbsAnyOS(p) && base != "" {
+						p = filepath.Join(base, p)
+					}
+					out[filepath.Clean(p)] = struct{}{}
+				}
+				break
+			}
+		}
+	}
+	return out
+}
+
+// isAbsAnyOS reports whether a path is absolute in EITHER convention,
+// which filepath.IsAbs alone cannot: it answers for the HOST os only, so
+// a WSL/Linux daemon parsing a Windows rollout sees `C:\repo\a.go` as
+// relative and a Windows host parsing a Linux rollout sees `/repo/a.go`
+// the same way. Either mistake would send an already-absolute header
+// through filepath.Join and destroy a pair that used to match — the
+// adapter deliberately supports foreign-OS rollouts (see
+// internal/platform/crossmount), so this is a live shape, not a
+// hypothetical.
+//
+// Detection only: no normalization, no drive-letter rewriting. Both
+// sides of the comparison keep the producer's own spelling, so they
+// match each other exactly as they did before relative resolution
+// existed.
+func isAbsAnyOS(p string) bool {
+	if filepath.IsAbs(p) || strings.HasPrefix(p, "/") {
+		return true
+	}
+	// UNC (`\\server\share`) and Windows drive-letter (`C:\`, `c:/`).
+	if strings.HasPrefix(p, `\\`) {
+		return true
+	}
+	if len(p) >= 3 && p[1] == ':' && (p[2] == '\\' || p[2] == '/') {
+		c := p[0]
+		return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+	}
+	return false
+}
+
+// changesFileSet is the executor side of the same guard: the paths a
+// patch_apply_end reports it actually wrote.
+func changesFileSet(changes map[string]patchApplyChange) map[string]struct{} {
+	out := map[string]struct{}{}
+	for p := range changes {
+		if p != "" {
+			out[filepath.Clean(p)] = struct{}{}
+		}
+	}
+	return out
+}
+
+// sameFileSet reports whether two path sets are equal. Equality — not
+// overlap — is the safety property: it is what makes a wrong pairing
+// structurally impossible rather than merely unlikely.
+func sameFileSet(a, b map[string]struct{}) bool {
+	if len(a) != len(b) || len(a) == 0 {
+		return false
+	}
+	for p := range a {
+		if _, ok := b[p]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// claimPatchInvocation finds the invocation row a patch_apply_end
+// belongs to when the call_id join has already missed, and REMOVES it
+// from the queue so it can never be claimed twice.
+//
+// The match is oldest-first within the SAME TURN, gated on exact
+// file-set equality. Order is what disambiguates the common case of one
+// turn patching the same file repeatedly (every such invocation has an
+// identical file set, so only sequence can tell them apart); the
+// equality gate is what stops order from mis-pairing anything else. A
+// turn is the right scope because sub-agents carry their own turn ids,
+// so their patches cannot interleave into this queue.
+//
+// Known bound, accepted: if an invocation's own patch_apply_end never
+// arrives (an aborted apply), the NEXT executor event for an identical
+// file set in the same turn claims it instead. The row count stays
+// correct and only the association shifts by one, between two patches
+// of the same file in the same turn. Returning false (no claim) always
+// degrades to the standalone row — this function never merges on doubt.
+func claimPatchInvocation(queues map[string][]patchInvocation, turn string, files map[string]struct{}) (patchInvocation, bool) {
+	q := queues[turn]
+	for i, cand := range q {
+		if !sameFileSet(cand.files, files) {
+			continue
+		}
+		queues[turn] = append(q[:i:i], q[i+1:]...)
+		return cand, true
+	}
+	return patchInvocation{}, false
+}
+
+// dropPatchInvocation removes the queue entry for a row index that has
+// already been merged through another path, so it cannot be claimed a
+// second time. Scans every turn because the queue is keyed on the
+// invocation row's own turn, which need not equal the turn the
+// executor event reports.
+func dropPatchInvocation(queues map[string][]patchInvocation, idx int) {
+	for turn, q := range queues {
+		for i, cand := range q {
+			if cand.idx == idx {
+				queues[turn] = append(q[:i:i], q[i+1:]...)
+				return
+			}
+		}
+	}
 }
 
 // patchApplyTargetFromChanges picks the first key from a patch_apply_end

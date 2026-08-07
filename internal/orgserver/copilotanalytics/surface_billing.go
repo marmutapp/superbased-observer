@@ -14,7 +14,8 @@ import (
 // post-June-2026 AI-Credits / premium-request metered spend — already USD, read
 // not recomputed (do NOT multiply by a hardcoded rate; findings §4.2). Line items
 // are org/account-level (no per-login attribution), so they land under
-// orgAggregateKey and feed the SIBLING CostSummary, never spendCTE.
+// orgAggregateKey and feed rollup/telemetry.go::telemetryCopilot (CostUSD +
+// the per-day OverageByDay series) as a SIBLING read, never spendCTE.
 //
 // RESIDUAL (findings Q-C4): the exact product/sku/unitType strings are
 // doc-reconstructed; lock them against a live payload. We match product=="copilot"

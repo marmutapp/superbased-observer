@@ -93,6 +93,9 @@ const SecurityPage = lazy(() =>
 const EgressPage = lazy(() =>
   import("@/pages/Egress").then((m) => ({ default: m.EgressPage })),
 );
+const PoliciesPage = lazy(() =>
+  import("@/pages/Policies").then((m) => ({ default: m.PoliciesPage })),
+);
 const PrivacyPage = lazy(() =>
   import("@/pages/Privacy").then((m) => ({ default: m.PrivacyPage })),
 );
@@ -145,6 +148,7 @@ function AnimatedRoutes() {
           <Route path="actions" element={<ActionsPage />} />
           <Route path="security" element={<SecurityPage />} />
           <Route path="egress" element={<EgressPage />} />
+          <Route path="policies" element={<PoliciesPage />} />
           <Route path="tools" element={<ToolsPage />} />
           <Route path="compression" element={<CompressionPage />} />
           <Route path="cache" element={<CachePage />} />

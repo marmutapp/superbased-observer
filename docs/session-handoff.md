@@ -298,7 +298,7 @@ viewer #1.
   `daemon_shutdown`. For any launcher whose tool grounds a **native resume**,
   the attach client then offers prompt-with-timeout auto-resume ("resuming
   session <id> in 5s — Enter now, Ctrl-C skip") onto the SAME transcript via
-  the tool's own resume mechanism. As of 2026-07-29 that is **21 of the 22
+  the tool's own resume mechanism. As of 2026-08-06 that is **23 of the 24
   launchers**: the flagships `claude` (`--resume`) and `codex` (`resume`), plus
   the live-verified wave `opencode` / `kilo` / `cline-cli` / `gemini` /
   `copilot-cli` / `pi` / `qwen` / `grok` / `kimi` / `devin` / `hermes` /
@@ -308,7 +308,9 @@ viewer #1.
   reason as cursor), `open-interpreter` (`resume <SESSION_ID>` — the codex
   subcommand shape) and `command-code` (`--session <id>`; its `-r/--resume`
   sibling is optional-value AND name-resolving, so the required-value
-  `--session` is the one used). Each observer launcher
+  `--session` is the one used), plus the 2026-08-06 wave `muse` (`resume
+  <session-uuid>`, subcommand shape) and `prime-agent` (`--resume <path|id>`,
+  required-value flag). Each observer launcher
   exposes a uniform `--resume <id>` flag and translates it to the tool's own
   argv (e.g. `opencode --session <id>`, `kiro-cli chat --resume-id <id>`,
   `goose session --resume --session-id <id>`); the registry declares the

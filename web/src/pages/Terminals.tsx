@@ -45,6 +45,12 @@ type TerminalPolicy = {
   allowed_tools: string[];
   allowed_project_roots: string[];
   launchable_tools: string[];
+  // allow_shell is a SEPARATE opt-in from allow_fresh_agent — a plain shell is
+  // a strictly larger execution-authority expansion than a launchable AI tool
+  // (arbitrary commands vs. one of the capability-registry's known
+  // launchers), so it needs its own conscious toggle. See
+  // internal/config's TerminalLaunchConfig.AllowShell.
+  allow_shell: boolean;
   restart_required_on_save: boolean;
   // Runtime bounds — live-applied by POST /api/terminal/limits (no restart),
   // read-only on this GET.
@@ -123,6 +129,7 @@ export function TerminalsPage() {
 
   // Local editable copy of the policy, seeded from the server.
   const [allowFresh, setAllowFresh] = useState(false);
+  const [allowShell, setAllowShell] = useState(false);
   const [tools, setTools] = useState<string[]>([]);
   const [roots, setRoots] = useState<string[]>([]);
   const [newRoot, setNewRoot] = useState("");
@@ -148,6 +155,7 @@ export function TerminalsPage() {
   useEffect(() => {
     if (p) {
       setAllowFresh(p.allow_fresh_agent);
+      setAllowShell(p.allow_shell);
       setTools(p.allowed_tools ?? []);
       setRoots(p.allowed_project_roots ?? []);
       setMaxConcurrent(String(p.max_concurrent ?? 0));
@@ -215,6 +223,7 @@ export function TerminalsPage() {
         allow_fresh_agent: allowFresh,
         allowed_tools: tools,
         allowed_project_roots: roots,
+        allow_shell: allowShell,
       });
       if (res.restart_required) markRestartPending("terminal-policy");
       setSaved(true);
@@ -362,6 +371,28 @@ export function TerminalsPage() {
                 When on, the dashboard can spawn a new agent from the launchable set below, in one of the
                 allowed project roots. When off, every fresh-launch request is refused (session continuation
                 is unaffected).
+              </span>
+            </span>
+          </label>
+
+          <label className="flex items-start gap-2">
+            <input
+              type="checkbox"
+              checked={allowShell}
+              disabled={!p?.config_writable}
+              onChange={(e) => {
+                setSaved(false);
+                setAllowShell(e.target.checked);
+              }}
+              className="mt-0.5"
+            />
+            <span>
+              <span className="font-medium text-fg-1">Allow plain shell terminals</span>
+              <span className="block text-[11px] text-fg-3">
+                A SEPARATE opt-in from fresh-agent launches above — it starts your own shell ($SHELL, or
+                bash/sh as a fallback) instead of an AI tool, so it is a strictly larger execution-authority
+                expansion (any command, not one of the launchable tools). Turning on fresh-agent launches
+                does not also grant this. Config key: <code className="text-fg-2">[terminal.launch].allow_shell</code>.
               </span>
             </span>
           </label>

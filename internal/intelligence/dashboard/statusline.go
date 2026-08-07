@@ -255,14 +255,14 @@ func statuslineQueryRows(ctx context.Context, db *sql.DB, engine *cost.Engine, s
 		SELECT at.model, at.input_tokens, at.output_tokens, at.cache_read_tokens,
 		       at.cache_creation_tokens, at.cache_creation_1h_tokens,
 		       0 AS reasoning_tokens, at.web_search_requests,
-		       at.cost_usd AS recorded_cost, at.fast
+		       at.cost_usd AS recorded_cost, at.fast, at.timestamp
 		FROM api_turns at
 		WHERE 1=1` + atExtra + `
 		UNION ALL
 		SELECT tu.model, tu.input_tokens, tu.output_tokens, tu.cache_read_tokens,
 		       tu.cache_creation_tokens, tu.cache_creation_1h_tokens,
 		       tu.reasoning_tokens, tu.web_search_requests,
-		       tu.estimated_cost_usd AS recorded_cost, tu.fast
+		       tu.estimated_cost_usd AS recorded_cost, tu.fast, tu.timestamp
 		FROM token_usage tu
 		WHERE 1=1` + tuExtra + `
 		  AND (tu.source_event_id IS NULL OR tu.source_event_id = ''
@@ -273,7 +273,7 @@ func statuslineQueryRows(ctx context.Context, db *sql.DB, engine *cost.Engine, s
 	       COALESCE(cache_read_tokens, 0), COALESCE(cache_creation_tokens, 0),
 	       COALESCE(cache_creation_1h_tokens, 0),
 	       COALESCE(reasoning_tokens, 0), COALESCE(web_search_requests, 0),
-	       COALESCE(recorded_cost, 0), COALESCE(fast, 0)
+	       COALESCE(recorded_cost, 0), COALESCE(fast, 0), COALESCE(timestamp, '')
 	FROM combined`
 
 	args := make([]any, 0, len(proxyArgs)+len(atArgs)+len(tuArgs))
@@ -287,18 +287,24 @@ func statuslineQueryRows(ctx context.Context, db *sql.DB, engine *cost.Engine, s
 	}
 	defer rows.Close()
 
+	// dateAware gates the per-row time.Parse: an install with zero
+	// dated-pricing entries (the common case) pays nothing extra on
+	// this <100ms-budget hot path, matching cost/summary.go's pattern.
+	dateAware := engine != nil && engine.HasDatedPricing()
+
 	for rows.Next() {
 		var (
 			model    string
 			bundle   cost.TokenBundle
 			recorded float64
 			fastInt  int
+			tsStr    string
 		)
 		if err := rows.Scan(&model,
 			&bundle.Input, &bundle.Output,
 			&bundle.CacheRead, &bundle.CacheCreation, &bundle.CacheCreation1h,
 			&bundle.Reasoning, &bundle.WebSearchRequests,
-			&recorded, &fastInt); err != nil {
+			&recorded, &fastInt, &tsStr); err != nil {
 			return totals, fmt.Errorf("dashboard.statuslineQueryRows: scan: %w", err)
 		}
 		bundle.Fast = fastInt != 0
@@ -307,8 +313,12 @@ func statuslineQueryRows(ctx context.Context, db *sql.DB, engine *cost.Engine, s
 		switch {
 		case recorded > 0:
 			rowCost = recorded
-		default:
-			if p, ok := engine.Lookup(model); ok {
+		case engine != nil:
+			var ts time.Time
+			if dateAware {
+				ts, _ = time.Parse(time.RFC3339Nano, tsStr)
+			}
+			if p, ok := engine.LookupAt(model, ts); ok {
 				rowCost = cost.Compute(p, bundle)
 			}
 		}

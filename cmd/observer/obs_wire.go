@@ -145,7 +145,7 @@ func (a obsEgressReporter) ReportEgressRealized(ctx context.Context, out proxy.E
 // otherwise (decision D4 — the dashboard never imports obs; it just receives
 // generic routes here, the single host->obs seam). Build-tagged; the no_obs
 // build returns nil.
-func obsDashboardRoutes(ctx context.Context, cfg config.Config, db *sql.DB, logger *slog.Logger) []dashboard.ExtraRoute {
+func obsDashboardRoutes(ctx context.Context, cfg config.Config, configPath string, db *sql.DB, logger *slog.Logger) []dashboard.ExtraRoute {
 	if !cfg.Observability.Enabled {
 		return nil
 	}
@@ -155,9 +155,13 @@ func obsDashboardRoutes(ctx context.Context, cfg config.Config, db *sql.DB, logg
 		return nil
 	}
 	api := httpapi.New(obsStore, obsProxyEnricher{st: store.New(db)}, obsAdmissionService(ctx, cfg, db, logger), logger)
-	// Policy write-through persistence (gap-audit #11): the persist func is the
-	// cmd-side seam so httpapi never imports config-write machinery.
-	api.SetPolicyPersister(admissionPolicyPersister())
+	// Policy write-through persistence (gap-audit #11): the persist funcs are the
+	// cmd-side seam so httpapi never imports config-write machinery. configPath is
+	// the daemon's OWN loaded config path (the `--config` value), so a
+	// ?persist=1 write lands in the file this daemon actually reads — not a
+	// default ~/.observer/config.toml the daemon isn't using.
+	api.SetPolicyPersister(admissionPolicyPersister(configPath))
+	api.SetEgressPersister(egressPolicyPersister(configPath))
 	var routes []dashboard.ExtraRoute
 	for _, r := range api.Routes() {
 		// Classify obs routes PER ROUTE for the remote route-capability registry
@@ -190,6 +194,8 @@ func obsDashboardRoutes(ctx context.Context, cfg config.Config, db *sql.DB, logg
 var obsLocalOnlyObsRoutes = map[string]struct{}{
 	"POST /api/obs/admission/policy": {}, // persists the admission policy (config write)
 	"POST /api/obs/admission/check":  {}, // runs the judge, Persist:true (writes records + spends tokens)
+	"POST /api/obs/admission/test":   {}, // dry-runs the judge (spends tokens; records nothing)
+	"POST /api/obs/egress/policy":    {}, // persists the egress routing policy (config write)
 }
 
 // obsRouteCapability returns the remote capability class for one obs

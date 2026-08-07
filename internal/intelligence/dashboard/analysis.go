@@ -230,8 +230,15 @@ func (s *Server) handleAnalysisHeadline(w http.ResponseWriter, r *http.Request) 
 		// for symmetry and because a future pricing-table change could
 		// otherwise make the "always non-negative" assumption silently
 		// stop holding.
+		//
+		// DATE-EFFECTIVE: this is a HISTORICAL analysis over a past
+		// window, so the row is priced at the rate in force at its own
+		// timestamp (LookupAt), not at today's. With no dated timeline
+		// for the model — the default — LookupAt(ts) is byte-identical
+		// to Lookup(). `ts` is already parsed above; a malformed stamp
+		// leaves it zero, which LookupAt treats as "use current rates".
 		var rowCost, rowStdCost, rowAltCost float64
-		p, priced := s.opts.CostEngine.Lookup(model)
+		p, priced := s.opts.CostEngine.LookupAt(model, ts)
 		var modelHasLC bool
 		if priced && p.LongContextThreshold > 0 {
 			modelHasLC = true
@@ -794,14 +801,14 @@ func (s *Server) handleAnalysisTopSessions(w http.ResponseWriter, r *http.Reques
 		SELECT at.session_id, at.model, at.input_tokens, at.output_tokens, at.cache_read_tokens,
 		       at.cache_creation_tokens, at.cache_creation_1h_tokens,
 		       0 AS reasoning_tokens,
-		       at.web_search_requests, at.cost_usd
+		       at.web_search_requests, at.cost_usd, at.timestamp
 		FROM api_turns at` + atJoins + `
 		WHERE at.timestamp >= ?` + atWhere + `
 		UNION ALL
 		SELECT tu.session_id, tu.model, tu.input_tokens, tu.output_tokens, tu.cache_read_tokens,
 		       tu.cache_creation_tokens, tu.cache_creation_1h_tokens,
 		       tu.reasoning_tokens,
-		       tu.web_search_requests, tu.estimated_cost_usd
+		       tu.web_search_requests, tu.estimated_cost_usd, tu.timestamp
 		FROM token_usage tu` + tuJoins + `
 		WHERE tu.timestamp >= ?` + tuWhere + `
 		  AND (tu.source_event_id IS NULL OR tu.source_event_id = ''
@@ -814,7 +821,8 @@ func (s *Server) handleAnalysisTopSessions(w http.ResponseWriter, r *http.Reques
 	       COALESCE(cache_creation_1h_tokens, 0),
 	       COALESCE(reasoning_tokens, 0),
 	       COALESCE(web_search_requests, 0),
-	       COALESCE(cost_usd, 0)
+	       COALESCE(cost_usd, 0),
+	       COALESCE(timestamp, '')
 	FROM combined`
 
 	args := []any{tsArg, tsArg}
@@ -841,17 +849,16 @@ func (s *Server) handleAnalysisTopSessions(w http.ResponseWriter, r *http.Reques
 
 	for rows.Next() {
 		var (
-			sid    string
-			model  string
-			bundle cost.TokenBundle
-			rec    float64
+			sid, model, tsStr string
+			bundle            cost.TokenBundle
+			rec               float64
 		)
 		if err := rows.Scan(&sid, &model,
 			&bundle.Input, &bundle.Output,
 			&bundle.CacheRead, &bundle.CacheCreation, &bundle.CacheCreation1h,
 			&bundle.Reasoning,
 			&bundle.WebSearchRequests,
-			&rec); err != nil {
+			&rec, &tsStr); err != nil {
 			writeErr(w, err)
 			return
 		}
@@ -859,13 +866,18 @@ func (s *Server) handleAnalysisTopSessions(w http.ResponseWriter, r *http.Reques
 			continue // unattributed row, can't bucket by session
 		}
 
+		// Date-effective pricing ladder: recorded cost wins; otherwise
+		// price at the rate in force on the row's own timestamp.
 		var rowCost, rowStdCost float64
 		if rec > 0 {
 			rowCost = rec
 			rowStdCost = rec
-		} else if p, ok := s.opts.CostEngine.Lookup(model); ok {
-			rowCost = cost.Compute(p, bundle)
-			rowStdCost = cost.Compute(stripLongContext(p), bundle)
+		} else {
+			ts, _ := time.Parse(time.RFC3339Nano, tsStr)
+			if p, ok := s.opts.CostEngine.LookupAt(model, ts); ok {
+				rowCost = cost.Compute(p, bundle)
+				rowStdCost = cost.Compute(stripLongContext(p), bundle)
+			}
 		}
 
 		a, ok := agg[sid]
@@ -1145,14 +1157,14 @@ func (s *Server) handleAnalysisRoutingSuggestions(w http.ResponseWriter, r *http
 		SELECT at.session_id, at.model, at.input_tokens, at.output_tokens, at.cache_read_tokens,
 		       at.cache_creation_tokens, at.cache_creation_1h_tokens,
 		       0 AS reasoning_tokens,
-		       at.web_search_requests, at.cost_usd
+		       at.web_search_requests, at.cost_usd, at.timestamp
 		FROM api_turns at` + atJoins + `
 		WHERE at.timestamp >= ?` + atWhere + `
 		UNION ALL
 		SELECT tu.session_id, tu.model, tu.input_tokens, tu.output_tokens, tu.cache_read_tokens,
 		       tu.cache_creation_tokens, tu.cache_creation_1h_tokens,
 		       tu.reasoning_tokens,
-		       tu.web_search_requests, tu.estimated_cost_usd
+		       tu.web_search_requests, tu.estimated_cost_usd, tu.timestamp
 		FROM token_usage tu` + tuJoins + `
 		WHERE tu.timestamp >= ?` + tuWhere + `
 		  AND (tu.source_event_id IS NULL OR tu.source_event_id = ''
@@ -1165,7 +1177,8 @@ func (s *Server) handleAnalysisRoutingSuggestions(w http.ResponseWriter, r *http
 	       COALESCE(cache_creation_1h_tokens, 0),
 	       COALESCE(reasoning_tokens, 0),
 	       COALESCE(web_search_requests, 0),
-	       COALESCE(cost_usd, 0)
+	       COALESCE(cost_usd, 0),
+	       COALESCE(timestamp, '')
 	FROM combined`
 
 	args := []any{tsArg, tsArg}
@@ -1192,17 +1205,16 @@ func (s *Server) handleAnalysisRoutingSuggestions(w http.ResponseWriter, r *http
 
 	for rows.Next() {
 		var (
-			sid    string
-			model  string
-			bundle cost.TokenBundle
-			rec    float64
+			sid, model, tsStr string
+			bundle            cost.TokenBundle
+			rec               float64
 		)
 		if err := rows.Scan(&sid, &model,
 			&bundle.Input, &bundle.Output,
 			&bundle.CacheRead, &bundle.CacheCreation, &bundle.CacheCreation1h,
 			&bundle.Reasoning,
 			&bundle.WebSearchRequests,
-			&rec); err != nil {
+			&rec, &tsStr); err != nil {
 			writeErr(w, err)
 			return
 		}
@@ -1210,13 +1222,20 @@ func (s *Server) handleAnalysisRoutingSuggestions(w http.ResponseWriter, r *http
 			continue
 		}
 
+		// Date-effective pricing ladder: recorded cost wins; otherwise
+		// price at the rate in force on the row's own timestamp. The
+		// forward-looking "cheaper sibling" projection below stays on
+		// the undated Lookup — it's a what-if for switching TODAY.
 		var rowCost, rowStdCost float64
 		if rec > 0 {
 			rowCost = rec
 			rowStdCost = rec
-		} else if p, ok := s.opts.CostEngine.Lookup(model); ok {
-			rowCost = cost.Compute(p, bundle)
-			rowStdCost = cost.Compute(stripLongContext(p), bundle)
+		} else {
+			ts, _ := time.Parse(time.RFC3339Nano, tsStr)
+			if p, ok := s.opts.CostEngine.LookupAt(model, ts); ok {
+				rowCost = cost.Compute(p, bundle)
+				rowStdCost = cost.Compute(stripLongContext(p), bundle)
+			}
 		}
 
 		a, ok := agg[sid]
@@ -1436,7 +1455,10 @@ func (s *Server) handleAnalysisCostByHour(w http.ResponseWriter, r *http.Request
 		var rowCost float64
 		if recorded > 0 {
 			rowCost = recorded
-		} else if p, ok := s.opts.CostEngine.Lookup(model); ok {
+		} else if p, ok := s.opts.CostEngine.LookupAt(model, ts); ok {
+			// Date-effective: historical window, so price at the rate in
+			// force at the row's own timestamp. Identical to Lookup when
+			// the model has no dated timeline.
 			rowCost = cost.Compute(p, bundle)
 		}
 		h := ts.Hour()
@@ -1563,7 +1585,10 @@ func (s *Server) handleAnalysisCostByDowHour(w http.ResponseWriter, r *http.Requ
 		var rowCost float64
 		if recorded > 0 {
 			rowCost = recorded
-		} else if p, ok := s.opts.CostEngine.Lookup(model); ok {
+		} else if p, ok := s.opts.CostEngine.LookupAt(model, ts); ok {
+			// Date-effective: historical window, so price at the rate in
+			// force at the row's own timestamp. Identical to Lookup when
+			// the model has no dated timeline.
 			rowCost = cost.Compute(p, bundle)
 		}
 		dow := int(ts.Weekday())
@@ -1704,7 +1729,7 @@ func (s *Server) handleAnalysisCacheSavingsTrend(w http.ResponseWriter, r *http.
 		// both the actual and counterfactual price, so a fast-tier row's
 		// delta is itself computed at fast rates, not silently priced at
 		// standard rates.
-		p, ok := s.opts.CostEngine.Lookup(model)
+		p, ok := s.opts.CostEngine.LookupAt(model, ts)
 		if !ok {
 			continue
 		}

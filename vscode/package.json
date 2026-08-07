@@ -2,7 +2,7 @@
   "name": "superbased-observer",
   "displayName": "SuperBased",
   "description": "Claude Code cost tracking, Cursor token usage, Codex spend — AI coding agent observability across 29 adapters (Claude Code, Codex, Cursor, Cline + Cline CLI, Copilot, Gemini CLI, Hermes Agent, Kilo Code, Aider, Goose, Devin, and more), proxy-accurate. No telemetry. No cloud.",
-  "version": "1.28.0",
+  "version": "1.29.0",
   "publisher": "superbased",
   "license": "Apache-2.0",
   "author": "Santosh Kathira <contact@superbased.app>",
@@ -282,8 +282,8 @@
             "managed",
             "auto"
           ],
-          "default": "detect",
-          "description": "How the extension manages the observer daemon. 'detect' attaches only; 'managed' spawns on activation and kills on deactivate; 'auto' attaches if a daemon is found, otherwise spawns."
+          "default": "auto",
+          "description": "How the extension manages the observer daemon. 'auto' (default) attaches to a daemon you already started, and otherwise spawns one — and only ever stops a daemon it spawned itself. 'managed' behaves the same. 'detect' attaches only and never spawns, so the views stay empty until you run `observer start` yourself."
         },
         "observer.binary.path": {
           "type": "string",

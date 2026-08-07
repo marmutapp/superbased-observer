@@ -126,3 +126,57 @@ func TestReportMonthly(t *testing.T) {
 		t.Errorf("POST: got %d want 405", rr.Code)
 	}
 }
+
+// TestReportMonthly_DatedPricingLadder pins the recorded-cost →
+// dated-rate → undated-fallback ladder in handleReportMonthly's
+// per-row pricing (report.go:183-ish). Three rows in one session, one
+// month: a recorded row (must win verbatim over any computed price), an
+// unrecorded row before the synthetic rate-change boundary (must price
+// at the OLD/dated rate, not current), and an unrecorded row after the
+// boundary (must price at the NEW/current rate) — proving both rungs of
+// the fallback AND the mixed-aggregation case in one totals sum.
+func TestReportMonthly_DatedPricingLadder(t *testing.T) {
+	server, _ := wizardTestServer(t)
+	now := time.Now().UTC()
+	month := now.Format("2006-01")
+	boundary := now.Add(-2 * time.Hour)
+	server.opts.CostEngine = newLadderTestEngine(t, boundary)
+
+	seedLiveSession(t, server, "ladder-rep", "claude-code", now.Add(-5*time.Hour), now.Add(-30*time.Minute), 1)
+	insertTurn := func(ts time.Time, usd float64) {
+		t.Helper()
+		if _, err := server.opts.DB.Exec(
+			`INSERT INTO api_turns (session_id, timestamp, provider, model, input_tokens, output_tokens, cost_usd)
+			 VALUES ('ladder-rep', ?, 'anthropic', ?, ?, ?, ?)`,
+			ts.Format(time.RFC3339Nano), ladderModel, ladderBundle.Input, ladderBundle.Output, usd,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertTurn(now.Add(-4*time.Hour), 9.99) // recorded — must win verbatim
+	insertTurn(now.Add(-3*time.Hour), 0)    // unrecorded, before boundary — OLD dated rate
+	insertTurn(now.Add(-1*time.Hour), 0)    // unrecorded, after boundary — NEW/current rate
+
+	rr := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/report/monthly?month="+month, nil))
+	if rr.Code != 200 {
+		t.Fatalf("status %d body=%s", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		Totals struct {
+			CostUSD float64 `json:"cost_usd"`
+			Turns   int64   `json:"turns"`
+		} `json:"totals"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	want := 9.99 + ladderOldCost + ladderNewCost
+	if got.Totals.Turns != 3 {
+		t.Fatalf("turns: got %d want 3", got.Totals.Turns)
+	}
+	if diff := got.Totals.CostUSD - want; diff > 0.001 || diff < -0.001 {
+		t.Errorf("cost_usd: got %f want %f (recorded=9.99 old=%.2f new=%.2f)",
+			got.Totals.CostUSD, want, ladderOldCost, ladderNewCost)
+	}
+}

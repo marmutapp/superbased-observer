@@ -115,6 +115,47 @@ func TestTerminalPolicyPutRoundTrip(t *testing.T) {
 	}
 }
 
+// TestTerminalPolicyAllowShellRoundTrip pins allow_shell as an independent
+// opt-in on the same PUT surface: GET defaults to false, a PUT that sets it
+// (with no allow_fresh_agent/allowed_tools at all) persists to config and is
+// echoed back in the PUT response, and it does not flip allow_fresh_agent.
+func TestTerminalPolicyAllowShellRoundTrip(t *testing.T) {
+	s, h := newManageServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/terminal/policy", nil)
+	req.Host = "127.0.0.1:8080"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var get struct {
+		AllowShell bool `json:"allow_shell"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &get); err != nil {
+		t.Fatalf("decode GET: %v", err)
+	}
+	if get.AllowShell {
+		t.Error("default allow_shell must be false")
+	}
+
+	code, out := putPolicy(t, h, `{"allow_shell":true}`)
+	if code != http.StatusOK {
+		t.Fatalf("PUT = %d body=%v", code, out)
+	}
+	if out["allow_shell"] != true {
+		t.Errorf("PUT response allow_shell = %v, want true", out["allow_shell"])
+	}
+
+	cfg, err := config.Load(config.LoadOptions{GlobalPath: s.opts.ConfigPath})
+	if err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	if !cfg.Terminal.Launch.AllowShell {
+		t.Error("allow_shell not persisted")
+	}
+	if cfg.Terminal.Launch.AllowFreshAgent {
+		t.Error("allow_shell PUT must not also flip allow_fresh_agent")
+	}
+}
+
 func TestTerminalPolicyPutRejectsNonLaunchableTool(t *testing.T) {
 	_, h := newManageServer(t)
 	code, _ := putPolicy(t, h, `{"allow_fresh_agent":true,"allowed_tools":["totally-not-a-tool"]}`)

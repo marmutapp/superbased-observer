@@ -424,7 +424,7 @@ UNSHIPPED_PATTERNS=(
 # ---------------------------------------------------------------------
 
 assert_source_completeness() {
-    local covered present rel pattern unshipped missing
+    local covered covered_index present rel pattern unshipped missing
 
     covered="$(
         for p in "${SOURCE_PATHS[@]}"; do
@@ -434,6 +434,22 @@ assert_source_completeness() {
             esac
         done | sed "s|^$SRC/||" | sort -u
     )"
+
+    # Newline-delimited on BOTH ends so a `case` membership test below is
+    # exact-line, the way `grep -Fx` was. This replaced a
+    # `printf '%s\n' "$covered" | grep -Fxq -- "$rel"` pipeline that was
+    # RACILY WRONG under `set -o pipefail`: `grep -q` exits the instant it
+    # matches, `printf` then takes SIGPIPE, and the pipeline reports 141 —
+    # so the `&& continue` did not fire and a file that IS covered was
+    # reported as an uncovered gap. Nondeterministic by construction
+    # (whether printf's write completes before grep exits), it failed ~25%
+    # of runs naming a DIFFERENT arbitrary file each time. Pure-shell
+    # matching has no pipe, so it cannot regress that way — and it drops
+    # two forks per file.
+    # NOT `$(printf ...)`: command substitution strips trailing newlines,
+    # which would leave the LAST entry of the sorted list without its
+    # closing delimiter and report it as an uncovered gap on every run.
+    covered_index=$'\n'"$covered"$'\n'
 
     present="$(cd "$SRC" && find . -type f | sed 's|^\./||' | sort)"
 
@@ -448,7 +464,9 @@ assert_source_completeness() {
             esac
         done
         [ "$unshipped" -eq 0 ] || continue
-        printf '%s\n' "$covered" | grep -Fxq -- "$rel" && continue
+        case "$covered_index" in
+            *$'\n'"$rel"$'\n'*) continue ;;
+        esac
         missing="$missing  plugins/$rel"$'\n'
     done <<EOF
 $present
@@ -488,8 +506,13 @@ extract_section() {
     grep -Fxq -- "$start" "$file" || die "$file has no '$start' heading (README structure changed)"
     grep -Fxq -- "$end" "$file" || die "$file has no '$end' heading (README structure changed)"
     local start_line end_line
-    start_line=$(grep -Fxn -- "$start" "$file" | head -1 | cut -d: -f1)
-    end_line=$(grep -Fxn -- "$end" "$file" | head -1 | cut -d: -f1)
+    # `-m1` (grep stops itself) rather than `| head -1` (head closes the
+    # pipe under a still-writing grep): the latter is the same
+    # pipefail+SIGPIPE race that made assert_source_completeness fail ~25%
+    # of runs. Latent here only because every anchor currently occurs
+    # once — a second occurrence would start aborting the script.
+    start_line=$(grep -Fxn -m1 -- "$start" "$file" | cut -d: -f1)
+    end_line=$(grep -Fxn -m1 -- "$end" "$file" | cut -d: -f1)
     [ "$start_line" -lt "$end_line" ] || die "$file: '$start' does not precede '$end'"
     awk -v s="$start_line" -v e="$end_line" '
         NR < s || NR >= e { next }

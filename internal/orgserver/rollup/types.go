@@ -320,6 +320,16 @@ type VendorTelemetry struct {
 	Seats        *SeatStats       `json:"seats,omitempty"`      // Copilot only (latest snapshot)
 	Engagement   []KeyCount       `json:"engagement,omitempty"` // additive count metrics
 	Surfaces     []string         `json:"surfaces,omitempty"`   // multi-surface vendors (codex/copilot)
+
+	// OverageByDay is Copilot's per-day metered enhanced-billing overage
+	// (surface=billing, metric=cost, unit=usd), ordered by day ascending.
+	// It is the SAME additive USD feed CostUSD sums into one scalar — never
+	// the seat subscription (Seats.MonthlyUSD), which stays point-in-time
+	// and is deliberately excluded here too (the unit trap this rollup
+	// exists to avoid). Omitted when the org has no billing feed configured,
+	// so a deployment without enhanced billing doesn't render an empty or
+	// implied-$0 chart. Copilot only; nil for every other vendor.
+	OverageByDay []CostPoint `json:"overage_by_day,omitempty"`
 }
 
 // AcceptanceStats is the Claude Code edit-acceptance view: lines/edits accepted

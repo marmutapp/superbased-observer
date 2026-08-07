@@ -16,7 +16,7 @@ import (
 // importing that subsystem. Here a generic stand-in route is reachable and a
 // built-in route still works alongside it.
 func TestExtraRoutes_RegisteredIntoMux(t *testing.T) {
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}

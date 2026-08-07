@@ -201,6 +201,33 @@ func TestFreshSpecArgv(t *testing.T) {
 	}
 }
 
+// TestShellSpecArgv proves a SpecShell session's argv is ShellArgv verbatim —
+// BinPath/Subcommand/ArgvMode/SessionID are all ignored, mirroring SpecSetup's
+// SetupArgv-verbatim shape.
+func TestShellSpecArgv(t *testing.T) {
+	got := Spec{Kind: SpecShell, ShellArgv: []string{"/bin/bash"}, BinPath: "obs", Subcommand: "claude", SessionID: "should-be-ignored"}.argv()
+	want := []string{"/bin/bash"}
+	if !equalStr(got, want) {
+		t.Fatalf("shell argv = %v, want %v", got, want)
+	}
+}
+
+// TestShellSpecValidation proves Create requires a non-empty ShellArgv for a
+// SpecShell session and never demands BinPath/Subcommand for it (mirrors
+// TestSetupSpecValidation).
+func TestShellSpecValidation(t *testing.T) {
+	m := newTestManager(t, &fakeSpawner{}, time.Now)
+	if _, err := m.Create(Spec{Kind: SpecShell}); !errors.Is(err, ErrInvalidSpec) {
+		t.Fatalf("empty ShellArgv: got %v, want ErrInvalidSpec", err)
+	}
+	if _, err := m.Create(Spec{Kind: SpecShell, ShellArgv: []string{""}}); !errors.Is(err, ErrInvalidSpec) {
+		t.Fatalf("blank argv[0]: got %v, want ErrInvalidSpec", err)
+	}
+	if _, err := m.Create(Spec{Kind: SpecShell, ShellArgv: []string{"true"}}); err != nil {
+		t.Fatalf("valid shell spec (no BinPath/Subcommand) must create, got %v", err)
+	}
+}
+
 // TestSpecArgvModes pins the EXACT argv each ArgvMode produces, including the
 // ExtraArgs tail — the resume shape (fresh base + `--resume <id>` tail) and the
 // handoff shape (--continue-from + its modifiers), so the F2 argv seam has a

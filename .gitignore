@@ -53,6 +53,14 @@ web2/*.log
 # tracked; everything heavy stays out of git AND out of the Cloudflare
 # Pages deploy (see .github/workflows/website-deploy.yml step that strips
 # website/tools/ before `wrangler pages deploy`).
+# Build output of the Model Pricing Explorer (model-pricing/web). Produced
+# by the Website Deploy workflow from source and never committed — the site
+# is deployed from a CI checkout, so a stale copy in the tree would only
+# ever be a source of drift.
+website/model-prices/
+model-pricing/web/node_modules/
+model-pricing/web/out/
+
 website/tools/node_modules/
 website/tools/out/
 website/tools/vqa-out/
@@ -112,6 +120,25 @@ tmp/
 # handovers had to carry a standing warning never to `git add -A` here.
 .vite/
 .antigravitycli/
+
+# Resolved at build time by web/scripts/fetch-catalog.mjs — from the API when
+# reachable, from the committed seed otherwise. Generated, never committed.
+model-pricing/web/lib/catalog-data.json
+
+# Assembled by model-pricing/deploy/assemble.sh for `az vm run-command`; never edited by hand.
+model-pricing/deploy/install.generated.sh
+
+# Private keys must never live under website/ — that directory IS the Pages deploy root.
+website/keys/
+*.key.pem
+
+# Stray `go build ./plugins/plugingen` / `./website/track-gen` output. The
+# Makefile invokes both with `go run`, so a compiled copy in the repo root is
+# never used — it is 16 MB of untracked binary waiting to be committed by a
+# careless `git add -A`.
+/plugingen
+/track-gen
+/pricing-seedgen
 
 # Internal docs — kept locally on the private repo for development
 # context, untracked from the public repo. The dashboard's runtime

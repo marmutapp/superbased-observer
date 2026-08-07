@@ -45,7 +45,7 @@ route_proxy = true
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +212,7 @@ func TestAllowTerminalViewGatesAttachAndResumeSubscriptions(t *testing.T) {
 				lm := newRecordingLaunchManager(nil)
 				lm.attachHandles = map[string]bool{handle: true}
 				t.Cleanup(func() { close(lm.sub.release) })
-				database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
+				database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -271,7 +271,7 @@ func TestRemoteViewAttachDeniedWhenViewOff(t *testing.T) {
 	}
 	t.Cleanup(func() { close(lm.sub.release) })
 
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +318,7 @@ func TestRemoteViewAttachAllowedUnderOptIn(t *testing.T) {
 	}
 	t.Cleanup(func() { close(lm.sub.release) })
 
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}

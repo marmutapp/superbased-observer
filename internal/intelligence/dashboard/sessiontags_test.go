@@ -22,7 +22,7 @@ import (
 func newTagTestServer(t *testing.T) (*Server, *store.Store) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "tags.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestSessionsTagFilterPaginationCoherence(t *testing.T) {
 		t.Fatalf("tag sess-b: %v", err)
 	}
 	yes := true
-	if err := st.SetSessionAnnotation(ctx, "sess-c", &yes, nil); err != nil {
+	if err := st.SetSessionAnnotation(ctx, "sess-c", &yes, nil, nil); err != nil {
 		t.Fatalf("favorite sess-c: %v", err)
 	}
 
@@ -201,7 +201,7 @@ func TestSessionsTagFilterPaginationCoherence(t *testing.T) {
 func TestSessionsFavoriteSort(t *testing.T) {
 	s, st := newTagTestServer(t)
 	yes := true
-	if err := st.SetSessionAnnotation(context.Background(), "sess-a", &yes, nil); err != nil {
+	if err := st.SetSessionAnnotation(context.Background(), "sess-a", &yes, nil, nil); err != nil {
 		t.Fatalf("favorite sess-a: %v", err)
 	}
 
@@ -221,6 +221,47 @@ func TestSessionsFavoriteSort(t *testing.T) {
 	rows = body["rows"].([]any)
 	if rows[len(rows)-1].(map[string]any)["id"] != "sess-a" {
 		t.Fatalf("asc favorite sort put %v last, want sess-a", rows[len(rows)-1])
+	}
+}
+
+// TestSessionsRatingSort pins the `rating` sort key: the highest-rated session
+// comes first by default (desc), sort_dir=asc surfaces the worst-rated
+// (unrated=0 to the top), and the key survives the allow-list clamp.
+func TestSessionsRatingSort(t *testing.T) {
+	s, st := newTagTestServer(t)
+	ctx := context.Background()
+	nine, three := 9, 3
+	if err := st.SetSessionAnnotation(ctx, "sess-a", nil, nil, &three); err != nil {
+		t.Fatalf("rate sess-a: %v", err)
+	}
+	if err := st.SetSessionAnnotation(ctx, "sess-b", nil, nil, &nine); err != nil {
+		t.Fatalf("rate sess-b: %v", err)
+	}
+	// sess-c is left unrated (rating 0).
+
+	_, body := doJSON(t, s, http.MethodGet, "/api/sessions?limit=50&days=30&sort_by=rating", "")
+	if body["sort_by"] != "rating" {
+		t.Fatalf("sort_by echoed as %v — the allow-list dropped it", body["sort_by"])
+	}
+	rows := body["rows"].([]any)
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d, want 3", len(rows))
+	}
+	if rows[0].(map[string]any)["id"] != "sess-b" {
+		t.Fatalf("rating desc put %v first, want sess-b (rating 9)", rows[0].(map[string]any)["id"])
+	}
+	// The top row also carries the numeric rating on the wire.
+	if got := rows[0].(map[string]any)["rating"]; got != float64(9) {
+		t.Fatalf("sess-b rating on the wire = %v, want 9", got)
+	}
+	// Ascending flips it: the unrated session (0) sinks to the top.
+	_, body = doJSON(t, s, http.MethodGet, "/api/sessions?limit=50&days=30&sort_by=rating&sort_dir=asc", "")
+	rows = body["rows"].([]any)
+	if rows[len(rows)-1].(map[string]any)["id"] != "sess-b" {
+		t.Fatalf("asc rating sort put %v last, want sess-b", rows[len(rows)-1])
+	}
+	if rows[0].(map[string]any)["id"] != "sess-c" {
+		t.Fatalf("asc rating sort put %v first, want the unrated sess-c", rows[0].(map[string]any)["id"])
 	}
 }
 
@@ -340,7 +381,7 @@ func TestSessionDetailCarriesClassification(t *testing.T) {
 	}
 	yes := true
 	note := "compression baseline"
-	if err := st.SetSessionAnnotation(ctx, "sess-a", &yes, &note); err != nil {
+	if err := st.SetSessionAnnotation(ctx, "sess-a", &yes, &note, nil); err != nil {
 		t.Fatalf("annotate: %v", err)
 	}
 	_, body = doJSON(t, s, http.MethodGet, "/api/session/sess-a", "")

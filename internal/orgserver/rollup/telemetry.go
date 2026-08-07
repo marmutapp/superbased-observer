@@ -195,10 +195,41 @@ func telemetryCopilot(ctx context.Context, db *sql.DB, sinceDay string, perSeatP
 	v.CostUnit = costUnitLabel(overage, 0)
 	v.Engagement = engagementList(eng)
 	v.Surfaces = sortedKeys(surfaces)
+	if v.OverageByDay, err = telemetryCopilotOverageByDay(ctx, db, sinceDay); err != nil {
+		return nil, err
+	}
 	if v.Seats, err = telemetryCopilotSeats(ctx, db, sinceDay, perSeatPriceUSD); err != nil {
 		return nil, err
 	}
 	return v, nil
+}
+
+// telemetryCopilotOverageByDay reads the per-day metered enhanced-billing
+// overage (surface=billing, metric=cost, unit=usd) within the window, ordered
+// by day ascending. This is the SAME feed the caller sums into the single
+// CostUSD scalar — grouped by day instead of collapsed across the window. It
+// deliberately never touches the seats table: the seat subscription
+// (telemetryCopilotSeats' MonthlyUSD) is a point-in-time monthly figure, and
+// folding it into this additive per-day series would be the cross-vendor unit
+// trap this rollup exists to avoid. Returns nil (omitted on the wire) when the
+// org has no billing rows in the window.
+func telemetryCopilotOverageByDay(ctx context.Context, db *sql.DB, sinceDay string) ([]CostPoint, error) {
+	var out []CostPoint
+	q := `SELECT day, COALESCE(SUM(value),0) FROM copilot_analytics_daily
+	        WHERE day >= ? AND surface = 'billing' AND metric = 'cost' AND unit = 'usd'
+	        GROUP BY day ORDER BY day`
+	if err := eachRow(ctx, db, q, []any{sinceDay}, func(r *sql.Rows) error {
+		var day string
+		var val float64
+		if err := r.Scan(&day, &val); err != nil {
+			return err
+		}
+		out = append(out, CostPoint{Date: day, CostUSD: val})
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // telemetryCopilotSeats reads the latest seat-breakdown snapshot in the window

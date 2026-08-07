@@ -2,6 +2,174 @@
 
 All notable changes to SuperBased Observer are documented here.
 
+## [Unreleased]
+
+## [1.29.0] — 2026-08-07
+
+### Added
+
+- **feat(adapter): Meta Muse Code CLI — the 30th adapter.** Event-sourced
+  `session.jsonl` parsing (envelope → payload_type → event.kind) with
+  microsecond `recorded_at` timestamps. `model_completed.usage` needs
+  DUAL netting — input including `cache_read`, output including
+  reasoning — the OpenAI-Responses convention rather than Anthropic's;
+  a subagent run under `subagent/<child-uuid>/` rolls up into its
+  parent session. `auth.json`, `trust.json`, and `tui-history.jsonl`
+  are never read.
+- **feat(adapter): Prime Agent — the 31st adapter.** Prime Intellect's
+  Prime Agent CLI is a hard fork of pi-mono with its own parser, not a
+  retag of the existing `pi` adapter. Flat JSONL sessions under
+  `~/.prime/agent/sessions/<uuid>.jsonl` form a tree via `parentId`
+  (8-hex ids); the envelope timestamp is ISO-8601 while the inner
+  message timestamp is Unix milliseconds. Usage input arrives already
+  NET (`totalTokens == input+output+cacheRead+cacheWrite` exactly) —
+  the opposite of most adapters' gross-then-netted convention, so this
+  one is a genuine exception, not a bug. `ipython` is the sole
+  built-in tool: reads, edits, and shell commands all run through one
+  persistent Python kernel. A child agent run's usage folds into the
+  parent's token row via the same source-event id (ON CONFLICT
+  MAX-upgrade, never double-counted). `auth.json`,
+  `daemon-workers/*.json`, and the pickled `kernel-state.dill` sidecar
+  are never read.
+- **feat(cli): `observer muse` and `observer prime-agent` — launcher
+  verbs 22 → 24.** Muse launches non-proxied for now; an open
+  `--base-url` question blocks proxy routing until it's answered.
+  Prime Agent launches proxied, through its own
+  `~/.prime/agent/models.json` provider entry. Both ship with the same
+  grammar/resume-row/provider-merge conformance tests every other
+  launcher verb carries.
+- **feat(dashboard): plain-shell "New terminal" launch, opt-in.** The
+  New Terminal dialog can now spawn a bare shell — the child's own
+  `$SHELL`, or `/bin/bash`/`/bin/sh` as a fallback — instead of only a
+  known AI-tool launcher. Off by default and deliberately independent
+  of the existing fresh-agent toggle: `[terminal.launch].allow_shell`
+  is its own opt-in, because a plain shell can run any command, a
+  strictly larger authority grant than a capability-registry-bounded
+  AI-tool launch. The dialog only offers the option when the daemon
+  reports it enabled, rather than showing it and failing at launch
+  time.
+- **feat(dashboard,obs): Policies module — admission and egress policy
+  authoring on the node dashboard.** What used to be config-file-only
+  setup is now a guided editor at `/policies`: six tabs (Overview,
+  Templates, Guardrails, Routing, Test, Activity) covering an
+  11-entry template catalog across five groups (Scope, Safety, Cost,
+  Data locality, Bundles) for one-click guardrail criteria and egress
+  rules, plus live validate-and-apply and an activity feed. The UI
+  states its own honesty limit rather than hiding it: the dashboard
+  and the proxy each hold a SEPARATE `AdmissionService` instance, so
+  "Apply live" only takes effect on the dashboard's own SDK front door
+  immediately — egress edits and proxy-side enforcement need Save plus
+  a daemon restart. Paired with a new `examples/copilot-harness` demo
+  walking the whole Plane-A governance loop (admit → proxy → optional
+  OTLP trace) end to end.
+- **feat(store,dashboard,cli): overall session rating (1–10).** A
+  fourth session-classification primitive alongside tags, favorite,
+  and note (migration 080): one reviewer score per session, landing
+  as a column on the existing `session_annotations` row rather than a
+  new table. 0 is the "unrated" zero value everywhere, and an
+  annotation row is garbage-collected once favorite, note, and rating
+  are all back to their zero states — "no row" and "reviewed and
+  found unremarkable" stay indistinguishable, as intended. Node-local
+  like the rest of session classification: no wire surface, no
+  org-push column.
+- **feat(cost,dashboard): dated pricing — recorded → dated → undated.**
+  A new per-model rate timeline lets a price change take effect
+  without silently repricing history: usage before a cut keeps the
+  old rate, usage after keeps the new one. First landed against a
+  real change — the OpenAI GPT-5.6 Terra/Luna price cut effective
+  2026-07-30 — then rolled out across the dashboard surfaces that had
+  been pricing every row at today's flat rate regardless of when it
+  ran: report, budget, statusline, live, and experiments, plus two
+  more found beyond the originally named list. Each now prefers a
+  turn's own recorded `cost_usd` first, falls back to the rate that
+  was actually in force on that turn's own timestamp, and only falls
+  back further to the current flat rate when neither exists.
+- **feat(website): `/pricing`.** The site had no pricing link anywhere,
+  and a missing price label reads as a hidden price rather than a free
+  product. The page states what is true: the node **and** the
+  self-hosted org server are both Apache-2.0 with no licence gate, so
+  Teams can be self-hosted free today; commercial support and a managed
+  option are in design and do not exist yet. No figures, because none
+  are shipped. Pricing takes the Arcade slot in the primary nav; Arcade
+  stays reachable from both footers.
+- **feat(website): homepage rebuilt around the install command.** Four
+  competing hero subheadlines collapse to one, and
+  `npx @superbased/observer` becomes the primary copyable call to action
+  — the site's own analytics already counted installing as the
+  conversion while the gold button pointed at the docs. "No account · No
+  signup · No telemetry" is promoted out of fine print. A new
+  measurement-honesty section surfaces the public retraction, which had
+  no link from any marketing page, alongside two entry points to the
+  eight comparison pages, previously unreachable from the marketing
+  site.
+- **feat(website): FAQPage schema on the comparison pages.** The docs
+  renderer was already generic; emission was gated behind an allow-list
+  containing only the track section. Auditing Compare and flipping one
+  map entry adds 31 questions across 9 pages, taking site coverage from
+  30 pages / 151 questions to 39 / 182, with honesty parity holding by
+  construction.
+- **feat(website): RFC 9116 `security.txt`.** The disclosure route
+  existed only as prose; researchers and enterprise scanners look for
+  `/.well-known/security.txt` first, and its absence reads as no
+  process.
+- **test(website): licensing and release-date tripwires** in the
+  accuracy gate (9 → 11 check groups). The licensing check binds to
+  structural column identity — locate the header column named
+  SuperBased, inspect only its cells — rather than proximity to the
+  word, because comparison prose routinely names SuperBased and a
+  competitor in one sentence.
+
+### Fixed
+
+- **fix(integration,adapters): adapter-count surfaces move together,
+  30 → 31.** Landing Prime Agent meant every pinned adapter-count
+  surface had to move in the same pass — `observer adapters`, doc
+  counts, and the generated website pages that state "N coding tools"
+  — six drift gates re-verified in sync so the number can't drift out
+  from under the roster the way a stale "26 coding tools" once did
+  (see v1.28.0's tool-count drift fix).
+- **fix(vscode): `observer.daemon.mode` now defaults to `auto`.** It
+  shipped as `detect`, which never spawns the daemon, so a fresh install
+  showed an empty sidebar and a warning status bar until the user found
+  and changed a setting the README itself called "recommended for most
+  users" — the documentation and the default disagreed, and the default
+  won. `auto` attaches to a daemon you already started and only spawns
+  when none is running, and only ever stops a daemon it spawned itself.
+- **fix(website): three shipped claims that contradicted the site's own
+  honesty standard.** Literal `[REDACTED]` placeholders in the live
+  `/enterprise` SSO and enrolment copy; SuperBased's own Apache-2.0
+  licence described as "Source-available" across nine comparison pages,
+  next to competitors correctly labelled MIT; and npm/PyPI **downloads**
+  presented as "total installs" beside a 35-star repo.
+- **fix(website): the nav "Install free" button was unreadable.** It
+  rendered `--ink-dim` cream on gold at 1.52:1, in both rest and hover,
+  on every home-layout page: the CTA sits inside `.nav__links`, so that
+  rule's higher specificity beat `.nav__cta` and the intended dark text
+  never applied. Now 9.14:1.
+- **fix(website): WCAG AA contrast across both themes.** Eight measured
+  failures, worst 2.70:1, corrected by lightness and alpha only so hue
+  and brand identity are unchanged; verified live at 77 elements per
+  theme with zero failures.
+- **fix(website): meta descriptions across 61 docs pages.** All were
+  past the point where search results truncate, and 16 generated ones
+  carried a literal ellipsis mid-sentence. Composition is now
+  budget-aware, spending what is left after the per-tool lead on the
+  longest call-to-action rung that fits, so the marketing tail degrades
+  and the differentiating fact survives. Median length 209 → 154, zero
+  ellipses, all unique.
+- **fix(website): exactly one `<h1>` per docs page.** 62 of 95 emitted
+  two — one from the front-matter title, one from the markdown body.
+  Fixed in the renderer rather than the sources, because the changelog
+  page is itself generated and would have been overwritten.
+- **fix(website): sitemap freshness.** `lastmod` was a hardcoded
+  constant reused for every URL and never updated, leaving `/docs` a
+  month stale; it now derives per file from git history. `changefreq`
+  was "weekly" on 94 of 104 URLs, contradicting its own stale
+  timestamps.
+- **fix(website): missing `<main>` landmark and focus ring** on the
+  home-layout pages, which had neither while every support page had
+  both.
+
 ## [1.28.0] — 2026-08-01
 
 ### Added
@@ -1997,7 +2165,9 @@ All notable changes to SuperBased Observer are documented here.
   (idempotent; overrides `enabled_adapters` for the run). A future adapter's
   Backfill row appears automatically.
 - **Pricing: GPT-5.6 and Grok 4.5 model launches.** Added `gpt-5.6-sol`
-  ($5/$30), `gpt-5.6-terra` ($2.50/$15), `gpt-5.6-luna` ($1/$6), and a
+  ($5/$30), `gpt-5.6-terra` ($2.50 in / $15 out at launch), `gpt-5.6-luna`
+  ($1 in / $6 out at launch; OpenAI cut Terra and Luna prices on 2026-07-30 —
+  the current table reflects the cut), and a
   `gpt-5.6` family row. GPT-5.6 introduces the **first non-Anthropic explicit
   cache-write tier** (writes at 1.25× uncached input, reads keep the 90%
   discount); the write rate is wired into the cost table but INERT until a live

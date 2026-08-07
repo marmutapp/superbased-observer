@@ -32,7 +32,7 @@ func enableCaptureTestServer(t *testing.T, enabled bool, backend string) (*Serve
 	// be defensive: remove any .bak so the no-write proof in the idempotent test
 	// is unambiguous.
 	_ = os.Remove(cfgPath + ".bak")
-	database, err := db.Open(context.Background(), db.Options{Path: cfg.Observer.DBPath})
+	database, err := openTestDB(context.Background(), db.Options{Path: cfg.Observer.DBPath})
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}

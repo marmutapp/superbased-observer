@@ -99,6 +99,19 @@ var shapeFixturePathByAdapter = map[string]string{
 	// The <uuid>.checkpoints.jsonl sidecar shares the extension and is
 	// rejected by the adapter's own suffix test, not by the root gate.
 	"command-code": "/tmp/foreign/.commandcode/projects/-tmp-foo/9f4c1a20-0000-0000-0000-000000000000.jsonl",
+	// muse (Meta Muse Code) — the fixed-basename session.jsonl under a
+	// date-sharded .local/share/muse/sessions/YYYY/MM/DD/<uuid>/ tree. The
+	// shape predicate binds the `/muse/sessions/` segment (so the fixture
+	// repeats it below /tmp/foreign) plus the exact basename, which is what
+	// rejects the sibling cron.db / .session.lock / tool-outputs entries.
+	"muse": "/tmp/foreign/.local/share/muse/sessions/2026/08/06/9904307b-045a-4e99-a982-9b676b2ac87f/session.jsonl",
+	// prime-agent — a flat <uuid>.jsonl under .prime/agent/sessions/. The
+	// shape half is only the `.jsonl` extension (the vendor migrates a
+	// legacy per-project layout in place, so no depth can be bound), which
+	// makes the under-WatchPaths gate the SOLE install-root authority —
+	// exactly what this test proves, since the same bare shape is claude
+	// -code's, codex's, pi's and openclaw's too.
+	"prime-agent": "/tmp/foreign/.prime/agent/sessions/019f0000-1111-7222-8333-444444444444.jsonl",
 	// chatgpt-web — hook-only browser adapter with NO watch paths and an
 	// IsSessionFile that always returns false. Any shaped path is rejected
 	// (there is no on-disk session file), so the reject test passes and the

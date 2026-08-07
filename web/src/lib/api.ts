@@ -183,6 +183,7 @@ export function postSessionTags(
     remove: patch.remove ?? [],
     favorite: patch.favorite ?? null,
     note: patch.note ?? null,
+    rating: patch.rating ?? null,
   };
   return fetchJSON<SessionTagsResponse>(
     `/api/session/${encodeURIComponent(sessionId)}/tags`,

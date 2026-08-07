@@ -22,7 +22,8 @@ const DefaultBlendedInputRate = 3.0
 // restarting the daemon — in-flight Lookup callers keep their snapshot
 // of the old table, fresh callers see the new one.
 type Engine struct {
-	table atomic.Pointer[Table]
+	table    atomic.Pointer[Table]
+	warnings atomic.Pointer[[]string]
 }
 
 // NewEngine returns an engine seeded with baked-in defaults + user pricing
@@ -42,24 +43,44 @@ func (e *Engine) Reload(cfg config.IntelligenceConfig) {
 	if cfg.Pricing.Models != nil {
 		overrides := map[string]Pricing{}
 		for id, mp := range cfg.Pricing.Models {
-			overrides[id] = Pricing{
-				Input:                      mp.Input,
-				Output:                     mp.Output,
-				CacheRead:                  mp.CacheRead,
-				CacheCreation:              mp.CacheCreation,
-				CacheCreation1h:            mp.CacheCreation1h,
-				LongContextThreshold:       mp.LongContextThreshold,
-				LongContextInput:           mp.LongContextInput,
-				LongContextOutput:          mp.LongContextOutput,
-				LongContextCacheRead:       mp.LongContextCacheRead,
-				LongContextCacheCreation:   mp.LongContextCacheCreation,
-				LongContextCacheCreation1h: mp.LongContextCacheCreation1h,
-				FastMultiplier:             mp.FastMultiplier,
-			}
+			overrides[id] = pricingFromConfig(mp)
 		}
 		t.Merge(overrides)
 	}
+	// Dated overrides land AFTER the flat overrides so MergeDated's
+	// "seed the flat entry from the newest dated entry when the key has
+	// no flat entry" rule can see an operator's flat override too. Zero
+	// [intelligence.pricing.dated] → nothing is touched and the table
+	// stays on the pre-dated code path.
+	dated, warnings := DatedFromConfig(cfg.Pricing)
+	t.MergeDated(dated)
+	warnings = append(warnings, t.ValidateDated()...)
 	e.table.Store(t)
+	e.warnings.Store(&warnings)
+}
+
+// PricingWarnings returns advisory problems found while building the
+// active table — malformed [intelligence.pricing.dated] rows that were
+// SKIPPED, and dated timelines whose newest entry disagrees with the
+// current flat rate. Empty when the table is clean. Pricing never fails
+// closed on these; the slice exists so a surface can tell the operator
+// their override was ignored instead of silently applied.
+func (e *Engine) PricingWarnings() []string {
+	if e == nil {
+		return nil
+	}
+	w := e.warnings.Load()
+	if w == nil {
+		return nil
+	}
+	return append([]string(nil), *w...)
+}
+
+// HasDatedPricing reports whether the active table carries any dated
+// rate timeline. Per-row hot paths gate their timestamp parsing on this
+// so an install with no dated entries pays nothing for the feature.
+func (e *Engine) HasDatedPricing() bool {
+	return e != nil && e.Table().HasDated()
 }
 
 // Table returns the active pricing table snapshot. Safe to call from
@@ -90,6 +111,31 @@ func (e *Engine) LookupWithSource(model string) (Pricing, PricingSource, bool) {
 		return Pricing{}, PricingSourceMiss, false
 	}
 	return t.LookupWithSource(model)
+}
+
+// LookupAt is the date-aware Lookup — the rate in force for `model` at
+// `at`. Use it wherever HISTORICAL usage is being priced (rollups over a
+// past window, session detail, per-turn re-pricing). Live insert-time
+// pricing should keep using Lookup: the flat table is by contract the
+// CURRENT rate card, so Lookup ≡ LookupAt(now).
+//
+// A zero `at` (unparseable timestamp) deliberately falls back to current
+// rates rather than repricing to the oldest known tier.
+func (e *Engine) LookupAt(model string, at time.Time) (Pricing, bool) {
+	t := e.Table()
+	if t == nil {
+		return Pricing{}, false
+	}
+	return t.LookupAt(model, at)
+}
+
+// LookupWithSourceAt is the date-aware LookupWithSource.
+func (e *Engine) LookupWithSourceAt(model string, at time.Time) (Pricing, PricingSource, bool) {
+	t := e.Table()
+	if t == nil {
+		return Pricing{}, PricingSourceMiss, false
+	}
+	return t.LookupWithSourceAt(model, at)
 }
 
 // TokenBundle is the per-turn token shape the engine prices. Zero fields
@@ -187,6 +233,32 @@ func (e *Engine) Compute(model string, b TokenBundle) (float64, bool) {
 // (matching Compute's "unknown model → $0" semantics).
 func (e *Engine) ComputeBreakdown(model string, b TokenBundle) (Breakdown, bool) {
 	p, ok := e.Lookup(model)
+	if !ok {
+		return Breakdown{}, false
+	}
+	return ComputeBreakdown(p, b), true
+}
+
+// ComputeAt is the date-aware Compute — prices b at the rate in force
+// for `model` at `at`. See LookupAt for the zero-`at` contract.
+func (e *Engine) ComputeAt(model string, b TokenBundle, at time.Time) (float64, bool) {
+	p, ok := e.LookupAt(model, at)
+	if !ok {
+		return 0, false
+	}
+	return Compute(p, b), true
+}
+
+// ComputeBreakdownAt is the date-aware ComputeBreakdown.
+//
+// IMPORTANT — this prices ONE turn's bundle at ONE instant. Never hand
+// it tokens aggregated across a rate boundary: aggregate AFTER pricing,
+// not before. Every cost path in this repo is already per-row (the
+// long-context dispatch forced that years ago), so dated pricing needs
+// no SQL-side bucketing; the split-by-rate-period falls out of the
+// existing row loop for free.
+func (e *Engine) ComputeBreakdownAt(model string, b TokenBundle, at time.Time) (Breakdown, bool) {
+	p, ok := e.LookupAt(model, at)
 	if !ok {
 		return Breakdown{}, false
 	}

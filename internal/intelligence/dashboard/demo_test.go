@@ -23,7 +23,7 @@ func demoTestSeeder(t *testing.T) (seeder func(ctx context.Context) (*sql.DB, fu
 	seeds, cleanups = new(int), new(int)
 	seeder = func(ctx context.Context) (*sql.DB, func() error, error) {
 		*seeds++
-		database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "demo.db")})
+		database, err := openTestDB(ctx, db.Options{Path: filepath.Join(t.TempDir(), "demo.db")})
 		if err != nil {
 			return nil, nil, err
 		}
@@ -87,7 +87,7 @@ func demoState(t *testing.T, s *Server, method, path string) (code int, availabl
 // → stop (one cleanup; reads back on the real DB).
 func TestDemoMode(t *testing.T) {
 	tdir := t.TempDir()
-	realDB, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "real.db")})
+	realDB, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "real.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestDemoMode(t *testing.T) {
 // TestDemoModeUnavailable pins the no-seeder posture (tests, older
 // assemblies): state reports unavailable and start refuses honestly.
 func TestDemoModeUnavailable(t *testing.T) {
-	realDB, err := db.Open(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "real.db")})
+	realDB, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "real.db")})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -477,6 +477,10 @@ func continueFromLauncher(tool string) string {
 		return "observer open-interpreter"
 	case "command-code":
 		return "observer command-code"
+	case "muse":
+		return "observer muse"
+	case "prime-agent":
+		return "observer prime-agent"
 	default:
 		return ""
 	}

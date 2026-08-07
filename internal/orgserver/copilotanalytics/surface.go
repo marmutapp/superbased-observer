@@ -51,7 +51,8 @@ const orgAggregateKey = "__org__"
 
 // Metric names stored in copilot_analytics_daily. Engagement metrics are
 // Copilot-exclusive (no dedup risk, never summed into a cost figure); the cost
-// metrics feed the SIBLING CostSummary, never spendCTE.
+// metrics feed rollup/telemetry.go::telemetryCopilot as a SIBLING read, never
+// spendCTE.
 const (
 	// Engagement (unit: count) — Copilot-exclusive, surfaced as metrics only.
 	MetricActiveUsers     = "active_users"

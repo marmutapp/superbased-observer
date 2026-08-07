@@ -26,7 +26,7 @@ import (
 func newPreflightServer(t *testing.T, seam func(string) (ToolPreflight, bool)) *Server {
 	t.Helper()
 	tdir := t.TempDir()
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func newInstallServer(t *testing.T, lm LaunchManager, allowInstall func() bool, 
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "observer.db")
-	database, err := db.Open(context.Background(), db.Options{Path: dbPath})
+	database, err := openTestDB(context.Background(), db.Options{Path: dbPath})
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}

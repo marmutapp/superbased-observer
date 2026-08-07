@@ -86,7 +86,7 @@ type controlAuditHarness struct {
 
 func newControlAuditHarness(t *testing.T) *controlAuditHarness {
 	t.Helper()
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}

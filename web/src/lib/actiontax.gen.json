@@ -454,6 +454,18 @@
         "meta"
       ]
     },
+    "muse": {
+      "categories": [
+        "file",
+        "cmd",
+        "search",
+        "web",
+        "agent",
+        "skill",
+        "user",
+        "meta"
+      ]
+    },
     "open-interpreter": {
       "categories": [
         "file",
@@ -487,6 +499,14 @@
       ]
     },
     "pi": {
+      "categories": [
+        "file",
+        "cmd",
+        "search",
+        "web"
+      ]
+    },
+    "prime-agent": {
       "categories": [
         "file",
         "cmd",

@@ -131,13 +131,15 @@ func (s *Server) monthToDateCostByProject(r *http.Request, monthStart time.Time)
 		combined AS (
 			SELECT at.session_id, at.model, at.input_tokens, at.output_tokens,
 			       at.cache_read_tokens, at.cache_creation_tokens, at.cache_creation_1h_tokens,
-			       0 AS reasoning_tokens, at.web_search_requests, at.cost_usd
+			       0 AS reasoning_tokens, at.web_search_requests, at.cost_usd,
+			       at.timestamp
 			FROM api_turns at
 			WHERE at.timestamp >= ?
 			UNION ALL
 			SELECT tu.session_id, tu.model, tu.input_tokens, tu.output_tokens,
 			       tu.cache_read_tokens, tu.cache_creation_tokens, tu.cache_creation_1h_tokens,
-			       tu.reasoning_tokens, tu.web_search_requests, tu.estimated_cost_usd
+			       tu.reasoning_tokens, tu.web_search_requests, tu.estimated_cost_usd,
+			       tu.timestamp
 			FROM token_usage tu
 			WHERE tu.timestamp >= ?
 			  AND (tu.source_event_id IS NULL OR tu.source_event_id = ''
@@ -148,7 +150,8 @@ func (s *Server) monthToDateCostByProject(r *http.Request, monthStart time.Time)
 		       COALESCE(c.input_tokens, 0), COALESCE(c.output_tokens, 0),
 		       COALESCE(c.cache_read_tokens, 0), COALESCE(c.cache_creation_tokens, 0),
 		       COALESCE(c.cache_creation_1h_tokens, 0), COALESCE(c.reasoning_tokens, 0),
-		       COALESCE(c.web_search_requests, 0), COALESCE(c.cost_usd, 0)
+		       COALESCE(c.web_search_requests, 0), COALESCE(c.cost_usd, 0),
+		       COALESCE(c.timestamp, '')
 		FROM combined c
 		LEFT JOIN sessions s ON s.id = c.session_id
 		LEFT JOIN projects p ON p.id = s.project_id`,
@@ -166,15 +169,19 @@ func (s *Server) monthToDateCostByProject(r *http.Request, monthStart time.Time)
 			model  string
 			bundle cost.TokenBundle
 			rec    float64
+			tsStr  string
 		)
 		if rows.Scan(&root, &model, &bundle.Input, &bundle.Output,
 			&bundle.CacheRead, &bundle.CacheCreation, &bundle.CacheCreation1h,
-			&bundle.Reasoning, &bundle.WebSearchRequests, &rec) != nil {
+			&bundle.Reasoning, &bundle.WebSearchRequests, &rec, &tsStr) != nil {
 			continue
 		}
+		// Date-effective pricing ladder: recorded cost wins; otherwise
+		// price at the rate in force on the row's own timestamp.
 		rowCost := rec
 		if rowCost <= 0 && s.opts.CostEngine != nil {
-			if p, ok := s.opts.CostEngine.Lookup(model); ok {
+			ts, _ := time.Parse(time.RFC3339Nano, tsStr)
+			if p, ok := s.opts.CostEngine.LookupAt(model, ts); ok {
 				rowCost = cost.Compute(p, bundle)
 			}
 		}

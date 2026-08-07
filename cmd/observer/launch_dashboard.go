@@ -108,6 +108,7 @@ func terminalLaunchPolicy(tc config.TerminalConfig) termsvc.Policy {
 		AllowFresh:          tc.Enabled && tc.Launch.AllowFreshAgent,
 		AllowedTools:        tc.Launch.AllowedTools,
 		AllowedProjectRoots: tc.Launch.AllowedProjectRoots,
+		AllowShell:          tc.Enabled && tc.Launch.AllowShell,
 	}
 }
 
@@ -151,6 +152,7 @@ func (a *launchManagerAdapter) CreateFresh(spec dashboard.FreshLaunchSpec) (stri
 		ProjectRoot: crossmount.TranslateForeignPath(spec.ProjectRoot),
 		Rows:        spec.Rows,
 		Cols:        spec.Cols,
+		Shell:       spec.Shell,
 	})
 	if err != nil {
 		return "", mapFreshErr(err)
@@ -906,6 +908,8 @@ func mapFreshErr(err error) error {
 		return dashboard.ErrLaunchFreshDisabled
 	case errors.Is(err, termsvc.ErrToolNotAllowed):
 		return dashboard.ErrLaunchToolNotAllowed
+	case errors.Is(err, termsvc.ErrShellLaunchDisabled):
+		return dashboard.ErrLaunchShellDisabled
 	case errors.Is(err, termsvc.ErrProjectRootDenied):
 		return dashboard.ErrLaunchProjectRootDenied
 	default:

@@ -1959,6 +1959,202 @@ var registry = map[string]Capability{
 			},
 		},
 	},
+	// Meta's Muse Code CLI (docs/muse-adapter.md). Phase-0 grounded
+	// 2026-08-06 against a live `Muse Code 0.1.0 (0.1.0-R708.1)` install on
+	// Linux x86_64 (session log + config files + the shipped binary's own
+	// string table). Every cell below is either observed in that install or
+	// an explicit zero.
+	"muse": {
+		Tool: "muse",
+		// 8 grounded native tool names in internal/tooltax (4 from the live
+		// capture: bash / read_file / write_file / edit_file; 4 named
+		// verbatim in the binary: web_search / web_fetch / read_skill /
+		// search) plus the conventional defensive vocabulary.
+		Vocabulary: Vocabulary{
+			InTaxonomy: true,
+			Note: "27 tools were active in the Phase-0 run but the log's " +
+				"model_request_configured trace elides the names " +
+				"(active_tools:[\"<string>\"], #len=27), so the tail of the " +
+				"surface is defensive rather than observed",
+		},
+		// Model traffic goes to https://api.meta.ai/v1, whose base URL is
+		// MINTED BY THE LOGIN FLOW ("mint response missing api_key or
+		// base_url" / "unrecognized Model API base URL from login; using the
+		// default") and authenticated with a Model API key. TBH_AUTH_BASE_URL
+		// and TBH_MINT_BASE_URL steer only the auth + mint endpoints, NOT
+		// model traffic, so neither is a route knob. settings.json does carry
+		// an endpoint/transport block with `proxy` and mTLS fields plus a
+		// `destination` discriminator ("destination=external is direct-only:
+		// proxy/mTLS fields do not apply") — a real surface whose schema is
+		// NOT grounded and which has never been driven live. That is exactly
+		// probe_required: a documented-in-binary BYOK-ish path, unconfirmed on
+		// a live install. Proxy stays nil until a live turn lands an api_turns
+		// row (checklist §10.1f).
+		Proxy:       nil,
+		Routability: RouteStatusProbeRequired,
+		// The binary carries a Claude-Code-derived hook vocabulary in
+		// settings.json — user_prompt_submit / pre_tool_use /
+		// permission_request / post_tool_use / pre_llm_call / post_llm_call /
+		// pre_compact / post_compact / subagent_start / subagent_stop, with
+		// matcher-group diagnostics ("hook matcher group must declare
+		// `hooks`") and explicit Claude-compat rejections (D99 "Claude
+		// `command` plus `args` argv execution is not implemented yet"). But
+		// the on-disk matcher schema is not grounded and observer ships no
+		// receiver, so the honest value is None: a mechanism named here would
+		// make init claim a registration it cannot write.
+		Hook: HookSpec{Mechanism: HookNone},
+		// Muse is an MCP client (settings.json carries a server block with
+		// transport/command/env/framing/url/headers + stdio |
+		// streamable_http, and the binary reports "MCP tool name collision
+		// for `…`"), but that shape is its OWN, not the shared
+		// {"mcpServers":{…}} object any existing writer emits. No writer, no
+		// grounded PathHint → nil rather than a fabricated target.
+		MCP:    nil,
+		Native: NativeRails{},
+		// Tier-2 transcript capture only. model_completed.usage carries
+		// input/output/cache_read/cache_write/cached/reasoning; both gross
+		// fields are netted at emit time. No proxy lane ⇒ no Tier-1, and
+		// observer ships no pricing entry for Muse models because Meta
+		// publishes no per-token rate card for the subscription.
+		TokenTier: TokenTier{
+			Best: "transcript",
+			Gap: "no Tier-1 proxy path (login-minted base URL); no pricing " +
+				"entry for muse-* models, so cost rows resolve as unknown",
+		},
+		// The log re-reads in full (prompts, assistant text, tool bodies) so
+		// a completed session is a usable handoff source. No Launch: the
+		// interactive-seed contract has NOT been grounded — the checklist
+		// requires reading the tool's own --help, and this session was
+		// forbidden from invoking the CLI at all. InjectFile is the
+		// universal floor and is all that is claimed.
+		// Launcher GROUNDED 2026-08-06 against a live `muse --help` /
+		// `muse resume --help` / `muse exec --help` read (this session was
+		// permitted to invoke the CLI, unlike Phase 0). `Usage: muse
+		// [OPTIONS] [PROMPT]` seeds the interactive session as a bare
+		// trailing positional (LaunchSeeded); `cmd/observer/muse.go` is the
+		// wired launcher.
+		Handoff: HandoffCapability{
+			Transcript: TranscriptFull,
+			Inject:     []InjectKind{InjectFile, InjectPrompt},
+			Launch:     &LaunchSpec{Subcommand: "muse"},
+		},
+		// Attach grounded 2026-08-06 (attach-all-launchers); PTY handoff
+		// only — no prompt seeding, token capture path unchanged. muse is
+		// launched non-proxied (Proxy stays nil above), so the attach spec
+		// forwards no proxy env.
+		Attach: &AttachSpec{Subcommand: "muse"},
+		// Native resume GROUNDED off `muse resume --help`: `Usage: muse
+		// resume` / `muse resume --last` / `muse resume <session-uuid>` —
+		// a SUBCOMMAND whose positional argument is the session uuid. The
+		// id is our stored SessionID verbatim (muse's own directory-name
+		// uuid — internal/adapter/muse's sessionIDFromPath), so no
+		// transform. Argv construction verified via
+		// cmd/observer/resume_launcher_test.go, not a live resume (no paid
+		// turn was run).
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "muse", IDMechanism: "subcommand:resume"},
+		// Binary: Names.Unix populated (required for a launchable tool);
+		// Installs stays an EMPTY slice per the honesty rule — muse ships
+		// from lookaside.facebook.com behind an auth.meta.com device
+		// login, and no safe scriptable install command has been grounded
+		// for that channel.
+		Binary: &BinaryResolveSpec{Names: BinaryNames{Unix: []string{"muse"}}},
+	},
+	"prime-agent": {
+		Tool: "prime-agent",
+		// Prime Agent is deliberately a ONE-TOOL agent: "Available
+		// built-in tools: `ipython`" (README) — the model drives a
+		// persistent Python kernel for everything. `bash` and `edit` are
+		// the two other built-in names docs/extensions.md says an
+		// extension may override. All three carry tooltax rows; the rest
+		// of the classifier is the conventional defensive vocabulary.
+		Vocabulary: Vocabulary{
+			InTaxonomy: true,
+			Note: "the native surface is a single built-in tool (`ipython`); " +
+				"skills are Python-backed and run INSIDE that kernel, and MCP " +
+				"servers are reached from Python as `integration.<tool>(…)`, so " +
+				"neither adds an LLM-visible tool name",
+		},
+		// ROUTABLE surface, route NOT DRIVEN YET. `~/.prime/agent/
+		// models.json` accepts a custom provider with an explicit `baseUrl`
+		// and `"api":"openai-completions"` (vendor docs/models.md: "Add
+		// custom providers and models (Ollama, vLLM, LM Studio, proxies)
+		// via ~/.prime/agent/models.json"), and `prime-agent --provider
+		// <name>` selects it (confirmed in --help). That is structurally
+		// the SAME RouteProviderJSON route cmd/observer/pi.go already
+		// drives for pi — unsurprising, since prime-agent is a hard fork of
+		// the same pi-mono upstream and inherited the file schema.
+		//
+		// `cmd/observer/prime-agent.go` (added 2026-08-06, modelled 1:1 on
+		// pi.go) now writes that provider and execs
+		// `prime-agent --provider observer`. Proxy still stays nil: no
+		// live turn has landed an api_turns row through it yet, and
+		// checklist §10.1f forbids flipping the PROXY cell before that —
+		// this row is the grounded structural half, not the verified half.
+		Proxy:       nil,
+		Routability: RouteStatusRoutableNow,
+		// Prime Agent's extension points are TypeScript EXTENSIONS
+		// (-e/--extension, pi.registerTool / lifecycle callbacks), not a
+		// settings.json hook-command vocabulary observer can register into.
+		// Observer ships no receiver → None rather than a mechanism init
+		// cannot write.
+		Hook: HookSpec{Mechanism: HookNone},
+		// Prime Agent IS an MCP client, but its servers are configured
+		// through the TUI's /login → "MCP Connections" flow with
+		// credentials in auth.json, and are called from inside the Python
+		// kernel. That is not the shared {"mcpServers":{…}} object any
+		// existing writer emits, and no grounded on-disk path was
+		// established → nil rather than a fabricated target.
+		MCP:    nil,
+		Native: NativeRails{},
+		// Tier-2 transcript only (no proxy lane driven yet). usage carries
+		// input/output/cacheRead/cacheWrite + a provider-reported cost
+		// breakdown; `input` is already NET (totalTokens == input + output
+		// + cacheRead + cacheWrite holds exactly on every observed row), so
+		// nothing is re-netted.
+		TokenTier: TokenTier{
+			Best: "transcript",
+			Gap: "no reasoning-token count in the usage envelope on either " +
+				"API lane (thinking TEXT is captured, the count is not " +
+				"published); no pricing entries for the prime-inference / " +
+				"openrouter model ids seen, so cost rows resolve as unknown " +
+				"apart from the provider-reported usage.cost.total",
+		},
+		// The log re-reads in full — prompts, assistant text, thinking
+		// blocks, tool bodies and shell output — so a completed session is
+		// a usable handoff source.
+		//
+		// Launcher GROUNDED 2026-08-06 against a live `prime-agent --help`
+		// read (this session was permitted to invoke the CLI). `Usage:
+		// prime-agent [options] [@files...] [message...]` seeds the
+		// interactive session as a trailing positional (LaunchSeeded);
+		// `cmd/observer/prime-agent.go` is the wired launcher (also drives
+		// the RouteProviderJSON route structurally — see Proxy above,
+		// which stays nil pending a live-verified turn).
+		Handoff: HandoffCapability{
+			Transcript: TranscriptFull,
+			Inject:     []InjectKind{InjectFile, InjectPrompt},
+			Launch:     &LaunchSpec{Subcommand: "prime-agent"},
+		},
+		// Attach grounded 2026-08-06 (attach-all-launchers); PTY handoff
+		// only — no prompt seeding, token capture path unchanged.
+		Attach: &AttachSpec{Subcommand: "prime-agent"},
+		// Native resume GROUNDED off `prime-agent --help`: `-r, --resume
+		// <path|id>` is a REQUIRED-value flag (angle brackets) taking the
+		// session UUID this adapter already keys on (the `<uuid>.jsonl`
+		// filename stem), so no transform. Argv construction verified via
+		// cmd/observer/resume_launcher_test.go, not a live resume (no
+		// paid turn was run).
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "prime-agent", IDMechanism: "flag:--resume"},
+		// Binary: Names.Unix populated (required for a launchable tool);
+		// npm package `prime-agent` is a grounded install channel
+		// (`npm ls -g` confirmed the live install as `prime-agent@0.7.0`).
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{Unix: []string{"prime-agent"}},
+			Installs: []InstallHint{
+				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "prime-agent"}, Display: "npm install -g prime-agent"},
+			},
+		},
+	},
 }
 
 // RegistryVersion is the version of the adapter capability registry's

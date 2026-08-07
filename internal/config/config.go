@@ -1199,12 +1199,25 @@ type TerminalAttachConfig struct {
 // Default() with the same absent-key-preserves-default partial-merge treatment
 // as [terminal.attach]'s booleans.
 //
-// `allow_shell` is intentionally ABSENT — a general browser shell is a
-// separate, separately-reviewed feature, not part of F1.
+// `allow_shell` (AllowShell below) is a SEPARATE default-OFF opt-in for
+// spawning a plain shell (not an AI agent) via a fresh terminal launch —
+// added post-F1. It is independent of AllowFreshAgent: a bare shell can run
+// ANY command, a strictly larger execution-authority expansion than a known,
+// capability-registry-bounded AI-tool launcher, so it is gated by its own
+// explicit toggle even when fresh-agent launch is already on.
 type TerminalLaunchConfig struct {
-	// AllowFreshAgent is the master opt-in for non-handoff launches. Default
-	// FALSE. With it false, POST /api/terminal/launch refuses every request.
+	// AllowFreshAgent is the master opt-in for non-handoff AI-tool launches.
+	// Default FALSE. With it false, POST /api/terminal/launch refuses every
+	// non-shell request.
 	AllowFreshAgent bool `toml:"allow_fresh_agent"`
+	// AllowShell is the opt-in for a fresh PLAIN SHELL launch (the child's
+	// $SHELL, or /bin/bash / /bin/sh as a fallback — never an AI tool).
+	// Default FALSE, and deliberately independent of AllowFreshAgent: turning
+	// on fresh AI-tool launches must not silently also grant an arbitrary
+	// command shell. BurntSushi leaves an absent key untouched, so a
+	// pre-existing [terminal.launch] block that predates this key still
+	// loads with AllowShell=false.
+	AllowShell bool `toml:"allow_shell"`
 	// AllowInstall gates POST /api/terminal/install — the guided one-click
 	// "Install in terminal" affordance (tool-binary-resolution arc). Default
 	// TRUE: the consent is the explicit dashboard click that runs a grounded,
@@ -2649,8 +2662,53 @@ type IntelligenceCodeGraphConfig struct {
 }
 
 // PricingConfig carries per-model input/output/cache pricing.
+//
+// Models holds CURRENT rates — one entry per model id, replacing the
+// baked-in row wholesale. Dated optionally holds a HISTORICAL rate
+// timeline per model id, so a provider's mid-life price change doesn't
+// silently reprice everything that came before it. Zero Dated entries =
+// zero behaviour change.
 type PricingConfig struct {
 	Models map[string]ModelPricing `toml:"models"`
+	// Dated maps a model id to its rate timeline, newest-last (order in
+	// file doesn't matter; the cost engine sorts by effective_from).
+	// The rate for usage at time T is the LAST entry whose
+	// effective_from is <= T; if T precedes every entry, or the model
+	// has no timeline, Models / the baked-in table applies.
+	//
+	// Because the flat table always represents CURRENT rates, a price
+	// CUT needs BOTH periods spelled out — the historical one AND the
+	// new one:
+	//
+	//	[[intelligence.pricing.dated."gpt-5.6-terra"]]
+	//	effective_from = ""            # empty = since forever
+	//	input = 2.50
+	//	output = 15
+	//	cache_read = 0.25
+	//
+	//	[[intelligence.pricing.dated."gpt-5.6-terra"]]
+	//	effective_from = "2026-08-01"  # bare date = midnight UTC
+	//	input = 1.75
+	//	output = 10
+	//	cache_read = 0.175
+	//
+	// effective_from accepts a bare date or an RFC3339 stamp. A row with
+	// an unparseable date is SKIPPED (never fails closed) and reported
+	// through cost.Engine.PricingWarnings.
+	Dated map[string][]DatedModelPricing `toml:"dated"`
+}
+
+// DatedModelPricing is one period of a model's rate timeline: the rates
+// that took effect at EffectiveFrom. Every ModelPricing field is
+// available (including the long-context and fast-multiplier tiers) —
+// a provider can change any of them.
+//
+// EffectiveFrom is inclusive: usage at exactly this instant bills at
+// THIS entry's rates. Empty means "since forever", the idiomatic way to
+// spell a timeline's oldest period.
+type DatedModelPricing struct {
+	EffectiveFrom string `toml:"effective_from"`
+	ModelPricing
 }
 
 // ModelPricing is per-million-token pricing for a single model. CacheCreation
@@ -2695,7 +2753,7 @@ func Default() Config {
 				PollIntervalSeconds: 2,
 				MaxFileSizeMB:       50,
 				EnabledAdapters: []string{
-					"claude-code", "codex", "cline", "cline-cli", "roo-code", "cursor", "copilot", "copilot-cli", "cowork", "opencode", "openclaw", "pi", "gemini-cli", "antigravity", "antigravity-cli", "hermes", "kilo-code", "kilo-code-cli", "qwen-code", "kiro-cli", "crush", "kimi-code", "grok", "devin", "qoder", "aider", "goose", "chatgpt-web", "claude-web", "perplexity-web", "gemini-web", "copilot-web", "droid", "open-interpreter", "command-code",
+					"claude-code", "codex", "cline", "cline-cli", "roo-code", "cursor", "copilot", "copilot-cli", "cowork", "opencode", "openclaw", "pi", "gemini-cli", "antigravity", "antigravity-cli", "hermes", "kilo-code", "kilo-code-cli", "qwen-code", "kiro-cli", "crush", "kimi-code", "grok", "devin", "qoder", "aider", "goose", "chatgpt-web", "claude-web", "perplexity-web", "gemini-web", "copilot-web", "droid", "open-interpreter", "command-code", "muse", "prime-agent",
 				},
 			},
 			Freshness: FreshnessConfig{

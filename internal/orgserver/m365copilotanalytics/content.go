@@ -9,9 +9,9 @@ import (
 // UsageSummary is the SAFE, content-free aggregate rollup surfaced on the org
 // (web2) dashboard for M365 Copilot. It carries per-appClass interaction /
 // prompt / response counts — NO body content and NO cost (aiInteractionHistory is
-// not metered). This is the analogue of copilotanalytics.LoadCostSummary: a plain
-// read seam the dashboard handler calls, distinct from the admin-tier content
-// read below.
+// not metered). This is the analogue of GitHub Copilot's sibling-cost treatment
+// in rollup/telemetry.go::telemetryCopilot: a plain read seam the dashboard
+// handler calls, distinct from the admin-tier content read below.
 type UsageSummary struct {
 	OrgID        string
 	ByAppClass   []AppClassUsage

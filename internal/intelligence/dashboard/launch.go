@@ -218,6 +218,11 @@ type FreshLaunchSpec struct {
 	ProjectRoot string
 	Rows        uint16
 	Cols        uint16
+	// Shell requests a fresh PLAIN SHELL instead of an AI tool. When true,
+	// Tool/Subcommand are ignored by the application service — see
+	// handleTerminalLaunch's shellPseudoTool branch, gated by
+	// [terminal.launch].allow_shell instead of allowed_tools.
+	Shell bool
 }
 
 // ResumeLaunchSpec is the dashboard's server-derived NATIVE-resume request
@@ -323,6 +328,10 @@ var (
 	// ErrLaunchProjectRootDenied signals the requested project_root failed the
 	// allow-list / canonicalization check (400).
 	ErrLaunchProjectRootDenied = errors.New("project root not permitted")
+	// ErrLaunchShellDisabled signals [terminal.launch].allow_shell is off
+	// (403). Plain-shell launch is a SEPARATE conscious opt-in from
+	// allow_fresh_agent, never migrated on.
+	ErrLaunchShellDisabled = errors.New("plain-shell launch is disabled (set [terminal.launch].allow_shell)")
 	// ErrLaunchSetupInFlight signals a setup session of the same kind
 	// (operator-grant / login / install) is already starting — the setup
 	// single-flight refusal (409). Prevents a POST-spam from spawning many
@@ -1125,21 +1134,33 @@ func (s *Server) handleTerminalLaunch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	sub, ok := launchSubcommand(body.Tool)
-	if !ok {
-		http.Error(w, "tool "+body.Tool+" is not launchable in the embedded terminal", http.StatusBadRequest)
-		return
+	// The reserved pseudo-tool "shell" (termsvc.ShellTool) requests a fresh
+	// PLAIN SHELL — never a member of the launchable capability set, so it
+	// skips launchSubcommand entirely and is gated by [terminal.launch].
+	// allow_shell instead of allowed_tools (see FreshLaunchSpec.Shell).
+	isShell := body.Tool == termsvc.ShellTool
+	var sub string
+	if !isShell {
+		var ok bool
+		sub, ok = launchSubcommand(body.Tool)
+		if !ok {
+			http.Error(w, "tool "+body.Tool+" is not launchable in the embedded terminal", http.StatusBadRequest)
+			return
+		}
 	}
 	handle, err := s.opts.LaunchManager.CreateFresh(FreshLaunchSpec{
 		Tool:        body.Tool,
 		Subcommand:  sub,
 		ProjectRoot: body.ProjectRoot,
+		Shell:       isShell,
 	})
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrLaunchFreshDisabled):
 			http.Error(w, err.Error(), http.StatusForbidden)
 		case errors.Is(err, ErrLaunchToolNotAllowed):
+			http.Error(w, err.Error(), http.StatusForbidden)
+		case errors.Is(err, ErrLaunchShellDisabled):
 			http.Error(w, err.Error(), http.StatusForbidden)
 		case errors.Is(err, ErrLaunchProjectRootDenied):
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -1177,13 +1198,19 @@ func (s *Server) handleTerminalSessions(w http.ResponseWriter, r *http.Request) 
 	// re-canonicalizes a path — so its permitted/not-permitted marking matches the
 	// server's spawn-time ValidateProjectRoot check.
 	var allowedRoots []string
+	// shellEnabled reflects [terminal.launch].allow_shell — the "New terminal"
+	// dialog uses it to decide whether to offer the plain-shell picker option
+	// honestly (rather than always showing it and failing at launch time).
+	var shellEnabled bool
 	if cfg, err := loadConfigForDashboard(s.opts.ConfigPath); err == nil {
 		allowedRoots = resolveAllowedProjectRoots(cfg.Terminal.Launch.AllowedProjectRoots)
+		shellEnabled = cfg.Terminal.Enabled && cfg.Terminal.Launch.AllowShell
 	}
 	writeJSON(w, map[string]any{
 		"sessions":              s.visibleSnapshot(r.Context()),
 		"launchable_tools":      launchableTools(),
 		"allowed_project_roots": allowedRoots,
+		"shell_enabled":         shellEnabled,
 	})
 }
 

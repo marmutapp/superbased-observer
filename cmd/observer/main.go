@@ -165,6 +165,8 @@ func newRootCmdWith(deps usageDeps) *cobra.Command {
 	root.AddCommand(newDroidCmd())
 	root.AddCommand(newOpenInterpreterCmd())
 	root.AddCommand(newCommandCodeCmd())
+	root.AddCommand(newMuseCmd())
+	root.AddCommand(newPrimeAgentCmd())
 	root.AddCommand(newGuardCmd())
 	root.AddCommand(newBenchmarkCmd())
 	root.AddCommand(newHookCmd())

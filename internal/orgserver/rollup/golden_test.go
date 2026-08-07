@@ -199,6 +199,14 @@ func TestGolden_WireShapes(t *testing.T) {
 			want: `{"vendor":"copilot","display_name":"GitHub Copilot","days":1,"cost_usd":4,"seats":{"total":50,"active":40,"inactive":10,"utilization":0.8}}`,
 		},
 		{
+			name: "VendorTelemetry_copilotOverageByDay",
+			val: VendorTelemetry{
+				Vendor: "copilot", DisplayName: "GitHub Copilot", Days: 2, CostUSD: 5.5,
+				OverageByDay: []CostPoint{{Date: "2026-05-20", CostUSD: 1.5}, {Date: "2026-05-23", CostUSD: 4}},
+			},
+			want: `{"vendor":"copilot","display_name":"GitHub Copilot","days":2,"cost_usd":5.5,"overage_by_day":[{"date":"2026-05-20","cost_usd":1.5},{"date":"2026-05-23","cost_usd":4}]}`,
+		},
+		{
 			name: "TelemetryResult_empty",
 			val:  TelemetryResult{WindowDays: 30, Configured: false, Vendors: []VendorTelemetry{}},
 			want: `{"window_days":30,"configured":false,"vendors":[]}`,

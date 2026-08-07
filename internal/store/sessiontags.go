@@ -39,6 +39,10 @@ const MaxTagsPerSession = 16
 // MaxNoteLen bounds the per-session note (plan §0: "optional free text").
 const MaxNoteLen = 500
 
+// MaxRating is the top of the 1..MaxRating overall-session-rating scale
+// (migration 080). 0 is the reserved "unrated" sentinel, not a score.
+const MaxRating = 10
+
 // ErrInvalidTag rejects a tag that does not normalize to 1..MaxTagLen
 // characters drawn from [a-z0-9._-] — notably any unicode letter, emoji, or
 // punctuation outside that set.
@@ -51,13 +55,18 @@ var ErrTooManyTags = errors.New("store: session already carries the maximum numb
 // ErrNoteTooLong rejects a note longer than MaxNoteLen characters.
 var ErrNoteTooLong = errors.New("store: session note exceeds the maximum length")
 
-// Annotation is the per-session bookmark record: the favorite star plus the
-// optional note explaining why. The zero value is the "unannotated" state —
-// SetSessionAnnotation deletes the row when a mutation lands back on it, so an
-// absent row and a zero Annotation mean the same thing everywhere.
+// ErrInvalidRating rejects a rating outside 0..MaxRating (0 = clear/unrated).
+var ErrInvalidRating = errors.New("store: session rating must be 0 (unrated) or 1-10")
+
+// Annotation is the per-session bookmark record: the favorite star, the
+// optional note explaining why, and the optional 1..MaxRating overall rating.
+// The zero value is the "unannotated" state — SetSessionAnnotation deletes the
+// row when a mutation lands back on it, so an absent row and a zero Annotation
+// mean the same thing everywhere. Rating 0 is the "unrated" sentinel.
 type Annotation struct {
 	Favorite  bool   `json:"favorite"`
 	Note      string `json:"note,omitempty"`
+	Rating    int    `json:"rating,omitempty"`
 	UpdatedAt string `json:"updated_at,omitempty"`
 }
 
@@ -145,7 +154,7 @@ func normalizeTagSet(raw []string) ([]string, error) {
 // transaction. That residue is harmless: tags are written first, so an
 // ErrTooManyTags there aborts before the annotation write, leaving nothing
 // partially applied.
-func ValidateClassificationInput(add, remove []string, note *string) error {
+func ValidateClassificationInput(add, remove []string, note *string, rating *int) error {
 	addTags, err := normalizeTagSet(add)
 	if err != nil {
 		return fmt.Errorf("store.ValidateClassificationInput: %w", err)
@@ -159,6 +168,22 @@ func ValidateClassificationInput(add, remove []string, note *string) error {
 	}
 	if note != nil && len([]rune(*note)) > MaxNoteLen {
 		return fmt.Errorf("store.ValidateClassificationInput: %w (max %d characters)", ErrNoteTooLong, MaxNoteLen)
+	}
+	if err := validateRating(rating); err != nil {
+		return fmt.Errorf("store.ValidateClassificationInput: %w", err)
+	}
+	return nil
+}
+
+// validateRating accepts nil ("leave unchanged"), 0 ("clear / unrated"), or a
+// score in 1..MaxRating. Anything else is ErrInvalidRating. Shared by the
+// pre-flight and by SetSessionAnnotation's own defensive check.
+func validateRating(rating *int) error {
+	if rating == nil {
+		return nil
+	}
+	if *rating < 0 || *rating > MaxRating {
+		return fmt.Errorf("%w (got %d)", ErrInvalidRating, *rating)
 	}
 	return nil
 }
@@ -247,19 +272,23 @@ func (s *Store) MutateSessionTags(ctx context.Context, sessionID string, add, re
 	return nil
 }
 
-// SetSessionAnnotation applies a PARTIAL update to a session's favorite/note
-// annotation: a nil pointer leaves that field untouched, so the star toggle and
-// the note editor can each write independently.
+// SetSessionAnnotation applies a PARTIAL update to a session's
+// favorite/note/rating annotation: a nil pointer leaves that field untouched,
+// so the star toggle, the note editor and the rating control can each write
+// independently.
 //
 // The row is garbage-collected when the resulting state is the zero value
-// (favorite=false AND note=""): an unstarred, un-noted session carries no row,
-// so "absent" and "empty" never diverge.
-func (s *Store) SetSessionAnnotation(ctx context.Context, sessionID string, favorite *bool, note *string) error {
+// (favorite=false AND note="" AND rating=0): an unstarred, un-noted, unrated
+// session carries no row, so "absent" and "empty" never diverge.
+func (s *Store) SetSessionAnnotation(ctx context.Context, sessionID string, favorite *bool, note *string, rating *int) error {
 	if strings.TrimSpace(sessionID) == "" {
 		return fmt.Errorf("store.SetSessionAnnotation: empty session id")
 	}
 	if note != nil && len([]rune(*note)) > MaxNoteLen {
 		return fmt.Errorf("store.SetSessionAnnotation: %w (max %d characters)", ErrNoteTooLong, MaxNoteLen)
+	}
+	if err := validateRating(rating); err != nil {
+		return fmt.Errorf("store.SetSessionAnnotation: %w", err)
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -271,8 +300,8 @@ func (s *Store) SetSessionAnnotation(ctx context.Context, sessionID string, favo
 	var cur Annotation
 	var fav int
 	switch err := tx.QueryRowContext(ctx,
-		`SELECT favorite, note FROM session_annotations WHERE session_id = ?`, sessionID).
-		Scan(&fav, &cur.Note); {
+		`SELECT favorite, note, rating FROM session_annotations WHERE session_id = ?`, sessionID).
+		Scan(&fav, &cur.Note, &cur.Rating); {
 	case errors.Is(err, sql.ErrNoRows):
 	case err != nil:
 		return fmt.Errorf("store.SetSessionAnnotation: %w", err)
@@ -285,8 +314,11 @@ func (s *Store) SetSessionAnnotation(ctx context.Context, sessionID string, favo
 	if note != nil {
 		cur.Note = strings.TrimSpace(*note)
 	}
+	if rating != nil {
+		cur.Rating = *rating
+	}
 
-	if !cur.Favorite && cur.Note == "" {
+	if !cur.Favorite && cur.Note == "" && cur.Rating == 0 {
 		if _, err := tx.ExecContext(ctx,
 			`DELETE FROM session_annotations WHERE session_id = ?`, sessionID); err != nil {
 			return fmt.Errorf("store.SetSessionAnnotation: %w", err)
@@ -297,13 +329,14 @@ func (s *Store) SetSessionAnnotation(ctx context.Context, sessionID string, favo
 			favInt = 1
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO session_annotations (session_id, favorite, note, updated_at)
-			 VALUES (?, ?, ?, ?)
+			`INSERT INTO session_annotations (session_id, favorite, note, rating, updated_at)
+			 VALUES (?, ?, ?, ?, ?)
 			 ON CONFLICT(session_id) DO UPDATE SET
 			   favorite   = excluded.favorite,
 			   note       = excluded.note,
+			   rating     = excluded.rating,
 			   updated_at = excluded.updated_at`,
-			sessionID, favInt, cur.Note, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			sessionID, favInt, cur.Note, cur.Rating, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return fmt.Errorf("store.SetSessionAnnotation: %w", err)
 		}
 	}
@@ -320,8 +353,8 @@ func (s *Store) GetSessionAnnotation(ctx context.Context, sessionID string) (Ann
 	var fav int
 	var updated sql.NullString
 	switch err := s.db.QueryRowContext(ctx,
-		`SELECT favorite, note, updated_at FROM session_annotations WHERE session_id = ?`, sessionID).
-		Scan(&fav, &a.Note, &updated); {
+		`SELECT favorite, note, rating, updated_at FROM session_annotations WHERE session_id = ?`, sessionID).
+		Scan(&fav, &a.Note, &a.Rating, &updated); {
 	case errors.Is(err, sql.ErrNoRows):
 		return Annotation{}, nil
 	case err != nil:
@@ -391,7 +424,7 @@ func (s *Store) ListAnnotations(ctx context.Context, sessionIDs []string) (map[s
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(args)), ",")
 	rows, err := s.db.QueryContext(ctx,
 		//nolint:gosec // G202: only the ?-placeholder list is concatenated; every value is bound.
-		`SELECT session_id, favorite, note, updated_at FROM session_annotations
+		`SELECT session_id, favorite, note, rating, updated_at FROM session_annotations
 		 WHERE session_id IN (`+placeholders+`)`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("store.ListAnnotations: %w", err)
@@ -402,7 +435,7 @@ func (s *Store) ListAnnotations(ctx context.Context, sessionIDs []string) (map[s
 		var fav int
 		var a Annotation
 		var updated sql.NullString
-		if err := rows.Scan(&id, &fav, &a.Note, &updated); err != nil {
+		if err := rows.Scan(&id, &fav, &a.Note, &a.Rating, &updated); err != nil {
 			return nil, fmt.Errorf("store.ListAnnotations: %w", err)
 		}
 		a.Favorite = fav != 0

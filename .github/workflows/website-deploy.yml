@@ -5,6 +5,23 @@ on:
     branches: [main]
     paths:
       - 'website/**'
+      # The Model Pricing Explorer is built from source at deploy time and
+      # its output is not committed, so a change confined to the app would
+      # otherwise never reach production.
+      - 'model-pricing/**'
+
+  # The prices live in PostgreSQL but the page is STATIC — prerendered at
+  # build time so the rates are in the initial HTML for search engines.
+  # Nothing rebuilds the page when a row changes, so without this a price
+  # corrected in the database would sit there unpublished until somebody
+  # happened to push something unrelated.
+  #
+  # 06:20 UTC: after any overnight data work, before the working day.
+  schedule:
+    - cron: '20 6 * * *'
+
+  # For pulling a correction through immediately instead of waiting for 06:20.
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -53,8 +70,75 @@ jobs:
       # generators `gen` and `pagegen`) are likewise DEV-ONLY — only the
       # RENDERED website/docs/** and website/*.html output is meant to
       # deploy.
+      #
+      # website/tools/indexnow.mjs needs to run AFTER the Cloudflare Pages
+      # deploy below (pinging IndexNow before the pages are live would
+      # advertise URLs that still 404) but this step deletes it — copy it to
+      # a scratch path first so the later step still has it. It reads
+      # website/sitemap-pages.xml via its own --sitemap flag rather than a
+      # path relative to itself, since that file survives this strip but the
+      # script (from its scratch copy) no longer sits next to it.
+      - name: Preserve IndexNow script (stripped below, run after deploy)
+        run: cp website/tools/indexnow.mjs "$RUNNER_TEMP/indexnow.mjs"
+
       - name: Strip dev-only verification harness + page/docs sources
         run: rm -rf website/tools website/docs-src website/pages-src website/docs-tools
+
+      # The Model Pricing Explorer. It used to run as a Next server in Azure
+      # Container Apps behind an edge-key reverse proxy in website/_worker.js;
+      # the page was already prerendered as static content there, and the only
+      # server-side code it carried existed to defend and probe that origin.
+      # It is now exported and deployed with the rest of the site.
+      #
+      # Built LAST, after the drift/accuracy gates and the strip, so its
+      # output cannot be mistaken for a hand-edited page by those checks and
+      # cannot be deleted by the strip. The output is NOT committed — this
+      # step is the only thing that produces website/model-prices/.
+      #
+      # PRICING_BASE_PATH must match the path the site serves it at: the app
+      # stamps its own asset and link URLs with it at build time.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: model-pricing/web/package-lock.json
+
+      # PRICING_API_URL points at OUR OWN edge, not at the Azure origin. The
+      # worker holds the shared key the origin demands, so routing the build
+      # through it means the key never has to exist as a CI secret — and the
+      # NSG can stay narrowed to Cloudflare rather than also admitting
+      # GitHub's runners.
+      #
+      # This reads the CURRENTLY DEPLOYED worker, one deploy behind. That is
+      # fine and is why the fallback matters: on the first run after this
+      # route ships, the live worker does not have it yet, the fetch does not
+      # return a catalog, and the build takes the committed seed. It
+      # self-corrects on the next deploy. A catalog is never half-published —
+      # fetch-catalog.mjs validates the document and refuses one that shrank.
+      - name: Model Pricing Explorer — install, test, export
+        working-directory: model-pricing/web
+        env:
+          PRICING_API_URL: https://superbased.app/api/pricing
+          # On a SCHEDULED run the only purpose is fresh prices, so the seed
+          # fallback is switched off: falling back would republish the seed
+          # over a page already serving database data and silently drop the
+          # price history. Better to fail visibly and leave the good page up.
+          # Push-triggered runs keep the fallback, because they are shipping
+          # other changes that should not be blocked by a rebooting VM.
+          PRICING_API_REQUIRED: ${{ github.event_name == 'schedule' && '1' || '' }}
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+          PRICING_BASE_PATH=/model-prices npm run build
+
+      # `out/` is the export; the deploy publishes website/, so move it to
+      # the path it is served from. Removing any previous copy first keeps a
+      # rerun from leaving a stale chunk behind next to a fresh manifest.
+      - name: Stage the explorer into the site
+        run: |
+          rm -rf website/model-prices
+          mv model-pricing/web/out website/model-prices
+          test -f website/model-prices/index.html
 
       - name: Deploy to Cloudflare Pages
         uses: cloudflare/wrangler-action@v3
@@ -62,3 +146,17 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: pages deploy website --project-name=superbased-website --branch=main
+
+      # Best-effort Bing/Yandex fast-recrawl ping (IndexNow protocol; Google
+      # does not consume IndexNow, so this has no effect on Google indexing —
+      # the sitemap remains the source of truth there). Runs LAST, after the
+      # Cloudflare Pages deploy above has actually published the pages, using
+      # the copy stashed before the dev-tooling strip step. Submits the
+      # site's ~107 marketing/docs pages (from the committed
+      # website/sitemap-pages.xml) plus the Model Pricing Explorer's pages
+      # (fetched live from https://superbased.app/model-prices/sitemap.xml,
+      # since that sitemap is generated at deploy time and never committed).
+      # Fail-open by design (see the script's own header comment): a bad
+      # response or network error is logged, never fails this workflow.
+      - name: Notify IndexNow (Bing/Yandex, best-effort)
+        run: node "$RUNNER_TEMP/indexnow.mjs" --sitemap=website/sitemap-pages.xml

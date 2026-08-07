@@ -126,6 +126,21 @@ func argvModeForKind(kind termrun.Kind) termsession.ArgvMode {
 	return argvModeTable[kind]
 }
 
+// resolveShellArgv builds the server-derived argv for a SpecShell session: the
+// user's own $SHELL (never client-supplied — read from the daemon's own
+// process env), falling back to /bin/bash then /bin/sh if $SHELL is unset.
+// argv[0] is a plain program name/path resolved via PATH by exec.Command, same
+// as every other termsession Spawn path.
+func resolveShellArgv() []string {
+	if sh := os.Getenv("SHELL"); sh != "" {
+		return []string{sh}
+	}
+	if _, err := os.Stat("/bin/bash"); err == nil {
+		return []string{"/bin/bash"}
+	}
+	return []string{"/bin/sh"}
+}
+
 // Spawn starts a PTY-backed launcher for a validated request and returns its
 // opaque handle. It is the single place the OOB FD is allocated: after the
 // child is spawned the daemon closes its own copy of the write end so the read
@@ -163,6 +178,13 @@ func (l *ptyLauncher) Spawn(req termsvc.LaunchRequest) (string, error) {
 		// self-configures exactly like a bare launch (B2/B3). Nil for
 		// dashboard fresh/handoff launches → argv unchanged.
 		ExtraArgs: req.ExtraArgs,
+	}
+	if req.IsShell {
+		// A plain-shell fresh launch runs no `observer <sub>` at all — SpecShell
+		// carries its own server-derived argv (resolveShellArgv), ignoring
+		// BinPath/Subcommand/ArgvMode/SessionID entirely (see Spec.argv()).
+		spec.Kind = termsession.SpecShell
+		spec.ShellArgv = resolveShellArgv()
 	}
 	handle, cerr := l.mgr.Create(spec)
 	// Close the daemon's copy of the write end unconditionally: the child has

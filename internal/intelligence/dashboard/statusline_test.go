@@ -42,7 +42,7 @@ func openStatusline(t *testing.T, server *Server, sessionID string) StatuslineRe
 func newStatuslineFixture(t *testing.T) (*store.Store, *Server) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -387,6 +387,58 @@ func TestHandleStatuslineTile_CacheExpiresAndRecomputes(t *testing.T) {
 	}
 }
 
+// TestHandleStatuslineTile_DatedPricingLadder pins the same recorded →
+// dated → undated ladder in statuslineQueryRows, including its perf
+// gate (dateAware := engine.HasDatedPricing()): a recorded turn wins
+// verbatim, and an unrecorded turn before the synthetic boundary must
+// price at the OLD dated rate — which only happens if HasDatedPricing()
+// actually reports true and the per-row timestamp gets parsed, proving
+// the gate engages rather than silently short-circuiting to the
+// current-rate fallback.
+func TestHandleStatuslineTile_DatedPricingLadder(t *testing.T) {
+	withStatuslineTTL(t, 0)
+	st, server := newStatuslineFixture(t)
+	now := time.Now().UTC()
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	// Keep both rows, and the boundary, safely inside "today" — clamp
+	// to the hour-of-day so this doesn't flake near midnight.
+	hourOfDay := now.Sub(dayStart)
+	if hourOfDay < 4*time.Hour {
+		t.Skip("too close to UTC midnight for a safe same-day boundary fixture")
+	}
+	boundary := dayStart.Add(hourOfDay / 2)
+
+	engine := newLadderTestEngine(t, boundary)
+	server.opts.CostEngine = engine
+
+	if _, err := st.InsertAPITurn(context.Background(), models.APITurn{
+		SessionID: "sSeed", Provider: models.ProviderAnthropic,
+		Model: ladderModel, InputTokens: ladderBundle.Input, OutputTokens: ladderBundle.Output,
+		Timestamp: boundary.Add(30 * time.Minute), RequestID: "msg_ladder_recorded",
+		CostUSD: 9.99, // recorded — must win verbatim
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.InsertAPITurn(context.Background(), models.APITurn{
+		SessionID: "sSeed", Provider: models.ProviderAnthropic,
+		Model: ladderModel, InputTokens: ladderBundle.Input, OutputTokens: ladderBundle.Output,
+		Timestamp: boundary.Add(-30 * time.Minute), RequestID: "msg_ladder_dated",
+		CostUSD: 0, // unrecorded, before boundary — must price at the OLD dated rate
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !engine.HasDatedPricing() {
+		t.Fatal("test fixture engine must report HasDatedPricing() == true")
+	}
+
+	got := openStatusline(t, server, "")
+	want := 9.99 + ladderOldCost
+	if !approx(got.TodayUSD, want) {
+		t.Errorf("today_usd: got %v want %v (recorded=9.99 old=%.2f)", got.TodayUSD, want, ladderOldCost)
+	}
+}
+
 // BenchmarkHandleStatuslineTile is the query-cost regression guard the
 // plan requires (§7 / WP2 AC): a seeded, representative fixture (500
 // today rows spread across api_turns + token_usage, plus 200 rows for
@@ -404,7 +456,7 @@ func TestHandleStatuslineTile_CacheExpiresAndRecomputes(t *testing.T) {
 // see the reported ns/op in the benchmark tail for the measured figure.
 func BenchmarkHandleStatuslineTile(b *testing.B) {
 	path := filepath.Join(b.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		b.Fatal(err)
 	}

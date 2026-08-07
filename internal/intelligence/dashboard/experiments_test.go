@@ -194,3 +194,98 @@ func TestExperimentReport(t *testing.T) {
 		t.Errorf("unknown report: got %d want 404", rr.Code)
 	}
 }
+
+// TestExperimentReport_DatedPricingLadder pins the recorded → dated →
+// undated ladder in ComputeExperimentReport's per-turn pricing, and the
+// mixed-aggregation case: each arm gets one session with a recorded
+// turn (wins verbatim) plus a dated turn (before the synthetic
+// boundary, must price at the OLD rate) — so BOTH arms' TotalCostUSD
+// must reflect the same ladder, not just one of them.
+func TestExperimentReport_DatedPricingLadder(t *testing.T) {
+	server, _ := wizardTestServer(t)
+	now := time.Now().UTC()
+	// The experiment window is [StartedAt, now] — the boundary must sit
+	// INSIDE that window so both the pre-boundary (old-rate) and
+	// post-boundary (recorded) turns land in-population.
+	boundary := now.Add(-90 * time.Minute)
+	server.opts.CostEngine = newLadderTestEngine(t, boundary)
+
+	exp := config.ExperimentConfig{
+		Name: "ladder-exp", Class: "openai",
+		Control: "codex-safe", Candidate: "codex-variant",
+		StartedAt: now.Add(-3 * time.Hour).Format(time.RFC3339),
+	}
+	cfg, err := config.Load(config.LoadOptions{GlobalPath: server.opts.ConfigPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Experiments = []config.ExperimentConfig{exp}
+	if err := config.WriteToml(server.opts.ConfigPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.opts.DB.Exec(
+		`INSERT INTO projects (root_path, name, created_at) VALUES ('/ladder-exp', 'ladder-exp', ?)`,
+		now.Format(time.RFC3339Nano),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Find one session id per arm (same recompute the report itself uses).
+	var controlSID, candidateSID string
+	for i := 0; ; i++ {
+		sid := fmt.Sprintf("ladder-exp-s-%d", i)
+		_, arm := config.ExperimentArm(exp, sid)
+		if arm == "control" && controlSID == "" {
+			controlSID = sid
+		}
+		if arm == "candidate" && candidateSID == "" {
+			candidateSID = sid
+		}
+		if controlSID != "" && candidateSID != "" {
+			break
+		}
+	}
+
+	seedArm := func(sid string) {
+		t.Helper()
+		startedAt := now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
+		if _, err := server.opts.DB.Exec(
+			`INSERT INTO sessions (id, project_id, tool, started_at)
+			 VALUES (?, (SELECT id FROM projects WHERE root_path = '/ladder-exp'), 'codex', ?)`,
+			sid, startedAt,
+		); err != nil {
+			t.Fatal(err)
+		}
+		insertTurn := func(ts time.Time, usd float64) {
+			t.Helper()
+			if _, err := server.opts.DB.Exec(
+				`INSERT INTO api_turns (session_id, timestamp, provider, model, input_tokens, output_tokens, cost_usd)
+				 VALUES (?, ?, 'openai', ?, ?, ?, ?)`,
+				sid, ts.Format(time.RFC3339Nano), ladderModel, ladderBundle.Input, ladderBundle.Output, usd,
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+		insertTurn(now.Add(-30*time.Minute), 9.99) // recorded (after boundary) — must win verbatim
+		insertTurn(now.Add(-2*time.Hour), 0)       // unrecorded, before boundary — OLD dated rate
+	}
+	seedArm(controlSID)
+	seedArm(candidateSID)
+
+	rr := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/experiments/report?name=ladder-exp", nil))
+	if rr.Code != 200 {
+		t.Fatalf("report: %d %s", rr.Code, rr.Body.String())
+	}
+	var rep ExperimentReport
+	if err := json.NewDecoder(rr.Body).Decode(&rep); err != nil {
+		t.Fatal(err)
+	}
+	want := 9.99 + ladderOldCost
+	if diff := rep.Control.TotalCostUSD - want; diff > 0.001 || diff < -0.001 {
+		t.Errorf("control cost: got %f want %f (recorded=9.99 old=%.2f)", rep.Control.TotalCostUSD, want, ladderOldCost)
+	}
+	if diff := rep.Candidate.TotalCostUSD - want; diff > 0.001 || diff < -0.001 {
+		t.Errorf("candidate cost: got %f want %f (recorded=9.99 old=%.2f)", rep.Candidate.TotalCostUSD, want, ladderOldCost)
+	}
+}

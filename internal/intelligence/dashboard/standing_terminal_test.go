@@ -224,7 +224,7 @@ func newStandingManageServer(t *testing.T) (*Server, http.Handler, *revokeRecord
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "observer.db")
-	database, err := db.Open(context.Background(), db.Options{Path: dbPath})
+	database, err := openTestDB(context.Background(), db.Options{Path: dbPath})
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}

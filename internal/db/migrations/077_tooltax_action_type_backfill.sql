@@ -1863,6 +1863,109 @@ UPDATE actions
    AND raw_tool_name = 'fs_write';
 
 UPDATE actions
+   SET action_type = 'ask_user'
+ WHERE tool = 'muse'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'askuser', 'askuserquestion'
+   );
+
+UPDATE actions
+   SET action_type = 'edit_file'
+ WHERE tool = 'muse'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'applypatch', 'edit', 'editfile', 'multiedit', 'patch',
+     'replace'
+   );
+
+UPDATE actions
+   SET action_type = 'harness_call'
+ WHERE tool = 'muse'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'submitreminderdecision';
+
+UPDATE actions
+   SET action_type = 'read_file'
+ WHERE tool = 'muse'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'read', 'readfile', 'readmanyfiles', 'view', 'viewfile'
+   );
+
+UPDATE actions
+   SET action_type = 'run_command'
+ WHERE tool = 'muse'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'bash', 'exec', 'execcommand', 'execute', 'runcommand',
+     'shell', 'terminal'
+   );
+
+UPDATE actions
+   SET action_type = 'search_files'
+ WHERE tool = 'muse'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'findfiles', 'glob', 'listdir', 'listdirectory', 'listfiles',
+     'searchfiles'
+   );
+
+UPDATE actions
+   SET action_type = 'search_text'
+ WHERE tool = 'muse'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'codesearch', 'grep', 'ripgrep', 'search', 'searchtext'
+   );
+
+UPDATE actions
+   SET action_type = 'skill_invoke'
+ WHERE tool = 'muse'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'readskill', 'skill', 'useskill'
+   );
+
+UPDATE actions
+   SET action_type = 'spawn_subagent'
+ WHERE tool = 'muse'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'agent', 'delegate', 'spawnagent', 'subagent', 'task'
+   );
+
+UPDATE actions
+   SET action_type = 'todo_update'
+ WHERE tool = 'muse'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'todo', 'todowrite', 'updateplan', 'updatetodos'
+   );
+
+UPDATE actions
+   SET action_type = 'web_fetch'
+ WHERE tool = 'muse'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'fetch', 'fetchurl', 'readurl', 'webfetch'
+   );
+
+UPDATE actions
+   SET action_type = 'web_search'
+ WHERE tool = 'muse'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'websearch';
+
+UPDATE actions
+   SET action_type = 'write_file'
+ WHERE tool = 'muse'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'createfile', 'write', 'writefile'
+   );
+
+UPDATE actions
    SET action_type = 'agent_control'
  WHERE tool = 'open-interpreter'
    AND action_type = 'unknown'
@@ -2215,6 +2318,71 @@ UPDATE actions
 UPDATE actions
    SET action_type = 'write_file'
  WHERE tool = 'pi'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'create', 'create_file', 'write', 'write_file'
+   );
+
+UPDATE actions
+   SET action_type = 'edit_file'
+ WHERE tool = 'prime-agent'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'apply_patch', 'edit', 'edit_file', 'patch'
+   );
+
+UPDATE actions
+   SET action_type = 'read_file'
+ WHERE tool = 'prime-agent'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'cat', 'read', 'read_file', 'view'
+   );
+
+UPDATE actions
+   SET action_type = 'run_command'
+ WHERE tool = 'prime-agent'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'bash', 'command', 'exec', 'execute', 'ipython', 'run',
+     'shell'
+   );
+
+UPDATE actions
+   SET action_type = 'search_files'
+ WHERE tool = 'prime-agent'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'find', 'glob', 'list_files', 'ls'
+   );
+
+UPDATE actions
+   SET action_type = 'search_text'
+ WHERE tool = 'prime-agent'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'grep', 'search', 'search_text'
+   );
+
+UPDATE actions
+   SET action_type = 'web_fetch'
+ WHERE tool = 'prime-agent'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'fetch', 'fetch_url', 'web_fetch'
+   );
+
+UPDATE actions
+   SET action_type = 'web_search'
+ WHERE tool = 'prime-agent'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'web_search', 'websearch'
+   );
+
+UPDATE actions
+   SET action_type = 'write_file'
+ WHERE tool = 'prime-agent'
    AND action_type = 'unknown'
    AND raw_tool_name IN (
      'create', 'create_file', 'write', 'write_file'

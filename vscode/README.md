@@ -40,21 +40,14 @@ Open the command palette (`Ctrl+Shift+P` / `⌘⇧P`) and run:
 A terminal opens with a health-check. All four lines should show ✅.
 If anything fails, the error tells you what to fix.
 
-### 3. Start the daemon
+### 3. The daemon starts itself
 
-Two paths — pick whichever fits your workflow:
+Nothing to do — the extension ships in `auto` mode. It attaches to a
+daemon you already have running, and otherwise starts one for you. It
+only ever stops a daemon it started itself, so a daemon you launched in
+a terminal is left alone when you close the editor.
 
-**Option A — Let the extension manage it for you** (recommended for
-most users)
-
-1. Open Settings (`Ctrl+,` / `⌘,`)
-2. Search **"observer.daemon.mode"**
-3. Change it from `detect` to `auto`
-
-The daemon now starts automatically with VS Code and stops cleanly
-when you close it.
-
-**Option B — Start it yourself in a terminal**
+**Prefer to run it yourself?**
 
 ```bash
 observer start
@@ -121,7 +114,7 @@ session shows up in the dashboard with **accurate** token counts
 
 | Setting | Default | Purpose |
 |---|---|---|
-| `observer.daemon.mode` | `detect` | `detect` attaches only; `managed` spawns + kills with the editor; `auto` attaches if a daemon is running, otherwise spawns. |
+| `observer.daemon.mode` | `auto` | `auto` attaches if a daemon is running, otherwise spawns one (and only stops what it spawned); `managed` behaves the same; `detect` attaches only and never spawns. |
 | `observer.binary.path` | empty | Absolute path to override binary auto-detection. |
 | `observer.dashboard.port` | `8081` | Where the dashboard listens. |
 | `observer.proxy.port` | `8820` | Where the API reverse proxy listens. |

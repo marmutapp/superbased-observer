@@ -17,7 +17,7 @@ import (
 // resolver and optional remote controller (for the allow_terminal_view gate).
 func newProjectPanelServer(t *testing.T, resolver func(string) (string, bool), remote RemoteController) *Server {
 	t.Helper()
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}

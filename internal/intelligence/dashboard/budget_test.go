@@ -148,6 +148,65 @@ func TestHandleBudget(t *testing.T) {
 	}
 }
 
+// TestHandleBudget_DatedPricingLadder pins the same recorded → dated →
+// undated ladder in monthToDateCostByProject: a recorded row wins
+// verbatim, an unrecorded row before the synthetic boundary prices at
+// the OLD dated rate, and one after prices at the NEW/current rate —
+// all three folding into one project's month-to-date total.
+func TestHandleBudget_DatedPricingLadder(t *testing.T) {
+	server, _ := wizardTestServer(t)
+	now := time.Now().UTC()
+	boundary := now.Add(-2 * time.Hour)
+	server.opts.CostEngine = newLadderTestEngine(t, boundary)
+
+	seedLiveSession(t, server, "ladder-bud", "claude-code", now.Add(-5*time.Hour), now.Add(-30*time.Minute), 1)
+	writeBudgetConfig(t, server, 100, map[string]float64{"/live-p": 1000})
+	insertTurn := func(ts time.Time, usd float64) {
+		t.Helper()
+		if _, err := server.opts.DB.Exec(
+			`INSERT INTO api_turns (session_id, timestamp, provider, model, input_tokens, output_tokens, cost_usd)
+			 VALUES ('ladder-bud', ?, 'anthropic', ?, ?, ?, ?)`,
+			ts.Format(time.RFC3339Nano), ladderModel, ladderBundle.Input, ladderBundle.Output, usd,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertTurn(now.Add(-4*time.Hour), 9.99) // recorded — must win verbatim
+	insertTurn(now.Add(-3*time.Hour), 0)    // unrecorded, before boundary — OLD dated rate
+	insertTurn(now.Add(-1*time.Hour), 0)    // unrecorded, after boundary — NEW/current rate
+
+	rr := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/budget", nil))
+	if rr.Code != 200 {
+		t.Fatalf("status %d body=%s", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		Projects []struct {
+			Root   string  `json:"root"`
+			MTDUSD float64 `json:"mtd_usd"`
+		} `json:"projects"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	var mtd float64
+	found := false
+	for _, p := range got.Projects {
+		if p.Root == "/live-p" {
+			mtd = p.MTDUSD
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no /live-p project in response: %+v", got.Projects)
+	}
+	want := 9.99 + ladderOldCost + ladderNewCost
+	if diff := mtd - want; diff > 0.001 || diff < -0.001 {
+		t.Errorf("mtd_usd: got %f want %f (recorded=9.99 old=%.2f new=%.2f)",
+			mtd, want, ladderOldCost, ladderNewCost)
+	}
+}
+
 // TestHandleConfigSection_IntelligencePreservesBudgets pins the D14-
 // class guard: a Settings intelligence save that does NOT carry the
 // ProjectBudgetsUSD field must preserve stored budgets, while an

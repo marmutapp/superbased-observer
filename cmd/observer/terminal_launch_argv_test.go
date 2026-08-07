@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -102,5 +103,62 @@ func TestPtyLauncherArgvModePerKind(t *testing.T) {
 				t.Fatalf("continue-from argv = %v, want %v", gotContinue, tc.wantContinue)
 			}
 		})
+	}
+}
+
+// TestResolveShellArgvPrefersSHELL pins the server-derived-argv discipline: a
+// non-empty $SHELL in the daemon's OWN process env wins outright, never a
+// client-supplied value (there is no client input to this function at all).
+func TestResolveShellArgvPrefersSHELL(t *testing.T) {
+	t.Setenv("SHELL", "/usr/bin/zsh")
+	got := resolveShellArgv()
+	want := []string{"/usr/bin/zsh"}
+	if !equalArgs(got, want) {
+		t.Fatalf("resolveShellArgv() = %v, want %v", got, want)
+	}
+}
+
+// TestResolveShellArgvFallsBackToBash pins the fallback ladder when $SHELL is
+// unset: /bin/bash (present on essentially every Linux/macOS dev + CI host).
+func TestResolveShellArgvFallsBackToBash(t *testing.T) {
+	t.Setenv("SHELL", "")
+	if _, err := os.Stat("/bin/bash"); err != nil {
+		t.Skip("/bin/bash not present on this host")
+	}
+	got := resolveShellArgv()
+	want := []string{"/bin/bash"}
+	if !equalArgs(got, want) {
+		t.Fatalf("resolveShellArgv() = %v, want %v", got, want)
+	}
+}
+
+// TestPtyLauncherSpawnShellRequest pins the ptyLauncher.Spawn IsShell branch:
+// a shell request builds a SpecShell with ShellArgv from resolveShellArgv(),
+// ignoring BinPath/Subcommand/ArgvMode/SessionID entirely — the fixed,
+// server-derived argv a plain-shell launch requires (mirrors SpecSetup's
+// shape, see internal/termsession.Spec.argv()).
+func TestPtyLauncherSpawnShellRequest(t *testing.T) {
+	t.Setenv("SHELL", "/bin/dash")
+	sp := &recordingSpawner{}
+	mgr := termsession.NewManager(termsession.Options{
+		Spawner: sp, ReapInterval: time.Hour, Now: time.Now,
+	})
+	t.Cleanup(mgr.Shutdown)
+	launcher := &ptyLauncher{mgr: mgr, binPath: "/observer"}
+	req := termsvc.LaunchRequest{
+		Kind:       termrun.KindFresh,
+		Subcommand: "should-be-ignored",
+		SessionID:  "should-be-ignored",
+		IsShell:    true,
+	}
+	if _, err := launcher.Spawn(req); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	spec := sp.lastSpec()
+	if spec.Kind != termsession.SpecShell {
+		t.Fatalf("Kind = %v, want SpecShell", spec.Kind)
+	}
+	if !equalArgs(spec.ShellArgv, []string{"/bin/dash"}) {
+		t.Fatalf("ShellArgv = %v, want [/bin/dash]", spec.ShellArgv)
 	}
 }

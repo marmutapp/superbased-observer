@@ -208,7 +208,7 @@ web-org-clean:
 # so `gen` then renders the changelog page like any other docs page.
 # ---------------------------------------------------------------
 docs-build:
-	cd website/docs-tools && go run ./changeloggen -changelog ../../CHANGELOG.md -src ../docs-src -sitemap ../sitemap.xml -feed ../feed.xml
+	cd website/docs-tools && go run ./changeloggen -changelog ../../CHANGELOG.md -src ../docs-src -sitemap ../sitemap-pages.xml -feed ../feed.xml
 	cd website/docs-tools && go run ./gen -src ../docs-src -out ../docs -assets ../assets
 
 # ---------------------------------------------------------------

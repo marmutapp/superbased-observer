@@ -1000,8 +1000,28 @@ func (e *Engine) rollup(raws []rawRow, opts Options) Summary {
 	var unpricedTurnCount int
 	totalCompression := CompressionStats{}
 
+	// DATE-EFFECTIVE PRICING. This rollup is the canonical historical
+	// cost surface (`observer cost`, MCP get_cost_summary, the dashboard
+	// Cost tab, the tag rollups via SessionRowsByID) and it is already
+	// PER-ROW — the long-context dispatch has always forbidden pricing
+	// aggregated token sums. So a rate boundary inside the queried window
+	// splits itself: each row is priced at the rate in force at its own
+	// timestamp, and the buckets sum priced dollars, never tokens-then-
+	// price. No SQL-side bucketing is needed or wanted.
+	//
+	// PERF: gated on the table actually carrying a dated timeline. With
+	// zero dated entries (the default install) `dateAware` is false, no
+	// row pays a time.Parse, and every Lookup runs the pre-dated path.
+	dateAware := e.HasDatedPricing()
+
 	for _, r := range raws {
 		key := groupKey(r, opts.GroupBy)
+		// Zero when !dateAware or when the row's stamp is unparseable —
+		// both fall back to current rates (LookupAt's zero-time contract).
+		var rowAt time.Time
+		if dateAware {
+			rowAt, _ = time.Parse(time.RFC3339Nano, r.ts)
+		}
 		b, ok := buckets[key]
 		if !ok {
 			b = &bucket{
@@ -1040,7 +1060,7 @@ func (e *Engine) rollup(raws []rawRow, opts Options) Summary {
 		cost := r.recordedUSD
 		var aiCost, toolCost float64
 		if cost == 0 {
-			pricing, src, ok := e.LookupWithSource(r.model)
+			pricing, src, ok := e.LookupWithSourceAt(r.model, rowAt)
 			if !ok {
 				b.unknownModels[r.model] = true
 				totalUnknowns[r.model] = true
@@ -1076,7 +1096,7 @@ func (e *Engine) rollup(raws []rawRow, opts Options) Summary {
 		// rate. The pill (service_tier on the action row) still surfaces the
 		// requested tier for those models.
 		if r.tokens.Fast {
-			if p, ok := e.Lookup(r.model); ok && p.FastMultiplier > 0 {
+			if p, ok := e.LookupAt(r.model, rowAt); ok && p.FastMultiplier > 0 {
 				b.fastTurnCount++
 				b.fastCost += cost
 				totalFastTurns++
@@ -1099,7 +1119,7 @@ func (e *Engine) rollup(raws []rawRow, opts Options) Summary {
 				savedBytes = 0
 			}
 			r.compression.TokensSavedEst = savedBytes / 4 // ~4 chars/token
-			if pricing, ok := e.Lookup(r.model); ok && pricing.Input > 0 {
+			if pricing, ok := e.LookupAt(r.model, rowAt); ok && pricing.Input > 0 {
 				// V7-6 weighted blend: pre-v1.7.6 cost_saved_usd_est
 				// used pricing.Input flat, which overstated codex
 				// savings ~10× because codex sessions are cache_read-

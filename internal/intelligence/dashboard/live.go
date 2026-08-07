@@ -157,13 +157,13 @@ func (s *Server) attachLiveRollup(r *http.Request, ls *liveSession) {
 		combined AS (
 			SELECT at.model, at.input_tokens, at.output_tokens, at.cache_read_tokens,
 			       at.cache_creation_tokens, at.cache_creation_1h_tokens,
-			       0 AS reasoning_tokens, at.web_search_requests, at.cost_usd
+			       0 AS reasoning_tokens, at.web_search_requests, at.cost_usd, at.timestamp
 			FROM api_turns at
 			WHERE at.session_id = ?
 			UNION ALL
 			SELECT tu.model, tu.input_tokens, tu.output_tokens, tu.cache_read_tokens,
 			       tu.cache_creation_tokens, tu.cache_creation_1h_tokens,
-			       tu.reasoning_tokens, tu.web_search_requests, tu.estimated_cost_usd
+			       tu.reasoning_tokens, tu.web_search_requests, tu.estimated_cost_usd, tu.timestamp
 			FROM token_usage tu
 			WHERE tu.session_id = ?
 			  AND (tu.source_event_id IS NULL OR tu.source_event_id = ''
@@ -173,7 +173,7 @@ func (s *Server) attachLiveRollup(r *http.Request, ls *liveSession) {
 		       COALESCE(input_tokens, 0), COALESCE(output_tokens, 0),
 		       COALESCE(cache_read_tokens, 0), COALESCE(cache_creation_tokens, 0),
 		       COALESCE(cache_creation_1h_tokens, 0), COALESCE(reasoning_tokens, 0),
-		       COALESCE(web_search_requests, 0), COALESCE(cost_usd, 0)
+		       COALESCE(web_search_requests, 0), COALESCE(cost_usd, 0), COALESCE(timestamp, '')
 		FROM combined`,
 		ls.SessionID, ls.SessionID, ls.SessionID)
 	if err != nil {
@@ -186,10 +186,11 @@ func (s *Server) attachLiveRollup(r *http.Request, ls *liveSession) {
 			model  string
 			bundle cost.TokenBundle
 			rec    float64
+			tsStr  string
 		)
 		if rows.Scan(&model, &bundle.Input, &bundle.Output,
 			&bundle.CacheRead, &bundle.CacheCreation, &bundle.CacheCreation1h,
-			&bundle.Reasoning, &bundle.WebSearchRequests, &rec) != nil {
+			&bundle.Reasoning, &bundle.WebSearchRequests, &rec, &tsStr) != nil {
 			continue
 		}
 		ls.Turns++
@@ -200,11 +201,14 @@ func (s *Server) attachLiveRollup(r *http.Request, ls *liveSession) {
 		if model != "" {
 			models[model] = true
 		}
+		// Date-effective pricing ladder: recorded cost wins; otherwise
+		// price at the rate in force on the row's own timestamp.
 		switch {
 		case rec > 0:
 			ls.CostUSD += rec
 		case s.opts.CostEngine != nil:
-			if p, ok := s.opts.CostEngine.Lookup(model); ok {
+			ts, _ := time.Parse(time.RFC3339Nano, tsStr)
+			if p, ok := s.opts.CostEngine.LookupAt(model, ts); ok {
 				ls.CostUSD += cost.Compute(p, bundle)
 			}
 		}

@@ -22,7 +22,7 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 DOCS_SRC="website/docs-src"
-SITEMAP="website/sitemap.xml"
+SITEMAP="website/sitemap-pages.xml"
 
 if [ ! -d "$DOCS_SRC/track" ]; then
     echo "verify-track-build: missing $DOCS_SRC/track" >&2
@@ -35,7 +35,13 @@ trap 'rm -rf "$tmpdir"' EXIT
 cp -r "$DOCS_SRC" "$tmpdir/docs-src"
 cp "$SITEMAP" "$tmpdir/sitemap.xml"
 
+# -date-src points at the REAL tree. <lastmod> comes from each page's git
+# history, and the scratch copy above has none — without this every page falls
+# back to today's date, so the gate compares real commit dates against today
+# and fails every day regardless of whether anything drifted. The scratch copy
+# still does its job: nothing here writes to the working tree.
 go run ./website/track-gen -docs-src "$tmpdir/docs-src" -sitemap "$tmpdir/sitemap.xml" \
+    -date-src "$DOCS_SRC" \
     || { echo "verify-track-build: track-gen failed" >&2; exit 1; }
 
 fail=0

@@ -20,7 +20,7 @@ import { DataTable, Pagination } from "@/components/DataTable";
 import { ChartState } from "@/components/ChartState";
 import { SessionDetailPanel } from "@/components/SessionDetailPanel";
 import { TagPill } from "@/components/TagPill";
-import { FavoriteStar, TagEditor } from "@/components/TagEditor";
+import { FavoriteStar, RatingStars, TagEditor } from "@/components/TagEditor";
 import { postSessionTags } from "@/lib/api";
 import { useFilters, windowDaysApprox, windowParams } from "@/lib/filters";
 import { useApi } from "@/lib/useApi";
@@ -140,7 +140,10 @@ export function SessionsPage() {
   // replaced by the server's post-mutation truth on success and reverted on
   // failure, so it never drifts from the backend.
   const [annotations, setAnnotations] = useState<
-    Record<string, { tags?: string[]; favorite?: boolean; has_note?: boolean }>
+    Record<
+      string,
+      { tags?: string[]; favorite?: boolean; has_note?: boolean; rating?: number }
+    >
   >({});
   const addTagFilter = (tag: string) => {
     setTagFilters((cur) => (cur.includes(tag) ? cur : [...cur, tag]));
@@ -285,7 +288,7 @@ export function SessionsPage() {
   // patchAnnotation records an optimistic (or server-confirmed) override.
   const patchAnnotation = (
     id: string,
-    patch: { tags?: string[]; favorite?: boolean; has_note?: boolean },
+    patch: { tags?: string[]; favorite?: boolean; has_note?: boolean; rating?: number },
   ) => {
     setAnnotations((cur) => ({ ...cur, [id]: { ...cur[id], ...patch } }));
   };
@@ -301,10 +304,30 @@ export function SessionsPage() {
         favorite: r.favorite,
         tags: r.tags,
         has_note: (r.note ?? "") !== "",
+        rating: r.rating,
       });
       tagRollup.reload();
     } catch {
       patchAnnotation(row.id, { favorite: before });
+    }
+  };
+
+  // setRating writes the 1-10 overall score optimistically (0 = clear), then
+  // reconciles against the server's reply; a failed POST reverts to the
+  // pre-click value.
+  const setRating = async (row: SessionRow, next: number) => {
+    const before = row.rating ?? 0;
+    patchAnnotation(row.id, { rating: next });
+    try {
+      const r = await postSessionTags(row.id, { rating: next });
+      patchAnnotation(row.id, {
+        rating: r.rating,
+        favorite: r.favorite,
+        tags: r.tags,
+        has_note: (r.note ?? "") !== "",
+      });
+    } catch {
+      patchAnnotation(row.id, { rating: before });
     }
   };
 
@@ -417,6 +440,7 @@ export function SessionsPage() {
     () =>
       buildColumns(showScoring, liveSet, activeSet, setWatch, {
         onToggleFavorite: (r) => void toggleFavorite(r),
+        onSetRating: (r, rating) => void setRating(r, rating),
         onTagClick: addTagFilter,
         onTagsChange: (id, tags) => {
           patchAnnotation(id, { tags });
@@ -635,6 +659,7 @@ export function SessionsPage() {
             tags: next.tags,
             favorite: next.favorite,
             has_note: (next.note ?? "") !== "",
+            rating: next.rating,
           });
           tagRollup.reload();
         }}
@@ -976,6 +1001,7 @@ function nextDay(d: Date): Date {
 // as one object so buildColumns doesn't grow a fourth positional callback.
 type TagsCtx = {
   onToggleFavorite: (row: SessionRow) => void;
+  onSetRating: (row: SessionRow, rating: number) => void;
   onTagClick: (tag: string) => void;
   onTagsChange: (sessionId: string, tags: string[]) => void;
 };
@@ -1006,6 +1032,24 @@ function buildColumns(
         <FavoriteStar
           favorite={row.original.favorite === true}
           onToggle={() => tagsCtx.onToggleFavorite(row.original)}
+        />
+      ),
+    },
+    {
+      // Overall 1-10 rating. Server-sortable (sort_by=rating) so "best/worst
+      // first" orders the WHOLE filtered set, not just the loaded page —
+      // sort_dir=asc surfaces the worst-rated sessions (unrated sink to the top).
+      id: "rating",
+      header: () => (
+        <span title="Overall session rating (1-10)">Rating</span>
+      ),
+      accessorFn: (r) => r.rating ?? 0,
+      cell: ({ row }) => (
+        <RatingStars
+          rating={row.original.rating ?? 0}
+          onRate={(next) => tagsCtx.onSetRating(row.original, next)}
+          size={12}
+          showValue={false}
         />
       ),
     },

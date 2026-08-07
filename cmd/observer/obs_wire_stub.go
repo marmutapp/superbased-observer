@@ -69,7 +69,7 @@ func newObsTraceHandler(_ context.Context, _ config.Config, _ *sql.DB, _ *slog.L
 }
 
 // obsDashboardRoutes is the no_obs stub: no obs trajectory endpoints exist.
-func obsDashboardRoutes(_ context.Context, _ config.Config, _ *sql.DB, _ *slog.Logger) []dashboard.ExtraRoute {
+func obsDashboardRoutes(_ context.Context, _ config.Config, _ string, _ *sql.DB, _ *slog.Logger) []dashboard.ExtraRoute {
 	return nil
 }
 

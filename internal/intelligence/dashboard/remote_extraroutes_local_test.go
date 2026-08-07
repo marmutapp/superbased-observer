@@ -18,7 +18,7 @@ func noopHandler(http.ResponseWriter, *http.Request) {}
 // accepted.
 func TestExtraRoutesLocalPropagation(t *testing.T) {
 	rc, _ := newReadyRemoteController(t)
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -97,6 +97,17 @@ var DefaultCrossOSToolBasenames = map[string][]string{
 	// here misattributes an unrelated process to a session (cwd + the
 	// time window are the only other discriminators).
 	"command-code": {"command-code.exe", "command-code", "commandcode.exe", "commandcode", "node.exe", "node"},
+	// Meta Muse Code (2026-08-06): Linux/macOS only — the launcher platform
+	// table has no Windows build, so no .exe names exist to ground. The
+	// `muse` shell launcher execs a versioned native Rust ELF
+	// (muse-bin-<version>), hence the glob (codex-command-runner-* precedent);
+	// native binary rule: no node/python.
+	"muse": {"muse", "muse-bin-*"},
+	// Prime Intellect Prime Agent (2026-08-06): npm package `prime-agent`
+	// whose bin entry loads the same node bundle on every platform (the
+	// command-code/cline-cli/crush precedent), so node belongs here —
+	// Windows gets a .cmd shim, the real process is node.
+	"prime-agent": {"prime-agent.exe", "prime-agent", "node.exe", "node"},
 }
 
 // DefaultCrossOSToolLaunchers maps a session tool to the branded IDE/desktop
@@ -203,6 +214,11 @@ var DefaultRefreshLauncherBasenames = map[string]bool{
 	"command-code":     true,
 	"commandcode.exe":  true,
 	"commandcode":      true,
+	// prime-agent (2026-08-06): npm bin alias, distinctive enough to match on
+	// name alone (unlike `pi`, excluded below) — the generic node/node.exe the
+	// shim also presents is deliberately not added, same rule as command-code.
+	"prime-agent.exe": true,
+	"prime-agent":     true,
 	// NOTE: roo-code (node-only, no branded launcher), pi (`pi` too short/
 	// generic to match on name alone without the cwd guard), and cowork (claude
 	// launcher already covered) are intentionally NOT added here — they still

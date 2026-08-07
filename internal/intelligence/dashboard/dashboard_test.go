@@ -25,7 +25,7 @@ import (
 func newTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +297,7 @@ func TestAPIStatusCarriesHostOS(t *testing.T) {
 
 func TestAPICodexSupport_ChatGPTJSONLOnly(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,7 +357,7 @@ func TestAPICodexSupport_ChatGPTJSONLOnly(t *testing.T) {
 
 func TestAPICodexSupport_ChatGPTProxyUnlinked(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +420,7 @@ func TestAPICodexSupport_ChatGPTProxyUnlinked(t *testing.T) {
 
 func TestAPICodexSupport_ProxyLinked(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -494,7 +494,7 @@ func TestAPICost_Shape(t *testing.T) {
 // block and at least one row's compression.original_bytes > 0.
 func TestAPICost_TotalCompression(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -564,7 +564,7 @@ func TestAPICost_TotalCompression(t *testing.T) {
 // the new "Recent compression events" table on the Compression tab.
 func TestAPICompressionEvents(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -673,7 +673,7 @@ func TestAPICompressionEvents(t *testing.T) {
 // rollup shape — feeds the "Savings by mechanism" stacked-bar chart.
 func TestAPICompressionTimeseries(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -774,7 +774,7 @@ func approxEqual(a, b, eps float64) bool {
 // Pins the contract behind the action-type-mix chart on Tools tab.
 func TestAPIToolsBreakdown(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -914,7 +914,7 @@ func TestAPIToolsBreakdown(t *testing.T) {
 // Pins the new headline metrics on the redesigned Compression tab.
 func TestAPICost_CompressionSavingsDerived(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -981,7 +981,7 @@ func TestAPICost_CompressionSavingsDerived(t *testing.T) {
 // columns and the cost-summary line.
 func TestAPICost_TokenMathReconciles(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1524,7 +1524,7 @@ func TestAPISessions_ProjectFilter(t *testing.T) {
 // still showed 60+ day old rows.
 func TestAPISessions_DaysFilter(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1588,7 +1588,7 @@ func TestAPISessions_DaysFilter(t *testing.T) {
 // honored as an upper bound.
 func TestAPIActions_WindowContract(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1698,7 +1698,7 @@ func TestAPIActions_WindowContract(t *testing.T) {
 // excluded.
 func TestAPISessions_WindowIncludesRecentActivityOnOldSession(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1778,7 +1778,7 @@ func TestAPISessions_WindowIncludesRecentActivityOnOldSession(t *testing.T) {
 // expensive session even though it started oldest (last by the default order).
 func TestAPISessions_SortByCostIsGlobalAcrossPages(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2002,7 +2002,7 @@ func TestAPISessionDetail(t *testing.T) {
 // note explaining the empty bill — and never fabricates a cost.
 func TestAPISessionDetail_CursorContextBudget(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2066,7 +2066,7 @@ func TestAPISessionDetail_CursorContextBudget(t *testing.T) {
 // and when sessions.model IS set it must win over the fallback.
 func TestAPISessionDetail_ModelFallsBackToTokenUsage(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2152,7 +2152,7 @@ func TestAPISessionDetail_ModelFallsBackToTokenUsage(t *testing.T) {
 // detail endpoint. The COALESCE(...,0) fix must let it render 200 with tokens.
 func TestAPISessionDetail_ZeroActionsWithTokens(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2221,7 +2221,7 @@ func TestAPISessionDetail_ZeroActionsWithTokens(t *testing.T) {
 // engine.Compute, so it lands non-zero.
 func TestAPISessionDetail_CostSurvivesUnattributedProxy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2312,7 +2312,7 @@ func TestAPISessionDetail_CostSurvivesUnattributedProxy(t *testing.T) {
 // surface as their own message rows.
 func TestAPISessionMessages_GroupsByMessageID(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2452,7 +2452,7 @@ func TestAPISessionMessages_GroupsByMessageID(t *testing.T) {
 // unchanged.
 func TestAPISessionMessages_BrowserChatInlineBody(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2638,7 +2638,7 @@ func TestAPISessionMessages_BrowserChatInlineBody(t *testing.T) {
 // event surfaces as its own row.
 func TestAPISessionMessages_CodexTurnVsInferenceGrouping(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2773,7 +2773,7 @@ func TestAPISessionMessages_CodexTurnVsInferenceGrouping(t *testing.T) {
 // threshold even though each underlying turn stayed below it.
 func TestAPISessionMessages_LongContextPerTurn(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2853,7 +2853,7 @@ func TestAPISessionMessages_LongContextPerTurn(t *testing.T) {
 // row must render first in the timeline.
 func TestAPISessionMessages_TieBreakUserBeforeAssistant(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2925,7 +2925,7 @@ func TestAPISessionMessages_TieBreakUserBeforeAssistant(t *testing.T) {
 // and reports null.
 func TestAPISessionMessages_ElapsedMs(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3010,7 +3010,7 @@ func TestAPISessionMessages_ElapsedMs(t *testing.T) {
 // wall-clock ElapsedMs). Exposes per-tool-call duration_ms too.
 func TestAPISessionMessages_ToolDurationMs(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3097,7 +3097,7 @@ func TestAPISessionMessages_ToolDurationMs(t *testing.T) {
 // session.
 func TestAPISessionDetail_PerTurnDedup_GapFillAndPerModel(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3240,7 +3240,7 @@ func TestAPISessionDetail_PerTurnDedup_GapFillAndPerModel(t *testing.T) {
 // double-counted numbers).
 func TestAPISessionDetail_CodexShapeDedup(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3352,7 +3352,7 @@ func TestAPISessionDetail_CodexShapeDedup(t *testing.T) {
 // and silently under-counted whenever 1h-tier traffic appeared.
 func TestAPISessionDetail_CacheCreation1hTier(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3459,7 +3459,7 @@ func TestAPISessionDetail_CacheCreation1hTier(t *testing.T) {
 // regressed in, the cost would be 300K × $6 / 1M = $1.80.
 func TestAPISessionDetail_LongContextPerTurn(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3567,7 +3567,7 @@ func TestAPISessionDetail_LongContextPerTurn(t *testing.T) {
 // chart reads chronologically left-to-right.
 func TestAPITimeseriesCost_Chronological(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3639,7 +3639,7 @@ func TestAPITimeseriesCost_Chronological(t *testing.T) {
 // dedup applies (proxy preferred over JSONL for the same session).
 func TestAPITimeseriesTokensByModel(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3805,7 +3805,7 @@ func TestAPIDiscover(t *testing.T) {
 // are unchanged.
 func TestAPIActions_MetadataFilters(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3923,7 +3923,7 @@ func TestAPIActions_MetadataFilters(t *testing.T) {
 // Copilot's agent_response).
 func TestAPIActions_AssistantTextFilter(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4024,7 +4024,7 @@ func TestAPIActions_AssistantTextFilter(t *testing.T) {
 // (no filter, project-only, tool-only, both) matrix.
 func TestAPIPatterns_ToolFilter(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4365,7 +4365,7 @@ func TestAPIActionFullText(t *testing.T) {
 // every sub-day cost bucket rendered $0 even when turns had a stored cost.
 func TestAPITimeseriesCost_HourBucketCost(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4421,7 +4421,7 @@ func TestAPITimeseriesCost_HourBucketCost(t *testing.T) {
 // unioned count subqueries must each apply the exclusive upper bound.
 func TestAPIStatusScoped_HonorsUntil(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4500,7 +4500,7 @@ func TestAPIStatusScoped_HonorsUntil(t *testing.T) {
 // only received Days — so hours=1 returned 1h counts alongside 30d costs.
 func TestAPISessionsCalendar_CostHonorsWindow(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4592,7 +4592,7 @@ func TestAPISessionsCalendar_CostHonorsWindow(t *testing.T) {
 // actually AFTER `until` must NOT leak into a bounded window.
 func TestAPISessions_UntilBoundsActivityExists(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4658,7 +4658,7 @@ func TestAPISessions_UntilBoundsActivityExists(t *testing.T) {
 // resolution.
 func TestAPIActions_MalformedUntilKeepsToDate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4722,7 +4722,7 @@ func TestAPIActions_MalformedUntilKeepsToDate(t *testing.T) {
 // the resolved bucket.
 func TestAPICompressionTimeseries_BucketHour(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}

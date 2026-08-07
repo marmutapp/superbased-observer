@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/marmutapp/superbased-observer/internal/config"
 	"github.com/marmutapp/superbased-observer/internal/intelligence/dashboard"
 	"github.com/marmutapp/superbased-observer/internal/platform/crossmount"
 	"github.com/marmutapp/superbased-observer/internal/termsvc"
@@ -172,5 +173,93 @@ func TestDashResolveEnvTTL(t *testing.T) {
 	dashResolveEnv()
 	if builds != 2 {
 		t.Fatalf("expected a rebuild past TTL, got %d builds", builds)
+	}
+}
+
+// TestTerminalLaunchPolicyAllowShell pins terminalLaunchPolicy's AllowShell
+// wiring: it requires BOTH [terminal].enabled and [terminal.launch].allow_shell,
+// and is independent of allow_fresh_agent — mirroring AllowFresh's own
+// enabled-AND-opt-in gate, but as a SEPARATE opt-in (CLAUDE.md's "additive, not
+// invasive" — a bare shell must not ride in on the AI-tool fresh-launch flag).
+func TestTerminalLaunchPolicyAllowShell(t *testing.T) {
+	tests := []struct {
+		name            string
+		enabled         bool
+		allowFreshAgent bool
+		allowShell      bool
+		wantAllowFresh  bool
+		wantAllowShell  bool
+	}{
+		{"terminal disabled denies both regardless of opt-ins", false, true, true, false, false},
+		{"enabled, neither opt-in set", true, false, false, false, false},
+		{"enabled, fresh-agent only", true, true, false, true, false},
+		{"enabled, shell only", true, false, true, false, true},
+		{"enabled, both opt-ins", true, true, true, true, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tc2 := config.TerminalConfig{Enabled: tc.enabled}
+			tc2.Launch.AllowFreshAgent = tc.allowFreshAgent
+			tc2.Launch.AllowShell = tc.allowShell
+			got := terminalLaunchPolicy(tc2)
+			if got.AllowFresh != tc.wantAllowFresh {
+				t.Errorf("AllowFresh = %v, want %v", got.AllowFresh, tc.wantAllowFresh)
+			}
+			if got.AllowShell != tc.wantAllowShell {
+				t.Errorf("AllowShell = %v, want %v", got.AllowShell, tc.wantAllowShell)
+			}
+		})
+	}
+}
+
+// TestMapFreshErrShellDisabled pins the error-translation seam: termsvc's
+// ErrShellLaunchDisabled maps onto the dashboard's own sentinel, the same way
+// every other termsvc fresh-launch authorization error does, so
+// handleTerminalLaunch's switch (which only knows the dashboard sentinels)
+// renders it as an honest 403 naming the missing config knob.
+func TestMapFreshErrShellDisabled(t *testing.T) {
+	got := mapFreshErr(termsvc.ErrShellLaunchDisabled)
+	if !errors.Is(got, dashboard.ErrLaunchShellDisabled) {
+		t.Fatalf("mapFreshErr(ErrShellLaunchDisabled) = %v, want ErrLaunchShellDisabled", got)
+	}
+}
+
+// TestCreateFreshShellRequest pins launchManagerAdapter.CreateFresh's Shell
+// plumbing end to end: a shell request is authorized by AllowShell alone (no
+// AllowedTools entry needed — termsvc.ShellTool is deliberately never a member
+// of that list), and the resulting LaunchRequest reaching the Launcher carries
+// IsShell=true with the reserved pseudo-tool as its Tool label.
+func TestCreateFreshShellRequest(t *testing.T) {
+	lau := &recordingLauncher{}
+	svc := termsvc.New(termsvc.Options{
+		Recorder: assembledRecorder{},
+		Launcher: lau,
+		Policy: termsvc.Policy{
+			AllowShell: true,
+			// Deliberately no AllowFresh / AllowedTools — proves shell
+			// authorization does not need the AI-tool fresh-launch gate.
+		},
+	})
+	a := &launchManagerAdapter{svc: svc}
+
+	if _, err := a.CreateFresh(dashboard.FreshLaunchSpec{
+		Tool:  termsvc.ShellTool,
+		Shell: true,
+	}); err != nil {
+		t.Fatalf("CreateFresh shell: %v", err)
+	}
+	if !lau.last.IsShell {
+		t.Errorf("LaunchRequest.IsShell = false, want true: %+v", lau.last)
+	}
+	if lau.last.Tool != termsvc.ShellTool {
+		t.Errorf("LaunchRequest.Tool = %q, want %q", lau.last.Tool, termsvc.ShellTool)
+	}
+
+	// Without AllowShell, the same request is denied even though it needs no
+	// tool allow-list entry.
+	svc2 := termsvc.New(termsvc.Options{Recorder: assembledRecorder{}, Launcher: lau})
+	a2 := &launchManagerAdapter{svc: svc2}
+	if _, err := a2.CreateFresh(dashboard.FreshLaunchSpec{Tool: termsvc.ShellTool, Shell: true}); !errors.Is(err, dashboard.ErrLaunchShellDisabled) {
+		t.Fatalf("CreateFresh shell (disabled) err = %v, want ErrLaunchShellDisabled", err)
 	}
 }

@@ -332,7 +332,7 @@ func TestLoadCacheAnnotationsByKey_EmptyKeys(t *testing.T) {
 func TestLoadCacheAnnotationsByKey_AggregatesPerKey(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "cost.db")})
+	database, err := openTestDB(ctx, db.Options{Path: filepath.Join(t.TempDir(), "cost.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,7 +443,7 @@ func TestCollapseTier(t *testing.T) {
 func TestLoadOverviewEvents_FiltersScopeRows(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "cache.db")})
+	database, err := openTestDB(ctx, db.Options{Path: filepath.Join(t.TempDir(), "cache.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -534,7 +534,7 @@ func TestLoadOverviewEvents_FiltersScopeRows(t *testing.T) {
 func TestLoadCacheEvents_PagesAndFilters(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "ev.db")})
+	database, err := openTestDB(ctx, db.Options{Path: filepath.Join(t.TempDir(), "ev.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -622,7 +622,7 @@ func TestLoadCacheEvents_PagesAndFilters(t *testing.T) {
 func TestLoadCacheEntryStates_GroupsByState(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "es.db")})
+	database, err := openTestDB(ctx, db.Options{Path: filepath.Join(t.TempDir(), "es.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -681,7 +681,7 @@ func TestLoadCacheEntryStates_GroupsByState(t *testing.T) {
 func TestLoadCacheHealthSummary_HeadlineSignals(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "h.db")})
+	database, err := openTestDB(ctx, db.Options{Path: filepath.Join(t.TempDir(), "h.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -757,7 +757,7 @@ func TestLoadCacheHealthSummary_HeadlineSignals(t *testing.T) {
 func TestLoadCacheHealthSummary_UntrackedProvider(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "up.db")})
+	database, err := openTestDB(ctx, db.Options{Path: filepath.Join(t.TempDir(), "up.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -823,7 +823,7 @@ func TestLoadCacheHealthSummary_UntrackedProvider(t *testing.T) {
 func TestLoadCacheTimeseries_BucketsByDay(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "ts.db")})
+	database, err := openTestDB(ctx, db.Options{Path: filepath.Join(t.TempDir(), "ts.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -902,7 +902,7 @@ func TestLoadCacheTimeseries_BucketsByDay(t *testing.T) {
 func TestLoadCacheHealthSummary_ImplicitCache(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "impl.db")})
+	database, err := openTestDB(ctx, db.Options{Path: filepath.Join(t.TempDir(), "impl.db")})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -206,7 +206,22 @@ jobs:
     name: track page drift
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 is LOAD-BEARING for this job alone. Each track page's
+      # sitemap <lastmod> is derived from `git log -1 --format=%cs -- <file>`
+      # (website/track-gen/main.go). actions/checkout defaults to a depth-1
+      # clone, where that command reports the TIP commit's date for every
+      # path — so every page dates to "today", the gate compares those against
+      # the real commit dates in the committed sitemap, and fails. It would
+      # fail every day, on every branch, whatever the content, while passing
+      # locally where the history is complete.
+      #
+      # This is a SECOND cause behind the same symptom that 6602276d fixed:
+      # that commit stopped the generator reading history from a scratch copy
+      # outside the working tree (where git returns nothing at all). Both had
+      # to be fixed; either one alone still leaves the gate red on CI.
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version-file: 'go.mod'

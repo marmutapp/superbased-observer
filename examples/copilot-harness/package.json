@@ -1,0 +1,16 @@
+{
+  "name": "acme-copilot-harness",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal employee-copilot harness for SuperBased Observer Plane-A governance (admission + egress + trajectories).",
+  "scripts": {
+    "start": "node app.mjs"
+  },
+  "optionalDependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.53.0",
+    "@opentelemetry/resources": "^1.26.0",
+    "@opentelemetry/sdk-trace-node": "^1.26.0"
+  }
+}

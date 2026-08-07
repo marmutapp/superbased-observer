@@ -299,7 +299,7 @@ func newStartCmd() *cobra.Command {
 					// D4: the generalized-observability subsystem registers
 					// its /api/obs/* trajectory endpoints here (the single
 					// host->obs seam; nil when disabled or under no_obs).
-					ExtraRoutes: obsDashboardRoutes(ctx, cfg, database, slog.Default()),
+					ExtraRoutes: obsDashboardRoutes(ctx, cfg, configPath, database, slog.Default()),
 					// Embedded web-terminal launcher (docs/session-handoff.md
 					// launch section). Nil when [handoff].allow_dashboard_launch
 					// is false → endpoints 503, button hidden.

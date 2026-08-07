@@ -19,7 +19,7 @@ import (
 func TestStorageEndpoint(t *testing.T) {
 	tdir := t.TempDir()
 	dbPath := filepath.Join(tdir, "observer.db")
-	database, err := db.Open(context.Background(), db.Options{Path: dbPath})
+	database, err := openTestDB(context.Background(), db.Options{Path: dbPath})
 	if err != nil {
 		t.Fatal(err)
 	}

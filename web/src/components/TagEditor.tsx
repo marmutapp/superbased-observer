@@ -160,6 +160,105 @@ export function FavoriteStar({
   );
 }
 
+// MAX_RATING is the top of the 1..MAX_RATING overall-session-rating scale,
+// mirroring internal/store/sessiontags.go::MaxRating. 0 is "unrated".
+export const MAX_RATING = 10;
+
+// RatingStars — the overall "how well did this session perform" score, a row of
+// MAX_RATING stars. Purely presentational like FavoriteStar: the caller owns the
+// optimistic update + POST, so the same control works in a table cell and in the
+// detail panel header. Clicking star N sets the rating to N; clicking the star
+// that already equals the current rating clears it (back to unrated). Hover
+// previews the value.
+//
+// The remote gate is resolved HERE (canClassifySessions) so no call site can
+// forget it — the classification POST is Execute-class and unreachable from a
+// paired device. The stars still RENDER remotely (showing the score); they just
+// can't be changed.
+export function RatingStars({
+  rating,
+  onRate,
+  size = 13,
+  showValue = true,
+  className,
+}: {
+  rating: number;
+  onRate: (next: number) => void;
+  size?: number;
+  showValue?: boolean;
+  className?: string;
+}) {
+  const blocked = !canClassifySessions();
+  // hover previews a candidate score without committing; 0 = not hovering.
+  const [hover, setHover] = useState(0);
+  const shown = hover || rating;
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Overall session rating"
+      className={clsx("inline-flex items-center gap-0.5", className)}
+      onMouseLeave={() => setHover(0)}
+    >
+      {Array.from({ length: MAX_RATING }, (_, i) => {
+        const value = i + 1;
+        const filled = value <= shown;
+        return (
+          <button
+            key={value}
+            type="button"
+            role="radio"
+            aria-checked={rating === value}
+            aria-label={`Rate ${value} out of ${MAX_RATING}`}
+            disabled={blocked}
+            title={
+              blocked
+                ? CLASSIFY_REMOTE_BLOCKED_MSG
+                : rating === value
+                  ? `Rated ${value}/${MAX_RATING} — click to clear`
+                  : `Rate ${value}/${MAX_RATING}`
+            }
+            onMouseEnter={() => {
+              if (!blocked) setHover(value);
+            }}
+            onFocus={() => {
+              if (!blocked) setHover(value);
+            }}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (blocked) return;
+              // Toggle-off: re-picking the current score clears the rating.
+              onRate(rating === value ? 0 : value);
+            }}
+            className={clsx(
+              "inline-grid place-items-center rounded-1 p-px transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)]",
+              filled ? "text-warn" : "text-fg-4 hover:text-fg-2",
+              blocked && "cursor-not-allowed opacity-60",
+            )}
+          >
+            <svg
+              width={size}
+              height={size}
+              viewBox="0 0 16 16"
+              fill={filled ? "currentColor" : "none"}
+              stroke="currentColor"
+              strokeWidth="1.4"
+              strokeLinejoin="round"
+              aria-hidden
+            >
+              <path d="M8 1.8 10 6l4.4.5-3.3 3 .9 4.4L8 11.7 4 13.9l.9-4.4-3.3-3L6 6z" />
+            </svg>
+          </button>
+        );
+      })}
+      {showValue && rating > 0 && (
+        <span className="ml-1 font-mono text-[10px] tabular-nums text-fg-3">
+          {rating}/{MAX_RATING}
+        </span>
+      )}
+    </div>
+  );
+}
+
 // TagEditor renders its own trigger button and an anchored popover. It
 // portals to <body> (the Sessions table's overflow-x-auto wrapper would
 // otherwise clip it) and registers the portal root with the terminal

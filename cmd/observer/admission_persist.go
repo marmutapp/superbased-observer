@@ -63,7 +63,7 @@ type admissionEditorCriterion struct {
 // edited [observability.admission] policy, and writes through config.WriteToml
 // — the one config-write owner (atomic temp-file + rename, prior file kept as
 // .bak). CLAUDE.md #4: one owner per config write.
-func admissionPolicyPersister() func(ctx context.Context, policyJSON []byte) error {
+func admissionPolicyPersister(configPath string) func(ctx context.Context, policyJSON []byte) error {
 	return func(_ context.Context, policyJSON []byte) error {
 		var p admissionEditorPolicy
 		if err := json.Unmarshal(policyJSON, &p); err != nil {
@@ -80,7 +80,7 @@ func admissionPolicyPersister() func(ctx context.Context, policyJSON []byte) err
 		// CLI writers remain unserialized — an accepted limitation documented on
 		// WithConfigLock (flock is the future upgrade).
 		return config.WithConfigLock(func() error {
-			path, err := resolveAdmissionConfigPath("")
+			path, err := resolveAdmissionConfigPath(configPath)
 			if err != nil {
 				return fmt.Errorf("admissionPolicyPersister: resolve config path: %w", err)
 			}

@@ -17,7 +17,7 @@ import (
 func newCacheStatusServer(t *testing.T, cw config.CacheWarmConfig, seed bool) *Server {
 	t.Helper()
 	tdir := t.TempDir()
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}

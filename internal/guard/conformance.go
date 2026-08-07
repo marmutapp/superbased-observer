@@ -111,6 +111,16 @@ func ConformanceMatrix() []ConformanceEntry {
 		// guard surface — exactly the F2 coverage this table makes
 		// visible rather than hiding.
 		models.ToolDroid, models.ToolOpenInterpreter, models.ToolCommandCode,
+		// muse (2026-08-06): watcher-path adapter (event-sourced JSONL
+		// tail); registry Hook is HookNone (the binary carries a hook
+		// vocabulary but no receiver exists), so the post-hoc watcher
+		// row is its only guard surface.
+		models.ToolMuse,
+		// prime-agent (2026-08-06): watcher-path adapter (JSONL tail of
+		// the pi-fork session envelope); registry Hook is HookNone, so
+		// the post-hoc watcher row is its only guard surface — same
+		// shape as muse.
+		models.ToolPrimeAgent,
 	} {
 		entries = append(entries, watcherEntry(client))
 	}

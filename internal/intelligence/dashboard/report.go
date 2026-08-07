@@ -119,14 +119,16 @@ func (s *Server) handleReportMonthly(w http.ResponseWriter, r *http.Request) {
 			SELECT at.session_id, at.model, at.input_tokens, at.output_tokens,
 			       at.cache_read_tokens, at.cache_creation_tokens, at.cache_creation_1h_tokens,
 			       0 AS reasoning_tokens, at.web_search_requests, at.cost_usd,
-			       COALESCE(at.compression_original_bytes, 0) - COALESCE(at.compression_compressed_bytes, 0) AS comp_saved
+			       COALESCE(at.compression_original_bytes, 0) - COALESCE(at.compression_compressed_bytes, 0) AS comp_saved,
+			       at.timestamp
 			FROM api_turns at
 			WHERE at.timestamp >= ? AND at.timestamp < ?
 			  AND (at.error_class IS NULL OR at.error_class = '')
 			UNION ALL
 			SELECT tu.session_id, tu.model, tu.input_tokens, tu.output_tokens,
 			       tu.cache_read_tokens, tu.cache_creation_tokens, tu.cache_creation_1h_tokens,
-			       tu.reasoning_tokens, tu.web_search_requests, tu.estimated_cost_usd, 0
+			       tu.reasoning_tokens, tu.web_search_requests, tu.estimated_cost_usd, 0,
+			       tu.timestamp
 			FROM token_usage tu
 			WHERE tu.timestamp >= ? AND tu.timestamp < ?
 			  AND (tu.source_event_id IS NULL OR tu.source_event_id = ''
@@ -137,7 +139,8 @@ func (s *Server) handleReportMonthly(w http.ResponseWriter, r *http.Request) {
 		       COALESCE(c.input_tokens, 0), COALESCE(c.output_tokens, 0),
 		       COALESCE(c.cache_read_tokens, 0), COALESCE(c.cache_creation_tokens, 0),
 		       COALESCE(c.cache_creation_1h_tokens, 0), COALESCE(c.reasoning_tokens, 0),
-		       COALESCE(c.web_search_requests, 0), COALESCE(c.cost_usd, 0), COALESCE(c.comp_saved, 0)
+		       COALESCE(c.web_search_requests, 0), COALESCE(c.cost_usd, 0), COALESCE(c.comp_saved, 0),
+		       COALESCE(c.timestamp, '')
 		FROM combined c
 		LEFT JOIN sessions s ON s.id = c.session_id
 		LEFT JOIN projects p ON p.id = s.project_id`+projectWhere,
@@ -167,20 +170,27 @@ func (s *Server) handleReportMonthly(w http.ResponseWriter, r *http.Request) {
 
 	for rows.Next() {
 		var (
-			sid, tool, root, started, model string
-			bundle                          cost.TokenBundle
-			rec                             float64
-			compSaved                       int64
+			sid, tool, root, started, model, tsStr string
+			bundle                                 cost.TokenBundle
+			rec                                    float64
+			compSaved                              int64
 		)
 		if rows.Scan(&sid, &tool, &root, &started, &model,
 			&bundle.Input, &bundle.Output, &bundle.CacheRead, &bundle.CacheCreation,
 			&bundle.CacheCreation1h, &bundle.Reasoning, &bundle.WebSearchRequests,
-			&rec, &compSaved) != nil {
+			&rec, &compSaved, &tsStr) != nil {
 			continue
 		}
+		// Date-effective pricing ladder: a recorded cost (ground
+		// truth from the proxy or JSONL backfill) always wins; a row
+		// with no recorded cost is priced at the rate in force on
+		// its OWN timestamp (LookupAt falls back to the current rate
+		// when the model has no dated timeline or the timestamp is
+		// unparseable), never the current rate unconditionally.
 		rowCost := rec
 		if rowCost <= 0 && s.opts.CostEngine != nil {
-			if p, ok := s.opts.CostEngine.Lookup(model); ok {
+			ts, _ := time.Parse(time.RFC3339Nano, tsStr)
+			if p, ok := s.opts.CostEngine.LookupAt(model, ts); ok {
 				rowCost = cost.Compute(p, bundle)
 			}
 		}

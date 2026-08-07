@@ -982,7 +982,8 @@ func TestSessionClassificationPinnedOutOfPush(t *testing.T) {
 	}
 	fav := true
 	note := secNote
-	if err := st.SetSessionAnnotation(ctx, "sess-cc-1", &fav, &note); err != nil {
+	rating := 9 // the overall rating (migration 080) rides the same node-local row.
+	if err := st.SetSessionAnnotation(ctx, "sess-cc-1", &fav, &note, &rating); err != nil {
 		t.Fatalf("SetSessionAnnotation: %v", err)
 	}
 

@@ -100,7 +100,7 @@ export function SessionDetailPanel({
   // the host list can update its row without a full refetch.
   onAnnotationChange?: (
     sessionId: string,
-    next: { tags: string[]; favorite: boolean; note: string },
+    next: { tags: string[]; favorite: boolean; note: string; rating: number },
   ) => void;
 }) {
   // watchMode is seeded from the `watch` prop but locally toggleable —

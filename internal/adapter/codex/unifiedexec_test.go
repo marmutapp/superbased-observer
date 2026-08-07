@@ -300,7 +300,7 @@ func TestUnresolvedProgramsFailClosedToRunCommand(t *testing.T) {
 				t.Fatalf("parseUnifiedExec claims the program provably invokes no tool; "+
 					"it reaches the dispatcher: %q", c.program)
 			}
-			evt := New().buildCustomToolCallEvent(
+			evt, _ := New().buildCustomToolCallEvent(
 				"/tmp/rollout.jsonl", "call_unresolved", sessionContext{SessionID: "s"}, "",
 				time.Time{},
 				responseItemCustomToolCall{Name: "exec", Input: c.program}, "",
@@ -733,7 +733,7 @@ func TestParseRolloutUnifiedExec(t *testing.T) {
 func TestUnifiedExecTargetsAreTruncated(t *testing.T) {
 	t.Parallel()
 	long := strings.Repeat("a", 500)
-	evt := New().buildCustomToolCallEvent(
+	evt, _ := New().buildCustomToolCallEvent(
 		"/tmp/rollout.jsonl", "call_long", sessionContext{SessionID: "s"}, "",
 		time.Time{}, responseItemCustomToolCall{
 			Name:  "exec",
@@ -755,7 +755,7 @@ func TestUnifiedExecTargetsAreTruncated(t *testing.T) {
 func TestLegacyApplyPatchCustomToolCallUnchanged(t *testing.T) {
 	t.Parallel()
 	patch := "*** Begin Patch\n*** Update File: /repo/legacy.go\n@@\n-old\n+new\n*** End Patch\n"
-	evt := New().buildCustomToolCallEvent(
+	evt, _ := New().buildCustomToolCallEvent(
 		"/tmp/rollout.jsonl", "call_legacy", sessionContext{SessionID: "s"}, "/repo",
 		time.Time{}, responseItemCustomToolCall{Name: "apply_patch", Input: patch}, "",
 	)
@@ -779,7 +779,7 @@ func TestLegacyApplyPatchCustomToolCallUnchanged(t *testing.T) {
 // absorbed into run_command the way the whole family was pre-fix.
 func TestUnknownInnerCallIsUnknownNotRunCommand(t *testing.T) {
 	t.Parallel()
-	evt := New().buildCustomToolCallEvent(
+	evt, _ := New().buildCustomToolCallEvent(
 		"/tmp/rollout.jsonl", "call_future", sessionContext{SessionID: "s"}, "",
 		time.Time{}, responseItemCustomToolCall{
 			Name:  "exec",

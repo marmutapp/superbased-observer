@@ -18,7 +18,7 @@ import (
 // harness (which holds *testing.F) can build a server once, outside f.Fuzz.
 func newLaunchServerTB(tb testing.TB, lm LaunchManager) *Server {
 	tb.Helper()
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tb.TempDir(), "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tb.TempDir(), "d.db")})
 	if err != nil {
 		tb.Fatal(err)
 	}

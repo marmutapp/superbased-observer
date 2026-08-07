@@ -26,9 +26,11 @@
 // THE MERGE INVERSION (instance §5.2): unlike CC/Codex, Copilot has no per-token
 // agent spend to dedup against — its cost is a flat seat subscription + an
 // account-level metered billing line. So Copilot cost does NOT enter
-// rollup/cost.go::spendCTE; CostSummary (cost.go) is a SIBLING read that converts
-// seats×price + billing-usd to a USD subscription/usage figure, reported
-// alongside but never summed with per-turn spend.
+// rollup/cost.go::spendCTE; instead rollup/telemetry.go::telemetryCopilot reads
+// this package's own copilot_analytics_daily table directly and converts
+// seats×price + billing-usd to a USD subscription/usage figure (Seats +
+// CostUSD + the per-day OverageByDay series), reported alongside but never
+// summed with per-turn spend.
 //
 // IDENTITY (instance §5.3): Copilot's identity is the GitHub login, NOT an email
 // (GitHub emails are frequently private). ResolveOrgUserID takes an admin-supplied

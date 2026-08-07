@@ -1235,6 +1235,14 @@ func (m *Manager) Create(spec Spec) (string, error) {
 		if len(spec.SetupArgv) == 0 || spec.SetupArgv[0] == "" {
 			return "", ErrInvalidSpec
 		}
+	case SpecShell:
+		// A shell session runs a fixed server-derived argv (the resolved
+		// $SHELL / /bin/bash / /bin/sh); no BinPath/Subcommand/SessionID apply,
+		// mirroring SpecSetup's shape — but see the single-flight guard below,
+		// which deliberately does NOT apply to SpecShell.
+		if len(spec.ShellArgv) == 0 || spec.ShellArgv[0] == "" {
+			return "", ErrInvalidSpec
+		}
 	default:
 		// BinPath + Subcommand are always required; SessionID is required only
 		// for a handoff launch (ArgvModeHandoff) — a fresh/attach/resume launch

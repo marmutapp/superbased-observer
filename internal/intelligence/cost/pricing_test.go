@@ -128,9 +128,13 @@ func TestTable_OpenAI2026Q2Pricing(t *testing.T) {
 		// GPT-5.6 family (limited preview, 2026-06-25). CacheRead is the
 		// explicit 90%-discount read rate; the 1.25×-input cache-WRITE
 		// tier is asserted separately in TestTable_GPT56CacheWriteTier.
+		// Terra/Luna are the CURRENT (post-2026-07-30-cut) rates — the
+		// PRE-cut rates are pinned separately in
+		// TestDated_GPT56TerraLunaPriceCut (dated_test.go). Sol is
+		// unaffected by the cut.
 		{"gpt-5.6-sol", "gpt-5.6-sol", 5, 0.50, 30},
-		{"gpt-5.6-terra", "gpt-5.6-terra", 2.50, 0.25, 15},
-		{"gpt-5.6-luna", "gpt-5.6-luna", 1, 0.10, 6},
+		{"gpt-5.6-terra", "gpt-5.6-terra", 2.00, 0.20, 12.00},
+		{"gpt-5.6-luna", "gpt-5.6-luna", 0.20, 0.02, 1.20},
 		// Family fallback: a hypothetical future variant resolves via the
 		// longest-prefix "gpt-5.6" family row → Sol (flagship) rates.
 		{"gpt-5.6-nova → gpt-5.6 family (Sol rates)", "gpt-5.6-nova", 5, 0.50, 30},
@@ -194,8 +198,8 @@ func TestTable_GPT56CacheWriteTier(t *testing.T) {
 		wantInput   float64
 	}{
 		{"sol", "gpt-5.6-sol", 5},
-		{"terra", "gpt-5.6-terra", 2.50},
-		{"luna", "gpt-5.6-luna", 1},
+		{"terra", "gpt-5.6-terra", 2.00},
+		{"luna", "gpt-5.6-luna", 0.20},
 		{"family → sol", "gpt-5.6", 5},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1352,6 +1356,9 @@ func TestTable_2026Q3ResearchBatch(t *testing.T) {
 		{"doubao-seed-2-0-lite", "doubao-seed-2-0-lite", 0.088, 0.53, 0.018},
 		{"doubao-seed-2-0-mini", "doubao-seed-2-0-mini", 0.029, 0.29, 0.006},
 		{"muse-spark-1.1", "muse-spark-1.1", 1.25, 4.25, 0.15},
+		{"muse-spark-1.2", "muse-spark-1.2", 1.25, 4.25, 0.15},
+		{"muse-spark-1.2-contributor", "muse-spark-1.2-contributor", 0.10, 0.20, 0.002},
+		{"muse-spark (family) → standard rate", "muse-spark-1.3", 1.25, 4.25, 0.15},
 		{"north-mini-code-1-0 (free)", "north-mini-code-1-0", 0, 0, skipCache},
 		{"cohere/north-mini-code (free)", "cohere/north-mini-code", 0, 0, skipCache},
 		{"fugu-ultra", "fugu-ultra", 5, 30, 0.50},
@@ -1388,6 +1395,55 @@ func TestTable_2026Q3ResearchBatch(t *testing.T) {
 	}
 	if p.Input != 0 || p.Output != 0 {
 		t.Errorf("north-mini-code-1-0 should be exactly free: %+v", p)
+	}
+}
+
+// TestTable_MuseSpark1_2Wave pins the 2026-08-05 Muse Spark 1.2 release
+// (ai.developer.meta.com/docs/pricing-rate-limits): 1.2 launches at the
+// SAME standard rate as 1.1, plus the discounted "contributor" (opt-in
+// data-sharing) tier and the "muse-spark" family fallback. Also pins
+// WebSearchPerRequest ($2.50/1,000 queries flattened to $0.0025/call)
+// and that CacheCreation stays 0 across every Muse Spark row (Meta's
+// pricing page states no cache-write rate — unstated, never invented).
+func TestTable_MuseSpark1_2Wave(t *testing.T) {
+	tb := NewTable()
+	for _, tc := range []struct {
+		name, model                string
+		in, out, cacheR, webSearch float64
+		wantSource                 PricingSource
+	}{
+		{"1.1 standard", "muse-spark-1.1", 1.25, 4.25, 0.15, 0.0025, PricingSourceExact},
+		{"1.2 standard, same rate as 1.1", "muse-spark-1.2", 1.25, 4.25, 0.15, 0.0025, PricingSourceExact},
+		{"1.2 contributor tier: NOT swallowed by the family row", "muse-spark-1.2-contributor", 0.10, 0.20, 0.002, 0.0025, PricingSourceExact},
+		{"unrecognized future version falls to the family row", "muse-spark-1.3", 1.25, 4.25, 0.15, 0.0025, PricingSourceFamily},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, src, ok := tb.LookupWithSource(tc.model)
+			if !ok {
+				t.Fatalf("Lookup(%q) ok=false", tc.model)
+			}
+			if src != tc.wantSource {
+				t.Errorf("source: got %q want %q", src, tc.wantSource)
+			}
+			if p.Input != tc.in {
+				t.Errorf("input: got %v want %v", p.Input, tc.in)
+			}
+			if p.Output != tc.out {
+				t.Errorf("output: got %v want %v", p.Output, tc.out)
+			}
+			if p.CacheRead != tc.cacheR {
+				t.Errorf("cache_read: got %v want %v", p.CacheRead, tc.cacheR)
+			}
+			if p.WebSearchPerRequest != tc.webSearch {
+				t.Errorf("web_search_per_request: got %v want %v", p.WebSearchPerRequest, tc.webSearch)
+			}
+			if p.CacheCreation != 0 {
+				t.Errorf("cache_creation: got %v want 0 (Meta publishes no cache-write rate)", p.CacheCreation)
+			}
+			if p.LongContextThreshold != 0 {
+				t.Errorf("long_context_threshold: got %v want 0 (Meta: no premium for long context)", p.LongContextThreshold)
+			}
+		})
 	}
 }
 

@@ -27,7 +27,7 @@ func newEvidenceServer(t *testing.T, fake backfillExecFn) (*Server, string) {
 	if err := os.WriteFile(cfgPath, []byte(cfgToml), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: dbPath})
+	database, err := openTestDB(context.Background(), db.Options{Path: dbPath})
 	if err != nil {
 		t.Fatal(err)
 	}

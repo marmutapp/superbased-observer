@@ -55,7 +55,7 @@ endpoint = "http://localhost:9999/v1/chat/completions"
 	if err := os.WriteFile(cfgPath, []byte(seed), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +189,7 @@ match.arg_contains = "apply"
 	if err := os.WriteFile(cfgPath, []byte(seed), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}

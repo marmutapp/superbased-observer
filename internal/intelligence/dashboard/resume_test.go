@@ -51,7 +51,7 @@ func TestResumeInfoDerivation(t *testing.T) {
 func newResumeTestServer(t *testing.T, lm LaunchManager) *Server {
 	t.Helper()
 	tdir := t.TempDir()
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}

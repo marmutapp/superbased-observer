@@ -1,0 +1,27 @@
+-- 080_session_ratings.sql — the overall session rating (1–10).
+--
+-- A fourth session-classification primitive alongside tags / favorite / note
+-- (migration 075): a single 1–10 score for "how well did this session perform
+-- overall", authored by the reviewer. It is ONE-per-session review metadata,
+-- exactly the shape of the favorite/note bookmark, so it lands as a COLUMN on
+-- session_annotations rather than a new table — no new writer seam, no new
+-- reader, no new join.
+--
+--   0  = unrated (the DEFAULT, and the zero value everywhere)
+--   1..10 = the score
+--
+-- The store seam (internal/store/sessiontags.go) garbage-collects an
+-- annotation row once favorite=0 AND note='' AND rating=0, so "no row" and
+-- "unrated + unstarred + un-noted" remain the same state.
+--
+-- NODE-LOCAL, like the rest of session_annotations: the table is already pinned
+-- out of the org-push wire in tests/invariant/privacy_test.go's
+-- forbiddenCacheTables sentinel (a rating is less identifying than a tag name,
+-- but it rides the same node-local table, has no wire surface, and gets none
+-- here). No paired orgserver migration exists, by design — an org-shared score
+-- would need its own [org_client.share] key and privacy review.
+--
+-- Idempotent by the runner's version key: migrations apply exactly once, so the
+-- bare ADD COLUMN (SQLite has no ADD COLUMN IF NOT EXISTS) never runs twice.
+
+ALTER TABLE session_annotations ADD COLUMN rating INTEGER NOT NULL DEFAULT 0;

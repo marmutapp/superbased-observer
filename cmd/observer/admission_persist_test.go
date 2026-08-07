@@ -79,7 +79,7 @@ func TestAdmissionPolicyPersisterRoundTrip(t *testing.T) {
 	t.Setenv("HOME", home)
 	path := filepath.Join(home, ".observer", "config.toml")
 
-	if err := admissionPolicyPersister()(context.Background(), editorPolicyJSON(t)); err != nil {
+	if err := admissionPolicyPersister("")(context.Background(), editorPolicyJSON(t)); err != nil {
 		t.Fatalf("persist: %v", err)
 	}
 	if _, err := os.Stat(path); err != nil {
@@ -118,7 +118,7 @@ func TestAdmissionPolicyPersisterPreservesUnrelated(t *testing.T) {
 		t.Fatalf("seed write: %v", err)
 	}
 
-	if err := admissionPolicyPersister()(context.Background(), editorPolicyJSON(t)); err != nil {
+	if err := admissionPolicyPersister("")(context.Background(), editorPolicyJSON(t)); err != nil {
 		t.Fatalf("persist: %v", err)
 	}
 	cfg, err := config.Load(config.LoadOptions{GlobalPath: path})

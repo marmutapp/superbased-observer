@@ -121,7 +121,7 @@ func itoa(n int) string {
 // or token_usage rows.
 func TestAnalysisHeadline_EmptyDB(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func TestAnalysisHeadline_EmptyDB(t *testing.T) {
 // so cost computes at standard rates.
 func TestAnalysisHeadline_PeriodVsPrior(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func TestAnalysisHeadline_PeriodVsPrior(t *testing.T) {
 //     LC-eligible models)
 func TestAnalysisHeadline_HighContextAndLCSurcharge(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +310,7 @@ func TestAnalysisHeadline_HighContextAndLCSurcharge(t *testing.T) {
 // hiding 18k+ heavy turns on real Opus-heavy installs.
 func TestAnalysisHeadline_HighContextOpusModelAgnostic(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,7 +363,7 @@ func TestAnalysisHeadline_HighContextOpusModelAgnostic(t *testing.T) {
 // cache_creation) over the current period.
 func TestAnalysisHeadline_CacheEfficacy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,7 +407,7 @@ func TestAnalysisHeadline_CacheEfficacy(t *testing.T) {
 // computation when MonthlyBudgetUSD is set on the server options.
 func TestAnalysisHeadline_BudgetTile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -461,7 +461,7 @@ func TestAnalysisHeadline_BudgetTile(t *testing.T) {
 // denominator as it did pre-v1.4.50).
 func TestAnalysisHeadline_OutputRate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -511,7 +511,7 @@ func TestAnalysisHeadline_OutputRate(t *testing.T) {
 // Savings = $0.300 - $0.030 = $0.27.
 func TestAnalysisHeadline_CacheSavings(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -606,7 +606,7 @@ func TestAnalysisHeadline_CacheSavingsRecordedRows(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "d.db")
-			database, err := db.Open(context.Background(), db.Options{Path: path})
+			database, err := openTestDB(context.Background(), db.Options{Path: path})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -685,7 +685,7 @@ func TestAnalysisHeadline_CacheSavingsRecordedRows(t *testing.T) {
 //     which is still >= 0 — the invariant under test.
 func TestAnalysisHeadline_LCSurchargeClampedToRecorded(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -749,7 +749,7 @@ func TestAnalysisHeadline_LCSurchargeClampedToRecorded(t *testing.T) {
 // $0.90 delta, not the standard-priced $0.45.
 func TestAnalysisHeadline_CacheSavingsFastTierPricedAtFastRate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -795,7 +795,7 @@ func TestAnalysisHeadline_CacheSavingsFastTierPricedAtFastRate(t *testing.T) {
 //   - p95 = sorted[9] = $0.900 (the outlier)
 func TestAnalysisHeadline_PerTurnDistribution(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -848,7 +848,7 @@ func TestAnalysisHeadline_PerTurnDistribution(t *testing.T) {
 // Period cost / 2 = $/hour.
 func TestAnalysisHeadline_BurnRate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -896,7 +896,7 @@ func TestAnalysisHeadline_BurnRate(t *testing.T) {
 // $0.30 + Opus at $0.70 → top = Opus, concentration = 70%.
 func TestAnalysisHeadline_TopModel(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -962,7 +962,7 @@ func TestAnalysisHeadline_PriorMonthSameDay(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1037,7 +1037,7 @@ func TestAnalysisHeadline_PriorMonthShorterThanCurrentDay(t *testing.T) {
 	pinned := time.Date(2026, 5, 31, 14, 0, 0, 0, time.UTC)
 
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1101,7 +1101,7 @@ func TestAnalysisHeadline_PriorMonthShorterThanCurrentDay(t *testing.T) {
 // recorded_cost_share_pct should reflect that.
 func TestAnalysisHeadline_RecordedCostShare(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1140,7 +1140,7 @@ func TestAnalysisHeadline_RecordedCostShare(t *testing.T) {
 // budget_pct stays zero so the JS knows to render only the projection.
 func TestAnalysisHeadline_NoBudgetSetHidesPct(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1197,7 +1197,7 @@ func openRouting(t *testing.T, server *Server, days int) routingResponse {
 // between Opus 4.7 ($5/$25) and Sonnet 4.6 ($3/$15).
 func TestAnalysisRoutingSuggestions_TrivialOpusFlagged(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1252,7 +1252,7 @@ func TestAnalysisRoutingSuggestions_TrivialOpusFlagged(t *testing.T) {
 // trivial filter, neither should appear in the suggestions list.
 func TestAnalysisRoutingSuggestions_HeavyOpusSkipped(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1310,7 +1310,7 @@ func TestAnalysisRoutingSuggestions_HeavyOpusSkipped(t *testing.T) {
 // mixed Opus and Sonnet is intentional routing — leave it alone.
 func TestAnalysisRoutingSuggestions_MixedModelSkipped(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1351,7 +1351,7 @@ func TestAnalysisRoutingSuggestions_MixedModelSkipped(t *testing.T) {
 // TestAnalysisRoutingSuggestions_EmptyDB returns an empty list, not 500.
 func TestAnalysisRoutingSuggestions_EmptyDB(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1363,6 +1363,64 @@ func TestAnalysisRoutingSuggestions_EmptyDB(t *testing.T) {
 	got := openRouting(t, server, 30)
 	if len(got.Suggestions) != 0 || got.TotalSaving != 0 {
 		t.Errorf("empty DB: %+v", got)
+	}
+}
+
+// TestAnalysisRoutingSuggestions_DatedPricingLadder pins the recorded →
+// dated → undated ladder in handleAnalysisRoutingSuggestions's per-row
+// pricing: a recorded turn wins verbatim, an unrecorded turn before the
+// synthetic boundary prices at the OLD dated rate, and one after prices
+// at the NEW/current rate — folded into the flagged session's
+// CurrentCostUSD (and therefore its SavingsUSD against the forward-
+// looking Sonnet-4.6 projection, which correctly stays undated).
+func TestAnalysisRoutingSuggestions_DatedPricingLadder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "d.db")
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	st := store.New(database)
+	root := t.TempDir()
+	now := time.Now().UTC()
+	boundary := now.Add(-36 * time.Hour)
+
+	if _, err := st.Ingest(context.Background(), []models.ToolEvent{{
+		SourceFile: "f", SourceEventID: "e_ladder_r", SessionID: "sLadderRoute",
+		ProjectRoot: root, Timestamp: now.Add(-3 * 24 * time.Hour), Tool: models.ToolClaudeCode,
+		ActionType: models.ActionReadFile, Target: "x.go", Success: true,
+	}}, nil, store.IngestOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	insertTurn := func(ts time.Time, usd float64, reqID string) {
+		t.Helper()
+		if _, err := st.InsertAPITurn(context.Background(), models.APITurn{
+			SessionID: "sLadderRoute", Provider: models.ProviderAnthropic,
+			Model: ladderOpusModel, InputTokens: ladderTrivialBundle.Input, OutputTokens: ladderTrivialBundle.Output,
+			Timestamp: ts, RequestID: reqID, CostUSD: usd,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertTurn(now.Add(-2*24*time.Hour), 0.5, "msg_route_recorded")    // recorded — must win verbatim
+	insertTurn(now.Add(-2*24*time.Hour-time.Hour), 0, "msg_route_old") // before boundary — OLD dated rate
+	insertTurn(now.Add(-time.Hour), 0, "msg_route_new")                // after boundary — NEW/current rate
+
+	server, err := New(Options{DB: database, DBPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.opts.CostEngine = newLadderTestEngine(t, boundary)
+
+	got := openRouting(t, server, 30)
+	if len(got.Suggestions) != 1 || got.Suggestions[0].SessionID != "sLadderRoute" {
+		t.Fatalf("suggestions: got %+v", got.Suggestions)
+	}
+	s := got.Suggestions[0]
+	wantCurrent := 0.5 + ladderOldTrivialCost + ladderNewTrivialCost
+	if diff := s.CurrentCostUSD - wantCurrent; diff > 0.001 || diff < -0.001 {
+		t.Errorf("current_cost_usd: got %f want %f (recorded=0.5 old=%.3f new=%.3f)",
+			s.CurrentCostUSD, wantCurrent, ladderOldTrivialCost, ladderNewTrivialCost)
 	}
 }
 
@@ -1401,7 +1459,7 @@ func openTrend(t *testing.T, server *Server, dim string, days int) trendResponse
 // returns an empty series, and that an invalid dim is rejected.
 func TestAnalysisTrend_EmptyAndUnknownDim(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1432,7 +1490,7 @@ func TestAnalysisTrend_EmptyAndUnknownDim(t *testing.T) {
 // rolls up correctly. The dim toggle on the page rides this contract.
 func TestAnalysisTrend_GroupsByDimension(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1583,7 +1641,7 @@ func openMovers(t *testing.T, server *Server, dim string, days int) moversRespon
 // as a -100% mover with current=0.
 func TestAnalysisMovers_PeriodOverPeriod(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1681,7 +1739,7 @@ func TestAnalysisMovers_PeriodOverPeriod(t *testing.T) {
 // TestAnalysisMovers_EmptyAndUnknownDim handles fresh DB + invalid dim.
 func TestAnalysisMovers_EmptyAndUnknownDim(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1740,7 +1798,7 @@ func openTopSessions(t *testing.T, server *Server, days, limit int) topSessionsR
 // attribution, (c) tool/started_at enrichment from the sessions table.
 func TestAnalysisTopSessions_RankingAndBadges(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1876,11 +1934,66 @@ func TestAnalysisTopSessions_RankingAndBadges(t *testing.T) {
 	}
 }
 
+// TestAnalysisTopSessions_DatedPricingLadder pins the recorded → dated
+// → undated ladder in handleAnalysisTopSessions's per-row pricing: a
+// recorded turn wins verbatim, an unrecorded turn before the synthetic
+// boundary prices at the OLD dated rate, and one after prices at the
+// NEW/current rate — folded into one session's CostUSD.
+func TestAnalysisTopSessions_DatedPricingLadder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "d.db")
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	st := store.New(database)
+	root := t.TempDir()
+	now := time.Now().UTC()
+	boundary := now.Add(-36 * time.Hour)
+
+	if _, err := st.Ingest(context.Background(), []models.ToolEvent{{
+		SourceFile: "f", SourceEventID: "e_ladder", SessionID: "sLadder",
+		ProjectRoot: root, Timestamp: now.Add(-3 * 24 * time.Hour), Tool: models.ToolClaudeCode,
+		ActionType: models.ActionReadFile, Target: "x.go", Success: true,
+	}}, nil, store.IngestOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	insertTurn := func(ts time.Time, usd float64, reqID string) {
+		t.Helper()
+		if _, err := st.InsertAPITurn(context.Background(), models.APITurn{
+			SessionID: "sLadder", Provider: models.ProviderAnthropic,
+			Model: ladderModel, InputTokens: ladderBundle.Input, OutputTokens: ladderBundle.Output,
+			Timestamp: ts, RequestID: reqID, CostUSD: usd,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertTurn(now.Add(-2*24*time.Hour), 9.99, "msg_ladder_recorded")   // recorded — must win verbatim
+	insertTurn(now.Add(-2*24*time.Hour-time.Hour), 0, "msg_ladder_old") // before boundary — OLD dated rate
+	insertTurn(now.Add(-time.Hour), 0, "msg_ladder_new")                // after boundary — NEW/current rate
+
+	server, err := New(Options{DB: database, DBPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.opts.CostEngine = newLadderTestEngine(t, boundary)
+
+	got := openTopSessions(t, server, 30, 10)
+	if len(got.Sessions) != 1 || got.Sessions[0].ID != "sLadder" {
+		t.Fatalf("sessions: got %+v", got.Sessions)
+	}
+	want := 9.99 + ladderOldCost + ladderNewCost
+	if diff := got.Sessions[0].CostUSD - want; diff > 0.001 || diff < -0.001 {
+		t.Errorf("cost_usd: got %f want %f (recorded=9.99 old=%.2f new=%.2f)",
+			got.Sessions[0].CostUSD, want, ladderOldCost, ladderNewCost)
+	}
+}
+
 // TestAnalysisTopSessions_LimitAndEmpty pins the limit param and the
 // empty-DB path.
 func TestAnalysisTopSessions_LimitAndEmpty(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1927,7 +2040,7 @@ func openCostByHour(t *testing.T, server *Server, days int) costByHourResponse {
 // assume the array length is 24.
 func TestAnalysisCostByHour_EmptyAlwaysReturns24Buckets(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1957,7 +2070,7 @@ func TestAnalysisCostByHour_EmptyAlwaysReturns24Buckets(t *testing.T) {
 // UTC hours and verifies the bucket attribution + cost math.
 func TestAnalysisCostByHour_BucketsByUTCHour(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2045,7 +2158,7 @@ func openCacheSavingsTrend(t *testing.T, server *Server, days int) cacheSavingsT
 // zero-length series, not an error.
 func TestAnalysisCacheSavingsTrend_EmptyReturnsNoPoints(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2076,7 +2189,7 @@ func TestAnalysisCacheSavingsTrend_EmptyReturnsNoPoints(t *testing.T) {
 // includes the recorded row's 1M (50,000 + 1,000,000 = 1,050,000).
 func TestAnalysisCacheSavingsTrend_DailySavingsAttribution(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2171,7 +2284,7 @@ func TestAnalysisCacheSavingsTrend_DailySavingsAttribution(t *testing.T) {
 // actual=$0.05, alt=$0.50, delta=$0.45 — half the correct value.
 func TestAnalysisCacheSavingsTrend_FastTierPricedAtFastRate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2219,7 +2332,7 @@ func TestAnalysisCacheSavingsTrend_FastTierPricedAtFastRate(t *testing.T) {
 // cost DESC so the handler must re-sort before serializing.
 func TestAnalysisTrend_ChronologicalOrder(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -21,7 +21,7 @@ import (
 // (1..200; <1 / non-numeric ignored, >200 saturated) holds.
 func TestAPISessionMessages_Tail(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +158,7 @@ func TestAPISessionMessages_Tail(t *testing.T) {
 // arithmetic (total−N) and that total stays the full count.
 func TestAPISessionMessages_TailFullTimeline(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}

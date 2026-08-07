@@ -27,10 +27,12 @@ const (
 	toolKiloCodeCLI     = "kilo-code-cli"
 	toolKimiCode        = "kimi-code"
 	toolKiroCLI         = "kiro-cli"
+	toolMuse            = "muse"
 	toolOpenClaw        = "openclaw"
 	toolOpenCode        = "opencode"
 	toolOpenInterpreter = "open-interpreter"
 	toolPi              = "pi"
+	toolPrimeAgent      = "prime-agent"
 	toolQoder           = "qoder"
 	toolQwenCode        = "qwen-code"
 	toolRooCode         = "roo-code"
@@ -152,10 +154,12 @@ var specificRows = concat(
 	kiroCLIRows,
 	openClawRows,
 	piRows,
+	primeAgentRows,
 	qoderRows,
 	qwenCodeRows,
 	commandCodeRows,
 	aiderRows,
+	museRows,
 )
 
 // --- claude-code -----------------------------------------------------
@@ -725,6 +729,36 @@ var piRows = concat(
 	rows(toolPi, SurfaceBuiltin, ActionWebFetch, "web_fetch", "fetch", "fetch_url"),
 )
 
+// --- prime-agent -----------------------------------------------------
+// code: internal/adapter/primeagent/adapter.go (mapToolName).
+//
+// Prime Agent is deliberately a ONE-TOOL agent: "Available built-in
+// tools: `ipython`" (README) — the model drives a persistent Python
+// kernel to read files, edit code and run commands, so `ipython` is a
+// run_command, not a bespoke action type. `bash` and `edit` are the other
+// two built-in names docs/extensions.md says an extension may override.
+// Those three are the grounded vocabulary; everything else is the
+// conventional defensive set for a custom extension tool.
+//
+// prime-agent is NOT a toolAliases entry off pi: it is a hard fork whose
+// surface diverged to a single tool, so generating pi's ~30 names for it
+// would fabricate a vocabulary it does not have.
+var primeAgentRows = concat(
+	// grounded (live capture + README): the sole built-in tool.
+	rows(toolPrimeAgent, SurfaceBuiltin, ActionRunCommand,
+		"ipython", "bash", "shell", "command", "exec", "execute", "run"),
+	// grounded (docs/extensions.md "Overriding Built-in Tools").
+	rows(toolPrimeAgent, SurfaceBuiltin, ActionEditFile,
+		"edit", "patch", "apply_patch", "edit_file"),
+	rows(toolPrimeAgent, SurfaceBuiltin, ActionReadFile, "read", "cat", "view", "read_file"),
+	rows(toolPrimeAgent, SurfaceBuiltin, ActionWriteFile,
+		"write", "create", "write_file", "create_file"),
+	rows(toolPrimeAgent, SurfaceBuiltin, ActionSearchText, "grep", "search", "search_text"),
+	rows(toolPrimeAgent, SurfaceBuiltin, ActionSearchFiles, "glob", "find", "ls", "list_files"),
+	rows(toolPrimeAgent, SurfaceBuiltin, ActionWebSearch, "web_search", "websearch"),
+	rows(toolPrimeAgent, SurfaceBuiltin, ActionWebFetch, "web_fetch", "fetch", "fetch_url"),
+)
+
 // --- qoder -----------------------------------------------------------
 // code: internal/adapter/qoder/records.go:95-120 (actionMap).
 var qoderRows = concat(
@@ -812,6 +846,47 @@ var commandCodeRows = concat(
 var aiderRows = concat(
 	rows(toolAider, SurfaceBuiltin, ActionEditFile, "aider.apply_edit"),
 	rows(toolAider, SurfaceBuiltin, ActionRunCommand, "aider.run_command"),
+)
+
+// --- muse -------------------------------------------------------------
+// code: internal/adapter/muse/records.go (actionMap; keys are already
+// normalized by normalizeToolKey in the same file).
+//
+// GROUNDED from the live 2026-08-06 Phase-0 capture: bash, read_file,
+// write_file, edit_file. GROUNDED from the shipped 0.1.0-R708.1 binary's
+// own string table: web_search, web_fetch, read_skill (next to "Read one
+// available SKILL.md body as a tool result.") and `search` (from "child
+// tools may only include read_file, search, bash, or web_search"). `search`
+// is TOOL-SPECIFIC here rather than a fallback row precisely because the
+// name disagrees across adapters (see the fallbackRows note); Muse's own
+// guardrail string pairs it against web_search, so it is the code/text
+// search, not the web one. Everything else is the conventional agent
+// vocabulary the adapter maps defensively.
+var museRows = concat(
+	rows(toolMuse, SurfaceBuiltin, ActionReadFile,
+		"readfile", "read", "viewfile", "view", "readmanyfiles"),
+	rows(toolMuse, SurfaceBuiltin, ActionSearchFiles,
+		"listdirectory", "listdir", "listfiles", "glob", "findfiles", "searchfiles"),
+	rows(toolMuse, SurfaceBuiltin, ActionWriteFile, "writefile", "write", "createfile"),
+	rows(toolMuse, SurfaceBuiltin, ActionEditFile,
+		"editfile", "edit", "multiedit", "applypatch", "patch", "replace"),
+	rows(toolMuse, SurfaceBuiltin, ActionRunCommand,
+		"bash", "shell", "runcommand", "execcommand", "exec", "execute", "terminal"),
+	rows(toolMuse, SurfaceBuiltin, ActionSearchText,
+		"search", "grep", "searchtext", "ripgrep", "codesearch"),
+	rows(toolMuse, SurfaceBuiltin, ActionWebSearch, "websearch"),
+	rows(toolMuse, SurfaceBuiltin, ActionWebFetch,
+		"webfetch", "fetch", "fetchurl", "readurl"),
+	rows(toolMuse, SurfaceBuiltin, ActionSkillInvoke, "readskill", "skill", "useskill"),
+	rows(toolMuse, SurfaceOrchestration, ActionSpawnSubagent,
+		"task", "agent", "subagent", "spawnagent", "delegate"),
+	// grounded (live, sub-agent side): the reminder observer's verdict
+	// submission — writes a decision back into the harness, touches no
+	// workspace state.
+	rows(toolMuse, SurfaceMeta, ActionHarnessCall, "submitreminderdecision"),
+	rows(toolMuse, SurfaceBuiltin, ActionTodoUpdate,
+		"todowrite", "todo", "updateplan", "updatetodos"),
+	rows(toolMuse, SurfaceBuiltin, ActionAskUser, "askuser", "askuserquestion"),
 )
 
 // toolGlobRows are the tool-specific PREFIX globs. They sort after every

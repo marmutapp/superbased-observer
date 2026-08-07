@@ -46,7 +46,7 @@ func (s *fakeStatusSub) Close()                               {}
 
 func newStatusTestServer(t *testing.T, p TerminalStatusProvider) *Server {
 	t.Helper()
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func remoteWrap(next http.Handler) http.Handler {
 
 func newStatusLaunchTestServer(t *testing.T, p TerminalStatusProvider, lm LaunchManager) *Server {
 	t.Helper()
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1606,7 +1606,7 @@ func parseSessionsSortParams(r *http.Request) (sortBy string, desc bool) {
 	switch sortBy {
 	case "session", "tool", "project", "started_at", "elapsed", "actions",
 		"input", "cache_r", "cache_w", "output", "cost", "quality",
-		"errors", "redundancy", "favorite":
+		"errors", "redundancy", "favorite", "rating":
 	default:
 		sortBy = "started_at"
 	}
@@ -1668,6 +1668,13 @@ func sessionsSQLOrderClause(sortBy string, desc bool) string {
 		// so `sort_by=favorite` alone means "starred first".
 		expr = "(SELECT COUNT(*) FROM session_annotations sa" +
 			" WHERE sa.session_id = s.id AND sa.favorite = 1)"
+	case "rating":
+		// Scalar subquery, same shape as favorite: an unrated session (no row,
+		// or rating 0) sorts as 0. Default direction is DESC, so
+		// `sort_by=rating` alone means "highest-rated first"; sort_dir=asc
+		// surfaces the worst-rated sessions (rating 0/unrated sink to the top).
+		expr = "COALESCE((SELECT sa.rating FROM session_annotations sa" +
+			" WHERE sa.session_id = s.id), 0)"
 	}
 	return expr + " " + dir + ", s.started_at DESC, s.id ASC"
 }
@@ -1974,6 +1981,9 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		Tags     []string `json:"tags,omitempty"`
 		Favorite bool     `json:"favorite,omitempty"`
 		HasNote  bool     `json:"has_note,omitempty"`
+		// Rating is the 1-10 overall score (0 = unrated). omitempty for the
+		// same golden-payload-stability reason as the three above.
+		Rating int `json:"rating,omitempty"`
 	}
 	var out []sessRow
 	for rows.Next() {
@@ -2222,6 +2232,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 				a := annots[out[i].ID]
 				out[i].Favorite = a.Favorite
 				out[i].HasNote = a.Note != ""
+				out[i].Rating = a.Rating
 			}
 		} else {
 			s.opts.Logger.Warn("sessions: per-session annotation load failed", "err", aErr)
@@ -3040,6 +3051,7 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 		Tags     []string `json:"tags"`
 		Favorite bool     `json:"favorite"`
 		Note     string   `json:"note,omitempty"`
+		Rating   int      `json:"rating,omitempty"`
 	}
 
 	var d sessionDetail
@@ -3226,7 +3238,9 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 		             AND COALESCE(tw.output_tokens, 0) = COALESCE(at.output_tokens, 0)
 		             AND COALESCE(tw.cache_read_tokens, 0) = COALESCE(at.cache_read_tokens, 0)
 		             AND COALESCE(tw.cache_creation_tokens, 0) = COALESCE(at.cache_creation_tokens, 0)
-		       ) THEN 1 ELSE 0 END AS inherited_fast
+		       ) THEN 1 ELSE 0 END AS inherited_fast,
+		       -- Row timestamp: feeds DATE-EFFECTIVE pricing (proxyAwareCost).
+		       at.timestamp AS timestamp
 		FROM api_turns at WHERE at.session_id = ?
 		UNION ALL
 		SELECT tu.model, tu.input_tokens, tu.output_tokens, tu.cache_read_tokens,
@@ -3234,7 +3248,8 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 		       tu.reasoning_tokens,
 		       tu.web_search_requests, tu.estimated_cost_usd,
 		       COALESCE(tu.fast, 0) AS fast,
-		       0 AS inherited_fast
+		       0 AS inherited_fast,
+		       tu.timestamp AS timestamp
 		FROM token_usage tu
 		WHERE tu.session_id = ?
 		  AND (tu.source_event_id IS NULL OR tu.source_event_id = ''
@@ -3295,7 +3310,8 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 		       COALESCE(web_search_requests, 0),
 		       COALESCE(cost_usd, 0),
 		       COALESCE(fast, 0),
-		       COALESCE(inherited_fast, 0)
+		       COALESCE(inherited_fast, 0),
+		       COALESCE(timestamp, '')
 		FROM combined`,
 		id, id, id, sessionModel)
 	if err != nil {
@@ -3312,15 +3328,19 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 		var bundle cost.TokenBundle
 		var recorded float64
 		var fastInt, inheritedFastInt int
+		var tsStr string
 		if err := rows.Scan(&modelKey,
 			&bundle.Input, &bundle.Output,
 			&bundle.CacheRead, &bundle.CacheCreation, &bundle.CacheCreation1h,
 			&bundle.Reasoning,
 			&bundle.WebSearchRequests,
-			&recorded, &fastInt, &inheritedFastInt); err != nil {
+			&recorded, &fastInt, &inheritedFastInt, &tsStr); err != nil {
 			writeErr(w, err)
 			return
 		}
+		// Row timestamp feeds date-effective pricing (see proxyAwareCost).
+		// Unparseable/absent stamps stay zero → current rates.
+		rowAt, _ := time.Parse(time.RFC3339Nano, tsStr)
 		// Per-row cost: prefer recorded estimated_cost_usd / cost_usd
 		// when non-zero (only OpenCode + Pi adapters set it today; api_turns
 		// carries it for proxy rows). proxyAwareCost applies the F1 "keep
@@ -3334,7 +3354,7 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 		// renders as a single undifferentiated AI block.
 		var rowCost, rowAICost, rowToolCost float64
 		var rowInputCost, rowOutputCost, rowCacheReadCost, rowCacheCreationCost float64
-		if cb, ok := proxyAwareCost(s.opts.CostEngine, modelKey, bundle, recorded, fastInt != 0, inheritedFastInt != 0); ok {
+		if cb, ok := proxyAwareCost(s.opts.CostEngine, modelKey, bundle, recorded, fastInt != 0, inheritedFastInt != 0, rowAt); ok {
 			rowCost = cb.Total
 			rowAICost = cb.AICost
 			rowToolCost = cb.ToolCost
@@ -3467,6 +3487,7 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 		if annot, aErr := st.GetSessionAnnotation(r.Context(), id); aErr == nil {
 			d.Favorite = annot.Favorite
 			d.Note = annot.Note
+			d.Rating = annot.Rating
 		} else {
 			s.opts.Logger.Warn("session detail: annotation load failed", "err", aErr)
 		}
@@ -3542,7 +3563,14 @@ type actionBucket struct {
 // from the table so the premium lands. Returns ok=false only when the model
 // is unknown AND there's no recorded cost (caller leaves the row at $0,
 // matching prior behavior).
-func proxyAwareCost(engine *cost.Engine, model string, bundle cost.TokenBundle, recorded float64, ownFast, inheritedFast bool) (cost.Breakdown, bool) {
+//
+// `at` is the row's own timestamp, used for DATE-EFFECTIVE pricing: a
+// re-priced historical row bills at the rate in force when it ran, not
+// today's. Pass the zero time when no stamp is available — LookupAt then
+// falls back to current rates (never to the oldest tier). Recorded costs
+// are unaffected either way: they were priced at insert time, which is
+// already the historically correct rate.
+func proxyAwareCost(engine *cost.Engine, model string, bundle cost.TokenBundle, recorded float64, ownFast, inheritedFast bool, at time.Time) (cost.Breakdown, bool) {
 	bundle.Fast = ownFast || inheritedFast
 	if recorded > 0 && !(inheritedFast && !ownFast) {
 		// Recorded cost already reflects this row's own tier — use as-is.
@@ -3553,7 +3581,7 @@ func proxyAwareCost(engine *cost.Engine, model string, bundle cost.TokenBundle, 
 	if engine == nil {
 		return cost.Breakdown{}, false
 	}
-	return engine.ComputeBreakdown(model, bundle)
+	return engine.ComputeBreakdownAt(model, bundle, at)
 }
 
 // handleSessionMessages serves /api/session/<id>/messages — one row
@@ -3898,7 +3926,8 @@ func (s *Server) handleSessionMessages(w http.ResponseWriter, r *http.Request, s
 		// that inherited fast (its recorded cost was the standard wire tier).
 		bundle.Fast = fastInt != 0 || inheritedFastInt != 0
 		var costUSD, aiCostUSD, toolCostUSD float64
-		if cb, ok := proxyAwareCost(s.opts.CostEngine, model, bundle, recorded, fastInt != 0, inheritedFastInt != 0); ok {
+		msgAt, _ := time.Parse(time.RFC3339Nano, ts)
+		if cb, ok := proxyAwareCost(s.opts.CostEngine, model, bundle, recorded, fastInt != 0, inheritedFastInt != 0, msgAt); ok {
 			costUSD = cb.Total
 			aiCostUSD = cb.AICost
 			toolCostUSD = cb.ToolCost
@@ -3927,7 +3956,7 @@ func (s *Server) handleSessionMessages(w http.ResponseWriter, r *http.Request, s
 		// a price bump they don't incur. Anthropic Opus 4.8 (FastMultiplier
 		// 2) still lights up exactly as before.
 		if bundle.Fast {
-			if p, ok := s.opts.CostEngine.Lookup(model); ok && p.FastMultiplier > 0 {
+			if p, ok := s.opts.CostEngine.LookupAt(model, msgAt); ok && p.FastMultiplier > 0 {
 				mr.Fast = true
 			}
 		}

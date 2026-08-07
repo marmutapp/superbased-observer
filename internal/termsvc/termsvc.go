@@ -21,6 +21,8 @@ var (
 	ErrFreshLaunchDisabled = errors.New("termsvc: fresh-agent launch is disabled (set [terminal.launch].allow_fresh_agent)")
 	// ErrToolNotAllowed — the tool is not in [terminal.launch].allowed_tools.
 	ErrToolNotAllowed = errors.New("termsvc: tool is not in the fresh-launch allow-list")
+	// ErrShellLaunchDisabled — [terminal.launch].allow_shell is false.
+	ErrShellLaunchDisabled = errors.New("termsvc: plain-shell launch is disabled (set [terminal.launch].allow_shell)")
 	// ErrNoLauncher — the service was constructed without a Launcher.
 	ErrNoLauncher = errors.New("termsvc: no launcher configured")
 	// ErrAttachToolRequired — LaunchAttachable was given an empty Tool.
@@ -42,6 +44,11 @@ type Policy struct {
 	// AllowedProjectRoots is the operator-configured directory allow-list a
 	// fresh launch's project_root is validated against (canonicalized).
 	AllowedProjectRoots []string
+	// AllowShell is the separate opt-in for a fresh PLAIN SHELL launch
+	// (never an AI tool). Independent of AllowFresh/AllowedTools — a bare
+	// shell is not a member of the tool allow-list and is authorized by this
+	// flag alone.
+	AllowShell bool
 }
 
 // toolAllowed reports whether tool is in the fresh-launch allow-list.
@@ -118,6 +125,11 @@ type LaunchRequest struct {
 	// no-op because the inner launcher self-routes regardless of env (B2/B3).
 	// Empty for dashboard fresh/handoff launches.
 	ExtraArgs []string
+	// IsShell marks a fresh plain-shell launch (no AI tool, no Subcommand
+	// resolution against the capability registry). The Launcher spawns the
+	// child's $SHELL (falling back to /bin/bash / /bin/sh) instead of the
+	// usual `observer <Subcommand>` argv.
+	IsShell bool
 }
 
 // Launcher spawns a PTY-backed launcher and returns its opaque handle. It is
@@ -296,6 +308,10 @@ type FreshRequest struct {
 	ProjectRoot string
 	Rows        uint16
 	Cols        uint16
+	// Shell requests a fresh PLAIN SHELL instead of an AI tool. When true,
+	// Tool/Subcommand are ignored for authorization purposes (gated by
+	// Policy.AllowShell instead of AllowedTools) — see LaunchFresh.
+	Shell bool
 }
 
 // LaunchResult is what a launch returns to the dashboard.
@@ -304,25 +320,41 @@ type LaunchResult struct {
 	RunID  string
 }
 
-// LaunchFresh authorizes and starts a fresh agent (no --continue-from). It
-// fails closed on every authorization miss BEFORE minting a run or spawning a
-// process.
+// ShellTool is the reserved pseudo-tool name a plain-shell fresh launch is
+// recorded and reported under (status feed, run history, remote-sensitivity
+// classification) — it is never a member of the capability registry's
+// launchable-tool set, so it can never collide with a real AI-tool name.
+const ShellTool = "shell"
+
+// LaunchFresh authorizes and starts a fresh agent (no --continue-from), or —
+// when req.Shell is set — a fresh plain shell. It fails closed on every
+// authorization miss BEFORE minting a run or spawning a process.
 func (s *Service) LaunchFresh(ctx context.Context, req FreshRequest) (LaunchResult, error) {
 	if s.launcher == nil {
 		return LaunchResult{}, ErrNoLauncher
 	}
-	if !s.policy.AllowFresh {
-		return LaunchResult{}, ErrFreshLaunchDisabled
-	}
-	if !s.policy.toolAllowed(req.Tool) {
-		return LaunchResult{}, fmt.Errorf("%w: %q", ErrToolNotAllowed, req.Tool)
+	if req.Shell {
+		if !s.policy.AllowShell {
+			return LaunchResult{}, ErrShellLaunchDisabled
+		}
+	} else {
+		if !s.policy.AllowFresh {
+			return LaunchResult{}, ErrFreshLaunchDisabled
+		}
+		if !s.policy.toolAllowed(req.Tool) {
+			return LaunchResult{}, fmt.Errorf("%w: %q", ErrToolNotAllowed, req.Tool)
+		}
 	}
 	dir, err := ValidateProjectRoot(req.ProjectRoot, s.policy.AllowedProjectRoots)
 	if err != nil {
 		return LaunchResult{}, err
 	}
+	tool := req.Tool
+	if req.Shell {
+		tool = ShellTool
+	}
 	run := termrun.Run{
-		Tool:            req.Tool,
+		Tool:            tool,
 		Kind:            termrun.KindFresh,
 		ProjectRootHash: termrun.HashProjectRoot(dir),
 		LaunchedAt:      s.now(),
@@ -333,6 +365,7 @@ func (s *Service) LaunchFresh(ctx context.Context, req FreshRequest) (LaunchResu
 		Dir:        dir,
 		Rows:       req.Rows,
 		Cols:       req.Cols,
+		IsShell:    req.Shell,
 	})
 }
 

@@ -151,6 +151,18 @@ func TestLaunchFreshAuthorizationGate(t *testing.T) {
 			req:     FreshRequest{Tool: "claude-code", Subcommand: "claude", ProjectRoot: t.TempDir()},
 			wantErr: ErrProjectRootDenied,
 		},
+		{
+			name:    "shell disabled by default even with fresh-agent allowed",
+			policy:  Policy{AllowFresh: true, AllowedTools: []string{"claude-code"}},
+			req:     FreshRequest{Shell: true},
+			wantErr: ErrShellLaunchDisabled,
+		},
+		{
+			name:    "shell allowed, no tool allow-list required",
+			policy:  Policy{AllowShell: true},
+			req:     FreshRequest{Shell: true},
+			wantErr: nil,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -210,6 +222,32 @@ func TestLaunchFreshSuccessMintsRun(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected a launch event on the feed")
+	}
+}
+
+func TestLaunchShellSuccessMintsRun(t *testing.T) {
+	rec := newFakeRecorder()
+	l := &fakeLauncher{handle: "SHELLHANDLE"}
+	// AllowFresh is deliberately FALSE — shell authorization must be
+	// independent of the AI-tool fresh-launch gate.
+	svc := newService(t, Policy{AllowShell: true}, rec, l, nil)
+
+	res, err := svc.LaunchFresh(context.Background(), FreshRequest{Shell: true, Rows: 24, Cols: 80})
+	if err != nil {
+		t.Fatalf("LaunchFresh(shell): %v", err)
+	}
+	if res.Handle != "SHELLHANDLE" || res.RunID == "" {
+		t.Fatalf("result = %+v", res)
+	}
+	if len(rec.runs) != 1 {
+		t.Fatalf("expected 1 run recorded, got %d", len(rec.runs))
+	}
+	run := rec.runs[0]
+	if run.Kind != termrun.KindFresh || run.Tool != ShellTool {
+		t.Fatalf("run = %+v, want Tool=%q", run, ShellTool)
+	}
+	if !l.lastReq.IsShell {
+		t.Fatalf("launch request = %+v, want IsShell=true", l.lastReq)
 	}
 }
 

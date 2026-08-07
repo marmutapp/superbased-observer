@@ -58,6 +58,7 @@ func newTagCmd() *cobra.Command {
 		noFavorite  bool
 		note        string
 		clearNote   bool
+		rating      int
 		jsonOut     bool
 	)
 	cmd := &cobra.Command{
@@ -94,12 +95,20 @@ func newTagCmd() *cobra.Command {
 			case note != "":
 				notePtr = &note
 			}
-			// Validate the WHOLE mutation — tags AND note — before opening the
-			// DB or writing anything. The tag write and the annotation write are
-			// two store calls, so an invocation with valid tags and an over-long
-			// note would otherwise commit the tags and then fail, leaving a
-			// partial write behind. Mirrors the handler's pre-flight.
-			if err := store.ValidateClassificationInput(add, remove, notePtr); err != nil {
+			// --rating is a pointer only when the operator actually passed it, so
+			// omitting the flag leaves the rating unchanged while `--rating 0`
+			// clears it (Changed distinguishes the two — an int flag can't).
+			var ratingPtr *int
+			if cmd.Flags().Changed("rating") {
+				ratingPtr = &rating
+			}
+			// Validate the WHOLE mutation — tags, note AND rating — before opening
+			// the DB or writing anything. The tag write and the annotation write
+			// are two store calls, so an invocation with valid tags and an
+			// over-long note (or out-of-range rating) would otherwise commit the
+			// tags and then fail, leaving a partial write behind. Mirrors the
+			// handler's pre-flight.
+			if err := store.ValidateClassificationInput(add, remove, notePtr, ratingPtr); err != nil {
 				return err
 			}
 
@@ -119,8 +128,8 @@ func newTagCmd() *cobra.Command {
 					return err
 				}
 			}
-			if favPtr != nil || notePtr != nil {
-				if err := st.SetSessionAnnotation(cmd.Context(), sessionID, favPtr, notePtr); err != nil {
+			if favPtr != nil || notePtr != nil || ratingPtr != nil {
+				if err := st.SetSessionAnnotation(cmd.Context(), sessionID, favPtr, notePtr, ratingPtr); err != nil {
 					return err
 				}
 			}
@@ -147,6 +156,7 @@ func newTagCmd() *cobra.Command {
 					"tags":       tags,
 					"favorite":   annot.Favorite,
 					"note":       annot.Note,
+					"rating":     annot.Rating,
 				}, "", "  ")
 				fmt.Fprintln(out, string(body))
 				return nil
@@ -161,6 +171,9 @@ func newTagCmd() *cobra.Command {
 			} else {
 				fmt.Fprintf(out, "  tags: %s\n", strings.Join(tags, ", "))
 			}
+			if annot.Rating > 0 {
+				fmt.Fprintf(out, "  rating: %d/%d\n", annot.Rating, store.MaxRating)
+			}
 			if annot.Note != "" {
 				fmt.Fprintf(out, "  note: %s\n", annot.Note)
 			}
@@ -173,6 +186,7 @@ func newTagCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&noFavorite, "no-favorite", false, "Un-star the session")
 	cmd.Flags().StringVar(&note, "note", "", "Set the session note (max 500 characters)")
 	cmd.Flags().BoolVar(&clearNote, "clear-note", false, "Clear the session note")
+	cmd.Flags().IntVar(&rating, "rating", 0, "Set the overall session rating 1-10 (0 clears it)")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Emit machine-readable JSON")
 	return cmd
 }

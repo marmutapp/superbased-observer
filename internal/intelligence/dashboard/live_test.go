@@ -160,3 +160,58 @@ func TestHandleLive(t *testing.T) {
 		t.Errorf("POST: got %d want 405", rr.Code)
 	}
 }
+
+// TestHandleLive_DatedPricingLadder pins the same recorded → dated →
+// undated ladder in attachLiveRollup: a recorded turn wins verbatim, an
+// unrecorded turn before the synthetic boundary prices at the OLD
+// dated rate, and one after prices at the NEW/current rate — folded
+// into one session's lifetime CostUSD rollup.
+func TestHandleLive_DatedPricingLadder(t *testing.T) {
+	server, _ := wizardTestServer(t)
+	now := time.Now().UTC()
+	boundary := now.Add(-2 * time.Hour)
+	server.opts.CostEngine = newLadderTestEngine(t, boundary)
+
+	seedLiveSession(t, server, "ladder-live", "claude-code", now.Add(-4*time.Hour), now.Add(-time.Minute), 1)
+	insertTurn := func(ts time.Time, usd float64) {
+		t.Helper()
+		if _, err := server.opts.DB.Exec(
+			`INSERT INTO api_turns (session_id, timestamp, provider, model, input_tokens, output_tokens, cost_usd)
+			 VALUES ('ladder-live', ?, 'anthropic', ?, ?, ?, ?)`,
+			ts.Format(time.RFC3339Nano), ladderModel, ladderBundle.Input, ladderBundle.Output, usd,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertTurn(now.Add(-3*time.Hour+30*time.Minute), 9.99) // recorded — must win verbatim
+	insertTurn(now.Add(-3*time.Hour), 0)                   // unrecorded, before boundary — OLD dated rate
+	insertTurn(now.Add(-1*time.Hour), 0)                   // unrecorded, after boundary — NEW/current rate
+
+	rr := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/live?window_minutes=240", nil))
+	if rr.Code != 200 {
+		t.Fatalf("status %d body=%s", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		Active []struct {
+			SessionID string  `json:"session_id"`
+			CostUSD   float64 `json:"cost_usd"`
+			Turns     int64   `json:"turns"`
+		} `json:"active"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Active) != 1 || got.Active[0].SessionID != "ladder-live" {
+		t.Fatalf("active: %+v", got.Active)
+	}
+	a := got.Active[0]
+	if a.Turns != 3 {
+		t.Errorf("turns: got %d want 3", a.Turns)
+	}
+	want := 9.99 + ladderOldCost + ladderNewCost
+	if diff := a.CostUSD - want; diff > 0.001 || diff < -0.001 {
+		t.Errorf("cost_usd: got %f want %f (recorded=9.99 old=%.2f new=%.2f)",
+			a.CostUSD, want, ladderOldCost, ladderNewCost)
+	}
+}

@@ -43,7 +43,13 @@ const (
 	ToolCopilot  = "copilot"
 	ToolOpenCode = "opencode"
 	ToolOpenClaw = "openclaw"
-	ToolPi       = "pi"
+	// ToolPi is the pi coding agent (npm
+	// @earendil-works/pi-coding-agent, pi.dev), which persists session
+	// JSONL under ~/.pi/agent/sessions/<encoded-cwd>/<ts>_<uuid>.jsonl.
+	// Distinct from ToolPrimeAgent, which is a HARD FORK of the same
+	// upstream (pi-mono) with its own data home, session layout, entry
+	// vocabulary and single-tool (`ipython`) surface.
+	ToolPi = "pi"
 	// ToolGeminiCLI is Google's Gemini CLI agent (`@google/gemini-cli`),
 	// the Node.js terminal AI tool that writes plain JSON / JSONL
 	// session files under ~/.gemini/tmp/<project_hash>/chats/.
@@ -349,6 +355,42 @@ const (
 	// COMMAND_CODE_API_KEY / COMMANDCODE_API_ENV point at Command Code's
 	// own closed gateway, not a BYOK Anthropic/OpenAI-shaped endpoint.
 	ToolCommandCode = "command-code"
+	// ToolMuse is Meta's Muse Code CLI ("muse") — a statically linked Rust
+	// binary (`fbcode/musecode`, internal crate prefix `tbh_`) fronted by a
+	// self-updating shell launcher at ~/.local/bin/muse. Linux + macOS only;
+	// there is no Windows build. Persists an append-only EVENT-SOURCED log
+	// (NOT a chat transcript) at the date-sharded path
+	// ~/.local/share/muse/sessions/YYYY/MM/DD/<session-uuid>/session.jsonl,
+	// with child-agent logs under `<session>/subagent/<child-uuid>/`. Every
+	// line is a record envelope {schema_version,id,stream,sequence,
+	// recorded_at,record_type,payload_type,payload}; `recorded_at` is
+	// MICROSECONDS since epoch. Tokens come from the `model_completed`
+	// event's usage envelope, where BOTH gross fields must be netted:
+	// input_tokens INCLUDES cache_read_tokens and output_tokens INCLUDES
+	// reasoning_tokens (the OpenAI-Responses convention this backend
+	// speaks — `resp_`/`rs_`/`fc_`/`msg_` item ids). Model traffic goes to
+	// https://api.meta.ai/v1 with a login-MINTED base URL, so there is no
+	// operator-settable BYOK endpoint and no proxy lane today.
+	ToolMuse = "muse"
+	// ToolPrimeAgent is Prime Intellect's Prime Agent CLI ("prime-agent";
+	// npm `prime-agent`, also installed by
+	// app.primeintellect.ai/prime-agent/install.sh). A HARD FORK of
+	// pi-mono — it still carries the inherited `@earendil-works/pi-*`
+	// package identifiers and a `piConfig` manifest key — so its session
+	// ENVELOPE is recognisably pi-shaped, but it is NOT a rebadge of
+	// ToolPi: the data home is ~/.prime/agent (not ~/.pi/agent), sessions
+	// are FLAT `sessions/<session-uuid>.jsonl` (not per-project
+	// directories with a timestamp-prefixed basename), the entry
+	// vocabulary adds compaction / child_usage_attributed / agent_status /
+	// session_state / git_state / label / session_info, and the model is
+	// given exactly ONE built-in tool, `ipython`, a persistent Python
+	// kernel it drives to read, edit and run everything. Entry timestamps
+	// are ISO-8601 strings; the inner `message.timestamp` is Unix
+	// MILLISECONDS. `usage.input` is already NET of `cacheRead`
+	// (totalTokens == input+output+cacheRead+cacheWrite holds exactly), and
+	// the envelope publishes no reasoning-token count. Sessions carry a
+	// provider-reported `usage.cost` breakdown.
+	ToolPrimeAgent = "prime-agent"
 )
 
 // Normalized action types. See spec §5. Adapters map their tool-specific

@@ -30,6 +30,10 @@ type terminalPolicyPayload struct {
 	AllowFreshAgent     bool     `json:"allow_fresh_agent"`
 	AllowedTools        []string `json:"allowed_tools"`
 	AllowedProjectRoots []string `json:"allowed_project_roots"`
+	// AllowShell is the SEPARATE default-OFF opt-in for a fresh plain-shell
+	// launch — independent of AllowFreshAgent/AllowedTools (a bare shell is
+	// not a member of the tool allow-list).
+	AllowShell bool `json:"allow_shell"`
 }
 
 // handleTerminalPolicy serves GET/PUT /api/terminal/policy (whole-route Local).
@@ -57,6 +61,7 @@ func (s *Server) handleTerminalPolicyGet(w http.ResponseWriter, r *http.Request)
 		"allow_fresh_agent":     false,
 		"allowed_tools":         []string{},
 		"allowed_project_roots": []string{},
+		"allow_shell":           false,
 		// Runtime bounds (read-only here; written by the live-applying
 		// /api/terminal/limits verb). Surfaced from this same GET so the UI has
 		// both the current values and the confirm token from one fetch.
@@ -83,6 +88,7 @@ func (s *Server) handleTerminalPolicyGet(w http.ResponseWriter, r *http.Request)
 		}
 		resp["max_concurrent"] = cfg.Terminal.MaxConcurrent
 		resp["idle_timeout"] = cfg.Terminal.IdleTimeout
+		resp["allow_shell"] = cfg.Terminal.Launch.AllowShell
 	}
 	writeJSON(w, resp)
 }
@@ -149,6 +155,7 @@ func (s *Server) handleTerminalPolicyPut(w http.ResponseWriter, r *http.Request)
 	cfg.Terminal.Launch.AllowFreshAgent = body.AllowFreshAgent
 	cfg.Terminal.Launch.AllowedTools = tools
 	cfg.Terminal.Launch.AllowedProjectRoots = roots
+	cfg.Terminal.Launch.AllowShell = body.AllowShell
 	werr := writeConfigToml(s.opts.ConfigPath, cfg)
 	s.configWriteMu.Unlock()
 	remoteManageMu.Unlock()
@@ -160,12 +167,13 @@ func (s *Server) handleTerminalPolicyPut(w http.ResponseWriter, r *http.Request)
 	// Record the privilege-expanding write in the metadata-only remote_audit
 	// tail (plan §4), so the Remote panel's audit shows who changed launch
 	// policy — reuses the existing seam, no new table.
-	s.recordManageAudit(r, "terminal_policy", fmt.Sprintf("allow_fresh_agent=%v tools=%d roots=%d", body.AllowFreshAgent, len(tools), len(roots)))
+	s.recordManageAudit(r, "terminal_policy", fmt.Sprintf("allow_fresh_agent=%v tools=%d roots=%d allow_shell=%v", body.AllowFreshAgent, len(tools), len(roots), body.AllowShell))
 	writeJSON(w, map[string]any{
 		"saved":                 true,
 		"allow_fresh_agent":     body.AllowFreshAgent,
 		"allowed_tools":         tools,
 		"allowed_project_roots": roots,
+		"allow_shell":           body.AllowShell,
 		"config_path":           s.opts.ConfigPath,
 		"backup_path":           s.opts.ConfigPath + ".bak",
 		"restart_required":      true,

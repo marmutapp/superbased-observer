@@ -18,7 +18,7 @@ const testRemoteHost = "remote.example:8443"
 
 func newRemoteTestServer(t *testing.T, opts Options) *Server {
 	t.Helper()
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestEveryRouteClassifiedOrFailClosed(t *testing.T) {
 // RemoteController is present.
 func TestExtraRoutesRejectedWithoutCapabilityMetadata(t *testing.T) {
 	rc, _ := newReadyRemoteController(t)
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}

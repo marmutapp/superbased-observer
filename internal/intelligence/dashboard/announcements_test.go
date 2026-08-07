@@ -23,7 +23,7 @@ import (
 // New requires one.
 func newAnnouncementServer(t *testing.T) http.Handler {
 	t.Helper()
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,9 +65,14 @@ func stubAnnouncements(t *testing.T, now time.Time, set []announce.Announcement)
 // TestAnnouncements_EmptyIsArrayNotNull pins the contract the banner
 // depends on: no announcements must serialize as [], never null (a null
 // would land as `.announcements.length` on undefined in the frontend).
-// This is also the DEFAULT state of every shipped release, so it is the
-// case that actually runs in production.
+//
+// The empty set is INJECTED rather than inherited from the compiled-in
+// release set. It used to rely on that set being empty, which made the
+// test pass by coincidence — and fail the moment a release actually
+// authored an announcement, which is a normal thing to do and not a
+// regression in the contract under test.
 func TestAnnouncements_EmptyIsArrayNotNull(t *testing.T) {
+	stubAnnouncements(t, time.Now().UTC(), nil)
 	h := newAnnouncementServer(t)
 	code, body, got := getAnnouncements(t, h)
 	if code != http.StatusOK {
@@ -179,7 +184,7 @@ func enrolledService() EnrolmentService {
 // cmd/observer leaves Options.OrgClient a nil interface).
 func newAnnouncementServerWithOrgEnrolment(t *testing.T, orgEnabled bool, oc EnrolmentService) (http.Handler, *store.Store) {
 	t.Helper()
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(t.TempDir(), "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -109,7 +109,21 @@ type Announcement struct {
 // reaches older installs is R2 (the npm-registry piggyback field in
 // npm/observer/package.json), and the rail that reaches a fleet in
 // minutes is R3 (org). See plan §0 for why no fourth rail can exist.
-var releaseAnnouncements []Announcement
+// DRAFT — awaiting operator sign-off on the copy before any release.
+// Deliberately names NO version: the plugins tree it describes reached
+// users in the 1.28.0 refresh, but this text stays true whenever it
+// ships, so it cannot go stale against a retag or a slipped release.
+var releaseAnnouncements = []Announcement{
+	{
+		ID:        "2026-08-plugin-coverage",
+		Severity:  SeverityInfo,
+		Title:     "SuperBased now installs as a native plugin in 22 AI coding tools",
+		Body:      "Claude Code, Codex, Cursor, Copilot, Gemini, OpenCode and 16 more now have a native SuperBased plugin. See the plugins repo for the install command for your tool.",
+		URL:       "https://github.com/superbasedapp/plugins",
+		ExpiresAt: "2026-10-01T00:00:00Z",
+		Source:    SourceRelease,
+	},
+}
 
 // Release returns rail R1's compiled-in announcements. The returned
 // slice is a copy — callers (the dashboard handler) must not be able to

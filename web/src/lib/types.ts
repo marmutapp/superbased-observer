@@ -289,6 +289,8 @@ export type SessionRow = {
   tags?: string[];
   favorite?: boolean;
   has_note?: boolean;
+  // Overall session rating, 1-10 (absent/0 = unrated). omitempty on the wire.
+  rating?: number;
 };
 
 export type SessionsResponse = {
@@ -838,6 +840,7 @@ export type SessionDetail = {
   tags?: string[];
   favorite?: boolean;
   note?: string;
+  rating?: number;
 };
 
 // ---------- session classification: tags / favorites / notes ----------
@@ -857,20 +860,24 @@ export type TagRollupResponse = {
 };
 
 // SessionTagsRequest is the POST /api/session/<id>/tags body. `add`/`remove`
-// are always sent (possibly empty); `favorite`/`note` are null when the
-// mutation does not touch them — null means "leave as is", not "clear".
+// are always sent (possibly empty); `favorite`/`note`/`rating` are null when the
+// mutation does not touch them — null means "leave as is", not "clear". A
+// rating of 0 clears it (unrated); 1-10 is a score.
 export type SessionTagsRequest = {
   add: string[];
   remove: string[];
   favorite: boolean | null;
   note: string | null;
+  rating: number | null;
 };
 
 // SessionTagsResponse is the server's post-mutation truth for one session.
+// `rating` is 0 when the session is unrated.
 export type SessionTagsResponse = {
   tags: string[];
   favorite: boolean;
   note: string;
+  rating: number;
 };
 
 // TagManageRequest is the POST /api/sessions/tags/manage body: rename XOR

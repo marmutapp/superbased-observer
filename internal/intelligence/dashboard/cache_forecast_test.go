@@ -18,7 +18,7 @@ import (
 func openForecastTestDB(t *testing.T) (*sql.DB, func()) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "fc.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}

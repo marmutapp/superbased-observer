@@ -18,8 +18,15 @@ import (
 // The executor then stamps patch_apply_end with its OWN id —
 // `exec-<uuid>` — while the response_item carries `call_<hash>`. The two
 // live in different namespaces, so pending[pa.CallID] cannot match by
-// construction and every patch row takes the standalone path. Measured
-// over a 393-rollout reference corpus: 2,059 exec-uuid vs 416 call_hash.
+// construction. Measured over a 393-rollout reference corpus: 2,059
+// exec-uuid vs 416 call_hash.
+//
+// A missed id join no longer implies a standalone row: the turn-scoped,
+// file-set-gated fallback in claimPatchInvocation merges most of these
+// into their invocation instead (see adapter_patchpairing_test.go).
+// THIS fixture still takes the standalone path, and deliberately so —
+// its patch declares one file while the executor reports two, so the
+// equality gate abstains. That is the guard working, not the namespace.
 //
 // Two things had to be true for that row to be useful and neither was:
 //

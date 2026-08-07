@@ -291,3 +291,116 @@ func TestTelemetryCopilotSeatSubscriptionPricing(t *testing.T) {
 		t.Errorf("negative price produced %+v, want no priced fields (never a negative subscription)", cop3.Seats)
 	}
 }
+
+// TestTelemetryCopilotOverageByDay pins the new per-day metered-overage
+// series: values grouped and ordered by day, out-of-window rows excluded, and
+// — the load-bearing case — the seat subscription never leaking into it (the
+// unit trap: OverageByDay is additive per-day USD, MonthlyUSD is a
+// point-in-time monthly figure, and they must never mix).
+func TestTelemetryCopilotOverageByDay(t *testing.T) {
+	d := newDB(t)
+	ctx := context.Background()
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := d.ExecContext(ctx, q, args...); err != nil {
+			t.Fatalf("exec: %v\n%s", err, q)
+		}
+	}
+	row := `INSERT INTO copilot_analytics_daily (day, user_key, actor_type, surface, unit, metric, value, org_id, owner, pulled_at)
+	        VALUES (?, '__org__', 'org', ?, ?, ?, ?, 'org1', 'acme', '2026-05-26T04:00:00Z')`
+	// Multi-day metered overage, seeded out of day order to prove ORDER BY day.
+	// (billing rows are always user_key='__org__' — schema UNIQUE(day, user_key,
+	// surface, metric) — so one row per day is the realistic shape; SUM(value)
+	// still exercises the same aggregation telemetryCC/telemetryCodex use.)
+	exec(row, "2026-05-23", "billing", "usd", "cost", 4.00)
+	exec(row, "2026-05-20", "billing", "usd", "cost", 1.50)
+	exec(row, "2026-05-22", "billing", "usd", "cost", 2.25)
+	// Out-of-window row (outside the trailing 30-day window from fixedNow).
+	exec(row, "2026-03-01", "billing", "usd", "cost", 999.00)
+	// A hefty seat subscription snapshot on its own day — must NOT appear in
+	// OverageByDay (that would be the unit trap: summing a monthly
+	// subscription into an additive per-day metered series).
+	exec(row, "2026-05-24", "seats", "seats", "seats_total", 50)
+	exec(row, "2026-05-24", "seats", "seats", "seats_active", 40)
+
+	got, err := Telemetry(ctx, d, w30, fixedNow, testSeatPriceUSD)
+	if err != nil {
+		t.Fatalf("Telemetry: %v", err)
+	}
+	cop, ok := vendorMap(got.Vendors)["copilot"]
+	if !ok {
+		t.Fatalf("copilot vendor missing")
+	}
+
+	want := []CostPoint{
+		{Date: "2026-05-20", CostUSD: 1.50},
+		{Date: "2026-05-22", CostUSD: 2.25},
+		{Date: "2026-05-23", CostUSD: 4.00},
+	}
+	if len(cop.OverageByDay) != len(want) {
+		t.Fatalf("OverageByDay = %+v, want %+v", cop.OverageByDay, want)
+	}
+	for i, w := range want {
+		g := cop.OverageByDay[i]
+		if g.Date != w.Date || !near(g.CostUSD, w.CostUSD) {
+			t.Errorf("OverageByDay[%d] = %+v, want %+v (order-by-day)", i, g, w)
+		}
+	}
+	if !near(cop.CostUSD, 1.50+2.25+4.00) {
+		t.Errorf("CostUSD = %v, want the same total the series sums to (7.75)", cop.CostUSD)
+	}
+
+	// THE UNIT TRAP, asserted directly on the seam this test owns: the seat
+	// subscription's day (2026-05-24, 50 seats × $19 = $950/mo) must not
+	// appear as an entry in OverageByDay, and the series total (8.50) must
+	// stay far below the monthly subscription figure it would collide with
+	// if the two feeds were ever merged.
+	for _, p := range cop.OverageByDay {
+		if p.Date == "2026-05-24" {
+			t.Fatalf("OverageByDay leaked the seat-subscription day: %+v", cop.OverageByDay)
+		}
+	}
+	if cop.Seats == nil || !near(cop.Seats.MonthlyUSD, 50*testSeatPriceUSD) {
+		t.Fatalf("seat subscription setup broken: %+v", cop.Seats)
+	}
+	var sum float64
+	for _, p := range cop.OverageByDay {
+		sum += p.CostUSD
+	}
+	if sum >= cop.Seats.MonthlyUSD {
+		t.Errorf("OverageByDay sum %v >= seat MonthlyUSD %v — looks like the subscription leaked into the metered series", sum, cop.Seats.MonthlyUSD)
+	}
+}
+
+// TestTelemetryCopilotOverageByDay_EmptyOmitted pins the honest-empty case:
+// no billing rows in the window → nil series, omitted from the JSON wire (not
+// an empty array, which would render an empty chart).
+func TestTelemetryCopilotOverageByDay_EmptyOmitted(t *testing.T) {
+	d := newDB(t)
+	ctx := context.Background()
+	// Engagement-only row so the copilot vendor is "configured" but has no
+	// billing feed.
+	if _, err := d.ExecContext(ctx,
+		`INSERT INTO copilot_analytics_daily (day, user_key, actor_type, surface, unit, metric, value, org_id, owner, pulled_at)
+		 VALUES ('2026-05-23','__org__','org','engagement','count','chats',5,'org1','acme','2026-05-26T04:00:00Z')`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	got, err := Telemetry(ctx, d, w30, fixedNow, testSeatPriceUSD)
+	if err != nil {
+		t.Fatalf("Telemetry: %v", err)
+	}
+	cop, ok := vendorMap(got.Vendors)["copilot"]
+	if !ok {
+		t.Fatalf("copilot vendor missing")
+	}
+	if cop.OverageByDay != nil {
+		t.Errorf("OverageByDay = %+v, want nil (no billing rows)", cop.OverageByDay)
+	}
+	b, err := json.Marshal(cop)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), "overage_by_day") {
+		t.Errorf("empty OverageByDay must be omitted from the JSON wire: %s", b)
+	}
+}

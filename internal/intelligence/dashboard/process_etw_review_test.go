@@ -34,7 +34,7 @@ func etwReviewServer(t *testing.T, lm LaunchManager, masterEnabled, etwEnabled b
 	if err := config.WriteToml(cfgPath, cfg); err != nil {
 		t.Fatalf("seed config: %v", err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: cfg.Observer.DBPath})
+	database, err := openTestDB(context.Background(), db.Options{Path: cfg.Observer.DBPath})
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestETWStatusRemoteRedactionThroughTheRealAuthzChain(t *testing.T) {
 	if err := config.WriteToml(cfgPath, cfg); err != nil {
 		t.Fatalf("seed config: %v", err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: cfg.Observer.DBPath})
+	database, err := openTestDB(context.Background(), db.Options{Path: cfg.Observer.DBPath})
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}

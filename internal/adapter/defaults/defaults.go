@@ -36,9 +36,11 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/adapter/kilocode"
 	"github.com/marmutapp/superbased-observer/internal/adapter/kimicode"
 	"github.com/marmutapp/superbased-observer/internal/adapter/kirocli"
+	"github.com/marmutapp/superbased-observer/internal/adapter/muse"
 	"github.com/marmutapp/superbased-observer/internal/adapter/openclaw"
 	"github.com/marmutapp/superbased-observer/internal/adapter/opencode"
 	"github.com/marmutapp/superbased-observer/internal/adapter/pi"
+	"github.com/marmutapp/superbased-observer/internal/adapter/primeagent"
 	"github.com/marmutapp/superbased-observer/internal/adapter/qoder"
 	"github.com/marmutapp/superbased-observer/internal/adapter/qwencode"
 	"github.com/marmutapp/superbased-observer/internal/models"
@@ -94,6 +96,19 @@ func Adapters() []adapter.Adapter {
 		droid.New(),
 		codex.NewOpenInterpreter(),
 		commandcode.New(),
+		// 2026-08-06. Meta's Muse Code CLI: an event-sourced session log
+		// under a date-sharded sessions/YYYY/MM/DD/<uuid>/ tree (the same
+		// shape codex uses), plus child-agent logs one level deeper that
+		// carry tokens the parent log does not.
+		muse.New(),
+		// 2026-08-06. Prime Intellect's Prime Agent CLI: a hard fork of
+		// the same pi-mono upstream pi.New() covers, but with its own data
+		// home (~/.prime/agent), a FLAT sessions/<uuid>.jsonl layout, an
+		// extended entry vocabulary (compaction / child_usage_attributed /
+		// agent_status …) and a single built-in tool. Its own parser
+		// rather than a §2.1 boundary retag — see
+		// docs/plans/prime-agent-adapter-plan-2026-08-06.md §1.
+		primeagent.New(),
 		// Browser-chatbot rail. Hook-only: no WatchPaths (capture arrives
 		// via the browser extension's native-messaging bridge / loopback
 		// listener, not the file watcher). One adapter per *-web site; the

@@ -13,9 +13,10 @@ const seatsPerPage = 100
 
 // pollSeats reads the seat subscription baseline: the org seat-breakdown summary
 // (org-aggregate counts) + the per-seat list (per-login activity). Seats are
-// COUNTS, not dollars — the per-seat price ($19/$39) is applied at CostSummary,
-// never stored here. (Enterprise has no /copilot/billing summary — preview
-// /billing/seats only — so the summary is skipped for enterprise owners.)
+// COUNTS, not dollars — the per-seat price ($19/$39) is applied at
+// rollup/telemetry.go::telemetryCopilotSeats, never stored here. (Enterprise
+// has no /copilot/billing summary — preview /billing/seats only — so the
+// summary is skipped for enterprise owners.)
 func pollSeats(ctx context.Context, p *Poller, win window) ([]DailyMetric, error) {
 	var out []DailyMetric
 

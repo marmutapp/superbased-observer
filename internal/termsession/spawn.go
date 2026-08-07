@@ -26,6 +26,15 @@ const (
 	// local-writer-only. SetupArgv holds the full argv (argv[0] resolves via
 	// PATH).
 	SpecSetup
+	// SpecShell is a fresh PLAIN SHELL session — no AI agent, no OOB control
+	// channel semantics beyond what a normal fresh launch already carries.
+	// Unlike SpecSetup it is NOT local-writer-only and is NOT single-flighted
+	// — it behaves like SpecAgent for writer-lease/remote-view purposes (each
+	// "New terminal → Shell" click spawns a genuinely new PTY). ShellArgv
+	// holds the full argv (argv[0] resolves via PATH), server-derived from
+	// the child's $SHELL with a /bin/bash / /bin/sh fallback — never
+	// client-supplied.
+	SpecShell
 )
 
 // Spec is the fully server-derived launch specification. The Manager builds
@@ -51,6 +60,11 @@ type Spec struct {
 	// ignored for SpecAgent; an empty label disables single-flight for that
 	// setup session.
 	SetupLabel string
+	// ShellArgv is the complete, server-derived argv for a SpecShell session
+	// (the resolved $SHELL / /bin/bash / /bin/sh, with no arguments). Non-empty
+	// ONLY for SpecShell and NEVER client-supplied; ignored for every other
+	// Kind.
+	ShellArgv []string
 	// BinPath is the observer binary to exec, from os.Executable(),
 	// injected by cmd. Never client-supplied.
 	BinPath string
@@ -144,6 +158,10 @@ func (s Spec) argv() []string {
 		// (validated non-empty at Create). Copy so the caller's slice can't be
 		// mutated through the returned value.
 		return append([]string(nil), s.SetupArgv...)
+	}
+	if s.Kind == SpecShell {
+		// Same copy-on-return discipline as SpecSetup above.
+		return append([]string(nil), s.ShellArgv...)
 	}
 	switch s.ArgvMode {
 	case ArgvModeFresh:

@@ -47,7 +47,7 @@ func TestMechanismIsLossy(t *testing.T) {
 // row as "0 B compressed / 100% saved / $X saved (est)".
 func TestAPICompressionByModelLossy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: path})
+	database, err := openTestDB(context.Background(), db.Options{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -28,6 +28,11 @@ type API struct {
 	// editor (POST .../policy?persist=1), injected via SetPolicyPersister. nil
 	// = persistence unavailable (in-memory-only, the default).
 	persistPolicy PolicyPersistFunc
+	// persistEgress is the opt-in write-through seam for the egress policy
+	// editor (POST .../egress/policy?persist=1), injected via SetEgressPersister.
+	// nil = persistence unavailable (in-memory-only, the default). Symmetric to
+	// persistPolicy — the cmd-side seam so httpapi never imports config-write.
+	persistEgress PolicyPersistFunc
 	logger        *slog.Logger
 }
 
@@ -60,6 +65,7 @@ func (a *API) Routes() []Route {
 		{"GET /api/obs/eval/runs", a.handleEvalRuns},
 		{"GET /api/obs/eval/run/{id}", a.handleEvalRun},
 		{"POST /api/obs/admission/check", a.handleAdmissionCheck},
+		{"POST /api/obs/admission/test", a.handleAdmissionTest},
 		{"GET /api/obs/admission/status", a.handleAdmissionStatus},
 		{"GET /api/obs/admission/budget", a.handleAdmissionBudget},
 		{"GET /api/obs/admission/policy", a.handleAdmissionGetPolicy},
@@ -67,6 +73,8 @@ func (a *API) Routes() []Route {
 		{"GET /api/obs/admission/verdicts", a.handleAdmissionVerdicts},
 		{"GET /api/obs/egress/status", a.handleEgressStatus},
 		{"GET /api/obs/egress/decisions", a.handleEgressDecisions},
+		{"GET /api/obs/egress/policy", a.handleEgressGetPolicy},
+		{"POST /api/obs/egress/policy", a.handleEgressSetPolicy},
 	}
 }
 

@@ -125,6 +125,17 @@ var resumeTranslations = map[string]resumeTranslation{
 	// SessionID verbatim (the rollout `session_meta` UUID the codex parser
 	// adopts), so no transform.
 	"open-interpreter": {subcommand: "resume", positional: true},
+	// muse: `muse resume <session-uuid>` (grounded off `muse resume --help`:
+	// `Usage: muse resume` / `muse resume --last` / `muse resume
+	// <session-uuid>`) — the same positional-under-subcommand shape as
+	// open-interpreter. The id is our stored SessionID verbatim (muse's own
+	// directory-name uuid), so no transform.
+	"muse": {subcommand: "resume", positional: true},
+	// prime-agent: `prime-agent --resume <path|id>` — a REQUIRED-value flag
+	// (angle brackets, not `[path|id]`), so the plain two-token form is
+	// unambiguous (grounded off `prime-agent --help`). The id is our stored
+	// SessionID verbatim (the `<uuid>.jsonl` filename stem), so no transform.
+	"prime-agent": {flag: "--resume"},
 }
 
 // injectNativeResume translates the uniform observer `--resume <id>` into the

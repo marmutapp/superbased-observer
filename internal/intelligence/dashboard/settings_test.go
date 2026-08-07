@@ -32,7 +32,7 @@ monthly_budget_usd = 75
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ monthly_budget_usd = 75
 func TestHandleConfig_NoFileReturnsDefaults(t *testing.T) {
 	tdir := t.TempDir()
 	cfgPath := filepath.Join(tdir, "missing.toml") // never created
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ log_level = "info"
 		t.Fatal(err)
 	}
 
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ log_level = "info"
 // always given one, but tests / future ephemeral modes may not).
 func TestHandleConfigPricing_NoConfigPath(t *testing.T) {
 	tdir := t.TempDir()
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func TestHandleConfigPricing_NoConfigPath(t *testing.T) {
 // catches if the matching defaultPricing entry didn't get updated.
 func TestHandleConfigPricingDefaults_ShapeAndCoverage(t *testing.T) {
 	tdir := t.TempDir()
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +284,7 @@ log_level = "info"
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +342,7 @@ func TestHandleConfigSection_Dashboard(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte("[observer]\nlog_level = \"info\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,7 +418,7 @@ windows_binary_path = "/mnt/c/Users/x/.observer/observer.exe"
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -504,7 +504,7 @@ max_response_bytes = 8192
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -561,6 +561,122 @@ max_response_bytes = 8192
 	}
 }
 
+// TestHandleConfigSection_ObservabilityJudgeBudgetPartial pins the Policies
+// module's judge/budget write path (docs/handovers/policies-module-phase-b-*):
+// the observability section save is written by THREE surfaces (the Settings
+// Enabled toggle, the Policies judge form, the Policies budget form), so every
+// field is a pointer and only the sent fields apply. Critically, a judge/budget
+// save must NOT disable the subsystem (Enabled omitted ⇒ preserved) and must
+// never touch the admission criterion table (owned by the admission POLICY
+// persister, not this seam).
+func TestHandleConfigSection_ObservabilityJudgeBudgetPartial(t *testing.T) {
+	tdir := t.TempDir()
+	cfgPath := filepath.Join(tdir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte(`[observability]
+enabled = true
+
+[observability.judge]
+model = "qwen2.5:1.5b-instruct"
+base_url = "http://127.0.0.1:11434/v1"
+timeout_ms = 45000
+
+[observability.admission]
+enabled = true
+mode = "observe"
+
+[[observability.admission.criterion]]
+id = "on-scope"
+type = "valid_use_case"
+definition = "only product questions"
+decision = "ask"
+
+[observability.admission.budget]
+enabled = true
+per_user_5h_usd = 5.0
+per_user_weekly_usd = 25.0
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	server, err := New(Options{DB: database, ConfigPath: cfgPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	put := func(body string) int {
+		rr := httptest.NewRecorder()
+		server.Handler().ServeHTTP(rr,
+			httptest.NewRequest(http.MethodPut, "/api/config/section/observability", strings.NewReader(body)))
+		return rr.Code
+	}
+
+	// 1. Judge-only save: the model changes; Enabled, the criterion table, and
+	//    the budget all survive.
+	if code := put(`{"Judge":{"Model":"gpt-4o-mini","BaseURL":"https://openrouter.ai/api/v1","APIKeyEnv":"OPENROUTER_API_KEY","TimeoutMS":30000,"MaxTokens":0,"NumCtx":0}}`); code != 200 {
+		t.Fatalf("judge save status: %d", code)
+	}
+	got, err := config.Load(config.LoadOptions{GlobalPath: cfgPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Observability.Judge.Model != "gpt-4o-mini" {
+		t.Errorf("judge model not applied: %q", got.Observability.Judge.Model)
+	}
+	if !got.Observability.Enabled {
+		t.Error("judge save disabled the subsystem (Enabled omitted must preserve true)")
+	}
+	if len(got.Observability.Admission.Criterion) != 1 || got.Observability.Admission.Criterion[0].ID != "on-scope" {
+		t.Errorf("judge save clobbered the criterion table: %+v", got.Observability.Admission.Criterion)
+	}
+	if got.Observability.Admission.Budget.PerUser5hUSD != 5.0 {
+		t.Errorf("judge save clobbered the budget: %+v", got.Observability.Admission.Budget)
+	}
+
+	// 2. Budget-only save: caps change; the judge (just set) and the criterion
+	//    survive.
+	if code := put(`{"Admission":{"Budget":{"Enabled":true,"PerUser5hUSD":9.0,"PerUserWeeklyUSD":40.0,"PerUserMonthlyUSD":120.0,"UserHeader":""}}}`); code != 200 {
+		t.Fatalf("budget save status: %d", code)
+	}
+	got, err = config.Load(config.LoadOptions{GlobalPath: cfgPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Observability.Admission.Budget.PerUser5hUSD != 9.0 {
+		t.Errorf("budget not applied: %+v", got.Observability.Admission.Budget)
+	}
+	if got.Observability.Judge.Model != "gpt-4o-mini" {
+		t.Errorf("budget save clobbered the judge: %q", got.Observability.Judge.Model)
+	}
+	if len(got.Observability.Admission.Criterion) != 1 {
+		t.Errorf("budget save clobbered the criterion table: %+v", got.Observability.Admission.Criterion)
+	}
+
+	// 3. Enabled-only toggle (the Settings surface): flips the gate without
+	//    touching judge or budget.
+	if code := put(`{"Enabled":false}`); code != 200 {
+		t.Fatalf("enabled toggle status: %d", code)
+	}
+	got, err = config.Load(config.LoadOptions{GlobalPath: cfgPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Observability.Enabled {
+		t.Error("Enabled=false not applied")
+	}
+	if got.Observability.Judge.Model != "gpt-4o-mini" || got.Observability.Admission.Budget.PerUser5hUSD != 9.0 {
+		t.Errorf("enabled toggle clobbered judge/budget: judge=%q budget5h=%v",
+			got.Observability.Judge.Model, got.Observability.Admission.Budget.PerUser5hUSD)
+	}
+
+	// 4. A negative cap is rejected (400) and leaves the file untouched.
+	if code := put(`{"Admission":{"Budget":{"Enabled":true,"PerUser5hUSD":-1}}}`); code != 400 {
+		t.Fatalf("negative cap should be rejected: status %d", code)
+	}
+}
+
 // TestHandleConfigSection_SaveTerminalPartialBody pins F5 + F6: a PARTIAL
 // terminal body preserves the omitted attach field (pointer decode, F5), and the
 // restart_required flag reflects what actually changed — Attach.Enabled binds the
@@ -572,7 +688,7 @@ func TestHandleConfigSection_SaveTerminalPartialBody(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte("[terminal.attach]\nenabled = true\nroute_proxy = true\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -678,7 +794,7 @@ func TestHandleConfigSection_SaveTerminalStrictDecode(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte("[terminal.attach]\nenabled = true\nroute_proxy = true\ndefault_on = true\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -723,7 +839,7 @@ func TestHandleConfigSection_SaveBrowser(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte("[observer]\nlog_level = \"info\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -788,7 +904,7 @@ func TestHandleConfigSection_AdvisorCachetrackSecrets(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte("[observer]\nlog_level = \"info\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -866,7 +982,7 @@ func TestHandleConfigBackup_RestoreSwaps(t *testing.T) {
 	if err := os.WriteFile(bakPath, []byte("[observer]\nlog_level = \"info\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -926,7 +1042,7 @@ output = 999
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -968,7 +1084,7 @@ output = 999
 func TestHandleConfigSection_UnknownSection(t *testing.T) {
 	tdir := t.TempDir()
 	cfgPath := filepath.Join(tdir, "config.toml")
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1008,7 +1124,7 @@ func TestHandleAdminRestart_ScheduledResponse(t *testing.T) {
 // modes report -1 with a "needs scan" note.
 func TestHandleBackfillStatus(t *testing.T) {
 	tdir := t.TempDir()
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1097,7 +1213,7 @@ func TestConfigWrites_FireOnConfigSaved(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte("[observer]\nlog_level = \"info\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1173,7 +1289,7 @@ func TestHandleConfigSection_Profiles(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte("[observer]\nlog_level = \"info\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1253,7 +1369,7 @@ func TestHandleConfigSection_ConcurrentSectionSavesBothPersist(t *testing.T) {
 	}
 	baseline()
 
-	database, err := db.Open(context.Background(), db.Options{Path: dbPath})
+	database, err := openTestDB(context.Background(), db.Options{Path: dbPath})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1368,7 +1484,7 @@ func TestConfigWrite_RemoteManageRaceSectionSave(t *testing.T) {
 	}
 	baseline()
 
-	database, err := db.Open(context.Background(), db.Options{Path: dbPath})
+	database, err := openTestDB(context.Background(), db.Options{Path: dbPath})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1470,7 +1586,7 @@ handshake_timeout_ms = 7000
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}

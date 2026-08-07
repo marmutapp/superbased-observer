@@ -1,0 +1,118 @@
+# ===========================================================================
+# SuperBased Observer — ISOLATED demo node config for the Acme Copilot harness.
+#
+# Pass this with --config so the demo never touches your real ~/.observer:
+#
+#   OLLAMA_API_KEY=x ./bin/observer.exe start \
+#     --config examples/copilot-harness/demo-node.config.toml
+#
+# (run from the repo root — db_path below is relative to the working dir).
+#
+# It keeps its OWN db (demo-data/observer.db) and does NOT auto-register hooks,
+# so your real observer.db and your AI tools' hook config are left alone.
+# Everything else is default; only the demo-relevant blocks are set here.
+# ===========================================================================
+
+# --- Isolation: own DB, no hook auto-registration. Default ports otherwise ---
+# --- (node/dashboard :8081, proxy :8820, OTLP :4318/:4317).                 ---
+[observer]
+db_path = "examples/copilot-harness/demo-data/observer.db"
+
+[observer.hooks]
+auto_register = false
+
+# ===========================================================================
+# PROXY — the upstream the harness answers through. The harness calls
+# http://127.0.0.1:8820/up/ollama/v1/chat/completions ; the proxy strips
+# "/up/ollama" and forwards to the URL below (captured in api_turns).
+# ===========================================================================
+[proxy.upstreams]
+ollama = "http://127.0.0.1:11434"
+
+# ===========================================================================
+# PLANE A observability — the master switch (serves the OTLP receiver and
+# creates the obs_* tables).
+# ===========================================================================
+[observability]
+enabled = true
+
+# --- The judge LLM (shared by admission + eval). Hosting is DERIVED from the ---
+# --- base_url: a loopback URL => local, no key, no network egress.           ---
+[observability.judge]
+model       = "qwen2.5:1.5b-instruct"       # fast, reliable JSON verdicts on CPU
+base_url    = "http://127.0.0.1:11434/v1"   # Ollama's OpenAI-compatible API (loopback = local)
+api_key_env = "OLLAMA_API_KEY"              # env-var NAME; a local judge ignores it, but set it non-empty
+num_ctx     = 8192                          # Ollama context hint — only sent to a loopback judge
+timeout_ms  = 45000                         # generous: a CPU judge is slow
+
+# --- Admission: the input gate. Start in observe, flip to enforce when happy. --
+[observability.admission]
+enabled = true
+mode    = "observe"        # off | observe | enforce  (observe records, blocks nothing)
+strict  = false            # false = fail OPEN if the judge errors/times out
+
+[observability.admission.prefilter]
+max_message_bytes = 8192   # deterministic hard-deny ceiling (belt & braces)
+
+# --- Per-end-user budget guardrail. Identity arrives as X-Superbased-User. ----
+[observability.admission.budget]
+enabled              = true
+per_user_5h_usd      = 5.0
+per_user_weekly_usd  = 25.0
+per_user_monthly_usd = 80.0
+
+# --- CRITERIA -------------------------------------------------------------- --
+# DETERMINISTIC (no judge call): denied_topics + jailbreak + prefilter above.
+[[observability.admission.criterion]]
+id       = "topics"
+type     = "denied_topics"
+topics   = ["competitor pricing", "weapons", "malware", "cryptocurrency trading"]
+decision = "deny"
+severity = "high"
+
+[[observability.admission.criterion]]
+id       = "jailbreak"
+type     = "jailbreak"
+decision = "deny"
+severity = "critical"
+
+# STOCHASTIC (LLM-judged): valid_use_case. The judge adjudicates plain English.
+# Keep definitions specific — small models reward precision.
+#
+# NOTE: a `no-secrets` custom criterion was tried and REMOVED. On a small CPU
+# judge (qwen2.5:1.5b) it over-triggered (flagged benign password-reset help
+# and a poem as deny). The deterministic `jailbreak` layer already blocks real
+# exfiltration attempts, so the false positives cost more than the coverage.
+# Use a larger/GPU judge if you want a nuanced secrets criterion back.
+[[observability.admission.criterion]]
+id         = "use-case"
+type       = "valid_use_case"
+decision   = "ask"
+severity   = "warn"
+definition = "The request must be a workplace-support question for Acme Cloud employees: accounts, billing, IT help, HR, product features, troubleshooting, internal docs. Greetings and chit-chat are acceptable. Off-topic requests — creative writing, poems, homework, general knowledge, anything unrelated to Acme Cloud work — do NOT match. When a request does not match, respond with decision \"ask\" and criterion \"use-case\" so the user can clarify what Acme Cloud topic they need."
+
+# ===========================================================================
+# EGRESS ROUTING (Plane A). Composes ON the admission verdict, so a judge-FLAGGED
+# request (stochastic input) drives a deterministic routing action.
+#   advise  = evaluate + record the directive, never apply (shadow-roll first)
+#   enforce = actually rewrite the upstream on the proxy path
+# ===========================================================================
+[observability.egress]
+enabled = true
+mode    = "advise"        # flip to "enforce" after you review the decision log
+
+# Typed, shape-declared target. Ollama speaks OpenAI => shape = "openai".
+[[observability.egress.targets]]
+id    = "ollama-local"
+url   = "http://127.0.0.1:11434"
+shape = "openai"
+
+# Route any FLAG-or-stricter verdict to the on-prem model. on_unavailable=deny
+# makes it FAIL-CLOSED: if the local model is down the proxy refuses rather than
+# leaking a flagged prompt to a cloud provider.
+[[observability.egress.rules]]
+name           = "flagged-to-local"
+when           = { verdict_at_least = "flag" }
+action         = { route_to_upstream = "ollama-local" }
+on_unavailable = "deny"
+reason_code    = "egress_flagged_local"

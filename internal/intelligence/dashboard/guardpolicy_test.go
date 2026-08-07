@@ -49,7 +49,7 @@ func newGuardPolicyServer(t *testing.T) (*Server, string, string) {
 	if err := os.WriteFile(cfgPath, []byte(cfgToml), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}

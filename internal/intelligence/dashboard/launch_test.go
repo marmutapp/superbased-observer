@@ -15,6 +15,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/marmutapp/superbased-observer/internal/db"
+	"github.com/marmutapp/superbased-observer/internal/termsvc"
 )
 
 // --- fakes ---
@@ -140,7 +141,7 @@ func (m *fakeLaunchManager) RevokeRemoteWriterByHolder(string, string) bool { re
 func newLaunchTestServer(t *testing.T, lm LaunchManager) *Server {
 	t.Helper()
 	tdir := t.TempDir()
-	database, err := db.Open(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,6 +259,7 @@ func TestTerminalLaunchMapsServiceErrors(t *testing.T) {
 		{"tool not allowed → 403", ErrLaunchToolNotAllowed, http.StatusForbidden},
 		{"project root denied → 400", ErrLaunchProjectRootDenied, http.StatusBadRequest},
 		{"too many → 429", ErrLaunchTooMany, http.StatusTooManyRequests},
+		{"shell disabled → 403", ErrLaunchShellDisabled, http.StatusForbidden},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -287,6 +289,32 @@ func TestTerminalLaunchSuccess(t *testing.T) {
 	// The server resolved the subcommand from the registry, not the client.
 	if lm.lastFreshSpec.Tool != "codex" || lm.lastFreshSpec.Subcommand != "codex" {
 		t.Fatalf("fresh spec = %+v", lm.lastFreshSpec)
+	}
+}
+
+// TestTerminalLaunchShellBypassesToolAllowlist pins the reserved pseudo-tool
+// path: tool == termsvc.ShellTool ("shell") skips launchSubcommand entirely
+// (it is never a member of the launchable capability set) and reaches
+// CreateFresh with FreshLaunchSpec.Shell = true, no Subcommand.
+func TestTerminalLaunchShellBypassesToolAllowlist(t *testing.T) {
+	lm := &fakeLaunchManager{}
+	s := newLaunchTestServer(t, lm)
+	rec := postTerminalLaunch(t, s.Handler(), termsvc.ShellTool, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var out terminalLaunchResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Token == "" || out.Tool != termsvc.ShellTool || out.Subcommand != "" {
+		t.Fatalf("response = %+v", out)
+	}
+	if !lm.lastFreshSpec.Shell {
+		t.Fatalf("fresh spec Shell = false, want true: %+v", lm.lastFreshSpec)
+	}
+	if lm.lastFreshSpec.Subcommand != "" {
+		t.Fatalf("fresh spec Subcommand = %q, want empty for a shell request", lm.lastFreshSpec.Subcommand)
 	}
 }
 
@@ -355,6 +383,47 @@ func TestTerminalSessionsIncludesAllowedProjectRoots(t *testing.T) {
 	roots := getTerminalSessionsRoots(t, h)
 	if len(roots) != 1 || roots[0] != want {
 		t.Fatalf("allowed_project_roots = %v, want [%s]", roots, want)
+	}
+}
+
+// getTerminalSessionsShellEnabled GETs /api/terminal/sessions and returns the
+// shell_enabled field the New-terminal dialog reads to decide whether to
+// honestly offer the plain-shell picker option.
+func getTerminalSessionsShellEnabled(t *testing.T, h http.Handler) bool {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/terminal/sessions", nil)
+	req.Host = "127.0.0.1:8080"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/terminal/sessions = %d", rec.Code)
+	}
+	var out struct {
+		ShellEnabled bool `json:"shell_enabled"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return out.ShellEnabled
+}
+
+// TestTerminalSessionsIncludesShellEnabled asserts the sessions endpoint
+// surfaces [terminal.launch].allow_shell — off by default (deny-all), on once
+// the operator flips it via the policy PUT — so the dialog's shell-option
+// visibility matches the spawn-time gate without a second config read.
+func TestTerminalSessionsIncludesShellEnabled(t *testing.T) {
+	h := newManageServerWithLaunch(t, &fakeLaunchManager{})
+
+	if getTerminalSessionsShellEnabled(t, h) {
+		t.Fatal("expected shell_enabled=false before any policy write")
+	}
+
+	if code, out := putPolicy(t, h, `{"allow_shell":true}`); code != http.StatusOK {
+		t.Fatalf("PUT policy = %d (%v)", code, out)
+	}
+
+	if !getTerminalSessionsShellEnabled(t, h) {
+		t.Fatal("expected shell_enabled=true after allow_shell PUT")
 	}
 }
 

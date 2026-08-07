@@ -14,6 +14,7 @@ import {
   DropletIcon,
   EyeIcon,
   GearIcon,
+  LayersIcon,
   LightningIcon,
   ListIcon,
   PercentIcon,
@@ -41,6 +42,8 @@ function NavIconSvg({ icon }: { icon: NavIcon }) {
       return <ShieldIcon size={13} />;
     case "egress":
       return <CompassIcon size={13} />;
+    case "policies":
+      return <LayersIcon size={13} />;
     case "cost":
       return <DollarIcon size={13} />;
     case "analysis":

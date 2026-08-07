@@ -218,8 +218,8 @@ func TestAPIGuardConformance(t *testing.T) {
 	if blockers != 4 {
 		t.Errorf("block-capable channels = %d, want 4 (claude-code PreToolUse + cursor before×3)", blockers)
 	}
-	if watchers != 30 {
-		t.Errorf("watcher rows = %d, want 30 (every enabled adapter)", watchers)
+	if watchers != 32 {
+		t.Errorf("watcher rows = %d, want 32 (every enabled adapter; prime-agent joined 2026-08-06)", watchers)
 	}
 }
 

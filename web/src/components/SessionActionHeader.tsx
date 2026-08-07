@@ -5,7 +5,7 @@ import { HandoffCard } from "@/components/HandoffCard";
 import { JumpInButton } from "@/components/JumpInButton";
 import { ResumeButton } from "@/components/ResumeButton";
 import { TagPill } from "@/components/TagPill";
-import { FavoriteStar, TagEditor } from "@/components/TagEditor";
+import { FavoriteStar, RatingStars, TagEditor } from "@/components/TagEditor";
 import { postSessionTags } from "@/lib/api";
 import {
   CLASSIFY_REMOTE_BLOCKED_MSG,
@@ -62,7 +62,7 @@ export function SessionActionHeader({
   onFilterTag?: (tag: string) => void;
   onAnnotationChange?: (
     sessionId: string,
-    next: { tags: string[]; favorite: boolean; note: string },
+    next: { tags: string[]; favorite: boolean; note: string; rating: number },
   ) => void;
 }) {
   return (
@@ -83,6 +83,7 @@ export function SessionActionHeader({
         initialTags={d.tags ?? []}
         initialFavorite={d.favorite === true}
         initialNote={d.note ?? ""}
+        initialRating={d.rating ?? 0}
         onFilterTag={onFilterTag}
         onAnnotationChange={onAnnotationChange}
       />
@@ -135,6 +136,7 @@ function SessionAnnotationChips({
   initialTags,
   initialFavorite,
   initialNote,
+  initialRating,
   onFilterTag,
   onAnnotationChange,
 }: {
@@ -142,14 +144,16 @@ function SessionAnnotationChips({
   initialTags: string[];
   initialFavorite: boolean;
   initialNote: string;
+  initialRating: number;
   onFilterTag?: (tag: string) => void;
   onAnnotationChange?: (
     sessionId: string,
-    next: { tags: string[]; favorite: boolean; note: string },
+    next: { tags: string[]; favorite: boolean; note: string; rating: number },
   ) => void;
 }) {
   const [tags, setTags] = useState<string[]>(initialTags);
   const [favorite, setFavorite] = useState(initialFavorite);
+  const [rating, setRating] = useState(initialRating);
   // saved = the last value the server confirmed; draft = what's in the box.
   // Save-on-blur only fires when they differ, so tabbing through the field
   // costs nothing.
@@ -222,6 +226,7 @@ function SessionAnnotationChips({
     tags: string[];
     favorite: boolean;
     note: string;
+    rating: number;
   }) => onAnnotationChange?.(sessionId, next);
 
   // adoptServerNote folds a POST reply's note into local state without
@@ -247,10 +252,30 @@ function SessionAnnotationChips({
       const r = await postSessionTags(sessionId, { favorite: !before });
       setFavorite(r.favorite);
       setTags(r.tags ?? []);
+      setRating(r.rating);
       adoptServerNote(r.note ?? "");
-      report({ tags: r.tags ?? [], favorite: r.favorite, note: r.note ?? "" });
+      report({ tags: r.tags ?? [], favorite: r.favorite, note: r.note ?? "", rating: r.rating });
     } catch (e) {
       setFavorite(before);
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  // saveRating writes the 1-10 overall score (0 = clear) optimistically, then
+  // reconciles against the server reply — mirrors toggleFavorite.
+  async function saveRating(next: number) {
+    const before = rating;
+    setRating(next);
+    setErr(null);
+    try {
+      const r = await postSessionTags(sessionId, { rating: next });
+      setRating(r.rating);
+      setFavorite(r.favorite);
+      setTags(r.tags ?? []);
+      adoptServerNote(r.note ?? "");
+      report({ tags: r.tags ?? [], favorite: r.favorite, note: r.note ?? "", rating: r.rating });
+    } catch (e) {
+      setRating(before);
       setErr(e instanceof Error ? e.message : String(e));
     }
   }
@@ -275,7 +300,8 @@ function SessionAnnotationChips({
       setExternalNote(null);
       setFavorite(r.favorite);
       setTags(r.tags ?? []);
-      report({ tags: r.tags ?? [], favorite: r.favorite, note: serverNote });
+      setRating(r.rating);
+      report({ tags: r.tags ?? [], favorite: r.favorite, note: serverNote, rating: r.rating });
     } catch (e) {
       // Keep the operator's text in the box — losing typed prose on a failed
       // save would be worse than a stale-looking field. `saved` stays put, so
@@ -293,6 +319,19 @@ function SessionAnnotationChips({
   return (
     <section className="flex flex-wrap items-center gap-2">
       <FavoriteStar favorite={favorite} onToggle={() => void toggleFavorite()} />
+      <span
+        className="inline-flex items-center gap-1.5 rounded-2 border border-line-2 bg-bg-2 px-1.5 py-0.5"
+        title="Overall session rating — how well this session performed (1-10)"
+      >
+        <span className="text-[10px] uppercase tracking-[0.06em] text-fg-4">
+          rating
+        </span>
+        <RatingStars
+          rating={rating}
+          onRate={(next) => void saveRating(next)}
+          size={13}
+        />
+      </span>
       {tags.length === 0 ? (
         <span className="text-[11px] text-fg-4">no tags</span>
       ) : (
@@ -310,7 +349,7 @@ function SessionAnnotationChips({
         label={tags.length > 0 ? "edit tags" : "+ tag"}
         onTagsChange={(next) => {
           setTags(next);
-          report({ tags: next, favorite, note: saved });
+          report({ tags: next, favorite, note: saved, rating });
         }}
         onError={(m) => setErr(m)}
       />

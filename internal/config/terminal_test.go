@@ -21,6 +21,11 @@ func TestTerminalDefaults(t *testing.T) {
 	if len(c.Terminal.Launch.AllowedTools) != 0 || len(c.Terminal.Launch.AllowedProjectRoots) != 0 {
 		t.Error("fresh-launch allow-lists must default empty (deny-all)")
 	}
+	// Plain-shell launch is a SEPARATE conscious opt-in — OFF by default,
+	// independent of AllowFreshAgent.
+	if c.Terminal.Launch.AllowShell {
+		t.Error("shell launch must default OFF (privilege expansion)")
+	}
 	// IdleTimeout "0" = idle reaping DISABLED by default (continuity):
 	// a live session stays until its child exits or an explicit close.
 	if c.Terminal.MaxConcurrent != 9 || c.Terminal.IdleTimeout != "0" {
@@ -36,6 +41,7 @@ func TestTerminalPartialMerge(t *testing.T) {
 allow_fresh_agent = true
 allowed_tools = ["claude-code", "codex"]
 allowed_project_roots = ["/home/dev/projects"]
+allow_shell = true
 `
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -52,8 +58,42 @@ allowed_project_roots = ["/home/dev/projects"]
 	if len(cfg.Terminal.Launch.AllowedTools) != 2 {
 		t.Errorf("allowed_tools = %v", cfg.Terminal.Launch.AllowedTools)
 	}
+	if !cfg.Terminal.Launch.AllowShell {
+		t.Error("allow_shell did not flip on")
+	}
 	if !cfg.Terminal.Enabled || cfg.Terminal.MaxConcurrent != 9 {
 		t.Errorf("terminal-wide defaults lost on partial merge: %+v", cfg.Terminal)
+	}
+}
+
+// TestTerminalAllowShellIndependentOfAllowFreshAgent pins the invariant that
+// motivated AllowShell as a separate key: flipping allow_fresh_agent on must
+// NOT also grant allow_shell (a bare shell is a strictly larger execution-
+// authority expansion than a known, capability-registry-bounded AI-tool
+// launcher), and a pre-existing [terminal.launch] block written before
+// allow_shell existed must still load with AllowShell=false (BurntSushi leaves
+// an absent key untouched — same partial-merge mechanism AllowInstall relies
+// on, but seeded FALSE here rather than true).
+func TestTerminalAllowShellIndependentOfAllowFreshAgent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := `
+[terminal.launch]
+allow_fresh_agent = true
+allowed_tools = ["claude-code"]
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := Load(LoadOptions{GlobalPath: path, Env: func(string) string { return "" }})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Terminal.Launch.AllowFreshAgent {
+		t.Fatal("allow_fresh_agent did not flip on")
+	}
+	if cfg.Terminal.Launch.AllowShell {
+		t.Error("allow_shell must stay OFF when only allow_fresh_agent is set — a pre-existing block predating the key must not silently gain shell access")
 	}
 }
 

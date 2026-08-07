@@ -1,0 +1,10 @@
+# Isolated demo instance data — the demo node's own SQLite DB, WAL/SHM, and the
+# terminal-attach Unix socket. Regenerated on every `observer start`; never
+# committed (the socket also breaks `git add` — it can't index a socket file).
+demo-data/
+
+# Local env overrides for the harness (copy from .env.example).
+.env
+
+# Transient config backups written by `config.WriteToml` (e.g. a budget PUT).
+*.config.toml.bak

@@ -3,6 +3,7 @@ package cost
 import (
 	"regexp"
 	"strings"
+	"time"
 )
 
 // Pricing is USD per 1M tokens for one model. Zero fields are treated as
@@ -92,8 +93,15 @@ type Pricing struct {
 // the date suffix (e.g. "-20250514") is stripped and retried; on miss again,
 // family prefixes ("claude-sonnet-4", "gpt-4o") are tried. The zero value is
 // a usable empty table.
+//
+// `exact` always holds CURRENT rates. `dated` optionally holds a HISTORICAL
+// rate timeline per key, applied only by the *At lookups; see dated.go for
+// the full contract ("the date dimension lives at the rate, not at the
+// resolution"). A table with no dated timelines behaves exactly as it did
+// before dated pricing existed.
 type Table struct {
 	exact map[string]Pricing
+	dated map[string][]DatedPricing
 }
 
 // NewTable seeds a Table with the baked-in defaults from spec §24 and public
@@ -106,6 +114,10 @@ func NewTable() *Table {
 	for k, v := range defaultPricing {
 		t.exact[k] = v
 	}
+	// Baked-in historical rate timelines (dated.go). Verified entries only
+	// (e.g. the GPT-5.6 Terra/Luna 2026-07-30 price cut); a model with no
+	// verified rate change stays on the pre-dated lookup code path.
+	t.MergeDated(datedPricing)
 	return t
 }
 
@@ -154,12 +166,28 @@ func (t *Table) Lookup(model string) (Pricing, bool) {
 // return value is a PricingSource describing how the match resolved
 // (exact / date-stripped / family) so callers can surface a fallback
 // indicator. Match precedence is identical to Lookup.
+//
+// Returns CURRENT rates. Callers pricing HISTORICAL usage must use
+// LookupWithSourceAt with the usage timestamp — see dated.go.
 func (t *Table) LookupWithSource(model string) (Pricing, PricingSource, bool) {
+	return t.LookupWithSourceAt(model, time.Time{})
+}
+
+// LookupWithSourceAt is the date-aware LookupWithSource: it returns the
+// rate in force for `model` at `at`.
+//
+// The RESOLUTION ladder below is identical for both — `at` is consulted
+// only when a rung has already picked a table key, so PricingSource is
+// unaffected by the date. A zero `at`, a model with no dated timeline,
+// or an `at` that precedes every dated entry all resolve to the flat
+// (current) rate, making this byte-identical to LookupWithSource in the
+// zero-dated-entries case.
+func (t *Table) LookupWithSourceAt(model string, at time.Time) (Pricing, PricingSource, bool) {
 	if t == nil || t.exact == nil || model == "" {
 		return Pricing{}, PricingSourceMiss, false
 	}
-	if p, ok := t.exact[model]; ok {
-		return fillDefaults(p), PricingSourceExact, true
+	if _, ok := t.exact[model]; ok {
+		return t.rate(model, at), PricingSourceExact, true
 	}
 	// `:free` suffix guard: every open-weight free tier on OpenRouter /
 	// Kilo Gateway / first-party portals costs $0 regardless of family
@@ -176,8 +204,8 @@ func (t *Table) LookupWithSource(model string) (Pricing, PricingSource, bool) {
 	}
 	stripped := stripDateSuffix(model)
 	if stripped != model {
-		if p, ok := t.exact[stripped]; ok {
-			return fillDefaults(p), PricingSourceDateStripped, true
+		if _, ok := t.exact[stripped]; ok {
+			return t.rate(stripped, at), PricingSourceDateStripped, true
 		}
 	}
 	// Longest-prefix fallback: try progressively shorter family prefixes.
@@ -186,7 +214,7 @@ func (t *Table) LookupWithSource(model string) (Pricing, PricingSource, bool) {
 	lower := strings.ToLower(model)
 	for _, family := range familyKeys(t.exact) {
 		if strings.HasPrefix(lower, family) {
-			return fillDefaults(t.exact[family]), PricingSourceFamily, true
+			return t.rate(family, at), PricingSourceFamily, true
 		}
 	}
 	// Last-resort normalization: strip router/provider prefixes the family
@@ -198,13 +226,13 @@ func (t *Table) LookupWithSource(model string) (Pricing, PricingSource, bool) {
 	// "auto"/"" name no real model, so normalizeUnpricedModel returns "" and
 	// they correctly fall through to MISS (their cure is adapter-side).
 	if norm := normalizeUnpricedModel(model); norm != "" {
-		if p, ok := t.exact[norm]; ok {
-			return fillDefaults(p), PricingSourceFamily, true
+		if _, ok := t.exact[norm]; ok {
+			return t.rate(norm, at), PricingSourceFamily, true
 		}
 		lnorm := strings.ToLower(norm)
 		for _, family := range familyKeys(t.exact) {
 			if strings.HasPrefix(lnorm, family) {
-				return fillDefaults(t.exact[family]), PricingSourceFamily, true
+				return t.rate(family, at), PricingSourceFamily, true
 			}
 		}
 	}
@@ -653,12 +681,13 @@ var defaultPricing = map[string]Pricing{
 	// FIRST non-Anthropic explicit cache-WRITE tier: 5.6 introduces
 	// explicit cache breakpoints + a 30-minute minimum cache life and
 	// bills cache writes at 1.25× the uncached input rate → $6.25 / $3.125
-	// / $1.25. Cache reads keep the OpenAI 90%-discount shape ($0.50 /
-	// $0.25 / $0.10). CacheCreation1h is PINNED equal to CacheCreation:
-	// OpenAI has no 5m/1h tier split, and fillDefaults auto-derives
-	// CacheCreation1h = 2×Input whenever CacheCreation>0 (an Anthropic-
-	// shape default), so pinning it keeps a fabricated 2×-Input 1h rate
-	// out of the rate card.
+	// / $1.25 (Sol unchanged by the 2026-07-30 cut; Terra/Luna's write
+	// rates recompute to 1.25× their NEW input rates below). Cache reads
+	// keep the OpenAI 90%-discount shape. CacheCreation1h is PINNED equal
+	// to CacheCreation: OpenAI has no 5m/1h tier split, and fillDefaults
+	// auto-derives CacheCreation1h = 2×Input whenever CacheCreation>0 (an
+	// Anthropic-shape default), so pinning it keeps a fabricated 2×-Input
+	// 1h rate out of the rate card.
 	//
 	// The 1.25× write rate is INERT today: the proxy's OpenAI usage parse
 	// (internal/proxy/provider.go ~L519, streaming.go ~L299) only carries
@@ -666,15 +695,53 @@ var defaultPricing = map[string]Pricing{
 	// name is not yet grounded on a live 5.6 response. Wire it into
 	// provider.go/streaming.go once a live capture lands.
 	//
-	// No long-context threshold published for 5.6 (unlike 5.4/5.5's 272K)
-	// and no Fast tier documented. "Sol Ultra" is a high-effort mode of
-	// Sol, not a separate rate card. WebSearchPerRequest stays 0.01 like
-	// the other OpenAI rows.
-	"gpt-5.6-sol":   {Input: 5, Output: 30, CacheRead: 0.50, CacheCreation: 6.25, CacheCreation1h: 6.25, WebSearchPerRequest: 0.01},
-	"gpt-5.6-terra": {Input: 2.50, Output: 15, CacheRead: 0.25, CacheCreation: 3.125, CacheCreation1h: 3.125, WebSearchPerRequest: 0.01},
-	"gpt-5.6-luna":  {Input: 1, Output: 6, CacheRead: 0.10, CacheCreation: 1.25, CacheCreation1h: 1.25, WebSearchPerRequest: 0.01},
+	// PRICE CUT, effective 2026-07-30 (developers.openai.com/api/docs/
+	// changelog: "Starting July 30, GPT-5.6 Luna costs 80% less, while
+	// GPT-5.6 Terra costs 20% less"). Terra/Luna's OLD rates are
+	// preserved as the first entry of their datedPricing timeline
+	// (dated.go) — see TestDatedSeedIsSelfConsistent. Sol is UNCHANGED
+	// by this cut.
+	//
+	// Long-context + Fast tiers, added alongside the 2026-07-30 cut
+	// (developers.openai.com/api/docs/pricing): threshold 272K tokens,
+	// input/cache-read/cache-write at 2× standard, output at 1.5×
+	// standard. Fast mode (renamed from "Priority Processing" on
+	// 2026-07-30) bills at 2× standard. "Sol Ultra" is a high-effort
+	// mode of Sol, not a separate rate card. WebSearchPerRequest stays
+	// 0.01 like the other OpenAI rows.
+	"gpt-5.6-sol": {
+		Input: 5, Output: 30, CacheRead: 0.50, CacheCreation: 6.25, CacheCreation1h: 6.25, WebSearchPerRequest: 0.01,
+		LongContextThreshold: 272_000,
+		LongContextInput:     10.00, LongContextOutput: 45.00, LongContextCacheRead: 1.00,
+		LongContextCacheCreation: 12.50, LongContextCacheCreation1h: 12.50,
+		FastMultiplier: 2,
+	},
+	// Terra — NEW rate post-2026-07-30 cut (20% less). OLD rate ($2.50 /
+	// $15 / $0.25 / $3.125) is dated.go's timeline entry 1.
+	"gpt-5.6-terra": {
+		Input: 2.00, Output: 12.00, CacheRead: 0.20, CacheCreation: 2.50, CacheCreation1h: 2.50, WebSearchPerRequest: 0.01,
+		LongContextThreshold: 272_000,
+		LongContextInput:     4.00, LongContextOutput: 18.00, LongContextCacheRead: 0.40,
+		LongContextCacheCreation: 5.00, LongContextCacheCreation1h: 5.00,
+		FastMultiplier: 2,
+	},
+	// Luna — NEW rate post-2026-07-30 cut (80% less). OLD rate ($1 / $6
+	// / $0.10 / $1.25) is dated.go's timeline entry 1.
+	"gpt-5.6-luna": {
+		Input: 0.20, Output: 1.20, CacheRead: 0.02, CacheCreation: 0.25, CacheCreation1h: 0.25, WebSearchPerRequest: 0.01,
+		LongContextThreshold: 272_000,
+		LongContextInput:     0.40, LongContextOutput: 1.80, LongContextCacheRead: 0.04,
+		LongContextCacheCreation: 0.50, LongContextCacheCreation1h: 0.50,
+		FastMultiplier: 2,
+	},
 	// family prefix → Sol (flagship) rates, same convention as the `grok` family row
-	"gpt-5.6": {Input: 5, Output: 30, CacheRead: 0.50, CacheCreation: 6.25, CacheCreation1h: 6.25, WebSearchPerRequest: 0.01},
+	"gpt-5.6": {
+		Input: 5, Output: 30, CacheRead: 0.50, CacheCreation: 6.25, CacheCreation1h: 6.25, WebSearchPerRequest: 0.01,
+		LongContextThreshold: 272_000,
+		LongContextInput:     10.00, LongContextOutput: 45.00, LongContextCacheRead: 1.00,
+		LongContextCacheCreation: 12.50, LongContextCacheCreation1h: 12.50,
+		FastMultiplier: 2,
+	},
 	// ChatGPT web-UI dashed slugs (browser-extension chatgpt-web adapter,
 	// browser-extension/src/parsers.js) — the ChatGPT frontend echoes the
 	// model as "gpt-5-6-thinking" (dot-in-name replaced with a dash,
@@ -682,13 +749,27 @@ var defaultPricing = map[string]Pricing{
 	// family-prefix ladder in LookupWithSource can't bridge dash-vs-dot, so
 	// without an explicit alias these fell through to the unrelated "gpt-5"
 	// row (~5x underpriced). Pinned at Sol (flagship) rates — the same
-	// convention as the "gpt-5.6" family row above. KNOWN (accepted, LOW):
-	// like every exact key, the bare "gpt-5-6" also acts as a family PREFIX
-	// in LookupWithSource, so a hypothetical future "gpt-5-6x" slug would
-	// inherit these rates until given its own row — the ladder is not
-	// delimiter-aware by design (GPT-5.6 review 2026-07-18 #5).
-	"gpt-5-6-thinking": {Input: 5, Output: 30, CacheRead: 0.50, CacheCreation: 6.25, CacheCreation1h: 6.25, WebSearchPerRequest: 0.01},
-	"gpt-5-6":          {Input: 5, Output: 30, CacheRead: 0.50, CacheCreation: 6.25, CacheCreation1h: 6.25, WebSearchPerRequest: 0.01},
+	// convention as the "gpt-5.6" family row above (incl. the 2026-07-30
+	// long-context/Fast additions; Sol's base rate is unaffected by the
+	// price cut). KNOWN (accepted, LOW): like every exact key, the bare
+	// "gpt-5-6" also acts as a family PREFIX in LookupWithSource, so a
+	// hypothetical future "gpt-5-6x" slug would inherit these rates until
+	// given its own row — the ladder is not delimiter-aware by design
+	// (GPT-5.6 review 2026-07-18 #5).
+	"gpt-5-6-thinking": {
+		Input: 5, Output: 30, CacheRead: 0.50, CacheCreation: 6.25, CacheCreation1h: 6.25, WebSearchPerRequest: 0.01,
+		LongContextThreshold: 272_000,
+		LongContextInput:     10.00, LongContextOutput: 45.00, LongContextCacheRead: 1.00,
+		LongContextCacheCreation: 12.50, LongContextCacheCreation1h: 12.50,
+		FastMultiplier: 2,
+	},
+	"gpt-5-6": {
+		Input: 5, Output: 30, CacheRead: 0.50, CacheCreation: 6.25, CacheCreation1h: 6.25, WebSearchPerRequest: 0.01,
+		LongContextThreshold: 272_000,
+		LongContextInput:     10.00, LongContextOutput: 45.00, LongContextCacheRead: 1.00,
+		LongContextCacheCreation: 12.50, LongContextCacheCreation1h: 12.50,
+		FastMultiplier: 2,
+	},
 	"gpt-5.5": {
 		Input: 5, Output: 30, CacheRead: 0.50,
 		LongContextThreshold: 272_000,
@@ -1228,11 +1309,29 @@ var defaultPricing = map[string]Pricing{
 	// key above and are never shadowed by this one.
 	"doubao-seed-2-0": {Input: 0.47, Output: 2.35, CacheRead: 0.094},
 
-	// Meta — Muse Spark 1.1 (developer.meta.com), public API preview
-	// launched 2026-07-09. 1M context. Reasoning tokens bill at the
-	// output rate (same convention as Anthropic — no separate reasoning
-	// dimension on this struct).
-	"muse-spark-1.1": {Input: 1.25, Output: 4.25, CacheRead: 0.15},
+	// Meta — Muse Spark (ai.developer.meta.com/docs/pricing-rate-limits),
+	// public API preview. 1.1 launched 2026-07-09; 1.2 released
+	// 2026-08-05 at the SAME standard rate. 1M context. Reasoning tokens
+	// bill at the output rate (same convention as Anthropic — no
+	// separate reasoning dimension on this struct). WebSearchPerRequest
+	// is Meta's own "$2.50 per 1,000 search queries" flattened to a
+	// per-call rate ($2.50 / 1,000 = $0.0025), same unit convention as
+	// the Anthropic/OpenAI WebSearchPerRequest rows. CacheCreation stays
+	// 0 for every Muse Spark row — Meta's pricing page states no
+	// cache-write rate (unstated ⇒ uncharged, never invented). Meta also
+	// states "no premium for long context" for this line, so no
+	// LongContext* fields are set on any Muse Spark row.
+	"muse-spark-1.1": {Input: 1.25, Output: 4.25, CacheRead: 0.15, WebSearchPerRequest: 0.0025},
+	"muse-spark-1.2": {Input: 1.25, Output: 4.25, CacheRead: 0.15, WebSearchPerRequest: 0.0025},
+	// 1.2's discounted data-sharing tier (opt in to Meta using your
+	// traffic for model improvement) — Meta's own pricing page. Exact
+	// key so this contributor SKU is never shadowed by the family row
+	// below.
+	"muse-spark-1.2-contributor": {Input: 0.10, Output: 0.20, CacheRead: 0.002, WebSearchPerRequest: 0.0025},
+	// Bare "muse-spark" family prefix → standard (non-contributor) rate,
+	// so an unrecognized future version (e.g. "muse-spark-1.3") inherits
+	// the standard tier rather than MISSing to $0.
+	"muse-spark": {Input: 1.25, Output: 4.25, CacheRead: 0.15, WebSearchPerRequest: 0.0025},
 
 	// Cohere — North Mini Code 1.0. Genuinely free / $0, rate-limited per
 	// docs.cohere.com and the OpenRouter listing (not a promo). A paid

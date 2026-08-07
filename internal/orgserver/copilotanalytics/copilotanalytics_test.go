@@ -223,35 +223,6 @@ func TestUpsertIdempotent(t *testing.T) {
 	}
 }
 
-// --- The sibling cost rollup: seat monthly subscription + per-day overage,
-// never summing engagement counts. ---
-
-func TestLoadCostSummary(t *testing.T) {
-	db := testDB(t)
-	p := &Poller{DB: db, OrgID: "org1", spec: surfaceRegistry[SurfaceSeats]}
-	_, _ = p.upsert(context.Background(), []DailyMetric{
-		emitMetric("2026-06-14", orgAggregateKey, ActorOrg, SurfaceSeats, UnitSeats, MetricSeatsTotal, 120),
-		emitMetric("2026-06-13", orgAggregateKey, ActorOrg, SurfaceSeats, UnitSeats, MetricSeatsTotal, 100), // older snapshot
-		emitMetric("2026-06-14", orgAggregateKey, ActorOrg, SurfaceBilling, UnitUSD, MetricCost, 74),
-		emitMetric("2026-06-13", orgAggregateKey, ActorOrg, SurfaceBilling, UnitUSD, MetricCost, 10),
-		// Engagement count — must NOT be read into cost.
-		emitMetric("2026-06-14", "octodev", ActorUser, SurfaceEngagement, UnitCount, MetricChats, 999),
-	})
-
-	cs, err := LoadCostSummary(context.Background(), db, "org1", 19)
-	if err != nil {
-		t.Fatalf("LoadCostSummary: %v", err)
-	}
-	// Latest snapshot wins (2026-06-14, 120 seats) → monthly 120*19 = 2280.
-	if cs.SeatSnapshot.Day != "2026-06-14" || cs.SeatSnapshot.Seats != 120 || cs.SeatSnapshot.MonthlyUSD != 2280 {
-		t.Errorf("seat snapshot = %+v, want day 2026-06-14 / 120 / 2280", cs.SeatSnapshot)
-	}
-	// Overage is additive across days: 10 + 74 = 84.
-	if cs.TotalOverageUSD != 84 || len(cs.OverageByDay) != 2 {
-		t.Errorf("overage = %v over %d days, want 84/2", cs.TotalOverageUSD, len(cs.OverageByDay))
-	}
-}
-
 // --- NewPoller guards. ---
 
 func TestNewPollerErrors(t *testing.T) {

@@ -39,7 +39,7 @@ func etwStatusServer(t *testing.T, mutate func(*config.Config)) (*Server, string
 	if err := config.WriteToml(cfgPath, cfg); err != nil {
 		t.Fatalf("seed config: %v", err)
 	}
-	database, err := db.Open(context.Background(), db.Options{Path: cfg.Observer.DBPath})
+	database, err := openTestDB(context.Background(), db.Options{Path: cfg.Observer.DBPath})
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}

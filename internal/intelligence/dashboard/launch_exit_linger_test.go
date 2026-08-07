@@ -207,7 +207,7 @@ func TestAttachExitLingerStaysRemoteSensitive(t *testing.T) {
 	adapter := &svcManagerAdapter{svc: svc, mgr: mgr}
 
 	tdir := t.TempDir()
-	database, err := db.Open(context.Background(), db.Options{Path: tdir + "/d.db"})
+	database, err := openTestDB(context.Background(), db.Options{Path: tdir + "/d.db"})
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}

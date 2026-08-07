@@ -1,6 +1,6 @@
 {
   "name": "@superbased/observer",
-  "version": "1.28.0",
+  "version": "1.29.0",
   "description": "Claude Code cost tracking, Cursor token usage, Codex spend — AI coding agent observability across 29 adapters, proxy-accurate token counts and cost.",
   "keywords": [
     "ai",
@@ -42,13 +42,24 @@
     "LICENSE"
   ],
   "optionalDependencies": {
-    "@superbased/observer-linux-x64": "1.28.0",
-    "@superbased/observer-linux-arm64": "1.28.0",
-    "@superbased/observer-darwin-x64": "1.28.0",
-    "@superbased/observer-darwin-arm64": "1.28.0",
-    "@superbased/observer-win32-x64": "1.28.0"
+    "@superbased/observer-linux-x64": "1.29.0",
+    "@superbased/observer-linux-arm64": "1.29.0",
+    "@superbased/observer-darwin-x64": "1.29.0",
+    "@superbased/observer-darwin-arm64": "1.29.0",
+    "@superbased/observer-win32-x64": "1.29.0"
   },
   "scripts": {
     "test": "node bin/observer.js --version"
+  },
+  "superbased": {
+    "announcement": {
+      "id": "2026-08-plugin-coverage",
+      "severity": "info",
+      "title": "SuperBased now installs as a native plugin in 22 AI coding tools",
+      "body": "Claude Code, Codex, Cursor, Copilot, Gemini, OpenCode and 16 more now have a native SuperBased plugin. See the plugins repo for the install command for your tool.",
+      "url": "https://github.com/superbasedapp/plugins",
+      "expires_at": "2026-10-01T00:00:00Z",
+      "source": "release"
+    }
   }
 }

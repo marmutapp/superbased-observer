@@ -38,7 +38,7 @@ func withFakeHome(t *testing.T, contents string) string {
 func newSetupServer(t *testing.T, port int) *Server {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "d.db")
-	database, err := db.Open(context.Background(), db.Options{Path: dbPath})
+	database, err := openTestDB(context.Background(), db.Options{Path: dbPath})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -126,12 +126,25 @@ func (s *Server) handleConfigPricing(w http.ResponseWriter, r *http.Request) {
 	}
 	s.notifyConfigSaved()
 
-	writeJSON(w, map[string]any{
+	resp := map[string]any{
 		"saved":       true,
 		"config_path": s.opts.ConfigPath,
 		"backup_path": s.opts.ConfigPath + ".bak",
 		"models":      cfg.Intelligence.Pricing.Models,
-	})
+	}
+	// Advisory problems found while rebuilding the table — a malformed
+	// [intelligence.pricing.dated] row that was SKIPPED, or a dated
+	// timeline whose newest entry no longer matches the flat rate the
+	// operator just saved (a half-landed rate change: history would be
+	// right but today's costs wrong). Pricing never fails closed on
+	// these, so the save still succeeded; surfacing them is how the
+	// operator finds out their override was ignored.
+	if s.opts.CostEngine != nil {
+		if warn := s.opts.CostEngine.PricingWarnings(); len(warn) > 0 {
+			resp["warnings"] = warn
+		}
+	}
+	writeJSON(w, resp)
 }
 
 // notifyConfigSaved invokes the daemon's config-saved hook (P2.5 hot
@@ -175,6 +188,12 @@ func (s *Server) handleConfigPricingDefaults(w http.ResponseWriter, r *http.Requ
 	}
 	writeJSON(w, map[string]any{
 		"defaults": cost.BakedInDefaults(),
+		// The baked-in HISTORICAL rate timelines, keyed like `defaults`.
+		// Empty on a stock build. Present so this endpoint can never
+		// imply a model has had exactly one rate for all time when the
+		// cost engine is in fact splitting its history — see
+		// internal/intelligence/cost/dated.go.
+		"dated_defaults": cost.BakedInDatedDefaults(),
 	})
 }
 
@@ -628,19 +647,62 @@ func applySectionUpdate(cfg *config.Config, name string, body []byte, configPath
 	case "observability":
 		// The [observability] subsystem on/off gate (internal/obs): the
 		// OTLP /v1/traces receiver, the obs_* schema, trajectory
-		// ingestion + API, and the eval plane. The eval sub-config
-		// ([observability.eval] — judge model, online sampling) stays a
-		// hand-written config decision (local-only judge-model
-		// selection), so decode ONLY Enabled and preserve
-		// cfg.Observability.Eval — the same selective copy the
-		// intelligence/guard cases use for their non-form sub-structs.
+		// ingestion + API, and the eval plane.
+		//
+		// Three surfaces write this section, so every field is a POINTER
+		// and only the fields actually sent are applied (the terminal /
+		// process partial-merge discipline). This is REQUIRED, not a nicety:
+		// the Settings toggle sends {Enabled}, the Policies module's judge
+		// form sends {Judge}, and its budget form sends {Admission:{Budget}} —
+		// a plain-bool Enabled would decode to false and DISABLE the whole
+		// subsystem whenever the Policies form (which omits Enabled) saved.
+		//
+		// The shared judge binding ([observability.judge]), the admission
+		// judge override ([observability.admission.judge]), and the
+		// per-end-user budget ([observability.admission.budget]) are edited by
+		// the Policies module (judge + budget are read at daemon start, not
+		// hot-swappable, so this restart-oriented section save is their apply
+		// path — docs/handovers/policies-module-phase-b-handover-2026-08-04.md
+		// §5). Everything else under [observability] is preserved wholesale:
+		// Eval (hand-written judge-model selection), the admission criterion
+		// table + mode/scope/prefilter (owned by the admission POLICY persister
+		// cmd/observer/admission_persist.go — never this seam, CLAUDE.md #4),
+		// Egress, and Alerts.
 		var sec struct {
-			Enabled bool `json:"Enabled"`
+			Enabled   *bool                            `json:"Enabled"`
+			Judge     *config.ObservabilityJudgeConfig `json:"Judge"`
+			Admission *struct {
+				Budget *config.AdmissionBudgetConfig    `json:"Budget"`
+				Judge  *config.ObservabilityJudgeConfig `json:"Judge"`
+			} `json:"Admission"`
 		}
 		if err := json.Unmarshal(body, &sec); err != nil {
 			return fmt.Errorf("decode observability: %w", err)
 		}
-		cfg.Observability.Enabled = sec.Enabled
+		if sec.Enabled != nil {
+			cfg.Observability.Enabled = *sec.Enabled
+		}
+		if sec.Judge != nil {
+			if sec.Judge.TimeoutMS < 0 || sec.Judge.MaxTokens < 0 || sec.Judge.NumCtx < 0 {
+				return fmt.Errorf("observability judge: timeout_ms/max_tokens/num_ctx must be >= 0")
+			}
+			cfg.Observability.Judge = *sec.Judge
+		}
+		if sec.Admission != nil {
+			if sec.Admission.Budget != nil {
+				b := sec.Admission.Budget
+				if b.PerUser5hUSD < 0 || b.PerUserWeeklyUSD < 0 || b.PerUserMonthlyUSD < 0 {
+					return fmt.Errorf("observability admission budget: per-user caps must be >= 0")
+				}
+				cfg.Observability.Admission.Budget = *b
+			}
+			if sec.Admission.Judge != nil {
+				if sec.Admission.Judge.TimeoutMS < 0 || sec.Admission.Judge.MaxTokens < 0 || sec.Admission.Judge.NumCtx < 0 {
+					return fmt.Errorf("observability admission judge: timeout_ms/max_tokens/num_ctx must be >= 0")
+				}
+				cfg.Observability.Admission.Judge = *sec.Admission.Judge
+			}
+		}
 	case "secrets":
 		// Nested under [observer.secrets] in TOML but surfaced as its
 		// own section so the privacy-relevant scrubbing controls don't
