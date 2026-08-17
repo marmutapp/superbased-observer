@@ -125,6 +125,10 @@ type Spec struct {
 	// allow-listed, explicit set (flags observer understands + the `--`
 	// remainder), never a blind argv copy.
 	ExtraArgs []string
+	// WrapArgv is an optional isolation-wrapper argv prefix (e.g. bwrap
+	// flags ending in --); when non-empty argv() prepends it before
+	// [BinPath, Subcommand]. Empty = no wrapper (unchanged behaviour).
+	WrapArgv []string
 }
 
 // ArgvMode selects the launch argv SHAPE for a SpecAgent session. It is an
@@ -151,7 +155,11 @@ const (
 // argv builds the exec argv from the validated Spec. Server-derived only.
 // ArgvModeFresh is [bin, subcommand] + ExtraArgs; ArgvModeHandoff is
 // [bin, subcommand, "--continue-from", id] plus "--carry <c>" and
-// "--from-message <n>" when set, then ExtraArgs.
+// "--from-message <n>" when set, then ExtraArgs. When WrapArgv is non-empty
+// it is prepended before EVERYTHING — including BinPath — for SpecAgent and
+// SpecShell (a B9 sandbox wrap works for a plain shell for free). SpecSetup
+// is exempt: it runs a fixed, server-derived command verbatim and is never
+// wrapped.
 func (s Spec) argv() []string {
 	if s.Kind == SpecSetup {
 		// A SpecSetup session runs a fixed, server-derived command verbatim
@@ -160,14 +168,18 @@ func (s Spec) argv() []string {
 		return append([]string(nil), s.SetupArgv...)
 	}
 	if s.Kind == SpecShell {
-		// Same copy-on-return discipline as SpecSetup above.
-		return append([]string(nil), s.ShellArgv...)
+		// Same copy-on-return discipline as SpecSetup above, with the wrap
+		// prefix prepended when present.
+		return append(append([]string(nil), s.WrapArgv...), s.ShellArgv...)
 	}
 	switch s.ArgvMode {
 	case ArgvModeFresh:
-		return append([]string{s.BinPath, s.Subcommand}, s.ExtraArgs...)
+		a := append([]string(nil), s.WrapArgv...)
+		a = append(a, s.BinPath, s.Subcommand)
+		return append(a, s.ExtraArgs...)
 	default: // ArgvModeHandoff (zero value)
-		a := []string{s.BinPath, s.Subcommand, "--continue-from", s.SessionID}
+		a := append([]string(nil), s.WrapArgv...)
+		a = append(a, s.BinPath, s.Subcommand, "--continue-from", s.SessionID)
 		if s.Carry != "" {
 			a = append(a, "--carry", s.Carry)
 		}

@@ -2,16 +2,112 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/marmutapp/superbased-observer/internal/provenance"
 	"github.com/marmutapp/superbased-observer/internal/proxy"
 	"github.com/marmutapp/superbased-observer/internal/routing"
+	"github.com/marmutapp/superbased-observer/internal/routingconfig"
+	"github.com/marmutapp/superbased-observer/internal/selfobs/conformance"
+	"github.com/marmutapp/superbased-observer/internal/selfobs/emit"
+	"github.com/marmutapp/superbased-observer/internal/selfobs/run"
 	"github.com/marmutapp/superbased-observer/internal/store"
 )
+
+// routingState is the immutable value the RoutingStateHandle publishes
+// behind its atomic.Pointer — the router's ORG-LAYER effective identity
+// as of the last construction or hot-reload. Swapped whole, never
+// mutated in place, so a reader always sees a coherent triple.
+type routingState struct {
+	version int64  // org routing-policy version composed into the live policy
+	hash    string // org-layer running identity (routing.Policy.Hash(), 16-hex)
+	mode    string // advise|enforce (normalized by the reader)
+}
+
+// RoutingStateHandle exposes the router's ORG-LAYER effective state for
+// the P0-6 effective-policy-state reporter (docs/plans/plane-a-p0-6-
+// effective-policy-state-plan.md §4.2) AND carries the P0-7 hot-reload
+// closure. It is a LIVE carrier: wireRouting publishes the initial
+// routingState and liveRouter.ReloadOrgPolicy publishes a new one after
+// an accepted org policy is applied to the live engine, so the reporter
+// observes the router flip pending_restart -> effective with no daemon
+// restart. Reads are lock-free (atomic.Pointer load).
+//
+// effectiveHash is the ORG-LAYER running identity captured ONLY when an
+// org routing policy is composed into the live policy (version > 0).
+// With NO org policy composed (local-only routing), version is 0 and
+// hash is EMPTY — a purely-local routing config has no org desired-state
+// to report, so the reader resolves it to none/no_policy (R5-B2), never
+// the local-config hash.
+type RoutingStateHandle struct {
+	state atomic.Pointer[routingState]
+	// reload is the P0-7 hot-reload closure (§4.4 decision A), set by
+	// wireRouting to liveRouter.ReloadOrgPolicy. Unexported-set,
+	// exported-invoke via Reload; nil-safe.
+	reload func(context.Context) error
+}
+
+// store publishes a new routingState (construction + hot-reload).
+func (h *RoutingStateHandle) store(s routingState) { h.state.Store(&s) }
+
+// RunningVersion returns the org routing-policy version composed into the live
+// policy (0 = local-only, no org policy running).
+func (h *RoutingStateHandle) RunningVersion() int64 {
+	if s := h.state.Load(); s != nil {
+		return s.version
+	}
+	return 0
+}
+
+// EffectiveHash returns the org-layer running identity (16-hex) when an org
+// policy is composed, else "".
+func (h *RoutingStateHandle) EffectiveHash() string {
+	if s := h.state.Load(); s != nil {
+		return s.hash
+	}
+	return ""
+}
+
+// Mode returns the router's raw mode token (advise|enforce); the reader
+// normalizes advise->observe.
+func (h *RoutingStateHandle) Mode() string {
+	if s := h.state.Load(); s != nil {
+		return s.mode
+	}
+	return ""
+}
+
+// Snapshot returns the whole org-layer state triple in ONE atomic load
+// (P0-7 SHOULD-FIX 4). The P0-6 reader uses this so a reload between
+// RunningVersion/EffectiveHash/Mode cannot yield a mixed report
+// (e.g. version=2 with hash from v1). ok=false when nothing has been
+// published yet (routing off / not yet wired) — callers treat that as
+// the zero triple.
+func (h *RoutingStateHandle) Snapshot() (version int64, hash, mode string, ok bool) {
+	if h == nil {
+		return 0, "", "", false
+	}
+	s := h.state.Load()
+	if s == nil {
+		return 0, "", "", false
+	}
+	return s.version, s.hash, s.mode, true
+}
+
+// Reload invokes the P0-7 hot-reload closure (§4.4). Nil-safe on both a
+// nil handle and an unset closure (routing off / not yet wired), so the
+// start.go reload-sink registration is unconditional.
+func (h *RoutingStateHandle) Reload(ctx context.Context) error {
+	if h == nil || h.reload == nil {
+		return nil
+	}
+	return h.reload(ctx)
+}
 
 // liveRouter implements proxy.ModelRouter at the cmd boundary — the
 // single place the routing engine, the store-side snapshot refresher,
@@ -24,12 +120,32 @@ import (
 // decision-row insert happens in RecordServed on the proxy's detached
 // goroutine (or via the janitor for turns that never land).
 type liveRouter struct {
-	policy    routing.Policy
+	// policy is the live compiled decision policy, swapped whole by the
+	// P0-7 hot-reload (ReloadOrgPolicy). Decide loads a pointer-to-value
+	// and dereferences, so an in-flight decision keeps its consistent
+	// snapshot across a reload (routing.Decide takes Policy BY VALUE).
+	policy    atomic.Pointer[routing.Policy]
 	mode      string // advise | enforce
 	refresher *store.RoutingRefresher
 	store     *store.Store
 	logger    *slog.Logger
 	now       func() time.Time
+
+	// localSpec is the IMMUTABLE node-local routing spec captured at
+	// construction (routingconfig.Spec of [routing], BEFORE any org
+	// composition). ReloadOrgPolicy recomposes from it exactly as
+	// wireRouting did, so a reload reproduces construction (P0-7 B5).
+	localSpec routing.PolicySpec
+	// handle is the P0-6/P0-7 org-layer state carrier this router
+	// publishes its post-reload version/hash into (set by wireRouting).
+	handle *RoutingStateHandle
+
+	// reloadMu serializes ReloadOrgPolicy construct+publish so a
+	// concurrent reload can never publish an older composed version
+	// over a newer one (P0-7 BLOCKER 3; mirrors guard's B3). The
+	// production caller is single-threaded (PushLoop → reload sink),
+	// so this is defense + concurrency-test honesty, not a live race.
+	reloadMu sync.Mutex
 
 	mu       sync.Mutex
 	sessions map[string]*liveSessionState
@@ -42,6 +158,13 @@ type liveRouter struct {
 	// calibration pass re-detects within the hour — self-healing, no
 	// new table.
 	demoted atomic.Pointer[map[string]string]
+
+	// selfobs is the P1-10 decision-run emitter (cmd-injected; never
+	// imported by internal/routing). Nil/Nop ⇒ no emission.
+	selfobs emit.Sink
+	// selfobsSampleN is routing_sample_n (0=off, 1=every, N=1-of-N).
+	selfobsSampleN int
+	selfobsCounter atomic.Uint64
 }
 
 // SetDemotedRules swaps the demotion set (calibration job, §R18.3).
@@ -102,8 +225,7 @@ const pendingJanitorAge = 60 * time.Second
 const liveSessionCap = 1024
 
 func newLiveRouter(policy routing.Policy, mode string, refresher *store.RoutingRefresher, s *store.Store, logger *slog.Logger) *liveRouter {
-	return &liveRouter{
-		policy:    policy,
+	lr := &liveRouter{
 		mode:      mode,
 		refresher: refresher,
 		store:     s,
@@ -111,7 +233,157 @@ func newLiveRouter(policy routing.Policy, mode string, refresher *store.RoutingR
 		now:       time.Now,
 		sessions:  map[string]*liveSessionState{},
 		pending:   map[int64]pendingDecision{},
+		selfobs:   emit.Nop(),
 	}
+	lr.policy.Store(&policy)
+	return lr
+}
+
+// SetSelfObs injects the P1-10 emit sink + routing sample rate (plan
+// Phase B). sampleN 0 disables routing emission; 1 emits every Decide;
+// N>1 emits 1-of-N. Nil sink is treated as Nop.
+func (lr *liveRouter) SetSelfObs(sink emit.Sink, sampleN int) {
+	if lr == nil {
+		return
+	}
+	if sink == nil {
+		sink = emit.Nop()
+	}
+	lr.selfobs = sink
+	lr.selfobsSampleN = sampleN
+}
+
+// emitSelfObs samples and emits one routing DecisionRun (ADR-0004 /
+// P1-10 Phase B). Fire-and-forget; never blocks the Decide hot path on
+// network I/O beyond the sink's own async batcher.
+func (lr *liveRouter) emitSelfObs(sessionID string, kind routing.TurnKind, d routing.Decision, applied bool) {
+	if lr == nil || lr.selfobs == nil || lr.selfobsSampleN <= 0 {
+		return
+	}
+	n := lr.selfobsCounter.Add(1)
+	if n%uint64(lr.selfobsSampleN) != 0 {
+		return
+	}
+	decisions := make([]string, 0, 2+len(d.ReasonCodes))
+	if d.RuleName != "" {
+		decisions = append(decisions, "rule:"+d.RuleName)
+	}
+	decisions = append(decisions, "kind:"+string(kind))
+	for _, rc := range d.ReasonCodes {
+		decisions = append(decisions, string(rc))
+	}
+	outcome := "verified"
+	if !applied {
+		outcome = "dismissed"
+	}
+	lr.selfobs.Emit(context.Background(), run.DecisionRun{
+		RunID:       fmt.Sprintf("routing-%d", n),
+		TraceID:     sessionID,
+		Trigger:     "manual",
+		Component:   conformance.ComponentRouting,
+		Decisions:   decisions,
+		Outcome:     outcome,
+		InitiatedBy: provenance.ActorHuman,
+	})
+}
+
+// ReloadOrgPolicy recomposes the org routing policy from the node-local
+// cache (store.GetOrgRoutingPolicy -> routingconfig.ComposeOrgPolicy ->
+// routing.Compile, EXACTLY as wireRouting does at construction) and, on
+// success, atomically swaps the router's live decision policy, the
+// refresher's policy (+ all its policy-derived signals), and the
+// RoutingStateHandle version/hash into effect — so the very next Decide
+// enforces the accepted policy and the P0-6 reporter flips the router
+// point from pending_restart to effective, with NO daemon restart
+// (docs/plans/plane-a-p0-7-guard-router-hotreload-plan.md §2.2/§4).
+//
+// It is a NO-OP-with-error on a compose/lint failure (fail-safe: the
+// running policy is never downgraded by a bad reload), and a cheap
+// no-op when the running version already equals the cached accepted
+// version (SF7 steady-state churn guard; version is a faithful content
+// proxy — the routing accept path never caches an equal-version body).
+//
+// Publish order is STRICT (P0-7 B4/§4.6): the refresher's complete new
+// derived snapshot is published FIRST, then the live policy, then the
+// RoutingStateHandle LAST — so the reporter can never observe the router
+// effective at the new version while the refresher still serves the old
+// version's budget/path inputs. Any failure leaves all three on the
+// prior version. Safe to call concurrently with Decide on the hot path
+// (every swap is an atomic store or mutex-guarded). Concurrent reloads
+// are serialized by reloadMu and refuse to publish a composed version
+// older than the currently-published handle version (non-regressing).
+func (lr *liveRouter) ReloadOrgPolicy(ctx context.Context) error {
+	orgPol, ok, err := lr.store.GetOrgRoutingPolicy(ctx)
+	if err != nil {
+		return fmt.Errorf("routing.ReloadOrgPolicy: cache read: %w", err)
+	}
+	var composedOrgVersion int64
+	if ok {
+		composedOrgVersion = orgPol.Version
+	}
+
+	// Serialize construct+publish (B3). The cache read above is outside
+	// the lock so two reloads can observe the same cache; the
+	// non-regression check below refuses the stale publisher.
+	lr.reloadMu.Lock()
+	defer lr.reloadMu.Unlock()
+
+	// SF7 steady-state short-circuit: running == cached accepted version
+	// means the composed content is unchanged, so there is nothing to
+	// reload. Cold-recovery (running < cached — e.g. a boot that rejected
+	// the cache the New-time load could not use) still falls through.
+	if lr.handle != nil && lr.handle.RunningVersion() == composedOrgVersion {
+		return nil
+	}
+	// Non-regressing publish: refuse a candidate OLDER than the
+	// currently-published handle version (defensive mirror of guard's
+	// regressesOrg — a stale in-flight reload that captured an older
+	// cache must not overwrite a newer publication). Version 0
+	// (absent cache → local-only compose) is ALSO a regression when an
+	// org version is already running — the `composedOrgVersion > 0`
+	// guard would otherwise let an absent-cache reload publish v0 over
+	// v1 (codex re-gate B3 fold).
+	if lr.handle != nil {
+		running := lr.handle.RunningVersion()
+		if running > 0 && composedOrgVersion < running {
+			return fmt.Errorf("routing.ReloadOrgPolicy: refusing to publish org version %d over %d (non-regressing)", composedOrgVersion, running)
+		}
+	}
+
+	spec := lr.localSpec
+	if ok {
+		composed, cerr := routingconfig.ComposeOrgPolicy(spec, orgPol.Body)
+		if cerr != nil {
+			return fmt.Errorf("routing.ReloadOrgPolicy: compose org policy: %w", cerr)
+		}
+		spec = composed
+	}
+	policy, issues := routing.Compile(spec)
+	// routing.Compile never returns an error (fail-open); the promotion
+	// gate is LintHasErrors (P0-7 B5) — an error-severity lint on the
+	// recomposed policy is a no-op-with-error, stricter than startup
+	// (which only logs) because a live downgrade is worse than staying.
+	if routing.LintHasErrors(issues) {
+		return fmt.Errorf("routing.ReloadOrgPolicy: recomposed policy has lint errors (version %d); keeping running policy", composedOrgVersion)
+	}
+
+	// STRICT publish order (B4/§4.6): (1) the complete derived snapshot,
+	// (2) the live decision policy, (3) the RoutingStateHandle LAST.
+	if err := lr.refresher.ReloadPolicy(ctx, policy); err != nil {
+		return fmt.Errorf("routing.ReloadOrgPolicy: refresher reload: %w", err)
+	}
+	lr.policy.Store(&policy)
+	if lr.handle != nil {
+		next := routingState{mode: lr.mode}
+		if composedOrgVersion > 0 {
+			next.version = composedOrgVersion
+			next.hash = policy.Hash()
+		}
+		lr.handle.store(next)
+	}
+	lr.logger.Info("routing: org policy hot-reloaded",
+		"version", composedOrgVersion, "hash", policy.Hash(), "mode", lr.mode)
+	return nil
 }
 
 // Decide implements proxy.ModelRouter (§R9.2).
@@ -171,7 +443,7 @@ func (lr *liveRouter) Decide(shape proxy.RouterShape, sess proxy.RouterSession) 
 	}
 	lr.mu.Unlock()
 
-	d := routing.Decide(lr.policy, snap, in)
+	d := routing.Decide(*lr.policy.Load(), snap, in)
 
 	// Effort-only decisions (§R6.5) apply without a model change —
 	// the lowest-risk enforce action (zero cache loss).
@@ -187,6 +459,8 @@ func (lr *liveRouter) Decide(shape proxy.RouterShape, sess proxy.RouterSession) 
 			}
 		}
 	}
+
+	lr.emitSelfObs(sess.SessionID, kind, d, apply)
 
 	lr.mu.Lock()
 	// Coherence counts MODEL switches only — an applied effort-only

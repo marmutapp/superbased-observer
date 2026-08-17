@@ -1,0 +1,38 @@
+# Example: point Observer's observability judge at a Baseten-hosted
+# Qwen 2.5 3B Instruct deployment (OpenAI-compatible /v1/chat/completions).
+#
+# OPT-IN ONLY. This is NOT the default judge. The default judge posture is
+# OpenRouter free-models-only; drop this block into your own
+# ~/.observer/config.toml to switch the judge to Baseten. Remove it to revert.
+#
+# How to use:
+#   1. Deploy the model:  cd baseten/qwen25-3b-judge && truss push --promote
+#      (needs a WORKSPACE_MANAGE_ALL / personal-scoped Baseten API key).
+#   2. Copy the [observability.judge] block below into ~/.observer/config.toml.
+#   3. Replace <BASETEN_MODEL_ID> with the model id from the deploy (the id in
+#      the deployment's URL: https://model-<id>.api.baseten.co/...). You can
+#      also read it from:  scripts/demo-baseten.sh status
+#   4. Export the key in the daemon's environment:
+#        read -rs BASETEN_API_KEY && export BASETEN_API_KEY
+#      (Observer reads the key from the env var named by api_key_env; the key
+#      is NEVER written to config on disk.)
+#   5. Turn the deployment on before use and off after:
+#        scripts/demo-baseten.sh up      # activate; scale-to-zero stays on
+#        scripts/demo-baseten.sh down    # deactivate; spend stops
+
+[observability.judge]
+# `model` is the value sent as the request "model" field. It must equal the
+# vLLM --served-model-name from baseten/qwen25-3b-judge/config.yaml.
+model       = "Qwen/Qwen2.5-3B-Instruct"
+
+# Baseten production "sync" route = an OpenAI-compatible base URL. Observer
+# appends /chat/completions. Replace <BASETEN_MODEL_ID> with your model id.
+base_url    = "https://model-<BASETEN_MODEL_ID>.api.baseten.co/environments/production/sync/v1"
+
+# Name of the ENV VAR holding the Baseten key — never the key itself.
+api_key_env = "BASETEN_API_KEY"
+
+# A hosted judge call: bound latency + reply length tightly (the reply is only
+# a short JSON verdict).
+timeout_ms  = 30000
+max_tokens  = 256

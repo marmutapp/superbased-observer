@@ -49,6 +49,8 @@ func newKiroCmd() *cobra.Command {
 			"endpoints with no base-URL knob, so this launcher is NON-PROXIED —\n" +
 			"token capture happens via observer's local kiro-cli dual-store\n" +
 			"adapter, not the proxy.\n\n" +
+			"Model selection is scoped to the `chat` subcommand: pass\n" +
+			"`-- chat --model <m>` to select which model the chat session uses.\n\n" +
 			"With --continue-from <session-id> the launcher distills a handover\n" +
 			"from that session and seeds it via `kiro-cli chat \"<handover>\"`\n" +
 			"(the chat subcommand's positional prompt, delivery=inject_prompt),\n" +
@@ -57,8 +59,13 @@ func newKiroCmd() *cobra.Command {
 			"All arguments after the subcommand are forwarded to kiro-cli. Use\n" +
 			"`--` to separate observer flags from kiro-cli flags. NEVER touches\n" +
 			"API keys or AWS credentials.",
-		SilenceErrors: true,
+		SilenceErrors:      true,
+		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args, done, err := launcherArgsOrDone(cmd, args)
+			if done {
+				return err
+			}
 			// Attach gate (attach-all-launchers): default-on attach hands the PTY
 			// to the daemon. Seed-only spec (kiro-cli is native-exempt — no proxy
 			// env, no escape-hatch flag); kiro's chat is interactive with no
@@ -148,7 +155,6 @@ func newKiroCmd() *cobra.Command {
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "kiro-cli")
 	resume = registerResumeFlag(cmd, "kiro-cli")
-	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 

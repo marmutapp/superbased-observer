@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -39,7 +40,6 @@ import (
 // turn than a decision off dead signals.
 type RoutingRefresher struct {
 	store    *Store
-	policy   routing.Policy
 	resolver *routing.TierResolver
 	price    routing.PriceFn
 
@@ -50,11 +50,24 @@ type RoutingRefresher struct {
 
 	snap atomic.Pointer[routing.Snapshot]
 
-	// Single-writer state (only the Run/RefreshNow goroutine touches
-	// these): breaker memory + the slow-tick cache merged into each
-	// publish.
+	// mu serializes the single-writer discipline: every mutation of
+	// policy / breakers / slow and every snapshot publish runs under it,
+	// so the Run ticker, RefreshNow, and the P0-7 ReloadPolicy can never
+	// interleave a half-built state. Current() stays lock-free (it only
+	// atomic-loads snap), so the proxy hot path never touches mu.
+	mu sync.Mutex
+	// Single-writer state (only a Run/RefreshNow/ReloadPolicy holder of
+	// mu touches these): the live policy, breaker memory, and the
+	// slow-tick cache merged into each publish.
+	policy   routing.Policy
 	breakers map[string]*breakerMemory
 	slow     slowSignals
+
+	// testFailPublishAfterHealth is a test seam: when non-nil, publish
+	// invokes it AFTER computeHealth has mutated breaker memory and
+	// returns its error. Production leaves it nil. Used by the
+	// ReloadPolicy breaker-rollback test (P0-7 SHOULD-FIX 2).
+	testFailPublishAfterHealth func() error
 }
 
 // breakerMemory is the §R12.3 circuit-breaker timing state per model.
@@ -125,27 +138,91 @@ func (r *RoutingRefresher) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-slow.C:
+			r.mu.Lock()
 			if err := r.refreshSlow(ctx); err != nil {
 				r.store.logWarn(ctx, "routing: slow snapshot refresh", err)
 			}
 			if err := r.publish(ctx); err != nil {
 				r.store.logWarn(ctx, "routing: snapshot publish", err)
 			}
+			r.mu.Unlock()
 		case <-fast.C:
+			r.mu.Lock()
 			if err := r.publish(ctx); err != nil {
 				r.store.logWarn(ctx, "routing: snapshot publish", err)
 			}
+			r.mu.Unlock()
 		}
 	}
 }
 
 // RefreshNow performs one full (slow + fast) refresh and publish —
-// startup and tests.
+// startup and tests. Serialized with the Run ticker and ReloadPolicy
+// via the single-writer mutex.
 func (r *RoutingRefresher) RefreshNow(ctx context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if err := r.refreshSlow(ctx); err != nil {
 		return err
 	}
 	return r.publish(ctx)
+}
+
+// ReloadPolicy atomically swaps the refresher's live policy AND every
+// policy-derived signal (the slow-tick budget/window cache, the
+// breaker memory that publish's computeHealth mutates, and the
+// published snapshot, whose session path-class hits and budget/rate
+// bands are all policy-derived) in ONE transaction, serialized with
+// Run/RefreshNow via the single-writer mutex (P0-7 §4.2/SF-A). It
+// builds the new slow cache and a complete new snapshot against the
+// captured new policy; on ANY failure it RESTORES the prior policy +
+// slow cache + breakers and leaves the published snapshot untouched,
+// so a mid-reload failure leaves all policy-derived refresher state on
+// the prior version (fail-safe — never a torn or half-upgraded
+// snapshot; P0-7 SHOULD-FIX 2 closes the breaker-memory leak where a
+// failed publish left breaker mutations behind).
+//
+// This is the concrete shape of the "complete v2 snapshot first" fold:
+// the caller (liveRouter.ReloadOrgPolicy) publishes in the strict order
+// refresher-snapshot -> live policy -> RoutingStateHandle, so the P0-6
+// reporter can never observe the router effective at the new version
+// while the refresher still serves the old version's budget/path
+// inputs.
+func (r *RoutingRefresher) ReloadPolicy(ctx context.Context, policy routing.Policy) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	prevPolicy := r.policy
+	prevSlow := r.slow
+	prevBreakers := cloneBreakers(r.breakers)
+	r.policy = policy
+	if err := r.refreshSlow(ctx); err != nil {
+		r.policy = prevPolicy
+		r.slow = prevSlow
+		r.breakers = prevBreakers
+		return fmt.Errorf("store.RoutingRefresher.ReloadPolicy: slow: %w", err)
+	}
+	if err := r.publish(ctx); err != nil {
+		r.policy = prevPolicy
+		r.slow = prevSlow
+		r.breakers = prevBreakers
+		return fmt.Errorf("store.RoutingRefresher.ReloadPolicy: publish: %w", err)
+	}
+	return nil
+}
+
+// cloneBreakers deep-copies the breaker map so a failed ReloadPolicy
+// publish can restore the pre-mutation memory (computeHealth mutates
+// breakers in place via breakerStateFor).
+func cloneBreakers(in map[string]*breakerMemory) map[string]*breakerMemory {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]*breakerMemory, len(in))
+	for k, v := range in {
+		cp := *v
+		out[k] = &cp
+	}
+	return out
 }
 
 // publish runs the fast-signal queries, merges the cached slow
@@ -155,6 +232,11 @@ func (r *RoutingRefresher) publish(ctx context.Context) error {
 	health, err := r.computeHealth(ctx, now)
 	if err != nil {
 		return fmt.Errorf("store.RoutingRefresher: health: %w", err)
+	}
+	if r.testFailPublishAfterHealth != nil {
+		if herr := r.testFailPublishAfterHealth(); herr != nil {
+			return herr
+		}
 	}
 	cacheReads, err := r.store.selectRecentSessionCacheReads(ctx, now.Add(-2*time.Hour))
 	if err != nil {

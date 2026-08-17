@@ -23,6 +23,8 @@ import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { NotFoundPage } from "@/pages/NotFound";
 import { FilterProvider } from "@/lib/filters";
 import { TourProvider } from "@/components/tour/TourProvider";
+import { NAV_ITEMS } from "@/lib/nav";
+import { isSectionHidden, useGovernance, type Governance } from "@/lib/governance";
 
 // HelpDrawer carries the 164-entry registry — defer until first
 // open so it doesn't bloat the shell chunk.
@@ -103,6 +105,57 @@ const ReportPage = lazy(() =>
   import("@/pages/Report").then((m) => ({ default: m.ReportPage })),
 );
 
+// navIdForPath maps the current pathname onto its NAV_ITEMS id (exact
+// match — every route in AnimatedRoutes has a 1:1 NAV_ITEMS entry
+// except a handful of non-nav routes like /report, which return null
+// and are therefore never governed-hidden).
+function navIdForPath(pathname: string): string | null {
+  return NAV_ITEMS.find((it) => it.path === pathname)?.id ?? null;
+}
+
+// ManagedNotice renders instead of the page when the current route is
+// in the resolved governance posture's hidden_sections — a direct-URL
+// visit to a hidden page must say so, not blank out or 404.
+function ManagedNotice({ gov }: { gov: Governance | null }) {
+  const notice = gov?.notice;
+  return (
+    <div className="flex h-full items-center justify-center p-12">
+      <div className="max-w-md text-center">
+        <h2 className="text-[15px] font-semibold text-fg-1">
+          Managed by your organization
+        </h2>
+        <p className="mt-2 text-[12.5px] text-fg-3">
+          This page is managed by your organization and is not available on
+          this machine.
+        </p>
+        {(notice?.contact || notice?.policy_url) && (
+          <p className="mt-3 text-[11.5px] text-fg-3">
+            {notice?.contact && (
+              <a
+                href={`mailto:${notice.contact}`}
+                className="text-accent hover:underline"
+              >
+                {notice.contact}
+              </a>
+            )}
+            {notice?.contact && notice?.policy_url && " · "}
+            {notice?.policy_url && (
+              <a
+                href={notice.policy_url}
+                target="_blank"
+                rel="noreferrer"
+                className="text-accent hover:underline"
+              >
+                {notice.policy_url}
+              </a>
+            )}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // RouteErrorBoundary keys the boundary on the pathname so navigating
 // to another tab after a crash gives that tab a clean mount.
 function RouteErrorBoundary({ children }: { children: ReactNode }) {
@@ -177,6 +230,13 @@ export default function App() {
   // desktop and an overlay drawer on small screens; this drives it.
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const { pathname } = useLocation();
+  // Governed-node route guard: a direct-URL visit to a page this
+  // machine's organization hid must render an honest notice, not a
+  // blank page or a 404. No-op on a solo node (gov.data is
+  // {active: false, ...} or null, and isSectionHidden treats both as
+  // "nothing hidden").
+  const gov = useGovernance();
+  const routeHidden = isSectionHidden(gov.data, navIdForPath(pathname) ?? "");
   // Close the drawer whenever the route changes (nav tap, command
   // palette, back button) so it never lingers over the new page.
   useEffect(() => {
@@ -257,14 +317,18 @@ export default function App() {
             <KonamiEgg />
             <FilterBar onOpenPalette={() => setPaletteOpen(true)} />
             <div className="min-h-0 flex-1 overflow-y-auto">
-              {/* D-6: the boundary sits below the shell so a crashing
-                  page can't take the sidebar/topbar with it; keying on
-                  pathname resets it when the user navigates away. */}
-              <RouteErrorBoundary>
-                <Suspense fallback={<RouteFallback />}>
-                  <AnimatedRoutes />
-                </Suspense>
-              </RouteErrorBoundary>
+              {routeHidden ? (
+                <ManagedNotice gov={gov.data} />
+              ) : (
+                /* D-6: the boundary sits below the shell so a crashing
+                   page can't take the sidebar/topbar with it; keying on
+                   pathname resets it when the user navigates away. */
+                <RouteErrorBoundary>
+                  <Suspense fallback={<RouteFallback />}>
+                    <AnimatedRoutes />
+                  </Suspense>
+                </RouteErrorBoundary>
+              )}
             </div>
           </main>
           {helpEverOpened && (

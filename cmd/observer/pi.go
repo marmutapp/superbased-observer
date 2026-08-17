@@ -62,8 +62,13 @@ func newPiCmd() *cobra.Command {
 			"All arguments after the subcommand are forwarded to pi. Use `--` to\n" +
 			"separate observer flags from pi flags. Requires a running observer\n" +
 			"proxy (`observer start`).",
-		SilenceErrors: true,
+		SilenceErrors:      true,
+		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args, done, err := launcherArgsOrDone(cmd, args)
+			if done {
+				return err
+			}
 			// Attach-by-default (attach-all-launchers): hand the PTY to the
 			// daemon when attach resolves. pi routes via the `observer` provider
 			// in ~/.pi/agent/models.json (written by the daemon-spawned inner
@@ -162,7 +167,6 @@ func newPiCmd() *cobra.Command {
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "pi")
 	resume = registerResumeFlag(cmd, "pi")
-	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 

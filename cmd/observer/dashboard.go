@@ -15,6 +15,7 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/config"
 	"github.com/marmutapp/superbased-observer/internal/intelligence/cost"
 	"github.com/marmutapp/superbased-observer/internal/intelligence/dashboard"
+	"github.com/marmutapp/superbased-observer/internal/store"
 )
 
 // newDashboardCmd wires `observer dashboard` — embedded HTML + /api/* JSON
@@ -51,7 +52,16 @@ func newDashboardCmd() *cobra.Command {
 			// (no-op + fail-closed unless BOTH the [remote] substrate and the PTY
 			// launcher exist). Same assembly as `observer start`.
 			wireRemoteExecuteTier(cfg, launchMgr, remoteCtrl)
+			// Admin-controlled Plane B: this command runs no policy poller,
+			// so it installs the node.governance family from its verified
+			// on-disk LKG cache. Without this, `observer dashboard` would be
+			// an ungoverned surface a governed developer could just run
+			// instead of `observer start`.
+			govStore := store.New(database)
+			ngov := newNodeGovernanceHandle(governanceIdentityLoader(govStore), slog.Default())
+			loadNodeGovernanceLKG(cmd.Context(), cfg, govStore, ngov, slog.Default())
 			server, err := dashboard.New(dashboard.Options{
+				Governance:            ngov.Effective,
 				DB:                    database,
 				DBPath:                cfg.Observer.DBPath,
 				CostEngine:            cost.NewEngine(cfg.Intelligence),
@@ -79,12 +89,20 @@ func newDashboardCmd() *cobra.Command {
 				// is false → the endpoints 503 and the button hides.
 				LaunchManager:  launchMgr,
 				TerminalStatus: launchStatus,
+				// B9 sandboxed terminals: the availability probe behind
+				// GET /api/terminal/sandbox + the fail-closed launch validation.
+				// Nil unless [terminal.sandbox].enabled → endpoint reports
+				// disabled and a sandbox request 501s (fail closed).
+				SandboxProber: surfaces.sandboxProber,
 				// Tool-binary-resolution seams (tool-binary-resolution arc §5):
 				// pre-launch verdict + guided install. Defined as plain funcs so
 				// the dashboard package never imports internal/toolresolve.
 				ToolPreflight:    toolPreflightSeam(resolvedConfigPath, allowToolInstallSeam(resolvedConfigPath)),
 				AllowToolInstall: allowToolInstallSeam(resolvedConfigPath),
 				ToolInstallHint:  toolInstallHintSeam(),
+				// New Terminal model picker (B5): same seam `observer start`
+				// wires — recent token_usage history + registry Known examples.
+				RecentModels: recentModelsSeam(database),
 				// Per-terminal project panel (Arc A): token→root resolver from
 				// termsvc. Nil when the launch manager is absent → panel 404s.
 				ProjectRootResolver: projectRootResolver(launchMgr),

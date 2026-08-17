@@ -17,6 +17,7 @@ const (
 	toolCowork          = "cowork"
 	toolCrush           = "crush"
 	toolCursor          = "cursor"
+	toolDeepSeek        = "deepseek"
 	toolDevin           = "devin"
 	toolDroid           = "droid"
 	toolGeminiCLI       = "gemini-cli"
@@ -160,6 +161,7 @@ var specificRows = concat(
 	commandCodeRows,
 	aiderRows,
 	museRows,
+	deepSeekRows,
 )
 
 // --- claude-code -----------------------------------------------------
@@ -547,6 +549,41 @@ var gooseRows = concat(
 	rows(toolGoose, SurfaceBuiltin, ActionSearchText, "grep", "search", "rg", "ripgrep"),
 	rows(toolGoose, SurfaceBuiltin, ActionWebFetch, "fetch", "web_fetch", "read_url", "download"),
 	rows(toolGoose, SurfaceBuiltin, ActionWebSearch, "web_search", "websearch", "search_web"),
+)
+
+// --- deepseek ----------------------------------------------------------
+// code: internal/adapter/deepseek/records.go (actionMap).
+//
+// GROUNDED against the confirmed 24-name live inventory (a request/header
+// event embeds the full JSON-schema tool-definition set) — literal names
+// only, no defensive synonyms, since DeepSeek Harness's tool names are
+// already a single stable snake_case spelling.
+var deepSeekRows = concat(
+	rows(toolDeepSeek, SurfaceBuiltin, ActionAskUser, "ask_user_question"),
+	rows(toolDeepSeek, SurfaceBuiltin, ActionRunCommand, "bash"),
+	// create_goal / get_goal / update_goal are DSH's own goal-tracking
+	// trio — they record state back INTO the harness, not workspace
+	// state.
+	rows(toolDeepSeek, SurfaceBuiltin, ActionHarnessCall,
+		"create_goal", "get_goal", "update_goal", "exit_plan_mode"),
+	rows(toolDeepSeek, SurfaceBuiltin, ActionEditFile, "edit"),
+	rows(toolDeepSeek, SurfaceBuiltin, ActionSearchFiles, "glob"),
+	rows(toolDeepSeek, SurfaceBuiltin, ActionSearchText, "grep"),
+	// interrupt_agent / job_kill / job_list / job_output / list_agents /
+	// send_message are multi-agent orchestration control-plane calls —
+	// they don't spawn a NEW agent themselves.
+	rows(toolDeepSeek, SurfaceOrchestration, ActionAgentControl,
+		"interrupt_agent", "job_kill", "job_list", "job_output", "list_agents"),
+	rows(toolDeepSeek, SurfaceOrchestration, ActionAgentMessage, "send_message"),
+	// ralph / subagent / subagent_fork / workflow all launch a NEW agent
+	// run.
+	rows(toolDeepSeek, SurfaceOrchestration, ActionSpawnSubagent,
+		"ralph", "subagent", "subagent_fork", "workflow"),
+	rows(toolDeepSeek, SurfaceBuiltin, ActionReadFile, "read", "read_image"),
+	rows(toolDeepSeek, SurfaceBuiltin, ActionSkillInvoke, "skill"),
+	rows(toolDeepSeek, SurfaceBuiltin, ActionTodoUpdate, "todo_write"),
+	rows(toolDeepSeek, SurfaceBuiltin, ActionWebSearch, "web_search"),
+	rows(toolDeepSeek, SurfaceBuiltin, ActionWriteFile, "write"),
 )
 
 // --- devin -----------------------------------------------------------

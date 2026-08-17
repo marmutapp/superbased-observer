@@ -1,13 +1,9 @@
-# SuperBased Observer — TypeScript SDK
+# SuperBased Observer - TypeScript SDK
 
-**Instrument your own LLM app once, and get local, proxy-accurate cost +
-cache visibility, evals, and input guardrails — no data leaves the
-machine.** A thin convenience layer over OpenTelemetry (Node), this SDK
-sends your custom app / agent traces to a local SuperBased Observer via
-OTLP, surfacing them on the admin dashboard's **Trajectories** view next to
-the same cost/cache engine that powers Observer's coding-agent mode.
+A thin convenience layer over OpenTelemetry (Node). This SDK sends your
+custom app / agent traces to a local SuperBased Observer via OTLP.
 
-> **Provisional package name** (`@superbased/observer-sdk`) — final SDK naming
+> **Provisional package name** (`@superbased/observer-sdk`), final SDK naming
 > is an open decision (plan §15 Q1).
 
 ## Install & build
@@ -45,7 +41,7 @@ await shutdown();   // flush before a short-lived process exits
 
 Prompt/response bodies are captured **by default** when you pass them to the
 span helpers (`withLlmSpan(name, { prompt }, ...)`, `setUsage(span, { prompt, response })`,
-or `setContent(span, { prompt, response })` — the last also takes `toolArgs` /
+or `setContent(span, { prompt, response })`, the last also takes `toolArgs` /
 `toolResult` for TOOL spans). Observer persists them subject to your node's
 content-retention posture.
 
@@ -60,11 +56,11 @@ Each body is clipped client-side to `maxContentChars` (default 8000;
 `init({ maxContentChars: 0 })` disables the clip) so a giant prompt never
 bloats the OTLP export.
 
-## Admission check (input guardrails)
+## Pre-flight check
 
-`admit()` posts an incoming user message to the co-resident Observer node's
-input-admission gate (`docs/guardrails.md`) and returns an allow/flag/ask/deny
-`Verdict` — call it at your app's front door before running the agent:
+`admit()` posts a message to an optional pre-flight check endpoint on your
+Observer deployment and returns an allow/flag/ask/deny `Verdict`. Call it at
+your app's front door before running the agent:
 
 ```ts
 const v = await admit(userMessage, { user: "alice", session: "s1" });
@@ -73,10 +69,8 @@ if (!v.allowed) return v.reason;
 
 Defaults to `http://127.0.0.1:8081/api/obs/admission/check` (the local node
 dashboard's port; override with `opts.endpoint` or
-`$SUPERBASED_ADMISSION_ENDPOINT`). Fails **open** on any transport error — an
-unreachable Observer never blocks your app; the judged decision itself (a
-local Ollama model, a custom-remote model, or a gateway/provider model) is
-entirely the server's own config.
+`$SUPERBASED_ADMISSION_ENDPOINT`). Fails **open** on any transport error: an
+unreachable Observer never blocks your app.
 
 ## How it maps
 
@@ -88,12 +82,13 @@ message id) doubles as the dedup key against the proxy's `api_turns` when no
 
 ## Design test
 
-Anything this SDK does, a stock OTel exporter pointed at Observer does too —
+Anything this SDK does, a stock OTel exporter pointed at Observer does too;
 the SDK is pure ergonomics. Direct third-party OTLP exporters are a supported
 tier (plan §15 Q2).
 
 ## Echo-guard caveat
 
-Never set the resource attribute `sbo.emitted_by=observer` — Observer's own
-marker; such a resource is **dropped** at ingestion. The SDK sets
-`sbo.sdk="superbased-typescript"` instead.
+Never set the resource attribute `sbo.emitted_by=observer`; it is Observer's
+own marker for telemetry it emitted, and any resource carrying it is
+**dropped** at ingestion. The SDK sets `sbo.sdk="superbased-typescript"`
+instead.

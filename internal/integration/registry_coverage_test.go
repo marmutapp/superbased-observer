@@ -849,6 +849,7 @@ var honestZeroPackages = map[string]string{
 	"perplexity-web": "../adapter/browserchat",
 	"gemini-web":     "../adapter/browserchat",
 	"copilot-web":    "../adapter/browserchat",
+	"junie":          "../adapter/junie",
 }
 
 // TestHonestZeroVocabularyHasNoClassifier gives the honest-zero branch
@@ -929,6 +930,179 @@ func TestVocabularyRowsResolveToRegisteredActionTypes(t *testing.T) {
 					"is category %q", c.Tool, e.Native, e.Category, e.ActionType,
 					tooltax.CategoryForActionType(e.ActionType))
 			}
+		}
+	}
+}
+
+// TestModelSpecGrounded pins a handful of load-bearing, individually
+// grounded ModelSpec shapes (B5 model picker) against regression — the
+// specific cases the new-adapter checklist / a future edit is most likely
+// to silently break: a delivery-kind flip (arg vs env), a missing Lead on
+// a subcommand-gated flag, or an explicit ModelNone getting "helpfully"
+// filled in without new grounding.
+func TestModelSpecGrounded(t *testing.T) {
+	want := map[string]integration.ModelSpec{
+		// copilot-cli's launcher OWNS --model and translates it to the
+		// COPILOT_MODEL env var for the BYOK provider internally — but from
+		// the REGISTRY's delivery-mechanism perspective (what the dashboard
+		// hands the launcher's argv) it is still ModelArg.
+		"copilot-cli": {Kind: integration.ModelArg, Flag: "--model"},
+		// goose's --model flag is reachable only under the headless `goose
+		// run` one-shot subcommand; the default interactive lane's only
+		// grounded mechanism is the GOOSE_MODEL env var.
+		"goose": {Kind: integration.ModelEnv, EnvVar: "GOOSE_MODEL"},
+		// kiro-cli's --model flag exists only on the `chat` subcommand.
+		"kiro-cli": {Kind: integration.ModelArg, Flag: "--model", Lead: []string{"chat"}},
+		// openclaw: no grounded seed-time model mechanism.
+		"openclaw": {Kind: integration.ModelNone},
+		// droid: --model exists only under the headless `droid exec`
+		// subcommand, not the interactive default `droid` launch.
+		"droid": {Kind: integration.ModelNone},
+		"claude-code": {
+			Kind: integration.ModelArg, Flag: "--model",
+			Known: []string{"opus", "sonnet", "fable"},
+		},
+		"codex": {Kind: integration.ModelArg, Flag: "--model", Known: []string{"o3"}},
+	}
+	for tool, spec := range want {
+		c, ok := integration.For(tool)
+		if !ok {
+			t.Errorf("tool %q has no registry row", tool)
+			continue
+		}
+		got := c.Model
+		if got.Kind != spec.Kind {
+			t.Errorf("%q: Model.Kind = %q, want %q", tool, got.Kind, spec.Kind)
+		}
+		if spec.Kind == integration.ModelArg && got.Flag != spec.Flag {
+			t.Errorf("%q: Model.Flag = %q, want %q", tool, got.Flag, spec.Flag)
+		}
+		if spec.Kind == integration.ModelEnv && got.EnvVar != spec.EnvVar {
+			t.Errorf("%q: Model.EnvVar = %q, want %q", tool, got.EnvVar, spec.EnvVar)
+		}
+		if !equalStringSlices(got.Lead, spec.Lead) {
+			t.Errorf("%q: Model.Lead = %v, want %v", tool, got.Lead, spec.Lead)
+		}
+		if len(spec.Known) > 0 && !equalStringSlices(got.Known, spec.Known) {
+			t.Errorf("%q: Model.Known = %v, want %v", tool, got.Known, spec.Known)
+		}
+	}
+}
+
+// equalStringSlices treats nil and empty as equal (Lead/Known are commonly
+// left as a nil zero value rather than an explicit empty slice).
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestModelSpecStructurallyValid walks every registry row and pins the
+// internal consistency of a populated ModelSpec: ModelArg must resolve to a
+// usable flag (an explicit Flag, or the "--model" default ModelLaunch
+// falls back to when Flag is empty — never both empty AND unusable), and
+// ModelEnv must carry a non-empty EnvVar (ModelLaunch has no default to
+// fall back to for the env case, unlike Flag). This is the shape-level
+// mirror of TestNativeResumeGrounded / TestAttachImpliesLauncher: a
+// populated capability whose delivery data is unusable is a bug, not a
+// valid honest-zero.
+func TestModelSpecStructurallyValid(t *testing.T) {
+	for _, c := range integration.Capabilities() {
+		switch c.Model.Kind {
+		case integration.ModelNone:
+			// The honest floor — no further shape to check.
+		case integration.ModelArg:
+			// Flag empty is fine (ModelLaunch defaults it to "--model");
+			// nothing else to require.
+		case integration.ModelEnv:
+			if c.Model.EnvVar == "" {
+				t.Errorf("adapter %q: Model.Kind is ModelEnv but EnvVar is empty", c.Tool)
+			}
+		default:
+			t.Errorf("adapter %q: Model.Kind is an unknown value %q", c.Tool, c.Model.Kind)
+		}
+		// Every populated Model spec (Kind != ModelNone) must actually
+		// build via ModelLaunch with a plausible model value — this is the
+		// same seam the dashboard picker calls, so a row that Kind-checks
+		// fine but errors out of ModelLaunch would be a silent dead end.
+		if c.Model.Kind != integration.ModelNone {
+			if _, _, err := integration.ModelLaunch(c.Model, "sonnet"); err != nil {
+				t.Errorf("adapter %q: ModelLaunch(Model, %q) unexpectedly errored: %v", c.Tool, "sonnet", err)
+			}
+		}
+	}
+}
+
+// TestSandboxDeclaredForEveryLaunchableAdapter pins the B9 honesty rule
+// (plan §2): every row whose Handoff.Launchable() is true must declare
+// either a non-empty Sandbox.StateRW or a non-empty Sandbox.Note. A
+// launchable tool with a zero-value SandboxSpec (both empty) is an
+// undeclared row — the same class of gap TestVocabularyDeclaredForEveryAdapter
+// catches for the taxonomy vocabulary, applied to sandbox filesystem
+// isolation. Non-launchable rows are untouched: a SandboxSpec only makes
+// sense for a tool the dashboard can start in-terminal.
+func TestSandboxDeclaredForEveryLaunchableAdapter(t *testing.T) {
+	for _, c := range integration.Capabilities() {
+		if !c.Handoff.Launchable() {
+			continue
+		}
+		if len(c.Sandbox.StateRW) == 0 && c.Sandbox.Note == "" {
+			t.Errorf("adapter %q: launchable but Sandbox is the zero value (no StateRW and no Note) — declare a grounded row or an honest Note", c.Tool)
+		}
+	}
+}
+
+// TestSandboxPathsWellFormed pins that every SandboxSpec.StateRW/StateRO
+// entry across the whole registry (not just launchable rows) is a clean,
+// HOME-RELATIVE subpath: not absolute, no ".." segment, not "." or "",
+// no leading "-" (an argv-injection guard mirroring the ModelLaunch/remote-
+// URL discipline elsewhere in the registry), and free of NUL/whitespace/
+// control bytes. These are the exact strings a later unit (internal/sandbox)
+// composes into `--bind-try <HOME>/<path> <same>` bwrap flags, so a
+// malformed entry here would be a malformed flag there.
+func TestSandboxPathsWellFormed(t *testing.T) {
+	check := func(t *testing.T, tool, field string, i int, p string) {
+		t.Helper()
+		switch {
+		case p == "":
+			t.Errorf("adapter %q: Sandbox.%s[%d] is empty", tool, field, i)
+			return
+		case p == ".":
+			t.Errorf("adapter %q: Sandbox.%s[%d] is %q", tool, field, i, p)
+			return
+		case filepath.IsAbs(p):
+			t.Errorf("adapter %q: Sandbox.%s[%d] %q is absolute (must be HOME-relative)", tool, field, i, p)
+		case strings.HasPrefix(p, "-"):
+			t.Errorf("adapter %q: Sandbox.%s[%d] %q starts with '-' (argv-injection risk)", tool, field, i, p)
+		}
+		for _, seg := range strings.Split(p, "/") {
+			if seg == ".." {
+				t.Errorf("adapter %q: Sandbox.%s[%d] %q contains a '..' segment", tool, field, i, p)
+			}
+		}
+		for _, r := range p {
+			switch {
+			case r == 0:
+				t.Errorf("adapter %q: Sandbox.%s[%d] %q contains a NUL byte", tool, field, i, p)
+			case r < 0x20 || r == 0x7f:
+				t.Errorf("adapter %q: Sandbox.%s[%d] %q contains a control byte", tool, field, i, p)
+			case r == ' ' || r == '\t' || r == '\n' || r == '\r':
+				t.Errorf("adapter %q: Sandbox.%s[%d] %q contains whitespace", tool, field, i, p)
+			}
+		}
+	}
+	for _, c := range integration.Capabilities() {
+		for i, p := range c.Sandbox.StateRW {
+			check(t, c.Tool, "StateRW", i, p)
+		}
+		for i, p := range c.Sandbox.StateRO {
+			check(t, c.Tool, "StateRO", i, p)
 		}
 	}
 }

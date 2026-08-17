@@ -52,8 +52,13 @@ func newGeminiCmd() *cobra.Command {
 			"All arguments after the subcommand are forwarded to gemini. Use\n" +
 			"`--` to separate observer flags from gemini flags. NEVER touches\n" +
 			"the API key. Requires a running observer proxy (`observer start`).",
-		SilenceErrors: true,
+		SilenceErrors:      true,
+		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args, done, err := launcherArgsOrDone(cmd, args)
+			if done {
+				return err
+			}
 			// Attach-by-default (attach-all-launchers): hand the PTY to the
 			// daemon when attach resolves. gemini-cli self-routes via
 			// GOOGLE_GEMINI_BASE_URL in the daemon-spawned inner launcher, so
@@ -154,7 +159,6 @@ func newGeminiCmd() *cobra.Command {
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "gemini-cli")
 	resume = registerResumeFlag(cmd, "gemini-cli")
-	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 

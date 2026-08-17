@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/marmutapp/superbased-observer/internal/sandbox"
 	"github.com/marmutapp/superbased-observer/internal/store"
 	"github.com/marmutapp/superbased-observer/internal/termfeed"
 	"github.com/marmutapp/superbased-observer/internal/termoob"
@@ -178,6 +179,12 @@ func (l *ptyLauncher) Spawn(req termsvc.LaunchRequest) (string, error) {
 		// self-configures exactly like a bare launch (B2/B3). Nil for
 		// dashboard fresh/handoff launches → argv unchanged.
 		ExtraArgs: req.ExtraArgs,
+		// B9 Seam-B application (plan §1/§3/D2): the bwrap wrapper prefix the
+		// Sandboxer resolved. termsession.Spec.argv() prepends it before
+		// [BinPath, Subcommand, ...ExtraArgs], so the whole inner `observer
+		// <verb>` launch runs inside the isolation boundary. Empty for every
+		// non-sandboxed launch → argv byte-identical to today.
+		WrapArgv: req.WrapArgv,
 	}
 	if req.IsShell {
 		// A plain-shell fresh launch runs no `observer <sub>` at all — SpecShell
@@ -253,6 +260,14 @@ func launchChildEnv(req termsvc.LaunchRequest, authToken string) []string {
 		envOOBTool+"="+req.Tool,
 		envOOBRun+"="+req.RunID,
 	)
+	// B9 (plan §6): when this launch runs inside the bwrap boundary, stamp the
+	// sandbox marker so the hook lane can honestly set Event.Caps.Sandboxed. It
+	// is set here AND stripped from inherited/caller env by isInternalChildEnv,
+	// so a user env can never spoof OBSERVER_SANDBOX=1 into a non-sandboxed
+	// child (U9 finding). Never set on an unsandboxed launch → honest zero.
+	if req.Sandboxed {
+		out = append(out, sandbox.EnvMarker+"=1")
+	}
 	return out
 }
 
@@ -261,7 +276,11 @@ func launchChildEnv(req termsvc.LaunchRequest, authToken string) []string {
 // from any inherited/caller-supplied env before re-adding its own fresh copy —
 // so a nested launch can never inherit a stale channel or spoof the marker.
 func isInternalChildEnv(kv string) bool {
-	return strings.HasPrefix(kv, "OBSERVER_OOB_") || strings.HasPrefix(kv, envDaemonChild+"=")
+	return strings.HasPrefix(kv, "OBSERVER_OOB_") ||
+		strings.HasPrefix(kv, envDaemonChild+"=") ||
+		// B9 (U9 finding): the sandbox marker is daemon-set on the child inside
+		// the boundary and must never be spoofable in via inherited/caller env.
+		strings.HasPrefix(kv, sandbox.EnvMarker+"=")
 }
 
 // setupChildEnv builds the environment for a SETUP session (CreateSetup) — the

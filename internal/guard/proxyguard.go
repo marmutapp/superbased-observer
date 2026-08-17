@@ -140,21 +140,26 @@ func (g *Guard) ScanProxyRequest(provider string, body []byte, sessionID string,
 	parsed := parseProxyBody(provider, body, wantTools)
 	target := provider + ":" + parsed.model
 
+	// Load ONE snapshot for the whole request scan (budget + egress +
+	// injection), so every Evaluate + its paired CategoryFor read the
+	// same engineSet (the NIT same-evaluation-snapshot contract).
+	es := g.set.Load()
+
 	// §12.1 budget check first (cheapest pass — a TTL-cached lookup +
 	// one engine evaluation). A hard-mode deny short-circuits the
 	// pipeline: the request never reaches the provider, so there is
 	// nothing to egress-scan and no new content enters the session.
 	if g.budgetLookup != nil {
-		g.scanBudget(&res, sessionID, target, now)
+		g.scanBudget(es, &res, sessionID, target, now)
 		if res.Deny {
 			return res
 		}
 	}
 	if g.cfg.Proxy.EgressScan {
-		g.scanEgress(&res, body, sessionID, target, now)
+		g.scanEgress(es, &res, body, sessionID, target, now)
 	}
 	if g.cfg.Proxy.InjectionHeuristics {
-		g.scanInjection(&res, parsed, sessionID, now)
+		g.scanInjection(es, &res, parsed, sessionID, now)
 	}
 	if len(parsed.mcpDecls) > 0 &&
 		!g.proxyAlreadySeen(sessionID, mcpDeclsSignature(parsed.mcpDecls), now) {
@@ -190,8 +195,10 @@ func mcpDeclsSignature(decls []mcpsec.ToolDecl) string {
 	return b.String()
 }
 
-// scanEgress implements the §8.2 half of ScanProxyRequest.
-func (g *Guard) scanEgress(res *ProxyRequestResult, body []byte, sessionID, target string, now time.Time) {
+// scanEgress implements the §8.2 half of ScanProxyRequest. es is the
+// caller's already-Loaded snapshot so the Evaluate+CategoryFor pair
+// stays consistent (NIT contract).
+func (g *Guard) scanEgress(es *engineSet, res *ProxyRequestResult, body []byte, sessionID, target string, now time.Time) {
 	// One detector pass produces both the findings and the candidate
 	// masked body. Only certain, non-allowlisted findings mask (§8.2:
 	// mask is for detector-certain types; entropy hits never mask).
@@ -226,7 +233,7 @@ func (g *Guard) scanEgress(res *ProxyRequestResult, body []byte, sessionID, targ
 		Secrets:   secrets,
 		Now:       now,
 	}
-	verdict, guardErr := g.Evaluate(ev)
+	verdict, guardErr := g.evaluateWith(es, ev)
 	verdict, approved := g.applyApprovals(verdict, &ev)
 	if verdict.Decision < policy.DecisionFlag && guardErr == nil {
 		return // R-172 disabled or overridden to allow
@@ -239,7 +246,7 @@ func (g *Guard) scanEgress(res *ProxyRequestResult, body []byte, sessionID, targ
 			Timestamp: now,
 		},
 		Kind:       policy.KindAPIRequest,
-		Category:   g.CategoryFor(verdict.RuleID),
+		Category:   g.categoryWith(es, verdict.RuleID),
 		Verdict:    verdict,
 		GuardError: guardErr != nil,
 	}
@@ -320,7 +327,7 @@ func (g *Guard) egressAllowed(value string) bool {
 // were new). Hits mark session taint with Imperative=true and record
 // flag verdicts; they never deny (F7) — R-180's table row is flag in
 // both modes, and nothing here consults egress_action.
-func (g *Guard) scanInjection(res *ProxyRequestResult, parsed proxyParsedBody, sessionID string, now time.Time) {
+func (g *Guard) scanInjection(es *engineSet, res *ProxyRequestResult, parsed proxyParsedBody, sessionID string, now time.Time) {
 	for i := range parsed.segments {
 		seg := &parsed.segments[i]
 		ev := policy.Event{
@@ -331,7 +338,7 @@ func (g *Guard) scanInjection(res *ProxyRequestResult, parsed proxyParsedBody, s
 			Raw:       []byte(seg.text),
 			Now:       now,
 		}
-		verdict, guardErr := g.Evaluate(ev)
+		verdict, guardErr := g.evaluateWith(es, ev)
 		if verdict.Decision < policy.DecisionFlag && guardErr == nil {
 			continue
 		}
@@ -358,7 +365,7 @@ func (g *Guard) scanInjection(res *ProxyRequestResult, parsed proxyParsedBody, s
 				Timestamp: now,
 			},
 			Kind:       policy.KindAPIRequest,
-			Category:   g.CategoryFor(verdict.RuleID),
+			Category:   g.categoryWith(es, verdict.RuleID),
 			Verdict:    verdict,
 			GuardError: guardErr != nil,
 		}
@@ -389,6 +396,8 @@ func (g *Guard) InspectProxyResponse(sessionID string, tools []ProxyToolUse, now
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
+	// One snapshot for every tool_use in this response (NIT contract).
+	es := g.set.Load()
 	var out []ActionVerdict
 	for i := range tools {
 		ev, ok := buildToolUseEvent(&tools[i])
@@ -399,7 +408,7 @@ func (g *Guard) InspectProxyResponse(sessionID string, tools []ProxyToolUse, now
 		ev.Caps = proxyResponseCaps
 		ev.Now = now
 		ev.Taint = g.taint.Snapshot(sessionID, 0, now)
-		verdict, guardErr := g.Evaluate(ev)
+		verdict, guardErr := g.evaluateWith(es, ev)
 		verdict, approved := g.applyApprovals(verdict, &ev)
 		if verdict.Decision < policy.DecisionFlag && guardErr == nil {
 			continue
@@ -412,7 +421,7 @@ func (g *Guard) InspectProxyResponse(sessionID string, tools []ProxyToolUse, now
 				Timestamp:  now,
 			},
 			Kind:        ev.Kind,
-			Category:    g.CategoryFor(verdict.RuleID),
+			Category:    g.categoryWith(es, verdict.RuleID),
 			Verdict:     verdict,
 			TaintOrigin: taintOriginFor(verdict, ev.Taint),
 			GuardError:  guardErr != nil,

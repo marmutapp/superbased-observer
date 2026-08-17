@@ -2272,6 +2272,64 @@ func TestProxy_SessionResolverMissLeavesNull(t *testing.T) {
 	}
 }
 
+// TestProxy_SessionResolverSkippedOnHostedLane is the PLANE BOUNDARY
+// regression pin (operator-reported class, 2026-08-13): a request that
+// arrives on an explicit /up/<id> hosted lane (Plane A) must NEVER consult
+// the process-based SessionResolver, which maps a connection to a local
+// coding-agent session (Plane B). Absent an explicit session id the hosted
+// turn stays unattributed (SessionID ""), never borrowing a codex/claude-code
+// session — that borrowing polluted the Plane-B cost rollups. Against the
+// pre-fix code (resolver called on every lane) this fails: the resolver is
+// invoked and the turn lands with "sess-from-bridge".
+func TestProxy_SessionResolverSkippedOnHostedLane(t *testing.T) {
+	const requestBody = `{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}`
+	const responseBody = `{"id":"msg_abc","model":"claude-sonnet-4","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
+
+	anth := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(responseBody))
+	})
+	anthUp := httptest.NewServer(anth)
+	defer anthUp.Close()
+
+	sink := &fakeSink{}
+	resolver := &fakeResolver{sessionID: "sess-from-bridge", ok: true}
+	p, err := New(Options{
+		AnthropicUpstream: anthUp.URL,
+		OpenAIUpstream:    "https://unused.example",
+		// The hosted lane routes to the same upstream; its PRESENCE on the
+		// /up/ prefix is what marks the request Plane A.
+		Upstreams:       map[string]string{"hosted": anthUp.URL},
+		Sink:            sink,
+		SessionResolver: resolver,
+	})
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	ts := httptest.NewServer(p.Handler())
+	defer ts.Close()
+
+	// Hosted lane, NO X-Session-Id: the resolver must be skipped entirely.
+	req, _ := http.NewRequest("POST", ts.URL+"/up/hosted/v1/messages", strings.NewReader(requestBody))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	resp.Body.Close()
+
+	turns := sink.all()
+	if len(turns) != 1 {
+		t.Fatalf("want 1 turn, got %d", len(turns))
+	}
+	if turns[0].SessionID != "" {
+		t.Errorf("hosted-lane turn borrowed a coding-agent session_id: got %q want empty", turns[0].SessionID)
+	}
+	if resolver.callCount() != 0 {
+		t.Errorf("SessionResolver must not run on a /up hosted lane (called %d times)", resolver.callCount())
+	}
+}
+
 // TestParseAnthropicResponse_CacheCreationTierBreakdown verifies the
 // non-streaming response parser captures both
 // usage.cache_creation_input_tokens (the legacy total) and the per-tier
@@ -2776,6 +2834,87 @@ func TestProxy_ChatGPTAuthStreamsBytesIncrementally(t *testing.T) {
 // the body+header fallback entirely and relied solely on X-Session-Id,
 // so codex's chatgpt-auth turns (which carry the UUID on `session_id`
 // but not in the body) collapsed to an empty session_id.
+// TestResolveAPITurnSessionIDHostedAppLaneHeaders pins the gateway-rail
+// conversation-identity lift (operator-reported 4-rows-per-prompt class,
+// 2026-08-14): on an explicit /up/<id> lane, X-Superbased-Session (our
+// contract) and Open WebUI's native X-OpenWebUI-Chat-Id are accepted as the
+// session id, in that priority order — and NEITHER is consulted on a
+// default (Plane-B) lane, where hosted-app conventions must never leak
+// into coding-agent attribution.
+func TestResolveAPITurnSessionIDHostedAppLaneHeaders(t *testing.T) {
+	p, err := New(Options{
+		AnthropicUpstream: "http://127.0.0.1:1",
+		OpenAIUpstream:    "http://127.0.0.1:1",
+		ChatGPTUpstream:   "http://127.0.0.1:1",
+		Sink:              &fakeSink{},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	cases := []struct {
+		name    string
+		lane    string
+		headers map[string]string
+		want    string
+	}{
+		{
+			name:    "up-lane lifts X-Superbased-Session",
+			lane:    "openrouter",
+			headers: map[string]string{"X-Superbased-Session": "conv-abc"},
+			want:    "conv-abc",
+		},
+		{
+			name:    "up-lane lifts X-OpenWebUI-Chat-Id",
+			lane:    "openrouter",
+			headers: map[string]string{"X-OpenWebUI-Chat-Id": "owui-chat-7"},
+			want:    "owui-chat-7",
+		},
+		{
+			name: "X-Superbased-Session wins over X-OpenWebUI-Chat-Id",
+			lane: "openrouter",
+			headers: map[string]string{
+				"X-Superbased-Session": "conv-abc",
+				"X-OpenWebUI-Chat-Id":  "owui-chat-7",
+			},
+			want: "conv-abc",
+		},
+		{
+			name:    "default lane must NOT lift hosted-app headers",
+			lane:    "",
+			headers: map[string]string{"X-Superbased-Session": "conv-abc", "X-OpenWebUI-Chat-Id": "owui-chat-7"},
+			want:    "",
+		},
+		{
+			name:    "up-lane blank header values are ignored",
+			lane:    "openrouter",
+			headers: map[string]string{"X-Superbased-Session": "   "},
+			want:    "",
+		},
+		{
+			name:    "up-lane hosted-app header outranks generic X-Session-Id",
+			lane:    "openrouter",
+			headers: map[string]string{"X-Session-Id": "generic", "X-OpenWebUI-Chat-Id": "owui-chat-7"},
+			want:    "owui-chat-7",
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodPost, "http://test/v1/chat/completions", nil)
+			for k, v := range tc.headers {
+				req.Header.Set(k, v)
+			}
+			if tc.lane != "" {
+				req = req.WithContext(context.WithValue(req.Context(), obsLaneCtxKey{}, tc.lane))
+			}
+			got := p.resolveAPITurnSessionID(req, models.ProviderOpenAI, []byte(`{"model":"nvidia/nemotron-3.5-lightning:free"}`))
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestResolveAPITurnSessionID(t *testing.T) {
 	p, err := New(Options{
 		AnthropicUpstream: "http://127.0.0.1:1",

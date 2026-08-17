@@ -211,9 +211,13 @@ func (s *Server) guardedHandler(addr string) http.Handler {
 //     closed) on an unclassified route or insufficient capability.
 //   - the mux (built with the controller's own /api/remote/* routes mounted).
 func (s *Server) remoteGuardedHandler(rc RemoteController) http.Handler {
-	mux, capMap := s.registerRoutes(rc)
+	mux, capMap, sections := s.registerRoutes(rc)
 	authz := s.remoteAuthz(mux, capMap, rc)
-	return browserGuard(authz, hostAllowlistPredicate(rc.AllowedHosts()))
+	// Admin-controlled Plane B (spec §3.5): the governance guard wraps the
+	// authz chain on THIS branch too. Both branches of guardedHandler get it
+	// — a governed section must be refused identically whether the request
+	// arrived on the owner-trusted loopback listener or a paired remote one.
+	return browserGuard(s.governanceGuard(mux, sections, authz), hostAllowlistPredicate(rc.AllowedHosts()))
 }
 
 // requiredCapability maps a route's registered base capability + the request

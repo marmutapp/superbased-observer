@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -12,6 +13,8 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/config"
 	"github.com/marmutapp/superbased-observer/internal/intelligence/advisor"
 	"github.com/marmutapp/superbased-observer/internal/intelligence/cost"
+	"github.com/marmutapp/superbased-observer/internal/selfobs/conformance"
+	"github.com/marmutapp/superbased-observer/internal/selfobs/run"
 	"github.com/marmutapp/superbased-observer/internal/store"
 )
 
@@ -59,6 +62,30 @@ func newAdviseCmd() *cobra.Command {
 			})
 			if err != nil {
 				return err
+			}
+			if cfg.SelfObs.Enabled {
+				sink, cleanup, serr := buildSelfObsSink(cfg, slog.Default())
+				if serr == nil {
+					emitSelfObsRun(sink, run.DecisionRun{
+						RunID: fmt.Sprintf("advisor-%d", days),
+						// The --project filter is a RAW filesystem path. It must
+						// never travel as sbo.run.trace_id, which the gateway
+						// classify tier retains verbatim as operational metadata
+						// at every capture level (finding B-B5). Hash it: runs
+						// over the same project still correlate, the path itself
+						// never leaves the node. Empty stays empty.
+						TraceID:   run.CorrelationID(projectRoot),
+						Trigger:   "manual",
+						Component: conformance.ComponentAdvisor,
+						Decisions: []string{
+							fmt.Sprintf("suggestions:%d", len(rep.Suggestions)),
+							fmt.Sprintf("sessions:%d", rep.SessionsScanned),
+						},
+						CostUSD: rep.TotalSavingsUSD,
+						Outcome: "verified",
+					})
+					cleanup()
+				}
 			}
 			if jsonOut {
 				body, _ := json.MarshalIndent(rep, "", "  ")

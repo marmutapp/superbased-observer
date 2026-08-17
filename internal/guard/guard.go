@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/marmutapp/superbased-observer/internal/config"
 	"github.com/marmutapp/superbased-observer/internal/policy"
@@ -113,33 +114,37 @@ type Guard struct {
 	roots    []string
 	readFile func(string) ([]byte, error)
 
-	// base evaluates events whose project has no project-layer
-	// policy (or no resolvable root). Built once: builtin + org +
-	// user.
-	base *policy.Engine
-	// userLayer is the parsed user policy file, kept so per-project
-	// engines re-merge it with each project layer.
-	userLayer *policyFile
-	// orgLayer is the parsed org policy bundle (spec §14.2), loaded
-	// from the verified local cache and merged as the strictness
-	// floor (merge.go). Nil on non-enrolled installs and whenever the
-	// cache fails verification (degrade to local-only policy — the
-	// §14.2 compat posture).
-	orgLayer *policyFile
 	// onPolicyState is Options.OnPolicyState (may be nil).
 	onPolicyState func(PolicyState)
 
-	mu             sync.Mutex
-	projectEngines map[string]*policy.Engine
-	issues         []string
-	states         []PolicyState
-	// ruleCategories maps rule ID → category for audit-row
-	// attribution (the Verdict deliberately carries no Category —
-	// spec §3.4). Seeded from the built-in catalog, extended by each
-	// loaded layer's rules. Two projects reusing the same user-rule
-	// ID with different categories last-write-wins — an acceptable,
-	// documented approximation (IDs are meant to be unique).
-	ruleCategories map[string]policy.Category
+	// set holds the ENTIRE org-derived engine snapshot behind ONE
+	// atomic.Pointer (P0-7 hot-reload): the base engine, the parsed
+	// org + user layers, the builtin/org/user layer states + rule
+	// categories, and the per-snapshot lazy project-engine cache.
+	// Every hot-path read Loads it lock-free; ReloadOrgLayer builds a
+	// FRESH engineSet against a re-verified org bundle and Stores it,
+	// so an accepted org policy applies to the LIVE decision engine
+	// in-process with no daemon restart. In-flight Evaluate calls keep
+	// the snapshot they Loaded (a consistent view); the swapped-in set
+	// starts with an empty project cache that rebuilds lazily against
+	// the new org layer.
+	set atomic.Pointer[engineSet]
+	// reloadMu serializes ReloadOrgLayer construct+publish so a
+	// concurrent reload can never publish an OLDER snapshot over a
+	// newer one (the production caller is single-threaded — the mutex
+	// is defensive and makes the concurrency test honest).
+	reloadMu sync.Mutex
+	// orgKeyPinHash + orgBundlePath are IMMUTABLE after New — the
+	// re-verification inputs ReloadOrgLayer feeds back through the
+	// SAME §14.2 acceptance path (signature + optional key pin) New
+	// used, so a reload verifies identically to construction.
+	orgKeyPinHash string
+	orgBundlePath string
+
+	// mu guards issues only — the engine snapshot (base, layers,
+	// project cache, states, categories) lives behind g.set.
+	mu     sync.Mutex
+	issues []string
 
 	taint *taintTracker
 
@@ -194,15 +199,15 @@ func New(opts Options) (*Guard, error) {
 		return nil, fmt.Errorf("guard.New: %w", err)
 	}
 	g := &Guard{
-		cfg:            opts.Config,
-		home:           opts.Home,
-		roots:          opts.KnownProjectRoots,
-		readFile:       opts.ReadFile,
-		onPolicyState:  opts.OnPolicyState,
-		projectEngines: make(map[string]*policy.Engine),
-		ruleCategories: make(map[string]policy.Category),
-		taint:          newTaintTracker(opts.Config.Taint),
-		watches:        make(map[string]configWatch),
+		cfg:           opts.Config,
+		home:          opts.Home,
+		roots:         opts.KnownProjectRoots,
+		readFile:      opts.ReadFile,
+		onPolicyState: opts.OnPolicyState,
+		orgKeyPinHash: opts.OrgKeyPinHash,
+		orgBundlePath: OrgBundlePath(opts.Config, opts.Home),
+		taint:         newTaintTracker(opts.Config.Taint),
+		watches:       make(map[string]configWatch),
 	}
 	if g.readFile == nil {
 		g.readFile = os.ReadFile
@@ -218,23 +223,32 @@ func New(opts Options) (*Guard, error) {
 	if opts.Config.Alerts.Desktop {
 		g.notifier = opts.Notifier
 	}
-	for _, info := range policy.Catalog() {
-		g.ruleCategories[info.ID] = info.Category
-	}
 	// [guard.proxy].egress_allow: compile once; bad patterns degrade
 	// (skipped + recorded) per the policy-file failure posture.
 	var allowIssues []string
 	g.egressAllow, allowIssues = compileEgressAllow(opts.Config.Proxy.EgressAllow)
 	g.issues = append(g.issues, allowIssues...)
 
+	// Layers are accumulated into LOCALS (not g fields) and sealed
+	// into the initial engineSet at the end — the snapshot is the one
+	// owner of the engine state (P0-7).
+	var orgLayer, userLayer *policyFile
+	var states []PolicyState
+
 	// Org layer (G13): read + verify + parse the locally cached,
 	// signed policy bundle. Absence is normal (not enrolled, no
 	// bundle published, or pre-G13 server); every failure degrades to
 	// local-only policy with the issue recorded — the §14.2 compat
 	// posture mirrors the user-layer failure posture below.
-	orgPath := OrgBundlePath(opts.Config, opts.Home)
-	if orgPath != "" {
-		g.loadOrgBundle(orgPath, opts.OrgKeyPinHash)
+	if g.orgBundlePath != "" {
+		pf, st, issue, loaded := g.parseOrgBundle(g.orgBundlePath, opts.OrgKeyPinHash)
+		if issue != "" {
+			g.issues = append(g.issues, issue)
+		}
+		if loaded {
+			orgLayer = pf
+			states = append(states, st)
+		}
 	}
 
 	// User layer: read + parse the configured policy file. Absence
@@ -249,15 +263,8 @@ func New(opts Options) (*Guard, error) {
 			if perr != nil {
 				g.issues = append(g.issues, fmt.Sprintf("user policy %s: %v", userPath, perr))
 			} else {
-				g.userLayer = pf
-				st := PolicyState{Layer: layerUser, Path: userPath, ContentHash: sha256hex(raw)}
-				g.states = append(g.states, st)
-				for i := range pf.rules {
-					g.ruleCategories[pf.rules[i].ID] = pf.rules[i].Category
-				}
-				if g.onPolicyState != nil {
-					g.onPolicyState(st)
-				}
+				userLayer = pf
+				states = append(states, PolicyState{Layer: layerUser, Path: userPath, ContentHash: sha256hex(raw)})
 			}
 		case os.IsNotExist(err):
 			// no user policy — built-ins only
@@ -266,42 +273,54 @@ func New(opts Options) (*Guard, error) {
 		}
 	}
 
-	base, err := g.buildEngine(mode, nil)
+	base, err := g.buildEngine(mode, orgLayer, userLayer, nil)
 	if err != nil {
 		// A layer that breaks ENGINE construction (e.g. an override
 		// on an unknown rule) degrades the same way a parse failure
 		// does: drop the offending layer, keep the innocent one.
 		// Isolate the culprit by retrying without org, then without
 		// user, then without both — the first combination that builds
-		// wins, and every dropped layer records an issue.
+		// wins, and every dropped layer records an issue (and its
+		// state, so PolicyStates never reports a dropped layer).
 		firstErr := err
-		orgL, userL := g.orgLayer, g.userLayer
-		if orgL != nil {
-			g.orgLayer, g.userLayer = nil, userL
-			if b, e := g.buildEngine(mode, nil); e == nil {
+		built := false
+		if orgLayer != nil {
+			if b, e := g.buildEngine(mode, nil, userLayer, nil); e == nil {
 				g.issues = append(g.issues, fmt.Sprintf("org policy layer dropped: %v", firstErr))
-				g.base = b
-				return g, nil
+				orgLayer, base, built = nil, b, true
+				states = dropLayerState(states, layerOrg)
 			}
 		}
-		if userL != nil {
-			g.orgLayer, g.userLayer = orgL, nil
-			if b, e := g.buildEngine(mode, nil); e == nil {
+		if !built && userLayer != nil {
+			if b, e := g.buildEngine(mode, orgLayer, nil, nil); e == nil {
 				g.issues = append(g.issues, fmt.Sprintf("user policy layer dropped: %v", firstErr))
-				g.base = b
-				return g, nil
+				userLayer, base, built = nil, b, true
+				states = dropLayerState(states, layerUser)
 			}
 		}
-		g.orgLayer, g.userLayer = nil, nil
-		if orgL != nil || userL != nil {
-			g.issues = append(g.issues, fmt.Sprintf("org+user policy layers dropped: %v", firstErr))
-		}
-		base, err = g.buildEngine(mode, nil)
-		if err != nil {
-			return nil, fmt.Errorf("guard.New: built-in engine: %w", err)
+		if !built {
+			if orgLayer != nil || userLayer != nil {
+				g.issues = append(g.issues, fmt.Sprintf("org+user policy layers dropped: %v", firstErr))
+			}
+			orgLayer, userLayer, states = nil, nil, nil
+			b, e := g.buildEngine(mode, nil, nil, nil)
+			if e != nil {
+				return nil, fmt.Errorf("guard.New: built-in engine: %w", e)
+			}
+			base = b
 		}
 	}
-	g.base = base
+
+	g.set.Store(newEngineSet(base, orgLayer, userLayer, states, buildRuleCategories(orgLayer, userLayer)))
+
+	// Fire OnPolicyState for the SURVIVING layer states (a dropped
+	// layer is never reported as loaded). Project layers load lazily
+	// and fire from engineFor.
+	if g.onPolicyState != nil {
+		for i := range states {
+			g.onPolicyState(states[i])
+		}
+	}
 	return g, nil
 }
 
@@ -313,11 +332,14 @@ func modeOrDefault(s string) string {
 	return s
 }
 
-// buildEngine assembles a policy.Engine from config + the org + user
-// layers + an optional project layer, applying the §4.6 one-way
-// layering merge (org floor on top).
-func (g *Guard) buildEngine(mode policy.Mode, project *policyFile) (*policy.Engine, error) {
-	extra, overrides, mergeIssues := mergeLayers(g.orgLayer, g.userLayer, project)
+// buildEngine assembles a policy.Engine from config + the passed org +
+// user layers + an optional project layer, applying the §4.6 one-way
+// layering merge (org floor on top). The layers are PARAMETERS (not g
+// fields) so New, ReloadOrgLayer, and the per-snapshot project-engine
+// build all funnel through this one seam against an explicit layer set
+// (B3 — no hidden read of mutable guard state).
+func (g *Guard) buildEngine(mode policy.Mode, org, user, project *policyFile) (*policy.Engine, error) {
+	extra, overrides, mergeIssues := mergeLayers(org, user, project)
 	g.recordIssues(mergeIssues)
 	// Boundary slices pass through as-is: nil (section absent) lets
 	// the engine defaults apply; an explicitly-empty TOML list means
@@ -374,85 +396,19 @@ func (g *Guard) LoadIssues() []string {
 
 // PolicyStates returns the loaded policy-layer descriptors for the
 // §14.4 policy-change log (persisted by the caller through
-// store.RecordGuardPolicyState).
+// store.RecordGuardPolicyState). Read off the live snapshot: after a
+// successful ReloadOrgLayer the org entry carries the just-accepted
+// version + hash (the pair guardRunningFromGuard reads).
 func (g *Guard) PolicyStates() []PolicyState {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	out := make([]PolicyState, len(g.states))
-	copy(out, g.states)
-	return out
+	return g.set.Load().policyStates()
 }
 
 // Mode returns the active global mode.
-func (g *Guard) Mode() policy.Mode { return g.base.Mode() }
+func (g *Guard) Mode() policy.Mode { return g.set.Load().base.Mode() }
 
 // RuleCount returns the base engine's active rule-row count (status
 // surfaces).
-func (g *Guard) RuleCount() int { return g.base.RuleCount() }
-
-// engineFor returns the engine for a project root, lazily loading
-// <root>/<project_policy> on first sight. A missing project policy
-// (the overwhelmingly common case) caches the base engine. Load-once
-// per root per process — a live config-change rescan joins with the
-// watcher's config seam in a later commit (documented approximation).
-func (g *Guard) engineFor(projectRoot string) *policy.Engine {
-	if projectRoot == "" || g.cfg.Rules.ProjectPolicy == "" {
-		return g.base
-	}
-	g.mu.Lock()
-	if eng, ok := g.projectEngines[projectRoot]; ok {
-		g.mu.Unlock()
-		return eng
-	}
-	if len(g.projectEngines) >= maxProjectEngines {
-		g.mu.Unlock()
-		return g.base
-	}
-	g.mu.Unlock()
-
-	eng := g.loadProjectEngine(projectRoot)
-
-	g.mu.Lock()
-	g.projectEngines[projectRoot] = eng
-	g.mu.Unlock()
-	return eng
-}
-
-// loadProjectEngine reads + parses + merges one project's policy
-// file. Every failure path degrades to the base engine with the issue
-// recorded.
-func (g *Guard) loadProjectEngine(projectRoot string) *policy.Engine {
-	path := ProjectPolicyPath(g.cfg, projectRoot)
-	raw, err := g.readFile(path)
-	switch {
-	case os.IsNotExist(err):
-		return g.base
-	case err != nil:
-		g.recordIssues([]string{fmt.Sprintf("project policy %s: %v", path, err)})
-		return g.base
-	}
-	pf, perr := parsePolicyFile(raw, layerProject)
-	if perr != nil {
-		g.recordIssues([]string{fmt.Sprintf("project policy %s: %v", path, perr)})
-		return g.base
-	}
-	eng, err := g.buildEngine(g.base.Mode(), pf)
-	if err != nil {
-		g.recordIssues([]string{fmt.Sprintf("project policy %s dropped: %v", path, err)})
-		return g.base
-	}
-	st := PolicyState{Layer: layerProject, Path: path, ContentHash: sha256hex(raw)}
-	g.mu.Lock()
-	g.states = append(g.states, st)
-	for i := range pf.rules {
-		g.ruleCategories[pf.rules[i].ID] = pf.rules[i].Category
-	}
-	g.mu.Unlock()
-	if g.onPolicyState != nil {
-		g.onPolicyState(st)
-	}
-	return eng
-}
+func (g *Guard) RuleCount() int { return g.set.Load().base.RuleCount() }
 
 // MaybeAlert fires a desktop notification for a verdict that meets
 // the [guard.alerts] threshold (desktop enabled at construction +
@@ -483,19 +439,17 @@ func (g *Guard) MaybeAlert(v ActionVerdict) {
 // guard rules --effective`. Project layers are per-root and lazy;
 // the CLI surfaces the base set plus the loaded project states.
 func (g *Guard) EffectiveRules() []policy.RuleInfo {
-	return g.base.RuleInfos()
+	return g.set.Load().base.RuleInfos()
 }
 
 // CategoryFor returns the category of a rule ID for audit-row
 // attribution ("" when unknown; GuardErrorRuleID reports "guard" so
-// wrapper rows filter as guard-health signals).
+// wrapper rows filter as guard-health signals). The CLI's unpaired
+// call Loads its own snapshot; the in-package Evaluate+CategoryFor hot
+// paths thread the SAME snapshot via categoryWith (the NIT
+// same-evaluation-snapshot contract).
 func (g *Guard) CategoryFor(ruleID string) string {
-	if ruleID == GuardErrorRuleID {
-		return "guard"
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return string(g.ruleCategories[ruleID])
+	return g.categoryWith(g.set.Load(), ruleID)
 }
 
 // Evaluate is the guard-level evaluation seam: it stamps nothing,
@@ -508,15 +462,35 @@ func (g *Guard) CategoryFor(ruleID string) string {
 //
 // Callers that own cross-event state (the ingest seam, the hook
 // handler) populate ev.Taint BEFORE calling — see EvaluateActions for
-// the ingest path that does both.
+// the ingest path that does both. The public entry Loads one snapshot;
+// in-package callers that also categorize should use evaluateWith +
+// categoryWith with a single Loaded snapshot (the NIT contract).
 func (g *Guard) Evaluate(ev policy.Event) (verdict policy.Verdict, guardErr error) {
+	return g.evaluateWith(g.set.Load(), ev)
+}
+
+// evaluateWith evaluates ev against an ALREADY-LOADED snapshot so the
+// caller can pair it with categoryWith on the same snapshot (the
+// same-evaluation-snapshot contract). The Q2 failure wrapper is
+// applied here.
+func (g *Guard) evaluateWith(es *engineSet, ev policy.Event) (verdict policy.Verdict, guardErr error) {
 	defer func() {
 		if r := recover(); r != nil {
 			guardErr = fmt.Errorf("guard.Evaluate: recovered: %v", r)
 			verdict = g.failureVerdict(guardErr)
 		}
 	}()
-	return g.engineFor(ev.ProjectRoot).Evaluate(ev), nil
+	return es.engineFor(g, ev.ProjectRoot).Evaluate(ev), nil
+}
+
+// categoryWith returns the category of ruleID off an ALREADY-LOADED
+// snapshot — the in-package pair for evaluateWith so a hot path never
+// does a second g.set.Load() between evaluating and categorizing.
+func (g *Guard) categoryWith(es *engineSet, ruleID string) string {
+	if ruleID == GuardErrorRuleID {
+		return "guard"
+	}
+	return es.categoryFor(ruleID)
 }
 
 // failureVerdict builds the Q2 wrapper verdict: fail-open allow by

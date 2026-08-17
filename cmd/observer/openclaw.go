@@ -70,8 +70,13 @@ func newOpenclawCmd() *cobra.Command {
 			"All arguments after the subcommand are forwarded to openclaw. Use\n" +
 			"`--` to separate observer flags from openclaw flags. NEVER touches\n" +
 			"API keys. Requires a running observer proxy (`observer start`).",
-		SilenceErrors: true,
+		SilenceErrors:      true,
+		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args, done, err := launcherArgsOrDone(cmd, args)
+			if done {
+				return err
+			}
 			// Attach-by-default (attach-all-launchers): hand the PTY to the
 			// daemon when attach resolves. openclaw self-routes via
 			// OPENAI_BASE_URL in the daemon-spawned inner launcher, so forward NO
@@ -138,7 +143,6 @@ func newOpenclawCmd() *cobra.Command {
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "openclaw")
-	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 

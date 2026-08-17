@@ -31,6 +31,8 @@ func (g *Guard) EvaluatePostureFindings(findings []policy.PostureFinding, now ti
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
+	// One snapshot for the whole finding set (NIT contract).
+	es := g.set.Load()
 	var out []ActionVerdict
 	for i := range findings {
 		f := findings[i]
@@ -41,7 +43,7 @@ func (g *Guard) EvaluatePostureFindings(findings []policy.PostureFinding, now ti
 			PostureFindings: []policy.PostureFinding{f},
 			Now:             now,
 		}
-		verdict, guardErr := g.Evaluate(ev)
+		verdict, guardErr := g.evaluateWith(es, ev)
 		if verdict.Decision < policy.DecisionFlag && guardErr == nil {
 			continue
 		}
@@ -52,7 +54,7 @@ func (g *Guard) EvaluatePostureFindings(findings []policy.PostureFinding, now ti
 				Timestamp: now,
 			},
 			Kind:       policy.KindConfigChange,
-			Category:   g.CategoryFor(verdict.RuleID),
+			Category:   g.categoryWith(es, verdict.RuleID),
 			Verdict:    verdict,
 			GuardError: guardErr != nil,
 		})

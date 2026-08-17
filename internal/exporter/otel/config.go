@@ -1,6 +1,7 @@
 package otel
 
 import (
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -50,6 +51,14 @@ type Config struct {
 	SemconvStability string
 	// ServiceName is the resource service.name. Default "superbased-observer".
 	ServiceName string
+	// Headers are additional HTTP headers sent with every OTLP export (e.g. an
+	// Authorization bearer for a credential-bearing gateway). Optional; empty ⇒
+	// current behavior. Passed to otlptracehttp.WithHeaders when non-empty.
+	Headers map[string]string
+	// HTTPClient overrides the exporter's HTTP client (e.g. a redirect-guarded,
+	// TLS-pinned client). Optional; nil ⇒ current behavior. Passed to
+	// otlptracehttp.WithHTTPClient when non-nil.
+	HTTPClient *http.Client
 }
 
 // withEnvOverrides returns a copy of c with OTEL_* environment variables

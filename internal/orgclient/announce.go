@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/marmutapp/superbased-observer/internal/orgcontract"
-	"github.com/marmutapp/superbased-observer/internal/orgserver/organnounce"
 	"github.com/marmutapp/superbased-observer/internal/store"
 )
 
@@ -28,13 +27,13 @@ import (
 //     TOFU: the first received key is pinned with the cache row; a
 //     later key change is REFUSED loudly (re-enrol to rotate trust) —
 //     and it covers the DOMAIN-TAGGED, VERSION-BOUND message
-//     (organnounce.Verify), so a captured document cannot be replayed
+//     (orgcontract.VerifyAnnouncement), so a captured document cannot be replayed
 //     at a bumped version and a routing-policy document signed by the
 //     same org key cannot be presented here.
 //
 // The discipline mirrors FetchRoutingPolicy by design, down to the
 // refusal wording, and the same org signing key covers both rails —
-// but NOT the signed message: see organnounce.Verify and the
+// but NOT the signed message: see orgcontract.VerifyAnnouncement and the
 // ROUTING-SIG-1 row in docs/security.md.
 //
 // This adds NO network behaviour: it rides the push cycle the node
@@ -69,6 +68,7 @@ func (c *Client) FetchOrgAnnouncement(ctx context.Context) (bool, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+bearer)
 	resp, err := c.httpClient.Do(req)
+	c.noteRenewalFromResponse(RenewalPathOther, resp, err)
 	if err != nil {
 		return false, fmt.Errorf("orgclient.FetchOrgAnnouncement: %w", err)
 	}
@@ -107,7 +107,7 @@ func (c *Client) FetchOrgAnnouncement(ctx context.Context) (bool, error) {
 	if err := c.checkOrgKeyIdentity(ctx, announcementRail, doc.PublicKey); err != nil {
 		return false, fmt.Errorf("orgclient.FetchOrgAnnouncement: %w", err)
 	}
-	if err := organnounce.Verify(doc, pinned); err != nil {
+	if err := orgcontract.VerifyAnnouncement(doc, pinned); err != nil {
 		return false, fmt.Errorf("orgclient.FetchOrgAnnouncement: %w", err)
 	}
 	if err := c.store.UpsertOrgAnnouncement(ctx, store.OrgAnnouncementRow{

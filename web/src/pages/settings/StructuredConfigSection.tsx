@@ -19,12 +19,16 @@ export function StructuredConfigSection({
   description,
   badge,
   footer,
+  readOnly,
 }: {
   spec: SectionSpec;
   config: ConfigResponse | null;
   description?: string;
   badge?: React.ReactNode;
   footer?: React.ReactNode;
+  // Governance can lock a section read-only (docs/plane-a governance
+  // posture). No-op / undefined on an ungoverned node.
+  readOnly?: boolean;
 }) {
   // Dynamic select-option sources (D11): fields with `optionsFrom`
   // resolve their option list from the loaded config response, so
@@ -174,7 +178,8 @@ export function StructuredConfigSection({
           <button
             type="button"
             onClick={save}
-            disabled={!dirty || busy}
+            disabled={!dirty || busy || readOnly}
+            title={readOnly ? "Managed by your organization" : undefined}
             className="rounded-2 bg-accent px-3 py-1.5 text-[12px] font-semibold text-accent-on transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
           >
             {busy ? "Saving…" : "Save"}
@@ -182,7 +187,8 @@ export function StructuredConfigSection({
           <button
             type="button"
             onClick={reset}
-            disabled={!dirty || busy}
+            disabled={!dirty || busy || readOnly}
+            title={readOnly ? "Managed by your organization" : undefined}
             className="rounded-2 border border-line-2 bg-bg-2 px-3 py-1.5 text-[12px] text-fg-2 hover:bg-bg-3 disabled:cursor-not-allowed disabled:opacity-40"
           >
             Reset

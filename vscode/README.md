@@ -14,7 +14,7 @@
 <p align="center">
   Claude Code cost tracking. Cursor token usage. Codex spend. Captures,
   normalises, and analyses tool-call activity across
-  <a href="#supported-ai-tools">31 adapters</a> — Claude Code, Codex,
+  <a href="#supported-ai-tools">33 adapters</a> — Claude Code, Codex,
   Cursor, Cline, Copilot, Gemini CLI, Aider, Goose, Devin, and more.
   Zero telemetry. No data leaves your machine.
 </p>
@@ -151,7 +151,7 @@ Open the command palette (`Ctrl+Shift+P` / `⌘⇧P`) and type **SuperBased:**
 - **Aider**, **Goose**, **Devin**, **Qoder**, **Crush**, **Kimi Code**, **Grok**, **Kiro CLI**, **Qwen Code** — via JSONL / SQLite adapters
 - **Factory `droid`**, **Open Interpreter**, **Command Code** — via JSONL adapters
 
-31 adapters total. Five more (`chatgpt-web`, `claude-web`, `perplexity-web`,
+33 adapters total. Five more (`chatgpt-web`, `claude-web`, `perplexity-web`,
 `gemini-web`, `copilot-web`) capture browser-based chat via an opt-in
 browser extension that today installs unpacked only — not yet in the
 Chrome Web Store.

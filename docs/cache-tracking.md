@@ -892,7 +892,6 @@ each deferred to a named successor:
   graded the same way as the §14.3 opencode/kilo/cline-cli
   fixture-grading tests.
 - **P3 keep-alive advisor** — untouched. No work in this commit.
-- **P3 Teams cache rollup** — untouched. No work in this commit.
 
 ## §15.3 / P3 follow-up summary
 

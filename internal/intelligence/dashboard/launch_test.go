@@ -15,6 +15,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/marmutapp/superbased-observer/internal/db"
+	"github.com/marmutapp/superbased-observer/internal/store"
 	"github.com/marmutapp/superbased-observer/internal/termsvc"
 )
 
@@ -147,6 +148,25 @@ func newLaunchTestServer(t *testing.T, lm LaunchManager) *Server {
 	}
 	t.Cleanup(func() { _ = database.Close() })
 	s, err := New(Options{DB: database, LaunchManager: lm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// newLaunchTestServerWithRecentModels is newLaunchTestServer plus a
+// caller-supplied Options.RecentModels seam (B5 model-picker tests). Nil
+// recentModels behaves exactly like newLaunchTestServer (the seam stays
+// unset — the honest disabled state).
+func newLaunchTestServerWithRecentModels(t *testing.T, lm LaunchManager, recentModels func(context.Context, string) ([]store.RecentToolModel, error)) *Server {
+	t.Helper()
+	tdir := t.TempDir()
+	database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	s, err := New(Options{DB: database, LaunchManager: lm, RecentModels: recentModels})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,6 +335,173 @@ func TestTerminalLaunchShellBypassesToolAllowlist(t *testing.T) {
 	}
 	if lm.lastFreshSpec.Subcommand != "" {
 		t.Fatalf("fresh spec Subcommand = %q, want empty for a shell request", lm.lastFreshSpec.Subcommand)
+	}
+}
+
+// --- terminalLaunchRequest.Model + GET /api/terminal/launch/models (B5) ---
+
+func TestTerminalLaunchRequestUnmarshalsModel(t *testing.T) {
+	var req terminalLaunchRequest
+	if err := json.Unmarshal([]byte(`{"tool":"claude-code","project_root":"/repo","model":"opus"}`), &req); err != nil {
+		t.Fatal(err)
+	}
+	if req.Tool != "claude-code" || req.ProjectRoot != "/repo" || req.Model != "opus" {
+		t.Fatalf("req = %+v", req)
+	}
+}
+
+func fakeRecentModels(byTool map[string][]store.RecentToolModel) func(context.Context, string) ([]store.RecentToolModel, error) {
+	return func(_ context.Context, tool string) ([]store.RecentToolModel, error) {
+		return byTool[tool], nil
+	}
+}
+
+// TestTerminalLaunchDropsUnknownModel pins the fail-open membership check:
+// a model the picker never offered is silently DROPPED (the launch still
+// succeeds, with an empty Model on the fresh spec) — never a 400, never a
+// blocked launch.
+func TestTerminalLaunchDropsUnknownModel(t *testing.T) {
+	lm := &fakeLaunchManager{}
+	s := newLaunchTestServerWithRecentModels(t, lm, fakeRecentModels(nil))
+	body, _ := json.Marshal(terminalLaunchRequest{Tool: "claude-code", Model: "not-a-real-model"})
+	req := httptest.NewRequest(http.MethodPost, "/api/terminal/launch", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if lm.lastFreshSpec.Model != "" {
+		t.Fatalf("fresh spec Model = %q, want empty (dropped)", lm.lastFreshSpec.Model)
+	}
+}
+
+// TestTerminalLaunchAcceptsMemberModel pins the accept side: a model
+// present in modelSuggestionsFor's own output (here, claude-code's
+// registry-Known "opus") passes through unchanged onto the fresh spec.
+func TestTerminalLaunchAcceptsMemberModel(t *testing.T) {
+	lm := &fakeLaunchManager{}
+	s := newLaunchTestServerWithRecentModels(t, lm, fakeRecentModels(nil))
+	body, _ := json.Marshal(terminalLaunchRequest{Tool: "claude-code", Model: "opus"})
+	req := httptest.NewRequest(http.MethodPost, "/api/terminal/launch", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if lm.lastFreshSpec.Model != "opus" {
+		t.Fatalf("fresh spec Model = %q, want opus", lm.lastFreshSpec.Model)
+	}
+}
+
+func TestTerminalLaunchDropsModelWhenRecentModelsSeamNil(t *testing.T) {
+	lm := &fakeLaunchManager{}
+	// The plain newLaunchTestServer leaves Options.RecentModels unset (nil)
+	// — the honest disabled state (older-daemon parity).
+	s := newLaunchTestServer(t, lm)
+	body, _ := json.Marshal(terminalLaunchRequest{Tool: "claude-code", Model: "opus"})
+	req := httptest.NewRequest(http.MethodPost, "/api/terminal/launch", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if lm.lastFreshSpec.Model != "" {
+		t.Fatalf("fresh spec Model = %q, want empty when RecentModels is nil", lm.lastFreshSpec.Model)
+	}
+}
+
+func getTerminalLaunchModels(t *testing.T, h http.Handler, tool string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/terminal/launch/models?tool="+tool, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestTerminalLaunchModelsSupportedMergesHistoryAndKnown pins the endpoint's
+// composition: recent history comes first (Source "history", with
+// count/last_used), followed by the registry's Known examples not already
+// present in history (Source "known", no count/last_used).
+func TestTerminalLaunchModelsSupportedMergesHistoryAndKnown(t *testing.T) {
+	s := newLaunchTestServerWithRecentModels(t, &fakeLaunchManager{}, fakeRecentModels(map[string][]store.RecentToolModel{
+		// "opus" duplicates a registry Known entry — must appear ONCE, as
+		// history (not also as known).
+		"claude-code": {
+			{Model: "opus", Count: 5, LastUsed: "2026-08-08T00:00:00Z"},
+			{Model: "custom-history-model", Count: 1, LastUsed: "2026-08-07T00:00:00Z"},
+		},
+	}))
+	rec := getTerminalLaunchModels(t, s.Handler(), "claude-code")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var out terminalLaunchModelsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Supported {
+		t.Fatalf("out = %+v, want supported=true", out)
+	}
+	if len(out.Models) < 2 {
+		t.Fatalf("models = %+v, want at least the 2 history entries", out.Models)
+	}
+	seen := map[string]modelSuggestion{}
+	for _, m := range out.Models {
+		if _, dup := seen[m.Model]; dup {
+			t.Fatalf("model %q appears twice in %+v", m.Model, out.Models)
+		}
+		seen[m.Model] = m
+	}
+	if got := seen["opus"]; got.Source != "history" || got.Count != 5 {
+		t.Errorf("opus = %+v, want history source with count 5 (deduped against Known)", got)
+	}
+	if got := seen["custom-history-model"]; got.Source != "history" {
+		t.Errorf("custom-history-model = %+v, want history source", got)
+	}
+	if got, ok := seen["sonnet"]; !ok || got.Source != "known" || got.Count != 0 {
+		t.Errorf("sonnet = %+v (ok=%v), want a known-source entry with no count", got, ok)
+	}
+}
+
+// TestTerminalLaunchModelsUnsupportedForModelNoneTool pins the honest-hidden
+// floor: a tool with an explicit ModelSpec{Kind: ModelNone} (openclaw)
+// reports supported=false with an empty (non-nil) models list, even with a
+// live RecentModels seam.
+func TestTerminalLaunchModelsUnsupportedForModelNoneTool(t *testing.T) {
+	s := newLaunchTestServerWithRecentModels(t, &fakeLaunchManager{}, fakeRecentModels(nil))
+	rec := getTerminalLaunchModels(t, s.Handler(), "openclaw")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var out terminalLaunchModelsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Supported {
+		t.Fatalf("out = %+v, want supported=false for a ModelNone tool", out)
+	}
+	if out.Models == nil || len(out.Models) != 0 {
+		t.Fatalf("out.Models = %+v, want an empty non-nil slice", out.Models)
+	}
+}
+
+// TestTerminalLaunchModelsUnsupportedWhenSeamNil pins the nil-seam ⇒
+// unsupported degrade (older-daemon parity), mirroring how
+// handleTerminalPreflight treats a nil Options.ToolPreflight — except this
+// endpoint reports 200/supported:false rather than 501, matching the
+// frontend's fail-soft "any problem = no picker" contract.
+func TestTerminalLaunchModelsUnsupportedWhenSeamNil(t *testing.T) {
+	s := newLaunchTestServer(t, &fakeLaunchManager{})
+	rec := getTerminalLaunchModels(t, s.Handler(), "claude-code")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var out terminalLaunchModelsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Supported {
+		t.Fatalf("out = %+v, want supported=false with a nil RecentModels seam", out)
 	}
 }
 

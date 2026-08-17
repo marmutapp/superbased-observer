@@ -13,6 +13,8 @@ import (
 	"log/slog"
 	mrand "math/rand/v2"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -54,6 +56,157 @@ type Client struct {
 	httpClient   *http.Client
 	logger       *slog.Logger
 	agentVersion string
+
+	// P0-6 effective-policy-state fetch-outcome sinks (nil-defaulted seam,
+	// R6-1). When non-nil, PolicyPollLoop/PushLoop forward the TOTAL typed
+	// fetch outcome (§2.5b/§2.5c) here on every decisive cycle so the reporter
+	// can resolve stale_lkg and delivered_unaccepted, which onResult/success
+	// never surface. A nil sink is EXACTLY today's behaviour, so the existing
+	// call sites compile and run unchanged. Set via SetGuardOutcomeSink /
+	// SetRoutingOutcomeSink.
+	guardOutcomeSink   func(GuardFetchOutcome)
+	routingOutcomeSink func(RoutingFetchOutcome)
+
+	// routingReloadSink is the P0-7 router hot-reload trigger (docs/plans/
+	// plane-a-p0-7-guard-router-hotreload-plan.md §2.2/§4.5): a nil-defaulted
+	// additive seam invoked AFTER a routing policy is accepted + cached
+	// (rfStageAccepted, both newly-cached and already-current arms — SF7), so
+	// the caller can apply it to the live router in-process. Independent of
+	// routingOutcomeSink (one owner per concern: that sink updates the P0-6
+	// reporter slot, this one reloads the live router). Nil = today's exact
+	// no-op. Set via SetRoutingReloadSink.
+	routingReloadSink func(ctx context.Context)
+
+	// orgIdentityChangedSink is the Plane-A P0-5 Phase W enrolment-transition
+	// hook (plan §6.9): fired synchronously from Enroll/Unenroll AFTER the
+	// durable org_enrolment_generation bump/tombstone commits, so a caller
+	// that holds a live obs.AdmissionService IN THE SAME PROCESS (e.g. a
+	// future dashboard-driven enroll/unenroll path) can ClearOrg both
+	// families immediately rather than waiting for
+	// AdmissionService's own short-TTL identity recheck. orgclient must not
+	// import internal/obs (the boundary), so this is a plain func — nil
+	// (today's only real call path: the separate `observer enroll`/
+	// `observer unenroll` CLI processes, which hold no live
+	// AdmissionService) is an exact no-op. The cross-process case — a
+	// running daemon observing an unenrol/re-enrol performed by a SEPARATE
+	// `observer` invocation — is NOT this sink; it self-heals via
+	// AdmissionService's own activeEnrolmentIdentity cache instead (bounded
+	// by identityCheckTTL), which is what actually matters today. Set via
+	// SetOrgIdentityChangedSink.
+	orgIdentityChangedSink func()
+
+	// policyResourceCacheDir is the base directory for the generation-scoped
+	// on-disk policy-resource cache tree (plan §6.2). Set via
+	// SetPolicyResourceCacheDir; when non-empty, Enroll/Unenroll remove the
+	// org_key subtree so identity transitions do not leave stale envelopes
+	// (Codex SF3). Empty = no filesystem cleanup (tests that never install).
+	policyResourceCacheDir string
+
+	// shareProvider resolves the share posture PushOnce ships under
+	// (admin-controlled Plane B, Phase 1b §2.4). Nil means "use the config
+	// this client was constructed with", which is byte-identical to Phase
+	// 1a — so a build with no governance wiring behaves exactly as before.
+	//
+	// It exists because share directives are LOWERING-ONLY and must be HOT:
+	// a node that keeps shipping content for hours after the org said stop
+	// is precisely the failure the directive exists to prevent, and Client
+	// holds cfg from construction. One owner (store.ShareOptions), two feed
+	// paths (TOML, governance) — the pattern CLAUDE.md #4 blesses.
+	shareProvider func() store.ShareOptions
+
+	// governanceSidecarPath is the node-local governance sidecar, removed by
+	// Unenroll (§1.4 step 2b). Empty = nothing to remove (the solo case and
+	// every test that never wires governance).
+	governanceSidecarPath string
+
+	// renewalSink receives the classified outcome of every authenticated
+	// agent request (§4.2). Nil = today's exact behaviour.
+	renewalSink func(RenewalOutcome)
+}
+
+// SetShareProvider installs the hot share-posture resolver (§2.4). Passing
+// nil restores the cfg-derived default.
+func (c *Client) SetShareProvider(fn func() store.ShareOptions) {
+	if c == nil {
+		return
+	}
+	c.shareProvider = fn
+}
+
+// SetGovernanceSidecarPath tells Unenroll which sidecar to delete. Safe to
+// leave unset.
+func (c *Client) SetGovernanceSidecarPath(path string) {
+	if c == nil {
+		return
+	}
+	c.governanceSidecarPath = path
+}
+
+// GovernanceSidecarPath reports the sidecar Unenroll would delete. It
+// exists so the cmd layer can PIN its wiring (the 2026-08-15 smoke found
+// only start.go set the path, leaving CLI unenrolls orphaning the file).
+func (c *Client) GovernanceSidecarPath() string {
+	if c == nil {
+		return ""
+	}
+	return c.governanceSidecarPath
+}
+
+// shareOptions resolves the share posture for one push. The DEFAULT is
+// exactly the cfg-derived value Phase 1a built inline, so the seam is inert
+// until something installs a provider.
+func (c *Client) shareOptions() store.ShareOptions {
+	if c.shareProvider != nil {
+		return c.shareProvider()
+	}
+	return ShareOptionsFromConfig(c.cfg)
+}
+
+// ShareOptionsFromConfig maps an [org_client] config block onto the push
+// share posture. It is the ONE definition of that mapping; the governance
+// provider in cmd/observer LOWERS the result rather than rebuilding it, so
+// the two can never disagree about which keys exist.
+func ShareOptionsFromConfig(cfg config.OrgClientConfig) store.ShareOptions {
+	return store.ShareOptions{
+		FullContent:           cfg.Share.FullContent,
+		TargetActionAllowlist: cfg.Share.TargetActionAllowlist,
+		AdminManaged:          cfg.Share.AdminManaged,
+		RoutingSummary:        cfg.Share.RoutingSummary,
+		ObsSummary:            cfg.Share.Obs.Summary,
+		ObsTraces:             cfg.Share.Obs.Traces,
+		ObsContent:            cfg.Share.Obs.Content,
+		ObsEvalSummary:        cfg.Share.Obs.EvalSummary,
+		ObsAdmission:          cfg.Share.Obs.Admission,
+		ObsEvalItems:          cfg.Share.Obs.EvalItems,
+	}
+}
+
+// SetOrgIdentityChangedSink injects the Phase W enrolment-transition hook
+// (see the field's doc comment). Safe to leave unset.
+func (c *Client) SetOrgIdentityChangedSink(fn func()) { c.orgIdentityChangedSink = fn }
+
+// SetPolicyResourceCacheDir sets the on-disk policy-resource cache base
+// (Codex SF3). Safe to leave unset.
+func (c *Client) SetPolicyResourceCacheDir(dir string) { c.policyResourceCacheDir = dir }
+
+// removeGovernanceSidecar deletes the node-local governance sidecar (§1.4
+// unenrol step 2b). Best-effort and logged; never an unenrol failure.
+func (c *Client) removeGovernanceSidecar() {
+	if c == nil || c.governanceSidecarPath == "" {
+		return
+	}
+	if err := os.Remove(c.governanceSidecarPath); err != nil && !os.IsNotExist(err) {
+		c.logger.Warn("unenroll: could not remove the governance sidecar — pinned settings will lift at the next hook once the grant's own expiry passes",
+			"path", c.governanceSidecarPath, "err", err)
+	}
+}
+
+// clearPolicyResourceCacheTree removes <cacheDir>/<orgKey>/ best-effort.
+func (c *Client) clearPolicyResourceCacheTree(orgKey string) {
+	if c == nil || c.policyResourceCacheDir == "" || orgKey == "" {
+		return
+	}
+	_ = os.RemoveAll(filepath.Join(c.policyResourceCacheDir, orgKey))
 }
 
 // New constructs a push Client. httpClient may be nil (a default with a sane
@@ -106,63 +259,68 @@ type PushResult struct {
 // writes the org_enrolment row. The keychain and cursor are written BEFORE the
 // enrolment row so that a concurrently-running push loop, which keys off the
 // enrolment row, never observes an enrolled state with an un-seeded cursor.
-func (c *Client) Enroll(ctx context.Context, orgURL, token string) (*store.Enrolment, error) {
+func (c *Client) Enroll(ctx context.Context, orgURL, token string) (*store.Enrolment, *GrantOffer, error) {
 	orgURL = strings.TrimRight(strings.TrimSpace(orgURL), "/")
 	if orgURL == "" {
-		return nil, errors.New("orgclient.Enroll: org server URL is required")
+		return nil, nil, errors.New("orgclient.Enroll: org server URL is required")
 	}
 	if strings.TrimSpace(token) == "" {
-		return nil, errors.New("orgclient.Enroll: enrolment token is required")
+		return nil, nil, errors.New("orgclient.Enroll: enrolment token is required")
 	}
+
+	// Snapshot the OLD enrolment (nil on a fresh install) before it is
+	// overwritten below, so a re-enrolment can tombstone the old identity's
+	// policy-resource generation (plan §6.9) after the new one activates.
+	oldEnr, _ := c.store.LoadEnrolment(ctx) //nolint:errcheck // best-effort snapshot; a read failure just skips old-identity cleanup
 
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("orgclient.Enroll: keygen: %w", err)
+		return nil, nil, fmt.Errorf("orgclient.Enroll: keygen: %w", err)
 	}
 
 	gc, err := c.genClient(orgURL)
 	if err != nil {
-		return nil, fmt.Errorf("orgclient.Enroll: %w", err)
+		return nil, nil, fmt.Errorf("orgclient.Enroll: %w", err)
 	}
 	resp, err := gc.EnrollAgentWithResponse(ctx, gen.EnrollRequest{
 		OneTimeToken:   token,
 		AgentPublicKey: base64.RawURLEncoding.EncodeToString(pub),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("orgclient.Enroll: post: %w", err)
+		return nil, nil, fmt.Errorf("orgclient.Enroll: post: %w", err)
 	}
 	switch resp.StatusCode() {
 	case http.StatusOK:
 		// fall through
 	case http.StatusUnauthorized, http.StatusForbidden:
-		return nil, fmt.Errorf("orgclient.Enroll: %w: invalid or expired enrolment token", ErrAuthFailed)
+		return nil, nil, fmt.Errorf("orgclient.Enroll: %w: invalid or expired enrolment token", ErrAuthFailed)
 	default:
-		return nil, fmt.Errorf("orgclient.Enroll: server returned %d: %s", resp.StatusCode(), strings.TrimSpace(string(resp.Body)))
+		return nil, nil, fmt.Errorf("orgclient.Enroll: server returned %d: %s", resp.StatusCode(), strings.TrimSpace(string(resp.Body)))
 	}
 	er := resp.JSON200
 	if er == nil || er.Bearer == "" {
-		return nil, errors.New("orgclient.Enroll: server returned no bearer")
+		return nil, nil, errors.New("orgclient.Enroll: server returned no bearer")
 	}
 
 	// Seed the cursor + persist secrets BEFORE the enrolment row (see doc).
 	maxIDs, err := c.store.CurrentMaxIDs(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("orgclient.Enroll: seed cursor: %w", err)
+		return nil, nil, fmt.Errorf("orgclient.Enroll: seed cursor: %w", err)
 	}
 	if err := c.store.SavePushCursor(ctx, maxIDs); err != nil {
-		return nil, fmt.Errorf("orgclient.Enroll: save cursor: %w", err)
+		return nil, nil, fmt.Errorf("orgclient.Enroll: save cursor: %w", err)
 	}
 	// Wipe any prior-run last-push state so `observer org status` after
 	// a re-enroll reports "(none yet)" instead of a stale timestamp.
 	// N5 in docs/teams-test-regression-2026-06-03.md.
 	if err := c.store.ClearLastPushState(ctx); err != nil {
-		return nil, fmt.Errorf("orgclient.Enroll: clear last-push state: %w", err)
+		return nil, nil, fmt.Errorf("orgclient.Enroll: clear last-push state: %w", err)
 	}
 	if err := c.bearers.SaveAgentKey(priv); err != nil {
-		return nil, fmt.Errorf("orgclient.Enroll: %w", err)
+		return nil, nil, fmt.Errorf("orgclient.Enroll: %w", err)
 	}
 	if err := c.bearers.SaveBearer(er.Bearer); err != nil {
-		return nil, fmt.Errorf("orgclient.Enroll: %w", err)
+		return nil, nil, fmt.Errorf("orgclient.Enroll: %w", err)
 	}
 
 	enr := store.Enrolment{
@@ -174,8 +332,37 @@ func (c *Client) Enroll(ctx context.Context, orgURL, token string) (*store.Enrol
 		EnrolledAt:   time.Now().UTC().Format(time.RFC3339),
 		BearerKeyID:  c.cfg.KeychainID,
 	}
+
+	// Plane-A P0-5 (plan §6.9 / R6-B2 / R3-B2 / Codex B1): activate the new
+	// identity's policy-resource generation BEFORE WriteEnrolment so a
+	// concurrent FetchAndAccept never observes enrolled-without-generation
+	// (missing gen ≡ ErrNotEnrolled). Fail-closed on bump/clear errors —
+	// never leave enrolment visible without an active generation row. On
+	// any re-enrolment (same or different org key), clear prior
+	// policy-resource state so CAS cannot wedge on a stale generation
+	// column (Codex B3).
+	newOrgKey := OrgKey(orgURL, er.OrgID)
+	if oldEnr != nil {
+		oldOrgKey := OrgKey(oldEnr.OrgServerURL, oldEnr.OrgID)
+		if oldOrgKey != newOrgKey {
+			if _, err := c.store.BumpEnrolmentGeneration(ctx, oldOrgKey, true); err != nil {
+				return nil, nil, fmt.Errorf("orgclient.Enroll: tombstone old enrolment generation: %w", err)
+			}
+		}
+		if err := c.store.ClearPolicyResourceState(ctx, oldOrgKey); err != nil {
+			return nil, nil, fmt.Errorf("orgclient.Enroll: clear old policy-resource state: %w", err)
+		}
+		c.clearPolicyResourceCacheTree(oldOrgKey)
+	}
+	generation, err := c.store.BumpEnrolmentGeneration(ctx, newOrgKey, false)
+	if err != nil {
+		return nil, nil, fmt.Errorf("orgclient.Enroll: activate enrolment generation: %w", err)
+	}
 	if err := c.store.WriteEnrolment(ctx, enr); err != nil {
-		return nil, fmt.Errorf("orgclient.Enroll: write enrolment: %w", err)
+		return nil, nil, fmt.Errorf("orgclient.Enroll: write enrolment: %w", err)
+	}
+	if c.orgIdentityChangedSink != nil {
+		c.orgIdentityChangedSink()
 	}
 
 	// Pin the org POLICY signing key when the server delivered one
@@ -186,6 +373,7 @@ func (c *Client) Enroll(ctx context.Context, orgURL, token string) (*store.Enrol
 	// then pins trust-on-first-fetch instead. A malformed key is a
 	// server bug, WARN-only — enrolment's primary job (the push
 	// channel) must not fail over it; the fetch path will TOFU-pin.
+	pinnedKeyHash := ""
 	if er.OrgPolicyPublicKey != "" {
 		if keyHash, perr := pinBase64Key(er.OrgPolicyPublicKey); perr != nil {
 			c.logger.Warn("org policy key not pinned", "err", perr)
@@ -197,13 +385,101 @@ func (c *Client) Enroll(ctx context.Context, orgURL, token string) (*store.Enrol
 		}); perr != nil {
 			c.logger.Warn("org policy key not pinned", "err", perr)
 		} else {
+			pinnedKeyHash = keyHash
 			c.logger.Info("org policy signing key pinned at enrolment", "key_sha256", keyHash)
 		}
 	}
 
+	// Admin-controlled Plane B (spec §2.3, adversarial review A3/A4): the
+	// grant is evaluated ONLY AFTER the org policy key was actually pinned,
+	// and it is RETURNED, never written here. Two reasons this ordering is
+	// load-bearing:
+	//
+	//   - The pin write above is best-effort by design (enrolment's primary
+	//     job, the push channel, must not fail over it). A grant accepted
+	//     without a pin would be authority bound to nothing: the NEXT policy
+	//     fetch would TOFU-pin whatever key it saw, which need not be the key
+	//     the grant was signed under. So a missing/failed pin REFUSES the
+	//     grant, loudly, instead of storing it unverified.
+	//   - orgclient has no TTY, and by this point the bearer is saved, the
+	//     enrolment is written and the generation is bumped — there is no
+	//     honest place here to ask a human anything. cmd/observer/org.go owns
+	//     the confirmation and the store write.
+	offer := c.evaluateGrantOffer(er, orgURL, newOrgKey, generation, pinnedKeyHash)
+
 	c.logger.Info("enrolled in org", "org", enr.OrgName, "org_id", enr.OrgID,
 		"user_email", enr.UserEmail, "server", orgURL, "store", c.bearers.Backend())
-	return &enr, nil
+	return &enr, offer, nil
+}
+
+// GrantOffer is a VERIFIED enrolment grant plus the identity facts the node
+// needs in order to store it. Enroll returns one only when every gate passed;
+// a nil offer means "enrolled, ungoverned", which is exactly today's
+// behaviour and what every pre-governance server produces.
+type GrantOffer struct {
+	Grant        orgcontract.EnrolmentGrant
+	OrgKey       string
+	Generation   int64
+	KeyPinSHA256 string
+	ReceiptHash  string
+}
+
+// evaluateGrantOffer runs the accept gates for an offered grant. EVERY
+// refusal is logged with a named reason (adversarial review A3: a silently
+// skipped grant leaves the admin staring at a permanently ungoverned node
+// with no diagnosis) and returns nil, which enrols the node ungoverned.
+func (c *Client) evaluateGrantOffer(er *orgcontract.EnrollResponse, orgURL, orgKey string, generation int64, pinnedKeyHash string) *GrantOffer {
+	if er.Grant == nil {
+		return nil
+	}
+	g := *er.Grant
+	switch {
+	case er.OrgPolicyPublicKey == "":
+		c.logger.Warn("enrolment grant REFUSED: the server offered governance but sent no org policy signing key, so the grant cannot be bound to any key — enrolling ungoverned")
+		return nil
+	case pinnedKeyHash == "":
+		c.logger.Warn("enrolment grant REFUSED: the org policy signing key could not be pinned, so a grant would be authority bound to nothing — enrolling ungoverned")
+		return nil
+	case g.KeyPinSHA256 == "" || g.KeyPinSHA256 != pinnedKeyHash:
+		c.logger.Warn("enrolment grant REFUSED: the grant names a different org policy signing key than the one this enrolment pinned — enrolling ungoverned",
+			"grant_key_sha256", g.KeyPinSHA256, "pinned_key_sha256", pinnedKeyHash)
+		return nil
+	case g.OrgID != er.OrgID:
+		c.logger.Warn("enrolment grant REFUSED: the grant names a different org than the enrolment — enrolling ungoverned",
+			"grant_org_id", g.OrgID, "enrolment_org_id", er.OrgID)
+		return nil
+	case strings.TrimRight(strings.TrimSpace(g.OrgServerURL), "/") != orgURL:
+		c.logger.Warn("enrolment grant REFUSED: the grant names a different org server than the one being enrolled with — enrolling ungoverned",
+			"grant_server", g.OrgServerURL, "enrolment_server", orgURL)
+		return nil
+	}
+	pubRaw, derr := base64.RawURLEncoding.DecodeString(er.OrgPolicyPublicKey)
+	if derr != nil {
+		c.logger.Warn("enrolment grant REFUSED: org policy public key did not decode — enrolling ungoverned", "err", derr)
+		return nil
+	}
+	if verr := orgcontract.VerifyEnrolmentGrant(g, ed25519.PublicKey(pubRaw)); verr != nil {
+		c.logger.Warn("enrolment grant REFUSED: signature did not verify under the pinned org policy key — enrolling ungoverned", "err", verr)
+		return nil
+	}
+	if g.ExpiresAt != "" {
+		exp, perr := time.Parse(time.RFC3339, g.ExpiresAt)
+		if perr != nil {
+			c.logger.Warn("enrolment grant REFUSED: expires_at is not RFC3339 — enrolling ungoverned", "expires_at", g.ExpiresAt)
+			return nil
+		}
+		if !time.Now().UTC().Before(exp) {
+			c.logger.Warn("enrolment grant REFUSED: it is already expired — enrolling ungoverned", "expires_at", g.ExpiresAt)
+			return nil
+		}
+	}
+	return &GrantOffer{
+		Grant:        g,
+		OrgKey:       orgKey,
+		Generation:   generation,
+		KeyPinSHA256: pinnedKeyHash,
+		ReceiptHash:  orgcontract.EnrolmentGrantReceiptHash(g),
+	}
 }
 
 // Unenroll deletes the local enrolment row and clears the keychain secrets.
@@ -211,12 +487,56 @@ func (c *Client) Enroll(ctx context.Context, orgURL, token string) (*store.Enrol
 // the row each cycle, stops pushing as soon as it observes the absence. Absent
 // state is not an error (idempotent).
 func (c *Client) Unenroll(ctx context.Context) error {
+	// Snapshot first, then tombstone the generation BEFORE deleting the
+	// enrolment row (plan §6.9 / Codex B1): a concurrent fetch must observe
+	// tombstoned (or missing gen after clear) rather than a live enrolment
+	// with a still-active generation.
+	enr, _ := c.store.LoadEnrolment(ctx) //nolint:errcheck // best-effort snapshot; absent is fine
+
+	if enr != nil {
+		orgKey := OrgKey(enr.OrgServerURL, enr.OrgID)
+		if _, err := c.store.BumpEnrolmentGeneration(ctx, orgKey, true); err != nil {
+			return fmt.Errorf("orgclient.Unenroll: tombstone enrolment generation: %w", err)
+		}
+		// Admin-controlled Plane B (spec §5.1): delete the enrolment GRANT
+		// in the same fail-closed prefix as the tombstone, BEFORE the
+		// policy-resource state and the enrolment row. Revocation must
+		// leave nothing behind that could govern this machine, and the
+		// grant is the only artifact that could.
+		if err := c.store.DeleteEnrolmentGrant(ctx, orgKey); err != nil {
+			return fmt.Errorf("orgclient.Unenroll: delete enrolment grant: %w", err)
+		}
+		// Step 2b (Phase 1b §1.4): remove the governance sidecar, so a hook
+		// or MCP process spawned a millisecond later reads no pins. It is
+		// BEST-EFFORT because step 1 already tombstoned the generation and
+		// because the reader's own expiry rule is the backstop that makes a
+		// failed delete converge anyway — but leaving it would keep pinning
+		// keys in short-lived processes until the grant lapsed, which is a
+		// bad enough surprise to be worth the attempt and the log line.
+		c.removeGovernanceSidecar()
+		if err := c.store.ClearPolicyResourceState(ctx, orgKey); err != nil {
+			return fmt.Errorf("orgclient.Unenroll: clear policy-resource state: %w", err)
+		}
+		c.clearPolicyResourceCacheTree(orgKey)
+	}
+	// Belt-and-braces: an unenrol running against a DB whose enrolment row
+	// is already gone cannot derive an org_key, and an orphan grant is
+	// authority with no owner. Clearing unconditionally is safe — a grant
+	// only ever exists for the current enrolment.
+	if err := c.store.DeleteAllEnrolmentGrants(ctx); err != nil {
+		return fmt.Errorf("orgclient.Unenroll: delete enrolment grants: %w", err)
+	}
+
 	if err := c.store.DeleteEnrolment(ctx); err != nil {
 		return fmt.Errorf("orgclient.Unenroll: %w", err)
 	}
 	if err := c.bearers.Clear(); err != nil {
 		return fmt.Errorf("orgclient.Unenroll: %w", err)
 	}
+	if c.orgIdentityChangedSink != nil {
+		c.orgIdentityChangedSink()
+	}
+
 	c.logger.Info("unenrolled from org")
 	return nil
 }
@@ -285,18 +605,7 @@ func (c *Client) PushOnce(ctx context.Context) (PushResult, error) {
 	}
 	batch, err := c.store.SelectUnpushedSince(
 		ctx, cur, c.maxPushBytes(), enr.OrgID, enr.UserEmail,
-		store.ShareOptions{
-			FullContent:           c.cfg.Share.FullContent,
-			TargetActionAllowlist: c.cfg.Share.TargetActionAllowlist,
-			AdminManaged:          c.cfg.Share.AdminManaged,
-			RoutingSummary:        c.cfg.Share.RoutingSummary,
-			ObsSummary:            c.cfg.Share.Obs.Summary,
-			ObsTraces:             c.cfg.Share.Obs.Traces,
-			ObsContent:            c.cfg.Share.Obs.Content,
-			ObsEvalSummary:        c.cfg.Share.Obs.EvalSummary,
-			ObsAdmission:          c.cfg.Share.Obs.Admission,
-			ObsEvalItems:          c.cfg.Share.Obs.EvalItems,
-		},
+		c.shareOptions(),
 		store.ScopeOptions{
 			ProjectRootAllowlist: c.cfg.Scope.ProjectRootAllowlist,
 			ProjectRootDenylist:  c.cfg.Scope.ProjectRootDenylist,
@@ -372,9 +681,15 @@ func (c *Client) PushOnce(ctx context.Context) (PushResult, error) {
 	resp, err := gc.PushBatchWithBodyWithResponse(ctx, params, "application/json", bytes.NewReader(wire),
 		bearerEditor(bearer), gzipEncodingEditor)
 	if err != nil {
+		c.noteRenewal(RenewalPathPush, 0, err)
 		_ = c.store.RecordPush(ctx, int64(batch.RowCount()), int64(len(wire)), "retry", err.Error())
 		return PushResult{}, fmt.Errorf("orgclient.PushOnce: post: %w", err)
 	}
+	// The renewal signal (§4.2) is keyed off the PUSH path's own
+	// authorization, which is the requirement parent §11.3 states: an org
+	// that revokes push permission but leaves the policy poll working must
+	// not keep governing the machine indefinitely.
+	c.noteRenewal(RenewalPathPush, resp.StatusCode(), nil)
 
 	switch resp.StatusCode() {
 	case http.StatusOK:
@@ -432,7 +747,14 @@ func (c *Client) PushLoop(ctx context.Context) error {
 		// Best-effort §R19.1 policy sync rides the same cycle: a fetch
 		// failure never affects push health (P1 — the policy cache
 		// just stays at its last verified version).
-		if _, perr := c.FetchRoutingPolicy(ctx); perr != nil && !errors.Is(perr, ErrNotEnrolled) {
+		_, routingOutcome, perr := c.FetchRoutingPolicy(ctx)
+		// Forward the TOTAL typed outcome (§2.5b) to the P0-6 reporter. A nil
+		// outcome is a skip (context.Canceled — a shutdown, not a verdict); a
+		// nil sink (the default) is today's exact no-op (R6-1).
+		if routingOutcome != nil && c.routingOutcomeSink != nil {
+			c.routingOutcomeSink(*routingOutcome)
+		}
+		if perr != nil && !errors.Is(perr, ErrNotEnrolled) {
 			c.logger.Warn("org routing policy fetch failed", "err", perr)
 		}
 		// Rail R3 of the dashboard-announcements plan (§4) rides the

@@ -386,6 +386,19 @@ var seedTiers = map[string]Tier{
 	"gemini-pro-agent": TierOpusClass,
 	"gemini-3.1":       TierOpusClass, // cost family anchors 3.1 at Pro
 	"gemini-3.5-flash": TierHaikuClass,
+	// gemini-3.6-flash / gemini-3.7-flash: explicit, NOT relying on the
+	// bare "gemini-3" fallback below — that fallback is Pro-class, and
+	// "gemini-3.6-flash"/"gemini-3.7-flash" DO prefix-match the bare
+	// "gemini-3" key (both start with the literal "gemini-3"), so
+	// without these two rows a flash-class request would misclassify
+	// as Opus-class. Mirrors the pricing.go family-shadow note for the
+	// same two models. Both SKUs also share the same introductory
+	// pricing (through 2026-12-31, standard rate from 2027-01-01 per
+	// pricing.go / docs/pricing-reference.md, re-verified 2026-08-15)
+	// but that's a cost-only distinction — the tier classification
+	// below (TierHaikuClass) is unaffected either way.
+	"gemini-3.6-flash": TierHaikuClass,
+	"gemini-3.7-flash": TierHaikuClass,
 	"gemini-3-flash":   TierHaikuClass,
 	"gemini-3":         TierOpusClass, // Pro-representative, mirroring cost
 	"gemini-2.5-pro":   TierSonnetClass,
@@ -414,6 +427,17 @@ var seedTiers = map[string]Tier{
 	"kilo-auto/free":   TierFree,
 	"kilo-auto/small":  TierHaikuClass, // Kilo's title-generation slot
 	"ollama":           TierLocal,
+
+	// 2026-08 sweep additions. deepseek-v4-pro / grok-4.5 / grok-4.6 /
+	// qwen3.7-max / qwen3.7-plus / qwen3.8-max / kimi-k3 / minimax-m3 /
+	// nemotron-3.5-lightning are all already correctly placed by the
+	// bare family rows above (verified by prefix walk against
+	// tierFamilyKeys) — no new rows needed for those; see the W5 task
+	// report for the per-model reasoning. Baidu ERNIE and StepFun had NO
+	// existing family row at all (a miss → TierUnclassified), so those
+	// two get entries below.
+	"ernie":          TierSonnetClass, // Baidu's flagship line (ernie-5.1), same vendor-family pattern as glm/mistral/minimax
+	"step-3.7-flash": TierHaikuClass,  // StepFun's budget/speed SKU; no "step" family exists yet to fall back to
 }
 
 // seedRepresentatives names the canonical downshift target per

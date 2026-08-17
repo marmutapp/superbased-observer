@@ -108,6 +108,16 @@ var DefaultCrossOSToolBasenames = map[string][]string{
 	// command-code/cline-cli/crush precedent), so node belongs here —
 	// Windows gets a .cmd shim, the real process is node.
 	"prime-agent": {"prime-agent.exe", "prime-agent", "node.exe", "node"},
+	// DeepSeek Harness (`@deepseek-ai/dsh`): an npm bin loading a node bundle
+	// (the command-code/prime-agent precedent), so node belongs here; the
+	// branded `dsh` name anchors when present.
+	"deepseek": {"dsh.exe", "dsh", "node.exe", "node"},
+	// JetBrains Junie (2026-08-17): the `junie` launcher is a managed bash
+	// shim that execs a native versioned binary ALSO named `junie`
+	// (~/.local/share/junie/versions/<v>/junie) — no node/JVM name is exposed
+	// at the process level, so the branded basename is the whole entry (the
+	// muse native-binary precedent); Windows gets junie.exe.
+	"junie": {"junie.exe", "junie"},
 }
 
 // DefaultCrossOSToolLaunchers maps a session tool to the branded IDE/desktop

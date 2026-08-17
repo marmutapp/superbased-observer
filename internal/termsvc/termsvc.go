@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/marmutapp/superbased-observer/internal/integration"
 	"github.com/marmutapp/superbased-observer/internal/termfeed"
 	"github.com/marmutapp/superbased-observer/internal/termrun"
 )
@@ -31,6 +32,18 @@ var (
 	ErrAttachSubcommandRequired = errors.New("termsvc: attach launch requires a subcommand")
 	// ErrAttachDirNotAbsolute — LaunchAttachable was given a non-absolute Dir.
 	ErrAttachDirNotAbsolute = errors.New("termsvc: attach launch dir must be absolute")
+	// ErrSandboxUnavailable is returned when a caller requests a sandboxed
+	// fresh launch (FreshRequest.Sandbox) but the Service was constructed
+	// without a Sandboxer (B9 plan §7/§12 amendment A5). A nil Sandboxer means
+	// the feature is absent; a sandboxed request FAILS CLOSED rather than
+	// silently degrading to an unsandboxed launch. Returned BEFORE a run is
+	// minted, so no orphan terminal_runs row is created.
+	ErrSandboxUnavailable = errors.New("termsvc: sandboxed launch requested but no sandbox seam is configured")
+	// ErrWorkspacePrepFailed wraps a Sandboxer.Prepare error (workspace
+	// creation / git clone / bwrap-plan failure). Returned before a run is
+	// minted, same fail-closed posture as ErrSandboxUnavailable. The dashboard
+	// maps this to a 500.
+	ErrWorkspacePrepFailed = errors.New("termsvc: sandbox workspace preparation failed")
 )
 
 // Policy is the resolved fresh-launch authorization, built from the operator's
@@ -130,6 +143,75 @@ type LaunchRequest struct {
 	// child's $SHELL (falling back to /bin/bash / /bin/sh) instead of the
 	// usual `observer <Subcommand>` argv.
 	IsShell bool
+	// WrapArgv is an optional isolation-wrapper argv prefix (B9) resolved by
+	// the Sandboxer seam and threaded through to termsession.Spec.WrapArgv —
+	// the bwrap invocation wraps the WHOLE inner `observer <verb>` argv
+	// (including any ExtraArgs a model selection composed). Empty for every
+	// non-sandboxed launch.
+	WrapArgv []string
+	// Sandboxed records whether this launch went through the Sandboxer seam
+	// (B9). Carried alongside WrapArgv so the Launcher/recorder can label the
+	// run without re-deriving it from WrapArgv's mere presence.
+	Sandboxed bool
+}
+
+// Sandboxer prepares an isolation-wrapped launch: it prepares the workspace
+// (host-side git) and returns the resolved working Dir plus the bwrap wrapper
+// argv prefix. A nil Sandboxer means the feature is absent — a sandboxed
+// request then fails closed (never degrades to unsandboxed; B9 plan §12
+// amendment A5).
+//
+// termsvc declares this interface itself and imports neither
+// internal/sandbox nor internal/workspace (CLAUDE.md module-boundary rule
+// #2): only plain string/[]string cross the seam via PrepareRequest /
+// PrepareResult. It is satisfied by a cmd adapter over the two pure B9
+// packages (cmd/observer/terminal_sandbox.go).
+type Sandboxer interface {
+	// Prepare resolves the workspace this run will operate in and the argv
+	// prefix that wraps the inner launch inside the isolation boundary. On
+	// success PrepareResult.Dir is the workspace's absolute path (either the
+	// original validated project root for a "live" source, or a freshly
+	// prepared managed-workspace directory) and PrepareResult.WrapArgv is the
+	// bwrap invocation prefix (or empty, for a backend that needs none).
+	Prepare(ctx context.Context, req PrepareRequest) (PrepareResult, error)
+}
+
+// PrepareRequest is what LaunchFresh hands the Sandboxer: the already-
+// authorized/validated project root plus the client's workspace-source
+// choice. Tool selects the SandboxSpec row (state binds); ProjectRoot is the
+// canonical path ValidateProjectRoot already accepted.
+type PrepareRequest struct {
+	// Tool is the target tool name, used to resolve its capability-registry
+	// SandboxSpec (StateRW/StateRO binds).
+	Tool string
+	// ProjectRoot is the canonical, already-validated project root
+	// (ValidateProjectRoot's return value).
+	ProjectRoot string
+	// WorkspaceSource selects the workspace-preparation mechanism: "live"
+	// (default; the workspace IS ProjectRoot, no copy), "clone-local",
+	// "clone-remote", or "worktree" (off by default; B9 plan §4).
+	WorkspaceSource string
+	// WorkspaceRemote is the remote URL for a "clone-remote" source. Ignored
+	// otherwise.
+	WorkspaceRemote string
+	// WorkspaceBranch is an optional branch to check out after clone/worktree.
+	// Ignored for "live".
+	WorkspaceBranch string
+}
+
+// PrepareResult is what a successful Sandboxer.Prepare returns.
+type PrepareResult struct {
+	// Dir is the resolved working directory the launch spawns into: the
+	// original ProjectRoot for a "live" source, or a freshly prepared
+	// managed-workspace directory otherwise.
+	Dir string
+	// WrapArgv is the isolation-wrapper argv prefix (e.g. a bwrap invocation)
+	// to thread into LaunchRequest.WrapArgv. May be empty.
+	WrapArgv []string
+	// Note is an optional human-readable detail (e.g. which SandboxSpec row
+	// was used, or a workspace-prep caveat) for logging; never surfaced to the
+	// authorization decision.
+	Note string
 }
 
 // Launcher spawns a PTY-backed launcher and returns its opaque handle. It is
@@ -159,6 +241,10 @@ type runMeta struct {
 	// the rest of runMeta and read through Service.ProjectRoot.
 	dir     string
 	endedAt time.Time
+	// sandboxed records whether this run was launched through the B9
+	// Sandboxer seam (in-memory only; no DB column — see B9 plan §10 ledger
+	// G19, "was this historical run sandboxed?" is deliberately deferred).
+	sandboxed bool
 }
 
 // endedHandleGrace is how long a run's retained classification metadata (byMeta)
@@ -190,9 +276,21 @@ type Service struct {
 	policy   Policy
 	rec      RunRecorder
 	launcher Launcher
-	feed     *termfeed.Feed // optional; nil disables the status event feed
-	logger   *slog.Logger   // optional; nil disables the no-mapping debug log
-	now      func() time.Time
+	// sandboxer prepares a B9 sandboxed fresh launch (workspace + wrap argv).
+	// Optional; nil means the feature is absent — a Sandbox:true FreshRequest
+	// then fails closed with ErrSandboxUnavailable rather than silently
+	// degrading to an unsandboxed launch (§12 amendment A5).
+	sandboxer Sandboxer
+	// sandboxWorkspacesDir is the daemon's managed-workspace root (config
+	// `[terminal.sandbox].workspaces_dir`, resolved to an absolute default by
+	// the cmd wiring). It gates ValidateManagedWorkspace for a prepared
+	// non-"live" workspace; termsvc holds it directly rather than reading
+	// config itself (module-boundary rule #1 — config parsing stays outside
+	// this package).
+	sandboxWorkspacesDir string
+	feed                 *termfeed.Feed // optional; nil disables the status event feed
+	logger               *slog.Logger   // optional; nil disables the no-mapping debug log
+	now                  func() time.Time
 	// exitStatus, when set, is the authoritative "has this handle already
 	// exited?" query (termsession.Manager.ExitStatus). launch() consults it the
 	// instant it installs the handle→run mapping, to close the PRE-REGISTRATION
@@ -273,6 +371,12 @@ type Options struct {
 	// (see Service.onRunExit). Nil disables the direct seam (the status feed's
 	// term:exit is then the only exit signal — advisory only).
 	OnRunExit func(runID string)
+	// Sandboxer prepares a B9 sandboxed fresh launch (see Service.sandboxer).
+	// Nil disables the feature: a Sandbox:true FreshRequest then fails closed.
+	Sandboxer Sandboxer
+	// SandboxWorkspacesDir is the daemon's managed-workspace root (see
+	// Service.sandboxWorkspacesDir).
+	SandboxWorkspacesDir string
 }
 
 // New builds a Service.
@@ -282,19 +386,21 @@ func New(opts Options) *Service {
 		now = func() time.Time { return time.Now().UTC() }
 	}
 	return &Service{
-		policy:     opts.Policy,
-		rec:        opts.Recorder,
-		launcher:   opts.Launcher,
-		feed:       opts.Feed,
-		logger:     opts.Logger,
-		now:        now,
-		exitStatus: opts.ExitStatus,
-		onRunExit:  opts.OnRunExit,
-		byHandle:   make(map[string]string),
-		byRun:      make(map[string]string),
-		byMeta:     make(map[string]runMeta),
-		bySession:  make(map[string]sessionLink),
-		launching:  make(map[string]struct{}),
+		policy:               opts.Policy,
+		rec:                  opts.Recorder,
+		launcher:             opts.Launcher,
+		sandboxer:            opts.Sandboxer,
+		sandboxWorkspacesDir: opts.SandboxWorkspacesDir,
+		feed:                 opts.Feed,
+		logger:               opts.Logger,
+		now:                  now,
+		exitStatus:           opts.ExitStatus,
+		onRunExit:            opts.OnRunExit,
+		byHandle:             make(map[string]string),
+		byRun:                make(map[string]string),
+		byMeta:               make(map[string]runMeta),
+		bySession:            make(map[string]sessionLink),
+		launching:            make(map[string]struct{}),
 	}
 }
 
@@ -312,6 +418,30 @@ type FreshRequest struct {
 	// Tool/Subcommand are ignored for authorization purposes (gated by
 	// Policy.AllowShell instead of AllowedTools) — see LaunchFresh.
 	Shell bool
+	// Model is an optional model identifier for the New Terminal model
+	// picker (B5). The dashboard has already validated it by MEMBERSHIP
+	// against the tool's own suggestion list before it reaches here, but
+	// LaunchFresh still resolves the tool's ModelSpec itself and composes
+	// it via integration.ModelLaunch — fail-open on any error (unknown
+	// tool, ModelNone, a spec-level validation failure): the launch
+	// proceeds WITHOUT a model rather than aborting. Ignored when Shell.
+	Model string
+	// Sandbox requests a B9 filesystem-isolated launch (bwrap). When true and
+	// no Sandboxer is configured, LaunchFresh fails closed with
+	// ErrSandboxUnavailable — there is no silent unsandboxed fallback.
+	// Ignored when Shell (sandboxing a bare shell is not v1 scope).
+	Sandbox bool
+	// WorkspaceSource selects how the sandboxed workspace is prepared: "live"
+	// (default; no copy — the workspace IS ProjectRoot), "clone-local",
+	// "clone-remote", or "worktree" (off by default). Ignored when Sandbox is
+	// false.
+	WorkspaceSource string
+	// WorkspaceRemote is the remote URL for a "clone-remote" WorkspaceSource.
+	// Ignored otherwise.
+	WorkspaceRemote string
+	// WorkspaceBranch is an optional branch to check out after clone/worktree.
+	// Ignored for "live".
+	WorkspaceBranch string
 }
 
 // LaunchResult is what a launch returns to the dashboard.
@@ -353,11 +483,35 @@ func (s *Service) LaunchFresh(ctx context.Context, req FreshRequest) (LaunchResu
 	if req.Shell {
 		tool = ShellTool
 	}
+
+	// B9 sandbox seam — AFTER ValidateProjectRoot, BEFORE the run is minted
+	// (plan §1/§5): a failed or unavailable sandbox request never orphans a
+	// terminal_runs row. sandboxed/wrapArgv stay their zero values (false/nil)
+	// on the unchanged, non-sandboxed path — byte-identical to today.
+	var wrapArgv []string
+	sandboxed := req.Sandbox
+	if sandboxed {
+		prepared, perr := s.prepareSandbox(ctx, req, tool, dir)
+		if perr != nil {
+			return LaunchResult{}, perr
+		}
+		// The resolved dir becomes the workspace the run is spawned into and
+		// attributed to — ProjectRootHash below hashes THIS value, so
+		// attribution follows the prepared workspace, not the original
+		// project root (plan §5).
+		dir = prepared.Dir
+		wrapArgv = prepared.WrapArgv
+	}
+
 	run := termrun.Run{
 		Tool:            tool,
 		Kind:            termrun.KindFresh,
 		ProjectRootHash: termrun.HashProjectRoot(dir),
 		LaunchedAt:      s.now(),
+	}
+	var extraArgs, extraEnv []string
+	if req.Model != "" && !req.Shell {
+		extraArgs, extraEnv = s.resolveModelLaunch(req.Tool, req.Model)
 	}
 	return s.launch(ctx, run, LaunchRequest{
 		Subcommand: req.Subcommand,
@@ -366,7 +520,73 @@ func (s *Service) LaunchFresh(ctx context.Context, req FreshRequest) (LaunchResu
 		Rows:       req.Rows,
 		Cols:       req.Cols,
 		IsShell:    req.Shell,
+		ExtraArgs:  extraArgs,
+		ExtraEnv:   extraEnv,
+		WrapArgv:   wrapArgv,
+		Sandboxed:  sandboxed,
 	})
+}
+
+// prepareSandbox resolves a sandboxed fresh launch's workspace + wrap argv
+// through the Sandboxer seam (B9 plan §1/§7). It fails closed: a nil
+// Sandboxer returns ErrSandboxUnavailable, and any Sandboxer.Prepare error is
+// wrapped in ErrWorkspacePrepFailed — both returned BEFORE LaunchFresh mints
+// a run, so a failed sandbox request never orphans a terminal_runs row.
+//
+// When the prepared Dir differs from the caller's already-validated project
+// root (a managed, non-"live" workspace was created), it must additionally
+// canonicalize strictly under the daemon's configured managed-workspace root
+// via ValidateManagedWorkspace. A "live" source — where Prepare legitimately
+// returns Dir == validatedRoot, the workspace IS the project root, no copy —
+// skips that check: the root was already authorized by ValidateProjectRoot,
+// and ValidateManagedWorkspace's managedRoot gate would otherwise wrongly
+// reject every ordinary project directory.
+func (s *Service) prepareSandbox(ctx context.Context, req FreshRequest, tool, validatedRoot string) (PrepareResult, error) {
+	if s.sandboxer == nil {
+		return PrepareResult{}, ErrSandboxUnavailable
+	}
+	result, err := s.sandboxer.Prepare(ctx, PrepareRequest{
+		Tool:            tool,
+		ProjectRoot:     validatedRoot,
+		WorkspaceSource: req.WorkspaceSource,
+		WorkspaceRemote: req.WorkspaceRemote,
+		WorkspaceBranch: req.WorkspaceBranch,
+	})
+	if err != nil {
+		return PrepareResult{}, fmt.Errorf("%w: %w", ErrWorkspacePrepFailed, err)
+	}
+	if result.Dir != validatedRoot {
+		canon, verr := ValidateManagedWorkspace(result.Dir, s.sandboxWorkspacesDir)
+		if verr != nil {
+			return PrepareResult{}, fmt.Errorf("%w: %w", ErrWorkspacePrepFailed, verr)
+		}
+		result.Dir = canon
+	}
+	return result, nil
+}
+
+// resolveModelLaunch composes the argv/env for a client-requested model
+// (B5, New Terminal model picker) from the tool's capability-registry
+// ModelSpec, dispatching on capability SHAPE (ModelSpec.Kind) rather than
+// tool name (CLAUDE.md #3). It is fail-open by design: an unknown tool, a
+// tool with no model capability (ModelNone), or any integration.ModelLaunch
+// validation error all just return nil, nil — LaunchFresh proceeds with the
+// tool's own default rather than aborting a launch over a model that turns
+// out to be unusable.
+func (s *Service) resolveModelLaunch(tool, model string) (extraArgs, extraEnv []string) {
+	cap, ok := integration.For(tool)
+	if !ok {
+		return nil, nil
+	}
+	args, env, err := integration.ModelLaunch(cap.Model, model)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("termsvc: dropping requested model, launching with tool default",
+				"tool", tool, "model", model, "error", err)
+		}
+		return nil, nil
+	}
+	return args, env
 }
 
 // HandoffRequest is the dashboard-derived continue-a-session request. It does
@@ -614,7 +834,7 @@ func (s *Service) launch(ctx context.Context, run termrun.Run, lr LaunchRequest)
 			dir = ""
 		}
 	}
-	s.byMeta[handle] = runMeta{Kind: run.Kind, Tool: run.Tool, dir: dir}
+	s.byMeta[handle] = runMeta{Kind: run.Kind, Tool: run.Tool, dir: dir, sandboxed: lr.Sandboxed}
 	s.mu.Unlock()
 
 	s.publish(termfeed.Event{
@@ -713,6 +933,17 @@ func (s *Service) ProjectRoot(handle string) (string, bool) {
 		return "", false
 	}
 	return m.dir, true
+}
+
+// Sandboxed reports whether a live-or-lingering PTY handle was launched
+// through the B9 Sandboxer seam (in-memory only — see runMeta.sandboxed).
+// ok=false for an unknown handle, matching ProjectRoot/KindForHandle's
+// no-store-read, byMeta-served contract.
+func (s *Service) Sandboxed(handle string) (sandboxed bool, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, ok := s.byMeta[handle]
+	return m.sandboxed, ok
 }
 
 // SessionForRun returns the observer session id a run has been correlated to,

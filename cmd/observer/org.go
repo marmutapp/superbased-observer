@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,20 +81,59 @@ func buildOrgBundle(ctx context.Context, configPath string) (orgBundle, error) {
 	// internal/obs. A no-op (zero providers) when obs is disabled / no_obs.
 	st.SetObsOrgProviders(obsOrgProviders(ctx, cfg, database, logger))
 	bs := orgclient.OpenBearerStore(cfg.OrgClient.KeychainID, filepath.Dir(cfg.Observer.DBPath), logger)
+	client := orgclient.New(cfg.OrgClient, st, bs, version, nil, logger)
+	client.SetPolicyResourceCacheDir(policyResourceCacheDir(cfg))
+	// Unenroll's step 2b (mini-spec §4.5) deletes the governance sidecar,
+	// and `observer unenroll` runs through THIS bundle — not the daemon's
+	// start.go wiring, which was the only place the path was set until the
+	// 2026-08-15 live smoke caught the orphan: a CLI unenroll left the
+	// sidecar behind, so hooks kept applying pins until its embedded grant
+	// clock expired. Every org CLI client gets the path.
+	client.SetGovernanceSidecarPath(config.ResolveGovernanceSidecarPath(cfg, ""))
 	return orgBundle{
-		client:  orgclient.New(cfg.OrgClient, st, bs, version, nil, logger),
+		client:  client,
 		store:   st,
 		cfg:     cfg,
 		cleanup: func() { _ = database.Close() },
 	}, nil
 }
 
+// orgJudgeRelayFunc is the C1 judge relay seam
+// (docs/plans/c1-judge-relay-spec-2026-08-15.md §3): a plain func value, NOT
+// the orgclient.Client type, threaded from where the client is constructed
+// (start.go / proxy.go, daemon scope) into the admission/eval judge build in
+// obs_wire.go. This keeps the reverse-import boundary intact — obs_wire.go
+// (and everything it calls in internal/obs) never imports internal/orgclient;
+// only cmd/observer does. purpose is "admission" or "eval"; modelHint is
+// optional and recorded only. A nil value means "no relay available" (not
+// enrolled, or org push disabled) — callers must treat that as a soft-fail
+// per §3, never a panic.
+type orgJudgeRelayFunc func(ctx context.Context, purpose, prompt, modelHint string) (text, model string, err error)
+
+// orgJudgeRelayFuncFor wraps an *orgclient.Client's JudgeRelay method as an
+// orgJudgeRelayFunc. Nil-safe: a nil client (org push disabled, or client
+// construction failed) yields a nil func, letting the caller detect
+// "no relay available" without a type-asserting nil check of its own.
+func orgJudgeRelayFuncFor(c *orgclient.Client) orgJudgeRelayFunc {
+	if c == nil {
+		return nil
+	}
+	return func(ctx context.Context, purpose, prompt, modelHint string) (string, string, error) {
+		reply, err := c.JudgeRelay(ctx, purpose, prompt, modelHint)
+		if err != nil {
+			return "", "", err
+		}
+		return reply.Text, reply.Model, nil
+	}
+}
+
 func newEnrollCmd() *cobra.Command {
 	var (
-		configPath  string
-		linkURL     string
-		writeBlock  bool
-		wireClients bool
+		configPath       string
+		linkURL          string
+		writeBlock       bool
+		wireClients      bool
+		acceptGovernance bool
 	)
 	cmd := &cobra.Command{
 		Use:   "enroll [<org-url> <token>]",
@@ -120,23 +160,35 @@ high-water id).`,
 			if err != nil {
 				return err
 			}
-			c, cleanup, enabled, err := buildOrgClient(cmd.Context(), configPath)
+			b, err := buildOrgBundle(cmd.Context(), configPath)
 			if err != nil {
 				return err
 			}
-			defer cleanup()
-			enr, err := c.Enroll(cmd.Context(), orgURL, token)
+			defer b.cleanup()
+			c, enabled := b.client, b.cfg.OrgClient.Enabled
+			enr, offer, err := c.Enroll(cmd.Context(), orgURL, token)
 			if err != nil {
 				return err
 			}
 			out := cmd.OutOrStdout()
 			fmt.Fprintf(out, "Enrolled in %s (org_id %s) as %s.\n", enr.OrgName, enr.OrgID, enr.UserEmail)
 			fmt.Fprintf(out, "Pushing to %s.\n", enr.OrgServerURL)
+			// Admin-controlled Plane B (spec §2.3): the org may have offered
+			// a GOVERNANCE GRANT alongside the enrolment. It is written only
+			// after a human confirms it here — orgclient verified the
+			// signature under the key this enrolment pinned, but consent is
+			// a CLI concern, and a grant nobody agreed to would make the
+			// whole consent model a lie.
+			if offer != nil {
+				if err := confirmAndStoreGrant(cmd, b.store, offer, acceptGovernance); err != nil {
+					return err
+				}
+			}
 			if writeBlock {
 				cfgPath, werr := resolveConfigPath(configPath)
 				if werr != nil {
 					fmt.Fprintf(out, "\nWarn: could not resolve config path to write [org_client] block: %v\n", werr)
-				} else if added, werr := ensureOrgClientBlock(cfgPath); werr != nil {
+				} else if added, werr := ensureOrgClientBlock(cfgPath, enr.OrgServerURL); werr != nil {
 					fmt.Fprintf(out, "\nWarn: could not write [org_client] block to %s: %v\n", cfgPath, werr)
 				} else if added {
 					fmt.Fprintf(out, "\nWrote default [org_client] block to %s — restart `observer start` to begin pushing.\n", cfgPath)
@@ -213,6 +265,8 @@ high-water id).`,
 	cmd.Flags().StringVar(&linkURL, "link", "", "Enrol magic link (http(s)://host/enrol/<code>)")
 	cmd.Flags().BoolVar(&writeBlock, "write-block", true, "auto-write a default [org_client] block to config.toml (use --write-block=false to skip)")
 	cmd.Flags().BoolVar(&wireClients, "wire-clients", true, "auto-register hooks + MCP + proxy routing for every detected AI client (use --wire-clients=false to skip)")
+	cmd.Flags().BoolVar(&acceptGovernance, "accept-governance", false,
+		"accept an organisation governance grant without an interactive prompt (scripted rollout; see `observer org grant show` for what was granted)")
 	return cmd
 }
 
@@ -267,20 +321,48 @@ func resolveConfigPath(explicit string) (string, error) {
 // block already existed and the file was untouched. Idempotent: a
 // second call after the first is a no-op.
 //
+// orgServerURL is written into the block (tracker #41): the push loop
+// reads the enrolment row's URL from the DB, but the policy-bundle
+// runner and the disclosure surfaces read [org_client].org_server_url
+// from config — leaving it unwritten left an enrolled node's guard
+// org-layer silently unwired. Empty is tolerated (the key is simply
+// omitted) so older callers keep working.
+//
 // The append is text-only — we never re-encode the whole file — so a
 // hand-curated config keeps its comments, formatting, and ordering.
-func ensureOrgClientBlock(path string) (bool, error) {
+// hasOrgClientTableHeader reports whether body already declares a real
+// [org_client] TOML table. It matches only a header at the start of a line
+// (after indentation) — a bare substring search false-positived on configs
+// whose COMMENTS mention [org_client], most notably the shipped gateway-role
+// template (deploy/observer-gateway/config.toml), which made enroll silently
+// skip the block write in exactly the deployment the template exists for
+// (found live during the 2026-08-16 org-server-to-Azure move).
+func hasOrgClientTableHeader(body string) bool {
+	for _, ln := range strings.Split(body, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(ln), "[org_client]") {
+			return true
+		}
+	}
+	return false
+}
+
+func ensureOrgClientBlock(path, orgServerURL string) (bool, error) {
 	body, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		return false, err
 	}
-	if strings.Contains(string(body), "[org_client]") {
+	if hasOrgClientTableHeader(string(body)) {
 		return false, nil
+	}
+	urlLine := ""
+	if u := strings.TrimSpace(orgServerURL); u != "" {
+		urlLine = "org_server_url = " + strconv.Quote(u) + "\n"
 	}
 	block := "\n[org_client]\n" +
 		"# enabled = true means observer start ships activity rollups to the org server\n" +
 		"# on every push_interval_seconds. Set to false to pause sharing without unenrolling.\n" +
 		"enabled = true\n" +
+		urlLine +
 		"push_interval_seconds = 900\n" +
 		"max_push_bytes = 1048576  # 1 MiB\n" +
 		"\n" +
@@ -337,6 +419,13 @@ not delete anything already shared with the org server.`,
 				return err
 			}
 			fmt.Fprintf(out, "Unenrolled from %s. Local credentials cleared.\n", st.OrgName)
+			// Admin-controlled Plane B (spec §5.1): Unenroll deleted the
+			// enrolment grant, so any organisation governance of this
+			// machine's dashboard lifted with it. Say so explicitly — a
+			// developer who ran this to get their pages back needs to know
+			// it worked, and one who did not needs to know what changed.
+			fmt.Fprintln(out, "Any organisation governance of this dashboard has been removed; local settings apply again.")
+			fmt.Fprintln(out, "Data already shared with the organisation stays with the organisation.")
 
 			// Symmetric cleanup for the RegisterClaudeCode write
 			// from enroll: drop ANTHROPIC_BASE_URL from
@@ -384,7 +473,7 @@ not delete anything already shared with the org server.`,
 func newOrgCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "org",
-		Short: "Organisation (Teams) enrolment status, scope, manual push, preview, backfill",
+		Short: "Organisation enrolment status, scope, manual push, preview, backfill",
 	}
 	cmd.AddCommand(
 		newOrgStatusCmd(),
@@ -393,6 +482,7 @@ func newOrgCmd() *cobra.Command {
 		newOrgPreviewCmd(),
 		newOrgBackfillCmd(),
 		newOrgEmitManagedSettingsCmd(),
+		newOrgGrantCmd(),
 	)
 	return cmd
 }
@@ -632,7 +722,7 @@ func newOrgPushNowCmd() *cobra.Command {
 	var configPath string
 	cmd := &cobra.Command{
 		Use:   "push-now",
-		Short: "Push any unpushed activity to the org server immediately",
+		Short: "Push any unpushed activity to the enrolled organisation immediately",
 		Long: `Runs one push cycle now instead of waiting for the interval. Useful to
 verify enrolment end to end or to flush before shutting down.
 

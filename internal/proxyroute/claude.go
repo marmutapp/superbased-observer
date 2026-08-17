@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 )
 
 // claudeBaseURL is the proxy URL we write into Claude Code's settings.
@@ -120,9 +122,13 @@ func (r *Registrar) registerClaudeCodeAt(dir, want, toolLabel string) Registrati
 }
 
 // UnregisterClaudeCode removes ANTHROPIC_BASE_URL from
-// `~/.claude/settings.json`'s env block IF it currently points at a
-// loopback URL (any observer install). Preserves a third-party
-// proxy entry the operator deliberately configured. Idempotent: if
+// `~/.claude/settings.json`'s env block IF it currently points at THIS
+// registrar's own route: a loopback URL on the registrar's configured
+// proxy port. Preserves a third-party proxy entry the operator
+// deliberately configured AND another observer install's loopback route
+// on a different port (ledger B5.25: a scratch node's unenroll, built
+// with port 18820, used to strip a real install's :8820 route because
+// this method matched any loopback URL). Idempotent: if
 // the key is absent, returns AlreadySet=false + Added=false with no
 // error and no file mutation.
 //
@@ -174,9 +180,10 @@ func (r *Registrar) UnregisterClaudeCode() RegistrationResult {
 		res.AlreadySet = true
 		return res
 	}
-	if !IsObserverBaseURL(cur) {
-		// Third-party / non-loopback — leave the operator's choice
-		// alone. Don't error: unenroll is best-effort cleanup.
+	if !isOwnClaudeBaseURL(cur, r.opts.ProxyPort) {
+		// Third-party, non-loopback, or another observer install's
+		// loopback route on a different port — leave the operator's
+		// choice alone. Don't error: unenroll is best-effort cleanup.
 		res.AlreadySet = true
 		res.BaseURL = cur
 		return res
@@ -207,6 +214,22 @@ func (r *Registrar) UnregisterClaudeCode() RegistrationResult {
 		return res
 	}
 	return res
+}
+
+// isOwnClaudeBaseURL reports whether raw is the loopback route THIS
+// registrar's install owns: a loopback host on exactly the registrar's
+// configured proxy port. RegisterClaudeCode always writes an explicit
+// port, so a loopback URL without one (or with an unparsable one) is
+// never ours and stays untouched.
+func isOwnClaudeBaseURL(raw string, port int) bool {
+	if !IsObserverBaseURL(raw) {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return u.Port() == strconv.Itoa(port)
 }
 
 // writeClaudeSettings emits settings as stable-keyed, 2-space-indented

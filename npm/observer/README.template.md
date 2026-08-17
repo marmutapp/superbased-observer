@@ -10,7 +10,7 @@
 **Claude Code cost tracking. Cursor token usage. Codex spend.
 AI coding agent observability — one local tool, proxy-accurate.**
 SuperBased captures, normalizes, and analyzes every AI
-coding tool call across **31 adapters** — Claude Code, Codex, Cursor,
+coding tool call across **33 adapters** — Claude Code, Codex, Cursor,
 Cline + Cline CLI, GitHub Copilot (VS Code) + Copilot CLI, Gemini CLI,
 OpenCode, Google Antigravity, Cowork, Nous Research's Hermes Agent,
 Kilo Code (legacy IDE extension + CLI), Aider, Goose, Devin, OpenClaw,
@@ -21,14 +21,9 @@ reconciles the *exact* tokens your provider billed (net input, cache
 JSONL-derived estimate. No telemetry, no cloud, no data leaves your
 machine.
 
-**Two planes, one binary.** Plane B is coding-agent observability —
-desktop-first: this package, capturing your own AI coding tools, with
-an optional team rollup server. Plane A is general LLM-app
-observability — admin-server-first: OTLP trace/span capture, evals,
-and an LLM-as-judge input-admission guardrail for an application you
-host. Most installs only ever use Plane B; see the [main
-repo](https://github.com/superbasedapp/observer#readme) for
-the full two-plane explainer.
+**One local binary.** SuperBased captures, normalizes, and analyzes
+every AI coding tool call on your machine: proxy-accurate cost,
+compression, cache tracking, and session handoff.
 
 <p align="center">
   <img src="https://github.com/superbasedapp/observer/raw/main/docs/assets/infographics/one-local-path.png" alt="One local path for AI coding activity" width="780">
@@ -39,7 +34,7 @@ the full two-plane explainer.
 - [Install](#install)
 - [Five-minute quickstart](#five-minute-quickstart)
 - [Zero-setup cost report: `observer usage`](#zero-setup-cost-report-observer-usage)
-- [Two planes, one binary](#two-planes-one-binary)
+- [One local binary](#one-local-binary)
 - [Per-AI-client setup](#per-ai-client-setup)
 - [Architecture in detail](#architecture-in-detail)
 - [Dashboard tour](#dashboard-tour)
@@ -300,7 +295,7 @@ handler, dashboard, MCP server, and CLI never make an outbound network
 call on observer's behalf. The only code paths that touch the network
 are the optional API proxy (which forwards **your** requests unchanged
 to the AI provider you already use) and a handful of explicit opt-in
-features (message-summary LLM, codeintel MCP, Teams org-server).
+features (message-summary LLM, codeintel MCP).
 
 The full privacy statement — what observer stores, what it reads,
 what it never stores, the explicit list of outbound-network call sites

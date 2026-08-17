@@ -3,6 +3,7 @@ import { NavLink } from "react-router-dom";
 import clsx from "clsx";
 import { NAV_GROUPS, type NavIcon } from "@/lib/nav";
 import { useApi } from "@/lib/useApi";
+import { filterNavGroups, useGovernance } from "@/lib/governance";
 import { fmtBytes, fmtCompact } from "@/lib/format";
 import {
   BarChartIcon,
@@ -93,6 +94,13 @@ export function Sidebar({
   const watcherHealth = useApi<WatcherHealth>("/api/health/watcher", undefined, [], {
     refreshMs: 60000,
   });
+  // Governed nodes (enrolled + granted dashboard.visibility authority)
+  // may have nav sections hidden by their organization — a no-op on
+  // an ordinary solo node (gov.data is {active: false, ...} or null
+  // while loading, both of which filterNavGroups passes through
+  // unchanged).
+  const gov = useGovernance();
+  const navGroups = filterNavGroups(NAV_GROUPS, gov.data);
   const counts = navCounts(status.data);
   // Desktop (lg+) icon-only rail collapse. The pref is persisted in
   // localStorage ("1"/"0", ProcessesSection pattern) and only bites at
@@ -152,7 +160,7 @@ export function Sidebar({
       >
         <Brand onClose={onClose} collapsed={collapsed} />
         <nav className="flex-1 overflow-y-auto px-3 py-4">
-          {NAV_GROUPS.map((g) => (
+          {navGroups.map((g) => (
             <div key={g.id} className="mb-5">
               <div
                 className={clsx(
@@ -235,6 +243,23 @@ export function Sidebar({
             {!collapsed && <span>Collapse</span>}
           </button>
         </Tooltip>
+        {/* Governed-node notice — persistent, never a silent absence.
+            Only renders when this machine is actually governed AND
+            pages were actually hidden, so it never appears on a solo
+            node. Hidden at lg+ when collapsed for the same overflow
+            reason as Foot below. */}
+        {gov.data?.active && gov.data.hidden_sections.length > 0 && (
+          <NavLink
+            to="/settings"
+            onClick={onClose}
+            className={clsx(
+              "block border-t border-line-1 px-4 py-2 text-[10.5px] text-fg-3 hover:bg-bg-2 hover:text-fg-1",
+              collapsed && "lg:hidden",
+            )}
+          >
+            Some pages are hidden by your organization
+          </NavLink>
+        )}
         {/* Footer detail overflows the 56px rail — hide it at lg+ when
             collapsed. The mobile drawer (always full width) keeps it. */}
         <div className={clsx(collapsed && "lg:hidden")}>
@@ -282,29 +307,32 @@ function Brand({
   return (
     <div
       className={clsx(
-        "flex h-[var(--header-h)] items-center gap-2.5 border-b border-line-1 px-4",
+        "flex h-[var(--header-h)] items-center gap-2 border-b border-line-1 px-4",
         // Center the logo on the icon rail (lg+ collapsed); the mobile
         // drawer keeps the full brand row.
         collapsed && "lg:justify-center lg:gap-0 lg:px-2",
       )}
     >
-      <div
-        className="grid h-7 w-7 shrink-0 place-items-center rounded-2 text-base font-extrabold text-white"
-        style={{
-          background:
-            "linear-gradient(135deg, var(--brand-from), var(--brand-to))",
-          boxShadow: "0 4px 12px rgba(124, 92, 246, 0.35)",
-        }}
+      {/* The ▞ superbased wordmark, matching the marketing site's .sb-brand
+          exactly: the U+259E glyph (QUADRANT UPPER RIGHT AND LOWER LEFT) tinted
+          Blueprint blue, then lowercase "superbased" in the mono face. This is
+          the standalone glyph mark - NOT a badge box, NOT title case. */}
+      <span
+        aria-hidden
+        className="shrink-0 font-mono text-[21px] font-semibold leading-none"
+        style={{ color: "#2647E8" }}
       >
-        S
-      </div>
+        {"▞"}
+      </span>
       <div
         className={clsx(
           "flex flex-col leading-tight",
           collapsed && "lg:hidden",
         )}
       >
-        <b className="text-[13px] font-bold text-fg-0">SuperBased</b>
+        <b className="font-mono text-[15px] font-medium tracking-tight text-fg-0">
+          superbased
+        </b>
       </div>
       {/* Close button — mobile drawer only. */}
       <button

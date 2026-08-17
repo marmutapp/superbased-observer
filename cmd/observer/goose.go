@@ -56,8 +56,13 @@ func newGooseCmd() *cobra.Command {
 			"All arguments after the subcommand are forwarded to goose. Use\n" +
 			"`--` to separate observer flags from goose flags. NEVER touches\n" +
 			"API keys or ~/.config/goose/secrets.yaml.",
-		SilenceErrors: true,
+		SilenceErrors:      true,
+		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args, done, err := launcherArgsOrDone(cmd, args)
+			if done {
+				return err
+			}
 			// Attach gate (attach-all-launchers): default-on attach hands the PTY
 			// to the daemon. Seed-only spec (goose is launched non-proxied — no
 			// proxy env, no escape-hatch flag); incompatible when a handoff fork
@@ -157,7 +162,6 @@ func newGooseCmd() *cobra.Command {
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "goose")
 	resume = registerResumeFlag(cmd, "goose")
-	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 

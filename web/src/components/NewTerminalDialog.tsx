@@ -1,6 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { fetchJSON } from "@/lib/api";
-import type { ProjectRow, ProjectsResponse, ToolPreflight } from "@/lib/types";
+import type {
+  ProjectRow,
+  ProjectsResponse,
+  SandboxAvailability,
+  ToolModels,
+  ToolPreflight,
+} from "@/lib/types";
 import {
   PROJECT_ROOT_DENIED_MSG,
   REMOTE_TERMINAL_OFF_MSG,
@@ -23,6 +29,52 @@ const CUSTOM_ROOT = "\u0000custom";
 // [terminal.launch].allow_shell opt-in (shell_enabled from GET
 // /api/terminal/sessions), not the AI-tool allow-list.
 const SHELL_TOOL = "shell";
+
+// SANDBOX_SOURCE_LABELS maps the server's closed workspace-source vocabulary
+// (SandboxAvailability.sources[].id, mirrored 1:1 from internal/workspace's
+// Source constants) to the dialog's display labels — the ONE place that
+// vocabulary is spelled out for humans. Falls back to the raw id for any
+// future source the dialog hasn't been taught about yet, rather than hiding
+// it.
+const SANDBOX_SOURCE_LABELS: Record<string, string> = {
+  live: "Live project directory",
+  "clone-local": "Copy of the project (clone)",
+  "clone-remote": "Clone a remote URL",
+  worktree: "Worktree",
+};
+
+// sandboxDisabledReason computes the "Run in sandbox" checkbox's disabled
+// copy, honoring the honest-copy convention (CLAUDE.md): every disabled
+// control names the exact blocker verbatim from the server, never a generic
+// "unavailable". Priority: no tool picked > the probe hasn't resolved yet (or
+// failed — B5's fail-silent pattern: a broken probe disables the control
+// rather than erroring the whole dialog) > the daemon-wide verdict
+// (SandboxAvailability.reason, quoted verbatim) > the shell pseudo-tool
+// (never in the capability registry the probe's per-tool map is built from)
+// > the selected tool's own SandboxToolAvail.reason (v1 grounds only
+// claude-code; every other launchable tool carries an honest reason instead
+// of silently omitting itself from the map). Returns null when the checkbox
+// should be enabled.
+function sandboxDisabledReason(
+  tool: string,
+  probe: SandboxAvailability | null,
+): string | null {
+  if (!tool) return "Choose a tool first.";
+  if (!probe) {
+    return "Sandbox status unknown — this daemon may not support sandboxed terminals, or the probe request failed.";
+  }
+  if (!probe.available) {
+    return `Sandbox unavailable — ${probe.reason || "sandboxing is unavailable on this daemon"}`;
+  }
+  if (tool === SHELL_TOOL) {
+    return "A plain shell has no AI-tool state dirs to sandbox — not sandbox-launchable.";
+  }
+  const t = probe.tools?.[tool];
+  if (!t || !t.available) {
+    return t?.reason || "No grounded sandbox profile for this tool — not sandbox-launchable.";
+  }
+  return null;
+}
 
 // shortenPath renders an absolute root as ".../parent/leaf" for the option
 // label (the full path rides along as the option title). Mirrors the
@@ -111,6 +163,31 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
   // older daemon without the preflight endpoint behaves exactly as before.
   const [preflight, setPreflight] = useState<ToolPreflight | null>(null);
   const [installBusy, setInstallBusy] = useState(false);
+  // Model-suggestion list for the selected tool (B5 model picker), from GET
+  // /api/terminal/launch/models. Null when unknown, the tool doesn't support
+  // model selection, the seam is disabled (404/501 on an older daemon), or the
+  // fetch failed — in every case the picker simply doesn't render, mirroring
+  // the preflight strip's fail-silent degrade.
+  const [toolModels, setToolModels] = useState<ToolModels | null>(null);
+  // The user's explicit model choice; "" means "use the tool's own default"
+  // and is never sent on the launch POST.
+  const [modelSel, setModelSel] = useState("");
+  // Sandbox probe result (B9 U7), from GET /api/terminal/sandbox. Null when
+  // unfetched, the seam is disabled (an older daemon has no such route), or
+  // the fetch failed — mirrors the preflight/model-picker fail-silent
+  // degrade: the checkbox below simply renders disabled, never an error.
+  // Fetched once on dialog open (the response already carries a per-tool
+  // map covering every launchable tool, so a tool-change never needs its own
+  // refetch — see sandboxDisabledReason).
+  const [sandboxProbe, setSandboxProbe] = useState<SandboxAvailability | null>(null);
+  // Whether the user has opted into a sandboxed launch. There is no
+  // default_on signal in the probe response (only the server-local
+  // [terminal.sandbox].default_on config key, not wire-exposed) — defaults
+  // unchecked.
+  const [sandboxOn, setSandboxOn] = useState(false);
+  const [workspaceSource, setWorkspaceSource] = useState("live");
+  const [workspaceRemote, setWorkspaceRemote] = useState("");
+  const [workspaceBranch, setWorkspaceBranch] = useState("");
   // Remote-device launch gate: a paired device can only fresh-launch when the
   // owner has enabled [remote].allow_terminal. When it's off we say so up front
   // and disable Start, rather than letting the POST fail with a raw 403.
@@ -175,6 +252,53 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
       cancelled = true;
     };
   }, [tool]);
+
+  // Fetch the model-suggestion list for the selected tool (B5). Mirrors the
+  // preflight effect exactly: Shell is skipped (it has no model concept), a
+  // 404/501 or any other error clears the state silently, and a stale response
+  // from a since-abandoned tool is ignored via the same cancellation flag. The
+  // selected model is reset whenever the tool changes, whether or not the
+  // fetch succeeds — a model picked for one tool must never leak into another.
+  useEffect(() => {
+    setModelSel("");
+    if (!tool || tool === SHELL_TOOL) {
+      setToolModels(null);
+      return;
+    }
+    let cancelled = false;
+    fetchJSON<ToolModels>("/api/terminal/launch/models", { tool })
+      .then((d) => {
+        if (!cancelled) setToolModels(d);
+      })
+      .catch(() => {
+        if (!cancelled) setToolModels(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [tool]);
+
+  // Fetch the sandbox probe (B9 U7) once on dialog open. Unlike preflight/
+  // toolModels above this does NOT depend on `tool` — the response's `tools`
+  // map already covers every launchable tool in one shot, so re-selecting the
+  // tool dropdown re-evaluates sandboxDisabledReason from the SAME fetched
+  // probe rather than re-fetching. A 404/501 (older daemon) or any other
+  // error leaves sandboxProbe null, which sandboxDisabledReason renders as a
+  // disabled checkbox with an honest "status unknown" reason — mirrors the
+  // preflight/model-picker fail-silent degrade.
+  useEffect(() => {
+    let cancelled = false;
+    fetchJSON<SandboxAvailability>("/api/terminal/sandbox")
+      .then((d) => {
+        if (!cancelled) setSandboxProbe(d);
+      })
+      .catch(() => {
+        if (!cancelled) setSandboxProbe(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // installTool spawns the tool's grounded install command in a fresh embedded
   // terminal (POST /api/terminal/install), the guided fix for a not_found /
@@ -261,6 +385,33 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
     ? "No project roots are allow-listed — add one in [terminal.launch].allowed_project_roots (Terminals page → launch policy)"
     : "Not in [terminal.launch].allowed_project_roots — add it in the Terminals page → launch policy";
 
+  // Sandbox toggle (B9 U7): null when the checkbox should be enabled, else the
+  // honest disabled-copy string (see sandboxDisabledReason above).
+  const sandboxReason = useMemo(
+    () => sandboxDisabledReason(tool, sandboxProbe),
+    [tool, sandboxProbe],
+  );
+  const sandboxCheckboxDisabled = sandboxReason !== null;
+  // A source the user has currently picked but that isn't actually available
+  // (e.g. left on "clone-remote" after switching to a probe/tool where it's
+  // gated off) blocks the client-side hint the same way an empty remote URL
+  // does — the server re-validates regardless, this only prevents an
+  // obviously-doomed submit.
+  const selectedSourceAvail = sandboxProbe?.sources?.find((s) => s.id === workspaceSource);
+  const sandboxRemoteURLMissing =
+    sandboxOn && !sandboxCheckboxDisabled && workspaceSource === "clone-remote" && workspaceRemote.trim() === "";
+  const sandboxSourceUnavailable =
+    sandboxOn && !sandboxCheckboxDisabled && selectedSourceAvail !== undefined && !selectedSourceAvail.available;
+  const sandboxBlocksStart = sandboxOn && !sandboxCheckboxDisabled && (sandboxRemoteURLMissing || sandboxSourceUnavailable);
+
+  // If the tool changes (or the probe resolves) into a state where the
+  // sandbox checkbox becomes disabled, uncheck it rather than leaving a
+  // stale "on" that the POST body would silently drop (sandbox fields are
+  // only added when sandboxOn is true — see submit()).
+  useEffect(() => {
+    if (sandboxCheckboxDisabled) setSandboxOn(false);
+  }, [sandboxCheckboxDisabled]);
+
   async function submit() {
     if (!tool) {
       setErr("choose a tool");
@@ -270,9 +421,29 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
       setErr(REMOTE_TERMINAL_OFF_MSG);
       return;
     }
+    if (sandboxBlocksStart) {
+      setErr(
+        sandboxRemoteURLMissing
+          ? "Enter a remote URL to clone into the sandbox."
+          : "The selected workspace source isn't available — pick another one.",
+      );
+      return;
+    }
     setBusy(true);
     setErr(null);
     try {
+      // Sandbox fields are added ONLY when the checkbox is on — off, the
+      // request body is byte-identical to a pre-U7 launch (plan §5). The
+      // server re-validates workspace_source membership + everything else
+      // and fail-CLOSES; this is a UX hint, not authorization.
+      const sandboxFields = sandboxOn
+        ? {
+            sandbox: true,
+            workspace_source: workspaceSource || "live",
+            ...(workspaceRemote.trim() ? { workspace_remote: workspaceRemote.trim() } : {}),
+            ...(workspaceBranch.trim() ? { workspace_branch: workspaceBranch.trim() } : {}),
+          }
+        : {};
       const r = await fetchJSON<FreshLaunchResponse>(
         "/api/terminal/launch",
         undefined,
@@ -282,6 +453,8 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
           body: JSON.stringify({
             tool,
             project_root: effectiveRoot || undefined,
+            model: modelSel || undefined,
+            ...sandboxFields,
           }),
         },
       );
@@ -372,6 +545,35 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
           </option>
         </select>
 
+        {toolModels && toolModels.supported && toolModels.models.length > 0 && (
+          <>
+            <label
+              htmlFor="new-terminal-model"
+              className="mb-1 block text-[11px] font-medium text-fg-2"
+            >
+              Model <span className="text-fg-3">(optional)</span>
+            </label>
+            <select
+              id="new-terminal-model"
+              value={modelSel}
+              onChange={(e) => setModelSel(e.target.value)}
+              className="mb-3 w-full rounded-2 border bg-bg-0 px-2 py-1.5 text-[12px] text-fg-1"
+            >
+              <option value="" title={`Let ${tool} choose its own default model`}>
+                Tool default
+              </option>
+              {toolModels.models.map((m) => (
+                <option key={m.model} value={m.model} title={m.model}>
+                  {m.model}
+                  {m.source === "history" && m.count
+                    ? ` (${m.count.toLocaleString()} uses)`
+                    : ""}
+                </option>
+              ))}
+            </select>
+          </>
+        )}
+
         <label
           htmlFor="new-terminal-root"
           className="mb-1 block text-[11px] font-medium text-fg-2"
@@ -456,6 +658,103 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
         )}
         <div className="mb-3" />
 
+        <label className="mb-1 flex items-start gap-2">
+          <input
+            type="checkbox"
+            checked={sandboxOn}
+            disabled={sandboxCheckboxDisabled}
+            title={sandboxReason ?? undefined}
+            onChange={(e) => setSandboxOn(e.target.checked)}
+            className="mt-0.5"
+          />
+          <span>
+            <span className="font-medium text-fg-1">Run in sandbox</span>
+            <span className="block text-[11px] text-fg-3">
+              {sandboxReason ??
+                "Launch inside a bubblewrap sandbox with an isolated $HOME — the agent can't read or write your real home directory or other projects."}
+            </span>
+          </span>
+        </label>
+
+        {sandboxOn && !sandboxCheckboxDisabled && (
+          <div className="mb-3 mt-2 rounded-2 border border-line-2 bg-bg-2 p-2">
+            <label
+              htmlFor="new-terminal-sandbox-source"
+              className="mb-1 block text-[11px] font-medium text-fg-2"
+            >
+              Workspace
+            </label>
+            <select
+              id="new-terminal-sandbox-source"
+              value={workspaceSource}
+              onChange={(e) => setWorkspaceSource(e.target.value)}
+              className="w-full rounded-2 border bg-bg-0 px-2 py-1.5 text-[12px] text-fg-1"
+            >
+              {(sandboxProbe?.sources ?? []).map((s) => (
+                // Native <option> — title= stays (React tooltip can't render
+                // inside the browser-owned select popup), same convention as
+                // the project-root optgroups above.
+                <option
+                  key={s.id}
+                  value={s.id}
+                  disabled={!s.available}
+                  title={
+                    s.available
+                      ? SANDBOX_SOURCE_LABELS[s.id] ?? s.id
+                      : s.reason || "not available"
+                  }
+                >
+                  {SANDBOX_SOURCE_LABELS[s.id] ?? s.id}
+                  {s.available ? "" : " (unavailable)"}
+                </option>
+              ))}
+            </select>
+            {sandboxSourceUnavailable && (
+              <p className="mt-1 text-[10.5px] leading-relaxed text-warn">
+                {selectedSourceAvail?.reason || "This workspace source isn't available."}
+              </p>
+            )}
+            {workspaceSource === "clone-remote" && (
+              <>
+                <label
+                  htmlFor="new-terminal-sandbox-remote"
+                  className="mb-1 mt-2 block text-[11px] font-medium text-fg-2"
+                >
+                  Remote URL
+                </label>
+                <input
+                  id="new-terminal-sandbox-remote"
+                  type="text"
+                  value={workspaceRemote}
+                  onChange={(e) => setWorkspaceRemote(e.target.value)}
+                  placeholder="https://github.com/org/repo.git"
+                  className="w-full rounded-2 border bg-bg-0 px-2 py-1.5 font-mono text-[12px] text-fg-1"
+                />
+                <label
+                  htmlFor="new-terminal-sandbox-branch"
+                  className="mb-1 mt-2 block text-[11px] font-medium text-fg-2"
+                >
+                  Branch <span className="text-fg-3">(optional)</span>
+                </label>
+                <input
+                  id="new-terminal-sandbox-branch"
+                  type="text"
+                  value={workspaceBranch}
+                  onChange={(e) => setWorkspaceBranch(e.target.value)}
+                  placeholder="main"
+                  className="w-full rounded-2 border bg-bg-0 px-2 py-1.5 font-mono text-[12px] text-fg-1"
+                />
+                {sandboxRemoteURLMissing && (
+                  <p className="mt-1 text-[10.5px] leading-relaxed text-warn">
+                    Enter a remote URL — the daemon will run `git clone` with your
+                    ambient auth into a managed workspace.
+                  </p>
+                )}
+              </>
+            )}
+          </div>
+        )}
+
         {preflight && verdict !== "ok" && (
           <div className="mb-3">
             {(verdict === "ok_off_path" || verdict === "shadowed") &&
@@ -526,11 +825,17 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
                 ? verdict === "foreign_only"
                   ? `${tool} is installed on Windows, not in WSL — the daemon can't launch it`
                   : `${tool} is not installed`
-                : null;
+                : sandboxBlocksStart
+                  ? sandboxRemoteURLMissing
+                    ? "Enter a remote URL to clone into the sandbox, or choose a different workspace"
+                    : "The selected workspace source isn't available — choose a different one"
+                  : null;
             const startBtn = (
               <button
                 type="button"
-                disabled={busy || !tool || remoteBlocked || launchBlockedByVerdict}
+                disabled={
+                  busy || !tool || remoteBlocked || launchBlockedByVerdict || sandboxBlocksStart
+                }
                 onClick={submit}
                 className="rounded-2 bg-accent px-3 py-1.5 text-[12px] font-medium text-white disabled:opacity-50"
               >

@@ -27,12 +27,14 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/adapter/cowork"
 	"github.com/marmutapp/superbased-observer/internal/adapter/crush"
 	"github.com/marmutapp/superbased-observer/internal/adapter/cursor"
+	"github.com/marmutapp/superbased-observer/internal/adapter/deepseek"
 	"github.com/marmutapp/superbased-observer/internal/adapter/devin"
 	"github.com/marmutapp/superbased-observer/internal/adapter/droid"
 	"github.com/marmutapp/superbased-observer/internal/adapter/gemini"
 	"github.com/marmutapp/superbased-observer/internal/adapter/goose"
 	"github.com/marmutapp/superbased-observer/internal/adapter/grok"
 	"github.com/marmutapp/superbased-observer/internal/adapter/hermes"
+	"github.com/marmutapp/superbased-observer/internal/adapter/junie"
 	"github.com/marmutapp/superbased-observer/internal/adapter/kilocode"
 	"github.com/marmutapp/superbased-observer/internal/adapter/kimicode"
 	"github.com/marmutapp/superbased-observer/internal/adapter/kirocli"
@@ -70,6 +72,10 @@ func Adapters() []adapter.Adapter {
 		copilotcli.New(),
 		cowork.New(),
 		cursor.New(),
+		// DeepSeek Harness (`npx @deepseek-ai/dsh web`) — web-only local
+		// GUI, own event-sourced session.jsonl.zstd parser (not a §2.1
+		// retag). Usage-capture scope only: no proxy/hooks/MCP/terminal.
+		deepseek.New(),
 		openclaw.New(),
 		opencode.New(),
 		pi.New(),
@@ -109,6 +115,11 @@ func Adapters() []adapter.Adapter {
 		// rather than a §2.1 boundary retag — see
 		// docs/plans/prime-agent-adapter-plan-2026-08-06.md §1.
 		primeagent.New(),
+		// 2026-08-17. JetBrains Junie: a TUI coding agent embedded in
+		// JetBrains IDEs. Own event-sourced parser: one events.jsonl per
+		// session directory under ~/.junie/sessions/<session-id>/, blocks
+		// (Terminal/FileChanges/Result) collapsed by a stable stepId.
+		junie.New(),
 		// Browser-chatbot rail. Hook-only: no WatchPaths (capture arrives
 		// via the browser extension's native-messaging bridge / loopback
 		// listener, not the file watcher). One adapter per *-web site; the

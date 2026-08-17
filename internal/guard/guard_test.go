@@ -257,7 +257,9 @@ func TestEvaluate_FailureWrapper(t *testing.T) {
 		if err != nil {
 			t.Fatalf("panic-rule engine: %v", err)
 		}
-		g.base = eng // same-package injection: the public API can't build a panicking engine
+		// same-package injection: the public API can't build a panicking
+		// engine, so swap a snapshot whose base is the panic engine.
+		g.set.Store(newEngineSet(eng, nil, nil, nil, map[string]policy.Category{}))
 		return g
 	}
 

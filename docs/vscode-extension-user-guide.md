@@ -486,9 +486,7 @@ The extension is **strictly local-first**:
   your VS Code remote-dev session.
 - **No data leaves your machine.** Every byte SuperBased captures is
   written to `~/.observer/observer.db` (or
-  `$OBSERVER_HOME/observer.db`) and stays there. If you enroll in
-  SuperBased Teams, you opt-in to a specific push contract; the
-  default is solo-local.
+  `$OBSERVER_HOME/observer.db`) and stays there.
 
 The same guarantees apply to the binary itself — SuperBased is
 Apache-2.0 and the source for everything captured + computed is in

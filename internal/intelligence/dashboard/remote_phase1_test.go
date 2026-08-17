@@ -64,7 +64,7 @@ func newReadyRemoteControllerWithTerminal(t *testing.T, allowTerminal bool) (Rem
 // registered with a non-Unclassified capability.
 func TestEveryRouteClassifiedOrFailClosed(t *testing.T) {
 	s := newRemoteTestServer(t, Options{})
-	_, capMap := s.registerRoutes(nil)
+	_, capMap, _ := s.registerRoutes(nil)
 	if len(capMap) < 50 {
 		t.Fatalf("suspiciously few routes classified (%d) — registry may not be wired", len(capMap))
 	}

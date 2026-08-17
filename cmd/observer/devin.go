@@ -41,6 +41,8 @@ func newDevinCmd() *cobra.Command {
 			"base-URL knob, so the proxy lane is a registry native-exempt item.\n" +
 			"Token capture happens via observer's local devin adapter\n" +
 			"(per-message metrics in the message_nodes store), not the proxy.\n\n" +
+			"devin supports a top-level `--model` flag to select the model\n" +
+			"(or use the DEVIN_MODEL environment variable).\n\n" +
 			"With --continue-from <session-id> the launcher distills a handover\n" +
 			"from that session and seeds it as devin's trailing positional prompt\n" +
 			"after the mandatory `--` separator (delivery=inject_prompt), so Devin\n" +
@@ -48,8 +50,13 @@ func newDevinCmd() *cobra.Command {
 			"docs/session-handoff.md.\n\n" +
 			"All arguments after the subcommand are forwarded to devin. Use `--`\n" +
 			"to separate observer flags from devin flags. NEVER touches API keys.",
-		SilenceErrors: true,
+		SilenceErrors:      true,
+		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args, done, err := launcherArgsOrDone(cmd, args)
+			if done {
+				return err
+			}
 			// Attach gate (attach-all-launchers): default-on attach hands the PTY
 			// to the daemon. Seed-only spec (devin is native-exempt — no proxy
 			// env, no escape-hatch flag); devin's TUI is interactive with no
@@ -129,7 +136,6 @@ func newDevinCmd() *cobra.Command {
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "devin")
 	resume = registerResumeFlag(cmd, "devin")
-	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 

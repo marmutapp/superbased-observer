@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -68,16 +69,36 @@ func newPolicyBundleRunner(cfg config.Config, st *store.Store, logger *slog.Logg
 	}
 }
 
-// onResult is the PolicyPollLoop callback.
+// onResult is the PolicyPollLoop callback. A rejection emits R-205
+// (deduped per rejection state); an ACCEPTED poll hot-reloads the live
+// guard org layer in-process (P0-7 §2.3) so the accepted version
+// becomes effective without a daemon restart; an UNCHANGED poll
+// reloads only when the live running version has diverged from the
+// cache (SF7 cold recovery), never in steady state.
 func (r *policyBundleRunner) onResult(res orgclient.PolicyResult) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if res.Status != orgclient.PolicyRejected {
-		// Any healthy outcome re-arms the dedup so a LATER rejection
-		// emits again even if it textually matches an old one.
+	switch res.Status {
+	case orgclient.PolicyRejected:
+		r.handleRejection(res)
+	case orgclient.PolicyApplied:
+		// A healthy outcome re-arms the dedup so a LATER rejection emits
+		// again even if it textually matches an old one.
 		r.lastReject = ""
-		return
+		r.reloadGuardLayer(res, false)
+	case orgclient.PolicyUnchanged:
+		r.lastReject = ""
+		r.reloadGuardLayer(res, true)
+	default:
+		// PolicyNone (404) or any other healthy outcome: nothing to
+		// reload; just re-arm the rejection dedup.
+		r.lastReject = ""
 	}
+}
+
+// handleRejection emits the once-per-rejection-state R-205 guard event
+// through the real engine (the mcpsecRunner precedent).
+func (r *policyBundleRunner) handleRejection(res orgclient.PolicyResult) {
 	key := fmt.Sprintf("%d|%s", res.Version, res.Detail)
 	if key == r.lastReject {
 		return
@@ -115,4 +136,57 @@ func (r *policyBundleRunner) onResult(res orgclient.PolicyResult) {
 	}
 	r.logger.Warn("org policy: bundle REJECTED — running on previous policy",
 		"version", res.Version, "detail", res.Detail, "rule", "R-205")
+}
+
+// reloadGuardLayer applies an accepted org policy to the LIVE guard
+// engine in-process (P0-7 §2.3). It is the ONE owner of the guard
+// acquire for the convergence path. divergenceOnly gates the SF7
+// cold-recovery arm: on an Unchanged poll the reload runs only when the
+// live running org version differs from the cache file's version
+// (res.CachedVersion) — steady-state (running==cached) skips it to
+// avoid re-verify churn. A failed reload is fail-safe: the live policy
+// is unchanged and P0-6 keeps honestly reporting pending_restart until
+// the next restart.
+func (r *policyBundleRunner) reloadGuardLayer(res orgclient.PolicyResult, divergenceOnly bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	gd := r.acquire(ctx)
+	if gd == nil {
+		// Guard off mid-flight (config raced): the cache still advanced,
+		// so a later start picks it up; it is just not live now.
+		r.logger.Warn("org policy: accepted bundle not applied to live engine (guard unavailable)",
+			"version", res.Version)
+		return
+	}
+	if divergenceOnly {
+		running := orgRunningVersion(gd)
+		if res.CachedVersion == 0 || running == res.CachedVersion {
+			return // steady state — nothing to converge
+		}
+		r.logger.Info("org policy: cold-recovery reload (running behind cache)",
+			"running", running, "cached", res.CachedVersion)
+	}
+	if err := gd.ReloadOrgLayer(ctx); err != nil {
+		r.logger.Warn("org policy: live reload failed — running on previous policy until restart",
+			"version", res.Version, "err", err)
+		return
+	}
+	r.logger.Info("org policy: applied to live engine (no restart)", "version", res.Version)
+}
+
+// orgRunningVersion returns the guard's live org-layer version as an
+// int64 (0 when no org layer is loaded or the version string does not
+// parse). It reads the "org" descriptor off the guard's live snapshot
+// (PolicyStates) — the exact pair the P0-6 reader consults.
+func orgRunningVersion(gd *guard.Guard) int64 {
+	for _, st := range gd.PolicyStates() {
+		if st.Layer == "org" { // guard's org-layer descriptor
+			v, err := strconv.ParseInt(st.Version, 10, 64)
+			if err != nil {
+				return 0
+			}
+			return v
+		}
+	}
+	return 0
 }

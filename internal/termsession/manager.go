@@ -1255,6 +1255,14 @@ func (m *Manager) Create(spec Spec) (string, error) {
 		}
 	}
 
+	// WrapArgv (B9 sandbox isolation-wrapper prefix) is optional, but when
+	// present its argv[0] (the wrapper binary, e.g. bwrap) must be non-empty
+	// — an empty argv[0] is a malformed exec target, the same class of
+	// mistake the BinPath/Subcommand emptiness checks above guard against.
+	if len(spec.WrapArgv) > 0 && spec.WrapArgv[0] == "" {
+		return "", ErrInvalidSpec
+	}
+
 	// Reserve a concurrency slot (and, for a labelled setup op, a single-flight
 	// slot) ATOMICALLY under the lock. The capacity gate counts in-flight
 	// reservations (pending) as well as live sessions, so N concurrent Creates

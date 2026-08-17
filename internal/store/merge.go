@@ -34,6 +34,18 @@ const (
 	// is removed they are simply unused strings; no edit is needed.
 	SourceObsSDK  = "sdk_otlp"
 	SourceObsOTLP = "otlp_trace"
+	// SourceProxyTurn mirrors internal/obs/span.SourceProxyTurn (the gateway
+	// rail, cmd/observer/obs_wire.go): a chat.completions span synthesized
+	// FROM an already-priced api_turns row. obsTurnSink.ReconcileLLMSpan
+	// gates on this source and never reconciles it back into api_turns (the
+	// row already exists — reconciling would be the span writing back into
+	// itself), so this value should never actually appear in api_turns.source
+	// today. The row exists as defense-in-depth per CLAUDE.md module rule
+	// #3/#5 (table-driven, not an implicit default): if that guard is ever
+	// removed or a new path writes this source, it must rank Exact — a
+	// proxy-priced turn is exact, not an SDK estimate — never silently fall
+	// through to Approx via `default`.
+	SourceProxyTurn = "proxy_turn"
 )
 
 // fidelityForSource maps a persisted source tag to its merge fidelity. An
@@ -45,6 +57,8 @@ func fidelityForSource(source string) turnmerge.Fidelity {
 		return turnmerge.FidelityNativeExact
 	case SourceJSONL, SourceObsSDK, SourceObsOTLP:
 		return turnmerge.FidelityApprox
+	case SourceProxyTurn:
+		return turnmerge.FidelityProxyExact
 	default: // "" (legacy) and SourceProxy
 		return turnmerge.FidelityProxyExact
 	}

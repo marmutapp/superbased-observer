@@ -1,0 +1,250 @@
+package nodegov
+
+import "sort"
+
+// Admin-controlled Plane B, Phase 1b: the CLOSED vocabularies for the
+// schema-2 directive classes (`pinned`, `share`, `features`).
+//
+// docs/plans/admin-controlled-plane-b-phase-1b-mini-spec-2026-08-15.md §1.9,
+// §2, §3. Every table here is an ALLOW-LIST, never a deny-list: a body
+// naming something outside it is a HARD compile error on both the publish
+// lint and the agent accept path, because an admin must never believe a key
+// is pinned when the node silently skipped it.
+
+// Direction bounds WHICH values the organization may force for a key.
+type Direction string
+
+const (
+	// DirFree — the org may set either value.
+	DirFree Direction = "free"
+	// DirRestrictiveOnly — the org may only force the SAFER value, which is
+	// the key's Safe field and the only value a body may carry for it.
+	DirRestrictiveOnly Direction = "restrictive_only"
+	// DirLoweringOnly is the share block's algebra (§2.1): the effective
+	// value is always at or below the node's own local value, so an org
+	// directive can pin or reduce, never raise. It is a share-key direction
+	// only; it never appears in PinnableKeys.
+	DirLoweringOnly Direction = "lowering_only"
+)
+
+// PinnableKey is one row of the settings.pin vocabulary: a dotted config
+// path the organization may fix, the Go kind its value must have, the
+// closed value set (when the key is enum-shaped), and the direction bound.
+//
+// Key MUST resolve against config.Default() — pinned by
+// TestEveryPinnableKeyResolvesInConfig, which walks every row here against a
+// reflect-walked default Config. That test exists because four rows of the
+// spec's first draft named paths that did not exist in the tree
+// (review B1): a table whose prose claims its paths were checked is not a
+// check.
+type PinnableKey struct {
+	// Key is the dotted config path (the TOML tag chain), e.g. "guard.mode".
+	Key string
+	// Kind is "bool" | "string" | "int" | "string_list".
+	Kind string
+	// Enum, when non-empty, is the ONLY permitted value set. It exists so a
+	// value config.Validate would reject (the live instance is
+	// guard.mode = "strict") is refused at PUBLISH and at ACCEPT rather
+	// than at config.Load — where it would turn every hook invocation on
+	// every node into an early return (review B4).
+	Enum []any
+	// Direction bounds which values the org may force.
+	Direction Direction
+	// Safe is the ONLY value a DirRestrictiveOnly key may carry.
+	Safe any
+	// Label is the admin-console display label.
+	Label string
+}
+
+// PinnableKeys is the v1b settings.pin allow-list.
+//
+// The four rows the spec's first draft carried and the 2026-08-15
+// adversarial review deleted are recorded here so they cannot silently
+// return:
+//
+//   - `secrets.enabled` — no such key; SecretsConfig nests under
+//     ObserverConfig and its only gate is EnableScrubbing. Corrected to
+//     observer.secrets.enable_scrubbing.
+//   - `process.enabled` — same nesting mistake; corrected to
+//     observer.process.enabled.
+//   - `mcp.enabled` — no such key, and honouring one would mean ADDING a
+//     governance gate to `observer serve`, which operator ruling R2 and the
+//     parent spec §13.5 forbid. Considered and rejected; do not re-add.
+//   - `terminal.remote_exec.enabled` — does not exist anywhere in the tree.
+//
+// `terminal.sandbox.enabled` is also deliberately absent (review M5): the
+// sandbox is Linux + WSL2 only and a sandbox that cannot be built FAILS the
+// launch, so pinning it on across a mixed fleet would kill dashboard
+// terminals for every macOS and native-Windows developer with a failure
+// that looks like a product bug.
+var PinnableKeys = []PinnableKey{
+	{Key: "guard.enabled", Kind: "bool", Direction: DirFree, Label: "Command guard"},
+	{
+		Key: "guard.mode", Kind: "string", Direction: DirFree,
+		Enum:  []any{"off", "observe", "enforce"},
+		Label: "Command guard mode",
+	},
+	// DirRestrictiveOnly with Safe=true, NOT free: §3 requires the `secrets`
+	// FEATURE to be on-only ("forcing scrubbing OFF is a privacy downgrade
+	// the org must not be able to command"), and §3's own closing sentence
+	// requires that direction to have ONE definition, checked at publish and
+	// at accept, in this table. A `free` row here would let a `pinned` body
+	// command exactly what the `features` body may not — two owners of one
+	// constraint.
+	{
+		Key: "observer.secrets.enable_scrubbing", Kind: "bool",
+		Direction: DirRestrictiveOnly, Safe: true, Label: "Secret scrubbing",
+	},
+	{Key: "compression.conversation.enabled", Kind: "bool", Direction: DirFree, Label: "Conversation compression"},
+	{Key: "codeintel.enabled", Kind: "bool", Direction: DirFree, Label: "Code intelligence"},
+	{Key: "cachetrack.enabled", Kind: "bool", Direction: DirFree, Label: "Cache tracking"},
+	{Key: "predict.enabled", Kind: "bool", Direction: DirFree, Label: "Cost predictor"},
+	{Key: "browser.enabled", Kind: "bool", Direction: DirRestrictiveOnly, Safe: false, Label: "Browser capture"},
+	{Key: "observer.process.enabled", Kind: "bool", Direction: DirRestrictiveOnly, Safe: false, Label: "Process observer"},
+	{Key: "remote.enabled", Kind: "bool", Direction: DirRestrictiveOnly, Safe: false, Label: "Remote access"},
+}
+
+// ShareKey is one row of the capture.pin vocabulary: an [org_client.share]
+// key the organization may LOWER or pin at the node's own level, never
+// raise (§2.1).
+//
+// `admin_managed` is structurally absent from this table AND from
+// PinnableKeys: it is the flag that flips content-sharing defaults raw, so a
+// remote path to it would be the remote-raise mistake wearing a different
+// hat. Pinned by TestAdminManagedNotRemotelySettable.
+type ShareKey struct {
+	// Key is the key's path RELATIVE to [org_client.share], e.g.
+	// "full_content" or "obs.traces".
+	Key string
+	// Kind is "bool" | "string_list".
+	Kind string
+	// Label is the admin-console display label.
+	Label string
+}
+
+// ShareKeys is the v1b capture.pin allow-list. Every row is
+// DirLoweringOnly by construction — the direction is a property of the
+// whole block, not of a row, so it is not repeated per row.
+var ShareKeys = []ShareKey{
+	{Key: "full_content", Kind: "bool", Label: "Full file paths and command text"},
+	{Key: "routing_summary", Kind: "bool", Label: "Routing summary rollup"},
+	{Key: "policy_state", Kind: "bool", Label: "Effective-policy-state reports"},
+	{Key: "target_action_allowlist", Kind: "string_list", Label: "Action types allowed to ship a raw target"},
+	{Key: "obs.summary", Kind: "bool", Label: "Observability: aggregate rollup"},
+	{Key: "obs.traces", Kind: "bool", Label: "Observability: trace structure"},
+	{Key: "obs.content", Kind: "bool", Label: "Observability: span bodies"},
+	{Key: "obs.eval_summary", Kind: "bool", Label: "Observability: eval health"},
+	{Key: "obs.admission", Kind: "bool", Label: "Observability: admission verdicts"},
+	{Key: "obs.eval_items", Kind: "bool", Label: "Observability: per-item eval scores"},
+}
+
+// ShareKeyConfigPath is the FULL dotted config path of a share key. It
+// exists so the exclusion test can assert no share key is also pinnable
+// without hand-writing the prefix in two places.
+func ShareKeyConfigPath(key string) string { return "org_client.share." + key }
+
+// Feature is one row of the feature.lock vocabulary. A feature is a
+// COMPILE-TIME ALIAS over a pinned key, never a second enforcement
+// mechanism: Compile expands it into the same pinned map the `pinned` block
+// produces, so a feature lock can never drift from the pin that implements
+// it.
+type Feature struct {
+	// ID is the feature id an org body names, e.g. "guard".
+	ID string
+	// Key is the pinnable key it expands to. It MUST be a row of
+	// PinnableKeys — enforced by TestEveryFeatureExpandsToAPinnableKey.
+	Key string
+	// Label is the admin-console display label.
+	Label string
+}
+
+// Features is the v1b feature.lock allow-list. The direction bound of each
+// feature is the direction of the PinnableKey it expands to — one
+// definition, checked at publish and at accept.
+//
+// The draft's `terminal_remote_exec` feature is deleted along with its
+// non-existent config key (review B1), and no `terminal_sandbox` feature is
+// offered (review M5).
+var Features = []Feature{
+	{ID: "guard", Key: "guard.enabled", Label: "Command guard"},
+	{ID: "secrets", Key: "observer.secrets.enable_scrubbing", Label: "Secret scrubbing"},
+	{ID: "codeintel", Key: "codeintel.enabled", Label: "Code intelligence"},
+	{ID: "compression_conversation", Key: "compression.conversation.enabled", Label: "Conversation compression"},
+	{ID: "browser_capture", Key: "browser.enabled", Label: "Browser capture"},
+	{ID: "process_observer", Key: "observer.process.enabled", Label: "Process observer"},
+	{ID: "remote_access", Key: "remote.enabled", Label: "Remote access"},
+}
+
+// BootstrapEnvelopeKeys is the structurally-excluded set (§1.9): keys a
+// governance body may NEVER name, because a remotely-set value would either
+// sever the rail that could fix it or brick the node before any rail could.
+// It is kept as data so TestBootstrapEnvelopeKeysNotPinnable can walk it.
+var BootstrapEnvelopeKeys = []string{
+	// The remote rail must not be able to re-point or sever the remote rail.
+	"org_client.org_server_url",
+	"org_client.enabled",
+	"org_client.keychain_id",
+	// A wrong value strands or bricks the node.
+	"dashboard.addr",
+	"observer.db_path",
+	"proxy.port",
+	"ingest.otel.grpc_addr",
+	"ingest.otel.http_addr",
+	// The privacy-posture flag that flips content sharing raw.
+	"org_client.share.admin_managed",
+	// Deferred to Phase 4 with the family.enforce:routing.optimization flip
+	// (parent §3.4 / §R23). Recorded here so nobody adds them "while they
+	// are in there".
+	"routing.enabled",
+	"routing.mode",
+}
+
+var (
+	pinnableByKey = func() map[string]PinnableKey {
+		m := make(map[string]PinnableKey, len(PinnableKeys))
+		for _, k := range PinnableKeys {
+			m[k.Key] = k
+		}
+		return m
+	}()
+	shareByKey = func() map[string]ShareKey {
+		m := make(map[string]ShareKey, len(ShareKeys))
+		for _, k := range ShareKeys {
+			m[k.Key] = k
+		}
+		return m
+	}()
+	featureByID = func() map[string]Feature {
+		m := make(map[string]Feature, len(Features))
+		for _, f := range Features {
+			m[f.ID] = f
+		}
+		return m
+	}()
+)
+
+// LookupPinnableKey returns the table row for a dotted config path.
+func LookupPinnableKey(key string) (PinnableKey, bool) { k, ok := pinnableByKey[key]; return k, ok }
+
+// IsPinnableKey reports whether the org may pin this dotted config path.
+func IsPinnableKey(key string) bool { _, ok := pinnableByKey[key]; return ok }
+
+// LookupShareKey returns the share-table row for a share key.
+func LookupShareKey(key string) (ShareKey, bool) { k, ok := shareByKey[key]; return k, ok }
+
+// IsShareKey reports whether key is an org-directable [org_client.share] key.
+func IsShareKey(key string) bool { _, ok := shareByKey[key]; return ok }
+
+// LookupFeature returns the feature row for a feature id.
+func LookupFeature(id string) (Feature, bool) { f, ok := featureByID[id]; return f, ok }
+
+// PinnableKeyPaths returns every pinnable dotted path, sorted. It is the
+// shape internal/config's mirror is compared against by the sync test.
+func PinnableKeyPaths() []string {
+	out := make([]string, 0, len(PinnableKeys))
+	for _, k := range PinnableKeys {
+		out = append(out, k.Key)
+	}
+	sort.Strings(out)
+	return out
+}

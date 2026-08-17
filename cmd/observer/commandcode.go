@@ -51,8 +51,13 @@ func newCommandCodeCmd() *cobra.Command {
 			"All arguments after the subcommand are forwarded to commandcode.\n" +
 			"Use `--` to separate observer flags from commandcode flags. NEVER\n" +
 			"touches API keys or stored auth.",
-		SilenceErrors: true,
+		SilenceErrors:      true,
+		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args, done, err := launcherArgsOrDone(cmd, args)
+			if done {
+				return err
+			}
 			// Attach gate (attach-all-launchers): default-on attach hands the PTY
 			// to the daemon. Seed-only spec (launched non-proxied — no proxy env,
 			// no escape-hatch flag); incompatible when a handoff fork is engaged,
@@ -175,7 +180,6 @@ func newCommandCodeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "command-code")
 	resume = registerResumeFlag(cmd, "command-code")
-	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 

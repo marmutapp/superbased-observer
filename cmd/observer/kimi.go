@@ -45,6 +45,8 @@ func newKimiCmd() *cobra.Command {
 			"config.toml, and no live routed turn has confirmed proxy capture.\n" +
 			"Token capture happens via observer's local kimi-code wire.jsonl\n" +
 			"adapter, not the proxy.\n\n" +
+			"kimi-code supports a top-level `--model` flag to select which model\n" +
+			"the session uses (pass it after `--` with your other kimi args).\n\n" +
 			"With --continue-from <session-id> the launch is DOC-ASSISTED:\n" +
 			"kimi-code has no initial-prompt seed lane (`-p` prints and exits;\n" +
 			"the TUI takes no seed flag), so the launcher writes the handover\n" +
@@ -53,8 +55,13 @@ func newKimiCmd() *cobra.Command {
 			"docs/session-handoff.md.\n\n" +
 			"All arguments after the subcommand are forwarded to kimi. Use `--`\n" +
 			"to separate observer flags from kimi flags. NEVER touches API keys.",
-		SilenceErrors: true,
+		SilenceErrors:      true,
+		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args, done, err := launcherArgsOrDone(cmd, args)
+			if done {
+				return err
+			}
 			// Attach gate (attach-all-launchers): default-on attach hands the PTY
 			// to the daemon. Seed-only spec (kimi is launched non-proxied — no
 			// proxy env, no escape-hatch flag). kimi-code is DocAssisted, so
@@ -135,7 +142,6 @@ func newKimiCmd() *cobra.Command {
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "kimi-code")
 	resume = registerResumeFlag(cmd, "kimi-code")
-	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 

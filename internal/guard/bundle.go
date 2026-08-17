@@ -42,50 +42,43 @@ import (
 // is a hardening layer, not an availability dependency), and a
 // rejected fetch never overwrites a previously good cache.
 
-// loadOrgBundle reads + verifies + parses the cached org bundle and
-// installs it as g.orgLayer. Called from New before the base engine
-// builds; every failure path records an issue and leaves the layer
-// nil. pinHash is Options.OrgKeyPinHash ("" skips the pin check).
-func (g *Guard) loadOrgBundle(path, pinHash string) {
+// parseOrgBundle reads + verifies + parses the cached org bundle
+// WITHOUT mutating g — the shared parse/verify half both New and
+// ReloadOrgLayer funnel through (B3/§3.2), so a reload verifies
+// identically to construction. Returns the parsed layer + its
+// PolicyState on success; on any failure it returns loaded=false with a
+// human issue string (empty issue = the bundle is simply absent, the
+// common non-enrolled case). pinHash is Options.OrgKeyPinHash ("" skips
+// the pin check — the hook-process path). The caller decides how to
+// record the issue / install the layer, so the function stays pure.
+func (g *Guard) parseOrgBundle(path, pinHash string) (pf *policyFile, st PolicyState, issue string, loaded bool) {
 	raw, err := g.readFile(path)
 	switch {
 	case os.IsNotExist(err):
-		return // not enrolled / no bundle published — the common case
+		return nil, PolicyState{}, "", false // not enrolled / no bundle published — the common case
 	case err != nil:
-		g.issues = append(g.issues, fmt.Sprintf("org bundle %s: %v", path, err))
-		return
+		return nil, PolicyState{}, fmt.Sprintf("org bundle %s: %v", path, err), false
 	}
 	var b orgcontract.PolicyBundle
 	if err := json.Unmarshal(raw, &b); err != nil {
-		g.issues = append(g.issues, fmt.Sprintf("org bundle %s: not a bundle envelope: %v — running without the org layer", path, err))
-		return
+		return nil, PolicyState{}, fmt.Sprintf("org bundle %s: not a bundle envelope: %v — running without the org layer", path, err), false
 	}
 	pub, err := orgcontract.VerifyPolicyBundle(b)
 	if err != nil {
-		g.issues = append(g.issues, fmt.Sprintf("org bundle %s rejected: %v — running without the org layer", path, err))
-		return
+		return nil, PolicyState{}, fmt.Sprintf("org bundle %s rejected: %v — running without the org layer", path, err), false
 	}
 	if pinHash != "" && orgcontract.PublicKeyPinHash(pub) != pinHash {
-		g.issues = append(g.issues, fmt.Sprintf("org bundle %s rejected: signing key does not match the enrolment pin — running without the org layer", path))
-		return
+		return nil, PolicyState{}, fmt.Sprintf("org bundle %s rejected: signing key does not match the enrolment pin — running without the org layer", path), false
 	}
-	pf, perr := parsePolicyFile([]byte(b.BundleTOML), layerOrg)
+	parsed, perr := parsePolicyFile([]byte(b.BundleTOML), layerOrg)
 	if perr != nil {
-		g.issues = append(g.issues, fmt.Sprintf("org bundle %s (version %d): %v — running without the org layer", path, b.Version, perr))
-		return
+		return nil, PolicyState{}, fmt.Sprintf("org bundle %s (version %d): %v — running without the org layer", path, b.Version, perr), false
 	}
-	g.orgLayer = pf
-	st := PolicyState{
+	st = PolicyState{
 		Layer:       layerOrg,
 		Path:        path,
 		Version:     strconv.FormatInt(b.Version, 10),
 		ContentHash: sha256hex([]byte(b.BundleTOML)),
 	}
-	g.states = append(g.states, st)
-	for i := range pf.rules {
-		g.ruleCategories[pf.rules[i].ID] = pf.rules[i].Category
-	}
-	if g.onPolicyState != nil {
-		g.onPolicyState(st)
-	}
+	return parsed, st, "", true
 }

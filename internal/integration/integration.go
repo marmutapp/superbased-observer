@@ -198,6 +198,14 @@ type Capability struct {
 	// TestAuthEnvImpliesAttachable pins that only an attachable row carries keys
 	// (a bare-only tool has no attach socket to forward across).
 	AuthEnv []string
+	// Model declares how a model can be selected at fresh-launch time (the
+	// dashboard New Terminal model picker, B5): zero value (ModelNone) = "no
+	// grounded seed-time model mechanism" — a valid final answer, never a
+	// TODO, and the picker stays hidden for that row. A populated ModelSpec
+	// is delivered via ModelLaunch at the boundary (args/env appended to the
+	// observer launcher's invocation), so no consumer branches on tool name
+	// (CLAUDE.md #3).
+	Model ModelSpec
 	// Vocabulary declares whether this adapter's NATIVE TOOL NAMES live in
 	// the canonical cross-adapter taxonomy table (internal/tooltax) — the
 	// WP-T3 teeth of the tool-taxonomy plan. A zero value is "not declared"
@@ -207,6 +215,14 @@ type Capability struct {
 	// is legal ONLY with a Note explaining the honest zero (the five
 	// browser-chat `*-web` rows capture chat turns, not tool calls).
 	Vocabulary Vocabulary
+	// Sandbox declares the HOME-RELATIVE state a tool needs at its real
+	// path inside a B9 filesystem sandbox (SandboxSpec). Zero value = "no
+	// grounded sandbox row, tool is not sandbox-launchable" — a valid
+	// answer for a Launchable row only when SandboxSpec.Note explains the
+	// honest zero (pinned by TestSandboxDeclaredForEveryLaunchableAdapter).
+	// v1 grounds only claude-code; every other launchable tool carries the
+	// Note fallback (plan amendment A3, ledger G21).
+	Sandbox SandboxSpec
 }
 
 // registry is the capability table, keyed by the adapter's canonical tool
@@ -267,6 +283,22 @@ var registry = map[string]Capability{
 		// REAL transcript. IDMechanism "flag:--resume"; the `observer claude`
 		// launcher exposes a uniform `--resume <id>` flag that maps to it.
 		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "claude", IDMechanism: "flag:--resume"},
+		// Model picker (B5). Grounded live 2026-08-08: `claude --help` lists
+		// `--model <model>` — "Provide an alias for the latest model (e.g.
+		// 'fable', 'opus', or 'sonnet') or a model's full name (e.g.
+		// 'claude-fable-5')". The `observer claude` launcher is
+		// DisableFlagParsing + launcherArgsOrDone (B6), so a forwarded
+		// `--model <value>` reaches the claude binary unmodified.
+		Model: ModelSpec{Kind: ModelArg, Flag: "--model", Known: []string{"opus", "sonnet", "fable"}},
+		// Sandbox filesystem-isolation row (B9). GROUNDED: the tool's own
+		// state lives at ~/.claude (settings/hooks/projects transcripts),
+		// ~/.claude.json + ~/.claude.json.backup (trust/onboarding/MCP
+		// config); ~/.local/share/claude holds the versioned install and is
+		// read-only from the sandbox's perspective.
+		Sandbox: SandboxSpec{
+			StateRW: []string{".claude", ".claude.json", ".claude.json.backup"},
+			StateRO: []string{".local/share/claude"},
+		},
 	},
 	"codex": {
 		Tool:        "codex",
@@ -310,6 +342,18 @@ var registry = map[string]Capability{
 		// the `observer codex` launcher exposes a uniform `--resume <id>` flag
 		// that maps to the `resume <id>` subcommand.
 		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "codex", IDMechanism: "subcommand:resume"},
+		// Model picker (B5). Grounded live 2026-08-08: `codex --help` lists
+		// `-m, --model <MODEL>` — "Model the agent should use" (also
+		// reachable via `-c model="o3"`, the example shown in help). The
+		// `observer codex` launcher is DisableFlagParsing + launcherArgsOrDone
+		// (B6), so a forwarded `--model <value>` reaches the codex binary
+		// unmodified.
+		Model: ModelSpec{Kind: ModelArg, Flag: "--model", Known: []string{"o3"}},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 
 	// Proxy-routable CLI (OpenAI-compatible base URL via launcher).
@@ -363,6 +407,17 @@ var registry = map[string]Capability{
 				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://opencode.ai/install | bash"}, Display: "curl -fsSL https://opencode.ai/install | bash"},
 			},
 		},
+		// Model picker (B5). Grounded live 2026-08-08: `opencode --help`
+		// lists `-m, --model  model to use in the format of provider/model`.
+		// The `observer opencode` launcher is DisableFlagParsing +
+		// launcherArgsOrDone (B6), so a forwarded `--model <value>` reaches
+		// the opencode binary unmodified.
+		Model: ModelSpec{Kind: ModelArg, Flag: "--model"},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 
 	// IDE/extension adapters that talk only to their own backend → no proxy
@@ -438,6 +493,19 @@ var registry = map[string]Capability{
 				{OS: "windows", Channel: "script", Argv: []string{"powershell", "-Command", "irm 'https://cursor.com/install?win32=true' | iex"}, Display: "irm 'https://cursor.com/install?win32=true' | iex"},
 			},
 		},
+		// Model picker (B5). Grounded live 2026-08-08: `cursor-agent --help`
+		// lists `--model <model>  Model to use (e.g., gpt-5,
+		// sonnet-4-thinking). Parameterized models accept quoted bracket
+		// overrides, e.g. 'claude-opus-4-8[context=1m,effort=high,
+		// fast=false]'`. The `observer cursor` launcher is
+		// DisableFlagParsing + launcherArgsOrDone (B6), so a forwarded
+		// `--model <value>` reaches the cursor-agent binary unmodified.
+		Model: ModelSpec{Kind: ModelArg, Flag: "--model", Known: []string{"gpt-5", "sonnet-4-thinking"}},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 	"cline": {
 		Tool:       "cline",
@@ -549,6 +617,26 @@ var registry = map[string]Capability{
 				{OS: "windows", Channel: "winget", Argv: []string{"winget", "install", "GitHub.Copilot"}, Display: "winget install GitHub.Copilot"},
 			},
 		},
+		// Model picker (B5). The `observer copilot-cli` launcher OWNS its
+		// own `--model` cobra flag (cmd/observer/copilotcli.go) and
+		// translates it to COPILOT_MODEL in the child env for the BYOK
+		// provider — it is NOT forwarded verbatim to the wrapped `copilot`
+		// binary's own `--model` flag (which picks among GitHub-hosted
+		// models, e.g. `copilot --model gpt-5.4`). ModelArg is still the
+		// correct delivery shape from the dashboard's perspective: the
+		// picker still appends `--model <value>` to the launcher's argv,
+		// just to a flag the launcher itself consumes rather than passes
+		// through. Known left empty: COPILOT_MODEL values are BYOK-provider-
+		// specific (operator's own upstream catalog), not the GitHub-hosted
+		// `copilot --model` values (e.g. gpt-5.4) that this row's flag does
+		// NOT select — no example was grounded for the BYOK lane, so none
+		// is fabricated here.
+		Model: ModelSpec{Kind: ModelArg, Flag: "--model"},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 	"kilo-code": {
 		Tool:       "kilo-code",
@@ -621,6 +709,11 @@ var registry = map[string]Capability{
 				{OS: "darwin", Channel: "brew", Argv: []string{"brew", "install", "Kilo-Org/tap/kilo"}, Display: "brew install Kilo-Org/tap/kilo"},
 			},
 		},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 
 	// CLI adapters captured via watcher/SQLite (+ opt-in receivers).
@@ -683,6 +776,17 @@ var registry = map[string]Capability{
 				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "cline"}, Display: "npm install -g cline"},
 			},
 		},
+		// Model picker (B5). Grounded live 2026-08-08: `cline --help` lists
+		// `-m, --model <model-id>  Model to use for the session with the
+		// selected provider`. The `observer cline-cli` launcher is
+		// DisableFlagParsing + launcherArgsOrDone (B6), so a forwarded
+		// `--model <value>` reaches the cline binary unmodified.
+		Model: ModelSpec{Kind: ModelArg, Flag: "--model"},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 	"hermes": {
 		Tool:       "hermes",
@@ -788,6 +892,23 @@ var registry = map[string]Capability{
 				{OS: "windows", Channel: "script", Argv: []string{"powershell", "-Command", "iex (irm https://hermes-agent.nousresearch.com/install.ps1)"}, Display: "iex (irm https://hermes-agent.nousresearch.com/install.ps1)"},
 			},
 		},
+		// Model picker (B5). Grounded live 2026-08-08: `hermes --help` lists
+		// `-m MODEL, --model MODEL  Model override for this invocation (e.g.
+		// anthropic/claude-sonnet-4.6) … Also settable via
+		// HERMES_INFERENCE_MODEL env var`. VERIFIED against
+		// cmd/observer/hermes.go's own OpenRouter-routing table
+		// (hermesRouteRules, "model-supplied" row): when
+		// hermesHasModelArg(scanArgs) is true — i.e. the caller supplied a
+		// non-blank `--model`/`-m` — the launcher injects `--provider
+		// observer` ALONGSIDE it and leaves the caller's model flag
+		// untouched; it never rewrites or drops it. So a dashboard-supplied
+		// `--model <value>` is RESPECTED, not clobbered (no conflict to flag).
+		Model: ModelSpec{Kind: ModelArg, Flag: "--model", Known: []string{"anthropic/claude-sonnet-4.6"}},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 	"cowork": {
 		Tool:       "cowork",
@@ -860,6 +981,16 @@ var registry = map[string]Capability{
 				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "@google/gemini-cli"}, Display: "npm install -g @google/gemini-cli"},
 			},
 		},
+		// Model picker (B5). Grounded live 2026-08-08: `gemini --help` lists
+		// `-m, --model  Model  [string]`. The `observer gemini` launcher is
+		// DisableFlagParsing + launcherArgsOrDone (B6), so a forwarded
+		// `--model <value>` reaches the gemini binary unmodified.
+		Model: ModelSpec{Kind: ModelArg, Flag: "--model"},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 	"openclaw": {
 		Tool:       "openclaw",
@@ -945,6 +1076,17 @@ var registry = map[string]Capability{
 				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "openclaw@latest"}, Display: "npm install -g openclaw@latest"},
 			},
 		},
+		// Model picker (B5): explicit ModelNone. `openclaw --help` and its
+		// `chat`/`tui` subcommand surfaces confirm no `--model` flag anywhere
+		// on the launch path (model selection lives entirely in the
+		// interactive `openclaw models` picker / config, not an argv flag) —
+		// the same grounded negative documented on Resume above.
+		Model: ModelSpec{Kind: ModelNone},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 	"pi": {
 		Tool:       "pi",
@@ -1008,6 +1150,19 @@ var registry = map[string]Capability{
 				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://pi.dev/install.sh | sh"}, Display: "curl -fsSL https://pi.dev/install.sh | sh"},
 			},
 		},
+		// Model picker (B5). Grounded live 2026-08-08: `pi --help` lists
+		// `--model <pattern>  Model pattern or ID (supports "provider/id" and
+		// optional ":<thinking>")`, with help examples `pi --model
+		// openai/gpt-4o "…"` and `pi --model sonnet:high "…"`. The
+		// `observer pi` launcher is DisableFlagParsing + launcherArgsOrDone
+		// (B6), so a forwarded `--model <value>` reaches the pi binary
+		// unmodified.
+		Model: ModelSpec{Kind: ModelArg, Flag: "--model", Known: []string{"openai/gpt-4o", "sonnet:high"}},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 	"antigravity": {
 		Tool:       "antigravity",
@@ -1065,6 +1220,21 @@ var registry = map[string]Capability{
 				{OS: "windows", Channel: "script", Argv: []string{"powershell", "-Command", "irm https://antigravity.google/cli/install.ps1 | iex"}, Display: "irm https://antigravity.google/cli/install.ps1 | iex"},
 			},
 		},
+		// Model picker (B5). Grounded live 2026-08-08: `agy --help` lists a
+		// top-level `--model  Model for the current CLI session`. VERIFIED
+		// cmd/observer/antigravity.go execs the real `agy` CLI (`return
+		// runSeedOnlyLaunch("agy", bin, args, continueDir)`) and is
+		// DisableFlagParsing + launcherArgsOrDone (B6), so a forwarded
+		// `--model <value>` reaches the agy binary unmodified. (The sibling
+		// "antigravity" row above is the decrypt-gated desktop app — it has
+		// no Handoff.Launch at all, so it gets no Model row; only this CLI
+		// row is launchable.)
+		Model: ModelSpec{Kind: ModelArg, Flag: "--model"},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 	"qwen-code": {
 		Tool:       "qwen-code",
@@ -1156,6 +1326,16 @@ var registry = map[string]Capability{
 				{OS: "darwin", Channel: "brew", Argv: []string{"brew", "install", "qwen-code"}, Display: "brew install qwen-code"},
 			},
 		},
+		// Model picker (B5). Grounded live 2026-08-08: `qwen --help` lists
+		// `-m, --model  Model  [string]`. The `observer qwen` launcher is
+		// DisableFlagParsing + launcherArgsOrDone (B6), so a forwarded
+		// `--model <value>` reaches the qwen binary unmodified.
+		Model: ModelSpec{Kind: ModelArg, Flag: "--model"},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 	"kiro-cli": {
 		Tool:       "kiro-cli",
@@ -1209,6 +1389,19 @@ var registry = map[string]Capability{
 				{OS: "windows", Channel: "script", Argv: []string{"powershell", "-Command", "irm 'https://cli.kiro.dev/install.ps1' | iex"}, Display: "irm 'https://cli.kiro.dev/install.ps1' | iex"},
 			},
 		},
+		// Model picker (B5). Grounded live 2026-08-08: `kiro-cli --model` does
+		// not exist at the top level (`kiro-cli --help` has no --model row);
+		// `kiro-cli chat --help` lists `--model <MODEL>  Current model to
+		// use` — the flag exists ONLY on the `chat` subcommand, mirroring the
+		// resume reality above (`kiroContinueSubcommand = "chat"` in
+		// cmd/observer/kiro.go, ensureLeadingSubcommand). Lead: ["chat"]
+		// composes the same leading subcommand.
+		Model: ModelSpec{Kind: ModelArg, Flag: "--model", Lead: []string{"chat"}},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 	"grok": {
 		Tool:       "grok",
@@ -1282,6 +1475,16 @@ var registry = map[string]Capability{
 				{OS: "windows", Channel: "script", Argv: []string{"powershell", "-Command", "irm https://x.ai/cli/install.ps1 | iex"}, Display: "irm https://x.ai/cli/install.ps1 | iex"},
 			},
 		},
+		// Model picker (B5). Grounded live 2026-08-08: `grok --help` lists
+		// `-m, --model <MODEL>  Model ID to use`. The `observer grok` launcher
+		// is DisableFlagParsing + launcherArgsOrDone (B6), so a forwarded
+		// `--model <value>` reaches the grok binary unmodified.
+		Model: ModelSpec{Kind: ModelArg, Flag: "--model"},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 	"kimi-code": {
 		Tool:       "kimi-code",
@@ -1379,6 +1582,19 @@ var registry = map[string]Capability{
 				{OS: "windows", Channel: "script", Argv: []string{"powershell", "-Command", "irm https://code.kimi.com/kimi-code/install.ps1 | iex"}, Display: "irm https://code.kimi.com/kimi-code/install.ps1 | iex"},
 			},
 		},
+		// Model picker (B5). Grounded live 2026-08-08: `kimi --help` lists
+		// `-m, --model <model>  LLM model alias to use for this invocation.
+		// Defaults to default_model in config.toml`, on the top-level
+		// command (not subcommand-gated, unlike Resume's --session). The
+		// `observer kimi` launcher is DisableFlagParsing + launcherArgsOrDone
+		// (B6), so a forwarded `--model <value>` reaches the kimi binary
+		// unmodified.
+		Model: ModelSpec{Kind: ModelArg, Flag: "--model"},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 	"crush": {
 		Tool:       "crush",
@@ -1483,6 +1699,18 @@ var registry = map[string]Capability{
 				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://cli.devin.ai/install.sh | bash"}, Display: "curl -fsSL https://cli.devin.ai/install.sh | bash"},
 			},
 		},
+		// Model picker (B5). Grounded live 2026-08-08: `devin --help` lists
+		// `--model <MODEL>  Model to use (e.g. "claude-sonnet-4",
+		// "claude-opus-4.6", "opus", "codex") [env: DEVIN_MODEL=]`. The
+		// `observer devin` launcher is DisableFlagParsing + launcherArgsOrDone
+		// (B6), so a forwarded `--model <value>` reaches the devin binary
+		// unmodified.
+		Model: ModelSpec{Kind: ModelArg, Flag: "--model", Known: []string{"claude-sonnet-4", "claude-opus-4.6", "opus", "codex"}},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 	"qoder": {
 		Tool:       "qoder",
@@ -1544,6 +1772,17 @@ var registry = map[string]Capability{
 				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://qoder.com/install | bash"}, Display: "curl -fsSL https://qoder.com/install | bash"},
 			},
 		},
+		// Model picker (B5). Grounded live 2026-08-08: `qodercli --help`
+		// lists `-m, --model <model>  Model for the current session`. The
+		// `observer qoder` launcher is DisableFlagParsing + launcherArgsOrDone
+		// (B6), so a forwarded `--model <value>` reaches the qodercli binary
+		// unmodified.
+		Model: ModelSpec{Kind: ModelArg, Flag: "--model"},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 	"aider": {
 		Tool:       "aider",
@@ -1577,6 +1816,48 @@ var registry = map[string]Capability{
 			Transcript: TranscriptFull,
 			Inject:     []InjectKind{InjectFile},
 			Note:       "no interactive-seed lane (--message exits after the turn)",
+		},
+	},
+	"deepseek": {
+		Tool: "deepseek",
+		// 24 native tool names GROUNDED against a live request/header event
+		// that embeds the full JSON-schema tool-definition set (see
+		// internal/adapter/deepseek/records.go actionMap + the tooltax
+		// deepSeekRows it mirrors). Literal names only, no defensive
+		// synonyms — DeepSeek Harness's names are already a single stable
+		// snake_case spelling.
+		Vocabulary: Vocabulary{InTaxonomy: true},
+		// DeepSeek Harness (`npx @deepseek-ai/dsh web`) is a web-only local
+		// GUI (http://127.0.0.1:3080, no separate terminal/TUI mode) with
+		// no documented BYOK / custom-base-URL surface. This adapter's
+		// scope is deliberately usage-capture only (no proxy launcher work
+		// was performed), so this is the honest default bucket rather than
+		// a confirmed negative — reclassify if a base-URL knob surfaces.
+		Proxy:       nil,
+		Routability: RouteStatusNativeExempt,
+		// No pre/post-tool hook surface is documented; none registered.
+		Hook: HookSpec{Mechanism: HookNone},
+		// Not an MCP client host observer writes into.
+		MCP:    nil,
+		Native: NativeRails{},
+		// data.usage on every assistant/message envelope carries
+		// {inputTokens,outputTokens,cacheReadTokens?}, PER-STEP (not
+		// cumulative), inputTokens already NET of cacheReadTokens
+		// (confirmed live: a row with inputTokens < cacheReadTokens). No
+		// cache-write field exists. Sub-agent token rollup is UNGROUNDED —
+		// see the package doc's "Known gaps" section.
+		TokenTier: TokenTier{
+			Best: "events_jsonl",
+			Gap:  "no cache-write field; sub-agent token rollup ungrounded",
+		},
+		// session.jsonl.zstd is fully re-readable (whole-file rewrite on
+		// every flush, re-decoded in full by ParseSessionFile), but there
+		// is no launcher in this adapter's scope (web-only GUI, no CLI
+		// seed lane) — file-lane carry only.
+		Handoff: HandoffCapability{
+			Transcript: TranscriptFull,
+			Inject:     []InjectKind{InjectFile},
+			Note:       "web-only GUI tool; no launcher, no interactive-seed lane in this adapter's scope",
 		},
 	},
 	"goose": {
@@ -1649,6 +1930,23 @@ var registry = map[string]Capability{
 				{OS: "linux", Channel: "brew", Argv: []string{"brew", "install", "block-goose-cli"}, Display: "brew install block-goose-cli"},
 			},
 		},
+		// Model picker (B5): ModelEnv, GOOSE_MODEL. Grounded live 2026-08-08:
+		// top-level `goose --help` / `goose session --help` (the default
+		// fresh-launch interactive lane) carry NO --model flag; only `goose
+		// run --help` does — "Override the GOOSE_MODEL environment variable
+		// for this run. The model must be supported by the specified
+		// provider" — confirming GOOSE_MODEL as the tool's OWN recognized
+		// env var (the run flag is documented sugar for exporting it). Since
+		// the dashboard's default fresh launch is the interactive lane
+		// (bare `goose` / `goose session`, not headless `goose run`) where
+		// no argv flag is reachable, env delivery is the only grounded
+		// seed-time mechanism.
+		Model: ModelSpec{Kind: ModelEnv, EnvVar: "GOOSE_MODEL"},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 
 	// Browser-chatbot rail (Phase 1 = ChatGPT only). Captured by the opt-in
@@ -1826,6 +2124,19 @@ var registry = map[string]Capability{
 				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "droid"}, Display: "npm install -g droid"},
 			},
 		},
+		// Model picker (B5): explicit ModelNone, not an oversight. Grounded
+		// live 2026-08-08: `droid --help` (the default interactive TUI
+		// launch this registry's Launch.Subcommand drives) lists no
+		// model-related flag at all; `-m, --model <id>` exists ONLY under
+		// `droid exec --help` (the headless one-shot lane, a different
+		// entry point observer does not seed through). No grounded
+		// seed-time mechanism on the interactive lane ⇒ the honest floor.
+		Model: ModelSpec{Kind: ModelNone},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 	// Rebadged OpenAI Codex CLI Rust build, installed under
 	// ~/.openinterpreter (docs/plans/openinterpreter-adapter-plan-2026-07-29.md).
@@ -1897,6 +2208,20 @@ var registry = map[string]Capability{
 				{OS: "windows", Channel: "script", Argv: []string{"powershell", "-Command", "irm https://www.openinterpreter.com/install.ps1 | iex"}, Display: "irm https://www.openinterpreter.com/install.ps1 | iex"},
 			},
 		},
+		// Model picker (B5). This fork is a rebadged codex build
+		// (internal/adapter/codex's codex.NewOpenInterpreter() retag,
+		// CLAUDE.md); its own `interpreter --help` was grounded live
+		// 2026-08-08 and lists `-m, --model <MODEL>` identically to
+		// codex's own flag — long form used per convention. The
+		// `observer open-interpreter` launcher is DisableFlagParsing +
+		// launcherArgsOrDone (B6), so a forwarded `--model <value>`
+		// reaches the interpreter binary unmodified.
+		Model: ModelSpec{Kind: ModelArg, Flag: "--model"},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 	// commandcode.ai's npm CLI (docs/plans/commandcode-adapter-plan-2026-07-29.md).
 	// Phase-0 research only — no adapter package yet (Phase A wiring row).
@@ -1980,6 +2305,18 @@ var registry = map[string]Capability{
 				{OS: "", Channel: "npm", Argv: []string{"npm", "install", "-g", "command-code"}, Display: "npm install -g command-code"},
 			},
 		},
+		// Model picker (B5). Grounded live 2026-08-08: `commandcode --help`
+		// lists `-m, --model <model>` — "Run on a specific model this
+		// session" — long form used per convention. The
+		// `observer command-code` launcher is DisableFlagParsing +
+		// launcherArgsOrDone (B6), so a forwarded `--model <value>`
+		// reaches the commandcode binary unmodified.
+		Model: ModelSpec{Kind: ModelArg, Flag: "--model"},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 	// Meta's Muse Code CLI (docs/muse-adapter.md). Phase-0 grounded
 	// 2026-08-06 against a live `Muse Code 0.1.0 (0.1.0-R708.1)` install on
@@ -2094,6 +2431,20 @@ var registry = map[string]Capability{
 				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://dev.meta.ai/install.sh | bash"}, Display: "curl -fsSL https://dev.meta.ai/install.sh | bash"},
 			},
 		},
+		// Model picker (B5). Grounded live 2026-08-08: `muse --help` lists
+		// `--model <MODEL>` — "Model id for non-echo providers" — under
+		// the default (interactive) usage line, not a subcommand-gated
+		// flag. The `observer muse` launcher is DisableFlagParsing +
+		// launcherArgsOrDone (B6), so a forwarded `--model <value>`
+		// reaches the muse binary unmodified. No Known values: muse's
+		// login-minted model catalog was never grounded live (Proxy above
+		// stays nil for the same reason), so none is fabricated here.
+		Model: ModelSpec{Kind: ModelArg, Flag: "--model"},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
 	},
 	"prime-agent": {
 		Tool: "prime-agent",
@@ -2204,6 +2555,56 @@ var registry = map[string]Capability{
 				{OS: "darwin", Channel: "script", Argv: []string{"bash", "-lc", "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"}, Display: "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"},
 			},
 		},
+		// Model picker (B5). Grounded live 2026-08-08: `prime-agent --help`
+		// lists a "Model options:" block with `--model <id>` — "Select a
+		// model" — under the default (interactive) usage line. The
+		// `observer prime-agent` launcher is DisableFlagParsing +
+		// launcherArgsOrDone (B6), so a forwarded `--model <value>` reaches
+		// the prime-agent binary unmodified.
+		Model: ModelSpec{Kind: ModelArg, Flag: "--model"},
+		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
+		// amendment A3) — only claude-code has a verified state-dir bind
+		// list; every other launchable tool carries the honest zero note
+		// until a per-tool probe grounds its StateRW/StateRO paths.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
+	},
+	// JetBrains Junie (docs/junie-adapter.md). Phase-0 grounded 2026-08-17
+	// against two real hello-world-scale sessions captured on the
+	// operator's own WSL2 Ubuntu install (Junie runs as a TUI embedded in
+	// a JetBrains IDE, not a standalone CLI observer can launch/attach).
+	"junie": {
+		Tool: "junie",
+		// Junie's events.jsonl is event-sourced: every record is a fixed
+		// TYPED envelope/block kind (TerminalBlockUpdatedEvent,
+		// FileChangesBlockUpdatedEvent, ResultBlockUpdatedEvent, …), not an
+		// LLM-invoked tool NAME the model chose among several options — so
+		// there is nothing for internal/tooltax to carry a row for. This is
+		// the same honest-zero shape as the browser-chat *-web rows, for a
+		// different reason (structural block kinds vs. no tool-call surface
+		// at all).
+		Vocabulary: Vocabulary{Note: "no native tool vocabulary: events.jsonl carries fixed typed block/event kinds (Terminal/FileChanges/Result blocks), not model-chosen tool names"},
+		// No base-URL knob has been grounded (only ~/.junie/settings.json's
+		// non-credential model/provider fields were read, per the task's
+		// off-limits list) — honest "not yet investigated", not a proven
+		// negative.
+		Proxy:       nil,
+		Routability: RouteStatusProbeRequired,
+		Hook:        HookSpec{Mechanism: HookNone},
+		MCP:         nil,
+		Native:      NativeRails{},
+		// Per-call model + cost + token counts come straight off
+		// LlmResponseMetadataEvent.modelUsage[] in events.jsonl — no cache
+		// tier is stated (CacheInputTokens/CacheCreateTokens both observed
+		// zero in the Phase-0 capture, so nothing to report as a gap yet).
+		TokenTier: TokenTier{Best: "events_jsonl"},
+		// events.jsonl reconstructs the full turn (verbatim prompt, agent
+		// narration, terminal/file/result blocks) — a genuinely re-readable
+		// transcript, same tier as cline's api_conversation_history.json.
+		// No InjectPrompt: Junie is IDE-embedded with no verified
+		// interactive-seed/launch contract, so Handoff.Launch stays nil
+		// (not launchable in-terminal) and cmd/observer/continuefrom.go has
+		// no "junie" case.
+		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile}},
 	},
 }
 

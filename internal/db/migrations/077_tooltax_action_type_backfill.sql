@@ -1099,6 +1099,99 @@ UPDATE actions
    );
 
 UPDATE actions
+   SET action_type = 'agent_control'
+ WHERE tool = 'deepseek'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'interrupt_agent', 'job_kill', 'job_list', 'job_output',
+     'list_agents'
+   );
+
+UPDATE actions
+   SET action_type = 'agent_message'
+ WHERE tool = 'deepseek'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'send_message';
+
+UPDATE actions
+   SET action_type = 'ask_user'
+ WHERE tool = 'deepseek'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'ask_user_question';
+
+UPDATE actions
+   SET action_type = 'edit_file'
+ WHERE tool = 'deepseek'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'edit';
+
+UPDATE actions
+   SET action_type = 'harness_call'
+ WHERE tool = 'deepseek'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'create_goal', 'exit_plan_mode', 'get_goal', 'update_goal'
+   );
+
+UPDATE actions
+   SET action_type = 'read_file'
+ WHERE tool = 'deepseek'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'read', 'read_image'
+   );
+
+UPDATE actions
+   SET action_type = 'run_command'
+ WHERE tool = 'deepseek'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'bash';
+
+UPDATE actions
+   SET action_type = 'search_files'
+ WHERE tool = 'deepseek'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'glob';
+
+UPDATE actions
+   SET action_type = 'search_text'
+ WHERE tool = 'deepseek'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'grep';
+
+UPDATE actions
+   SET action_type = 'skill_invoke'
+ WHERE tool = 'deepseek'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'skill';
+
+UPDATE actions
+   SET action_type = 'spawn_subagent'
+ WHERE tool = 'deepseek'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'ralph', 'subagent', 'subagent_fork', 'workflow'
+   );
+
+UPDATE actions
+   SET action_type = 'todo_update'
+ WHERE tool = 'deepseek'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'todo_write';
+
+UPDATE actions
+   SET action_type = 'web_search'
+ WHERE tool = 'deepseek'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'web_search';
+
+UPDATE actions
+   SET action_type = 'write_file'
+ WHERE tool = 'deepseek'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'write';
+
+UPDATE actions
    SET action_type = 'ask_user'
  WHERE tool = 'devin'
    AND action_type = 'unknown'

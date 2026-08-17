@@ -2,7 +2,23 @@ package orgclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
+)
+
+// Typed sentinels distinguishing the two failure modes of checkOrgKeyIdentity
+// (R5-B6). Without them the caller cannot tell a LOCAL pin-store DB-read failure
+// (non-decisive → Indeterminate) from a GENUINE cross-rail key mismatch
+// (decisive → RejectKeyPinMismatch), and would misreport a transient SQLite
+// error as a security rejection. errors.Is against these is the discriminator
+// the routing/announcement fetch classifiers use.
+var (
+	// errPinStoreRead wraps a failure to READ the node-local rail pins (a
+	// SQLite error), not a trust decision.
+	errPinStoreRead = errors.New("orgclient: rail pin-store read failed")
+	// errPinMismatch is the genuine cross-rail key-change refusal. Its message
+	// preserves the "key CHANGED" human-readable class the caller wraps.
+	errPinMismatch = errors.New("org distribution key CHANGED")
 )
 
 // Rail names used in key-identity refusals. They exist only to make the
@@ -66,14 +82,14 @@ func (c *Client) loadRailPins(ctx context.Context) ([]railPin, error) {
 func (c *Client) checkOrgKeyIdentity(ctx context.Context, ownRail, offered string) error {
 	pins, err := c.loadRailPins(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", errPinStoreRead, err)
 	}
 	for _, p := range pins {
 		if p.rail == ownRail || p.key == offered {
 			continue
 		}
-		return fmt.Errorf("org distribution key CHANGED (pinned %s… by the %s rail, got %s…) — refusing; one org has one signing key, re-enrol to rotate trust",
-			prefix8(p.key), p.rail, prefix8(offered))
+		return fmt.Errorf("%w (pinned %s… by the %s rail, got %s…) — refusing; one org has one signing key, re-enrol to rotate trust",
+			errPinMismatch, prefix8(p.key), p.rail, prefix8(offered))
 	}
 	return nil
 }

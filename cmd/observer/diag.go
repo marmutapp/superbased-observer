@@ -67,7 +67,7 @@ func newDoctorCmd() *cobra.Command {
 				} else {
 					report = report.Filter(args[0])
 					if len(report.Checks) == 0 {
-						return fmt.Errorf("no doctor checks or adapters match %q (adapters: claude-code, codex, opencode, cursor, cline, copilot, gemini-cli, …; checks: org, hooks, db, mcp)", args[0])
+						return fmt.Errorf("no doctor checks or adapters match %q (adapters: claude-code, codex, opencode, cursor, cline, copilot, gemini-cli, …; checks: org, hooks, db, mcp, governance)", args[0])
 					}
 				}
 			}

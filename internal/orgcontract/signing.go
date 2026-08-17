@@ -1,14 +1,18 @@
 package orgcontract
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
+	"sort"
 	"strconv"
 )
 
@@ -184,4 +188,182 @@ func DecodeCapped(r io.Reader, maxBytes int64, v any) error {
 		return fmt.Errorf("orgcontract.DecodeCapped: trailing bytes after the document")
 	}
 	return nil
+}
+
+// Policy-resource signing (Plane-A P0-5 unified policy resource,
+// docs/plane-a/unified-policy-resource.md §6;
+// docs/plans/plane-a-p0-5-unified-policy-resource-v1-plan.md §4.2). Domain-
+// separated from every other Ed25519 use in this file, including
+// PolicyBundle's dedicated policy-signing key use above: the message
+// SHAPES differ (length-prefixed multi-field vs newline-delimited
+// version+hash), so a signature minted for one rail can never verify on
+// the other even if an operator ever pointed both rails at the same key
+// bytes.
+
+// policyResourceSigningDomain is the fixed prefix opening every
+// PolicyResourceSigningMessage.
+const policyResourceSigningDomain = "sbo-policy-resource-v1"
+
+// policyResourceCapabilityPattern is the v1 capability-token grammar (plan
+// §4.2): lowercase, starts with a letter, then letters/digits/underscore/dot,
+// at most 64 characters total. It structurally excludes newlines and every
+// other framing-hostile byte, so a malformed token is rejected before it
+// ever reaches the signing message.
+var policyResourceCapabilityPattern = regexp.MustCompile(`^[a-z][a-z0-9_.]{0,63}$`)
+
+const (
+	// MaxPolicyResourceCapabilities bounds the capability list to a small,
+	// reviewable set (plan §4.2).
+	MaxPolicyResourceCapabilities = 32
+	// MaxPolicyResourceCapabilitiesBytes bounds the AGGREGATE size of the
+	// capability list (plan §4.2) — a defense-in-depth cap independent of
+	// the per-token length limit the grammar already implies.
+	MaxPolicyResourceCapabilitiesBytes = 2048
+	// MaxPolicyResourceDescriptionBytes is the dedicated publish-time
+	// description size cap (plan §4.2 "description size cap at publish";
+	// Codex SF8). Description is unsigned display metadata — still bounded
+	// so a publish request cannot park unbounded text in org_policy_resources.
+	MaxPolicyResourceDescriptionBytes = 4096
+)
+
+// NormalizeCapabilities validates, deduplicates, and sorts a capability list
+// under the v1 grammar + size caps (plan §4.2). PolicyResourceSigningMessage
+// calls this so the signer and every verifier always derive the IDENTICAL
+// canonical capability list from the same logical set, regardless of the
+// order or duplication the caller passed in — and so a capability
+// containing a newline (or any other grammar violation) is rejected before
+// it can ever reach the signed message.
+func NormalizeCapabilities(caps []string) ([]string, error) {
+	if len(caps) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]bool, len(caps))
+	out := make([]string, 0, len(caps))
+	total := 0
+	for _, c := range caps {
+		if !policyResourceCapabilityPattern.MatchString(c) {
+			return nil, fmt.Errorf("orgcontract.NormalizeCapabilities: capability %q fails the grammar ^[a-z][a-z0-9_.]{0,63}$", c)
+		}
+		if seen[c] {
+			continue
+		}
+		seen[c] = true
+		out = append(out, c)
+		total += len(c)
+	}
+	if len(out) > MaxPolicyResourceCapabilities {
+		return nil, fmt.Errorf("orgcontract.NormalizeCapabilities: %d distinct capabilities exceeds the %d-capability cap", len(out), MaxPolicyResourceCapabilities)
+	}
+	if total > MaxPolicyResourceCapabilitiesBytes {
+		return nil, fmt.Errorf("orgcontract.NormalizeCapabilities: capability list is %d bytes, exceeds the %d-byte aggregate cap", total, MaxPolicyResourceCapabilitiesBytes)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// writeLPField appends a length-prefixed field to buf: an 8-byte big-endian
+// length followed by the raw bytes. Every field in
+// PolicyResourceSigningMessage is framed this way so no field's content —
+// including SelectorsJSON, which may contain arbitrary JSON — can shift a
+// later field's boundary. This is stricter than PolicyBundleSigningMessage's
+// newline-delimited encoding because SelectorsJSON is not grammar-constrained
+// the way a bundle version number is.
+func writeLPField(buf *bytes.Buffer, s string) {
+	var lenBuf [8]byte
+	binary.BigEndian.PutUint64(lenBuf[:], uint64(len(s)))
+	buf.Write(lenBuf[:])
+	buf.WriteString(s)
+}
+
+// PolicyResourceSigningMessage returns the canonical, length-prefixed,
+// domain-separated bytes signed over a policy resource (plan §4.2). It
+// binds ID, Version, Family, CompilerVersion, BodyHash (not Body itself —
+// callers separately verify SHA-256(Body)==BodyHash, design §6),
+// SelectorsJSON, and the NORMALIZED capability list. Binding Version means a
+// captured signature for version N can never be replayed as a different
+// version; binding the capability list and selectors means neither can be
+// tampered post-signature without invalidating the signature (design §6:
+// "the signing message covers targeting and capabilities, not just Body").
+func PolicyResourceSigningMessage(id string, version int64, family, compilerVersion, bodyHash, selectorsJSON string, capabilities []string) ([]byte, error) {
+	normCaps, err := NormalizeCapabilities(capabilities)
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	buf.WriteString(policyResourceSigningDomain)
+	writeLPField(&buf, id)
+	writeLPField(&buf, strconv.FormatInt(version, 10))
+	writeLPField(&buf, family)
+	writeLPField(&buf, compilerVersion)
+	writeLPField(&buf, bodyHash)
+	writeLPField(&buf, selectorsJSON)
+	writeLPField(&buf, strconv.Itoa(len(normCaps)))
+	for _, c := range normCaps {
+		writeLPField(&buf, c)
+	}
+	return buf.Bytes(), nil
+}
+
+// SignPolicyResource signs r's canonical message with priv and returns the
+// base64url signature in the wire encoding SignedPolicyResource.Signature
+// carries. The caller must set r.BodyHash = hex(SHA-256(r.Body)) beforehand
+// — this function signs the message as given; it does not recompute or
+// verify BodyHash (that is VerifyPolicyResource's job on the other end).
+func SignPolicyResource(priv ed25519.PrivateKey, r SignedPolicyResource) (string, error) {
+	msg, err := PolicyResourceSigningMessage(r.ID, r.Version, r.Family, r.CompilerVersion, r.BodyHash, r.SelectorsJSON, r.RequiredCapabilities)
+	if err != nil {
+		return "", fmt.Errorf("orgcontract.SignPolicyResource: %w", err)
+	}
+	sig := ed25519.Sign(priv, msg)
+	return base64.RawURLEncoding.EncodeToString(sig), nil
+}
+
+// VerifyPolicyResource checks a resource's BodyHash against its own Body and
+// its signature against its own embedded PublicKey. Like VerifyPolicyBundle,
+// it deliberately does NOT decide whether the embedded key is TRUSTED —
+// callers compare PublicKeyPinHash(decoded key) against their pinned hash
+// before or after this check (the four-gate accept's gates 1+2, design §7).
+// Returns the decoded public key so callers can hash-pin it without
+// re-decoding.
+func VerifyPolicyResource(r SignedPolicyResource) (ed25519.PublicKey, error) {
+	sum := sha256.Sum256([]byte(r.Body))
+	if hex.EncodeToString(sum[:]) != r.BodyHash {
+		return nil, errors.New("orgcontract.VerifyPolicyResource: body hash mismatch")
+	}
+	pub, err := base64.RawURLEncoding.DecodeString(r.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("orgcontract.VerifyPolicyResource: decode public key: %w", err)
+	}
+	if len(pub) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("orgcontract.VerifyPolicyResource: public key is %d bytes, want %d", len(pub), ed25519.PublicKeySize)
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(r.Signature)
+	if err != nil {
+		return nil, fmt.Errorf("orgcontract.VerifyPolicyResource: decode signature: %w", err)
+	}
+	msg, err := PolicyResourceSigningMessage(r.ID, r.Version, r.Family, r.CompilerVersion, r.BodyHash, r.SelectorsJSON, r.RequiredCapabilities)
+	if err != nil {
+		return nil, fmt.Errorf("orgcontract.VerifyPolicyResource: %w", err)
+	}
+	if !ed25519.Verify(ed25519.PublicKey(pub), msg, sig) {
+		return nil, errors.New("orgcontract.VerifyPolicyResource: signature verification failed")
+	}
+	return ed25519.PublicKey(pub), nil
+}
+
+// PolicyResourceMessageDigest returns
+// hex(SHA-256(PolicyResourceSigningMessage(...))) — the "full message
+// digest" the equal-version replay rule and the distribution ETag are keyed
+// on (plan §4.2/§4.4/§6.3: "Equal-version short-circuit iff full message
+// digest matches cached digest; else reject version_replay"). Binding the
+// WHOLE signed message (not just Body) means a same-version republish that
+// changes only capabilities/selectors is also caught, not just a changed
+// Body.
+func PolicyResourceMessageDigest(r SignedPolicyResource) (string, error) {
+	msg, err := PolicyResourceSigningMessage(r.ID, r.Version, r.Family, r.CompilerVersion, r.BodyHash, r.SelectorsJSON, r.RequiredCapabilities)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(msg)
+	return hex.EncodeToString(sum[:]), nil
 }

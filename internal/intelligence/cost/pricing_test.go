@@ -411,10 +411,11 @@ func TestTable_OtherProviderPricing(t *testing.T) {
 		{"grok-4.5 flagship", "grok-4.5", 2, 0.20, 6},
 		{"grok-build-0.1", "grok-build-0.1", 1, 0.10, 2},
 		{"grok-build family", "grok-build-0.2", 1, 0.10, 2},
-		// Family fallback follows the current flagship (grok-4.5 $2/$6),
-		// bumped from the legacy grok-4.3 $1.25/$2.50 — same precedent as
-		// the kimi-k2-6 family bump.
-		{"grok family fallback → flagship", "grok-5", 2, 0.20, 6},
+		// Family fallback follows the current flagship's base (<200K) tier
+		// — grok-4.6 ($2/$6, real $0.50 cached-input rate), bumped from
+		// grok-4.5's fillDefault-only $2/$6/$0.20 (2026-08). Same precedent
+		// as the kimi-k2-6 family bump.
+		{"grok family fallback → flagship", "grok-5", 2, 0.50, 6},
 		{"kimi-k2-5", "kimi-k2-5", 0.60, 0.10, 3},
 		// Kimi K2.6 — added 2026-06-07; family prefix bumped to K2.6 rates.
 		{"kimi-k2-6", "kimi-k2-6", 0.684, 0.144, 3.42},
@@ -916,9 +917,11 @@ func TestTable_OpenRouterServedOpenWeightPricing(t *testing.T) {
 		{"x-ai/grok-build-0.1", "x-ai/grok-build-0.1", 1.00, 0.20, 2.00},
 		// Moonshot via OpenRouter.
 		{"moonshotai/kimi-k2.6", "moonshotai/kimi-k2.6", 0.684, 0.144, 3.42},
-		// Kimi K3 via OpenRouter — first-party rates; CacheRead mirrors
-		// Moonshot's own $0.30 cache-hit (OpenRouter lists no exact rate).
-		{"moonshotai/kimi-k3", "moonshotai/kimi-k3", 3, 0.30, 15},
+		// Kimi K3 via OpenRouter — OpenRouter's own listing ($2.80/$14,
+		// re-verified 2026-08-15), deliberately DIFFERENT from Moonshot's
+		// first-party $3/$15 card; CacheRead mirrors Moonshot's own $0.30
+		// cache-hit (OpenRouter lists no exact rate).
+		{"moonshotai/kimi-k3", "moonshotai/kimi-k3", 2.80, 0.30, 14},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p, src, ok := tb.LookupWithSource(tc.model)
@@ -1340,8 +1343,11 @@ func TestTable_2026Q3ResearchBatch(t *testing.T) {
 		{"qwen/qwen3.5-flash", "qwen/qwen3.5-flash", 0.10, 0.40, 0.01},
 		{"glm-5.2", "glm-5.2", 1.40, 4.40, 0.26},
 		{"z-ai/glm-5.2", "z-ai/glm-5.2", 1.40, 4.40, 0.26},
-		{"minimax-m3", "minimax-m3", 0.30, 1.20, 0.06},
-		{"minimax/minimax-m3", "minimax/minimax-m3", 0.30, 1.20, 0.06},
+		// minimax-m3 pins the LIST rate ($0.60/$2.40/$0.12), not the
+		// running "permanent" 50%-off promo ($0.30/$1.20/$0.06) — a promo,
+		// however framed, can revert without notice (2026-08 sweep).
+		{"minimax-m3", "minimax-m3", 0.60, 2.40, 0.12},
+		{"minimax/minimax-m3", "minimax/minimax-m3", 0.60, 2.40, 0.12},
 		{"hy3", "hy3", 0.15, 0.59, 0.037},
 		{"tencent/hy3", "tencent/hy3", 0.15, 0.59, 0.037},
 		{"step-3.5-flash", "step-3.5-flash", 0.10, 0.30, skipCache},
@@ -1831,4 +1837,45 @@ func TestTable_2026Q3UnboundedPrefixKnownLimitation(t *testing.T) {
 	if inklingCollision != inklingBase {
 		t.Errorf("inklinglabs-x rates %+v != inkling base rates %+v", inklingCollision, inklingBase)
 	}
+}
+
+// TestTable_20260816Sweep pins the 2026-08-16 price-sweep additions that
+// had no dedicated exact-row test yet: grok-4.6 (base tier + its 200K
+// long-context tier fields) and gemini-3.6-flash (the flash-class row
+// that must NOT fall through to the Pro-class bare "gemini-3" family,
+// per the family-shadow note on that row). Both rows already existed in
+// defaultPricing before this sweep; this test is the mutation-proof
+// harness the sweep was missing.
+func TestTable_20260816Sweep(t *testing.T) {
+	tb := NewTable()
+
+	t.Run("grok-4.6 base tier (<200K)", func(t *testing.T) {
+		p, src, ok := tb.LookupWithSource("grok-4.6")
+		if !ok {
+			t.Fatalf("Lookup(grok-4.6) ok=false")
+		}
+		if src != PricingSourceExact {
+			t.Errorf("source=%q want exact", src)
+		}
+		if p.Input != 2 || p.Output != 6 || p.CacheRead != 0.50 {
+			t.Errorf("base rates: %+v want input=2 output=6 cacheRead=0.50", p)
+		}
+		if p.LongContextThreshold != 200_000 || p.LongContextInput != 4 ||
+			p.LongContextOutput != 12 || p.LongContextCacheRead != 1.00 {
+			t.Errorf("long-context fields: %+v want threshold=200000 input=4 output=12 cacheRead=1.00", p)
+		}
+	})
+
+	t.Run("gemini-3.6-flash exact, not shadowed by bare gemini-3", func(t *testing.T) {
+		p, src, ok := tb.LookupWithSource("gemini-3.6-flash")
+		if !ok {
+			t.Fatalf("Lookup(gemini-3.6-flash) ok=false")
+		}
+		if src != PricingSourceExact {
+			t.Errorf("source=%q want exact", src)
+		}
+		if p.Input != 0.75 || p.Output != 3.75 || p.CacheRead != 0.075 {
+			t.Errorf("rates: %+v want input=0.75 output=3.75 cacheRead=0.075 (flash, not the Pro-class bare gemini-3 family)", p)
+		}
+	})
 }

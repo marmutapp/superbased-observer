@@ -7,12 +7,15 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/marmutapp/superbased-observer/internal/db"
 	"github.com/marmutapp/superbased-observer/internal/orgcontract"
 	"github.com/marmutapp/superbased-observer/internal/store"
 )
@@ -135,7 +138,7 @@ func TestFetchRoutingPolicy_RefusesKeyPinnedByAnnouncementRail(t *testing.T) {
 
 	pinAnnouncementKey(t, s, base64.StdEncoding.EncodeToString(k1Pub))
 
-	changed, err := c.FetchRoutingPolicy(ctx)
+	changed, _, err := c.FetchRoutingPolicy(ctx)
 	if err == nil || changed {
 		t.Fatalf("a key the announcement rail contradicts was accepted: changed=%v err=%v", changed, err)
 	}
@@ -145,6 +148,58 @@ func TestFetchRoutingPolicy_RefusesKeyPinnedByAnnouncementRail(t *testing.T) {
 	if _, ok, _ := s.GetOrgRoutingPolicy(ctx); ok {
 		t.Error("cache row written for a refused key")
 	}
+}
+
+// TestCheckOrgKeyIdentity_DistinguishesStoreReadFromMismatch is the R5-B6
+// sentinel proof: checkOrgKeyIdentity must return DISTINGUISHABLE typed errors
+// for a LOCAL pin-store read failure (non-decisive → the routing classifier
+// maps it to Indeterminate) versus a GENUINE cross-rail key mismatch (decisive
+// → RejectKeyPinMismatch). Collapsing them (returning one undifferentiated
+// error) would make a transient SQLite failure look like a security rejection.
+func TestCheckOrgKeyIdentity_DistinguishesStoreReadFromMismatch(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("genuine mismatch is errPinMismatch, not errPinStoreRead", func(t *testing.T) {
+		s := newAgentStore(t)
+		c := newTestClient(t, s, &memBearerStore{})
+		k1Pub, _, _ := ed25519.GenerateKey(rand.Reader)
+		k2Pub, _, _ := ed25519.GenerateKey(rand.Reader)
+		// Another rail pinned K1; offering K2 on the routing rail is a real
+		// cross-rail key change.
+		pinAnnouncementKey(t, s, base64.StdEncoding.EncodeToString(k1Pub))
+		err := c.checkOrgKeyIdentity(ctx, routingPolicyRail, base64.StdEncoding.EncodeToString(k2Pub))
+		if err == nil {
+			t.Fatal("a conflicting key was accepted")
+		}
+		if !errors.Is(err, errPinMismatch) {
+			t.Fatalf("err = %v, want errPinMismatch", err)
+		}
+		if errors.Is(err, errPinStoreRead) {
+			t.Fatal("a genuine mismatch must NOT be classified as a store-read failure")
+		}
+	})
+
+	t.Run("store read failure is errPinStoreRead, not errPinMismatch", func(t *testing.T) {
+		database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "agent.db")})
+		if err != nil {
+			t.Fatalf("db.Open: %v", err)
+		}
+		s := store.New(database)
+		c := newTestClient(t, s, &memBearerStore{})
+		// Force loadRailPins' GetOrgRoutingPolicy read to fail.
+		_ = database.Close()
+		kPub, _, _ := ed25519.GenerateKey(rand.Reader)
+		err = c.checkOrgKeyIdentity(ctx, routingPolicyRail, base64.StdEncoding.EncodeToString(kPub))
+		if err == nil {
+			t.Fatal("a closed pin store did not surface an error")
+		}
+		if !errors.Is(err, errPinStoreRead) {
+			t.Fatalf("err = %v, want errPinStoreRead", err)
+		}
+		if errors.Is(err, errPinMismatch) {
+			t.Fatal("a store-read failure must NOT be classified as a pin mismatch")
+		}
+	})
 }
 
 // TestUnenrolThenReEnrolWithNewKeyIsAccepted is the other half of

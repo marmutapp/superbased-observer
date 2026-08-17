@@ -186,6 +186,7 @@ func newRootCmdWith(deps usageDeps) *cobra.Command {
 	root.AddCommand(newOrgCmd())
 	root.AddCommand(newObserverAliasCmd())
 	root.AddCommand(newPrivacyCmd())
+	root.AddCommand(newWorkspacesCmd())
 	return root
 }
 

@@ -50,6 +50,12 @@ type terminalStack struct {
 	svc    *termsvc.Service
 	mgr    *termsession.Manager
 	status dashboard.TerminalStatusProvider
+	// sandboxProber is the B9 dashboard.SandboxProber (the SAME *sandboxRuntime
+	// wired as termsvc.Options.Sandboxer). Nil when [terminal.sandbox].enabled
+	// is false → the /api/terminal/sandbox endpoint reports disabled and the
+	// fail-closed launch validation 501s. Held as the interface so the surfaces
+	// pass a nil interface (not a nil pointer) to the dashboard when absent.
+	sandboxProber dashboard.SandboxProber
 	// attachAudit records the metadata-only terminal_attach spawn-audit row (F4,
 	// session-attach design §3.5). Nil when no DB is wired (auditing disabled).
 	// Built over the SAME SpawnAuditKind vocabulary the dashboard resume handler
@@ -110,6 +116,27 @@ type terminalStack struct {
 // Fresh-agent launch (F1) is a SEPARATE, default-off opt-in resolved into the
 // termsvc.Policy from [terminal] + [terminal.launch]; building the stack never
 // widens it (that stays gated on [terminal.launch].allow_fresh_agent).
+// resolveTerminalSandbox builds the B9 sandbox runtime (the ONE cmd-side type
+// implementing both the termsvc.Sandboxer and dashboard.SandboxProber seams
+// over internal/sandbox + internal/workspace) when [terminal.sandbox].enabled,
+// and returns the two termsvc inputs plus the dashboard prober. Every return is
+// the zero value when the feature is off OR the runtime fails to initialize (a
+// nil interface, not a non-nil interface over a nil pointer), so termsvc's
+// `sandboxer == nil` and the dashboard's nil-prober checks both fail closed.
+// Extracted from buildTerminalStack to keep that function under the gocyclo
+// bound.
+func resolveTerminalSandbox(cfg config.Config, binPath string, logger *slog.Logger) (termsvc.Sandboxer, string, dashboard.SandboxProber) {
+	if !cfg.Terminal.Sandbox.Enabled {
+		return nil, "", nil
+	}
+	rt, err := newSandboxRuntime(cfg.Terminal.Sandbox, cfg.Launch.Tools, filepath.Dir(cfg.Observer.DBPath), binPath, logger)
+	if err != nil {
+		logger.Warn("terminal sandbox disabled — could not initialize the sandbox runtime", "err", err)
+		return nil, "", nil
+	}
+	return rt, rt.workspacesDir(), sandboxSeamProber(rt)
+}
+
 func buildTerminalStack(cfg config.Config, database *sql.DB, logger *slog.Logger) (*terminalStack, error) {
 	// Leave the stack unbuilt on an OS with no in-process PTY backend (a
 	// native-Windows daemon). A nil stack is the honest "disabled" state: the
@@ -218,6 +245,20 @@ func buildTerminalStack(cfg config.Config, database *sql.DB, logger *slog.Logger
 
 	mgr := termsession.NewManager(opts)
 	launcher := &ptyLauncher{mgr: mgr, binPath: binPath, feed: feed, logger: logger}
+
+	// B9 sandbox runtime (plan §1/§9 U5): the ONE cmd-side type implementing
+	// BOTH the termsvc.Sandboxer (Prepare) and dashboard.SandboxProber
+	// (ProbeSandbox) seams over internal/sandbox + internal/workspace. Built
+	// ONLY when [terminal.sandbox].enabled — a nil runtime leaves both seams
+	// nil, which is the fail-closed "feature absent" state U4/U6 enforce
+	// (termsvc → ErrSandboxUnavailable; dashboard → 501 / disabled_by_config).
+	// A construction error (e.g. an unwritable workspaces_dir) is logged and
+	// leaves the feature off rather than failing the whole terminal stack.
+	// B9 sandbox seams, resolved out-of-line to keep buildTerminalStack under
+	// the gocyclo bound. All three are the zero value (nil interface / "") when
+	// [terminal.sandbox] is disabled, so termsvc + dashboard fail closed.
+	sandboxSeam, sandboxWorkspacesDir, sandboxProber := resolveTerminalSandbox(cfg, binPath, logger)
+
 	svc = termsvc.New(termsvc.Options{
 		Policy:   terminalLaunchPolicy(cfg.Terminal),
 		Recorder: termRunRecorder{st: store.New(database)},
@@ -231,6 +272,10 @@ func buildTerminalStack(cfg config.Config, database *sql.DB, logger *slog.Logger
 		// The DIRECT per-run exit seam: EndRunByHandle fires this once per run so
 		// the attach hub's correctness never rides the lossy status feed.
 		OnRunExit: hub.NotifyExit,
+		// B9: the sandbox workspace+wrap-argv seam (nil when disabled → a
+		// Sandbox:true FreshRequest fails closed with ErrSandboxUnavailable).
+		Sandboxer:            sandboxSeam,
+		SandboxWorkspacesDir: sandboxWorkspacesDir,
 	})
 	// Wire the OOB run->session correlation seam (P2-1): when the launcher
 	// wrapper announces the child's agent session id on the trusted OOB channel,
@@ -376,6 +421,7 @@ func buildTerminalStack(cfg config.Config, database *sql.DB, logger *slog.Logger
 		svc:              svc,
 		mgr:              mgr,
 		status:           statusProvider,
+		sandboxProber:    sandboxProber,
 		attachAudit:      newSpawnAuditSink(database, dashboard.SpawnAuditKind(termrun.KindAttach)),
 		hub:              hub,
 		resumableRuns:    resumable,
@@ -574,6 +620,12 @@ type terminalSurfaces struct {
 	launchMgr    dashboard.LaunchManager
 	launchStatus dashboard.TerminalStatusProvider
 	attachHost   attachsock.Host
+	// sandboxProber is the B9 dashboard.SandboxProber (nil unless
+	// [terminal.sandbox].enabled and the runtime initialized). start.go /
+	// dashboard.go wire it into dashboard.Options.SandboxProber; a nil value is
+	// the honest "sandbox feature absent" state (endpoint reports disabled,
+	// launch validation 501s).
+	sandboxProber dashboard.SandboxProber
 	// mgr is the concrete one-owner session manager (nil when no stack was
 	// built). Exposed so start.go can register post-construction hooks that
 	// need the concrete type (SetOnStandingLocalTakeover) — the dashboard
@@ -615,6 +667,11 @@ func buildTerminalSurfaces(cfg config.Config, database *sql.DB, logger *slog.Log
 	}
 	surf.close = stack.close
 	surf.mgr = stack.mgr
+	// B9: expose the sandbox prober (nil when the feature is off) so the
+	// dashboard's /api/terminal/sandbox + fail-closed launch validation see it.
+	// Independent of the launch-manager gate below: the endpoint is always
+	// registered and reports honestly whether sandbox support exists.
+	surf.sandboxProber = stack.sandboxProber
 	// Assign the launch manager only when the gate is on so the field stays a
 	// nil interface (not a non-nil interface over a nil pointer) when disabled —
 	// the dashboard keys off that nil to hide the button, and

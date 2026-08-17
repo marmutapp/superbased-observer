@@ -4,6 +4,203 @@ All notable changes to SuperBased Observer are documented here.
 
 ## [Unreleased]
 
+## [1.31.0] — 2026-08-17
+
+### Added
+
+- **feat(adapter): JetBrains Junie adapter** — event-sourced `events.jsonl`
+  capture for JetBrains' Junie coding agent, bringing the supported-tool
+  count to 33.
+- **feat(judge): opt-in Baseten judge provider** — a Qwen 2.5 3B Instruct
+  judge behind a budget on/off switch, for admission and eval scoring.
+- **docs: adapter count reconciled to 33** — READMEs, package manifests, and
+  in-product copy aligned to the 33 tools folded from the integration
+  registry.
+
+- **feat(plane-a): P1-4 remote-config and cert rotation v1** — server migration
+  040 `org_fleet_remote_config` / `org_fleet_cert_events`; GET/PUT
+  `/api/org/fleet/collectors/{id}/config`; POST
+  `/api/org/fleet/collectors/{id}/certs/rotate` (placeholder not_before/
+  not_after); fleet board gains `remote_config_present` / `last_cert_event`.
+
+- **refactor(plane-a): telemetry bundle helper for deployment paths** —
+  `telemetry.AssembleBundle` is the single seam for capabilities/Doctor/
+  connector Test connection; handlers no longer construct CH/Parquet/SQLite
+  adapters inline. Full Control Store rewrite (Postgres dialect across
+  orgserver handlers) remains residual (tracker P1-7).
+
+- **feat(plane-a): P1-1 FTS filter on ClickHouse query store** — additive
+  `model.QueryRequest.TextQuery`; ClickHouse `fts_text` column (DedupKey+
+  ServiceName) + `positionCaseInsensitive` filter. Trajectory
+  (`obs_traces`) explorer remains without FTS — TelemetryQueryStore only.
+
+- **feat(plane-a): P1-9 Doctor + demo IaC emit** — `POST /api/org/deployment/doctor`
+  returns `{ok, probes, ingest_ok, query_matched, detail}` (hot/ingest/query/
+  durable Probe + synthetic `doctor-<uuid>` batch when hot configured);
+  `GET /api/org/deployment/iac` emits static Terraform/Bicep demo templates
+  (CH URL / Blob / ACI open-webui vars, no secrets); `/deployment` Doctor +
+  IaC card.
+
+- **feat(plane-a): P1-7 ClickHouse HTTP adapter + JSONL durable SoR** —
+  `clickhouse.Store` (EnsureSchema / IngestBatch / Query / Probe via HTTP
+  JSONEachRow; `OBSERVER_CLICKHOUSE_URL` or `CLICKHOUSE_URL`); `parquet.Store`
+  filesystem JSONL under `OBSERVER_PARQUET_ROOT` (engine `parquet_object`,
+  interim until Arrow); stubs when unset; `assembleTelemetryBundle` prefers
+  env stores; `POST /api/org/deployment/doctor` synthetic ingest+query.
+
+- **feat(plane-a): P1-4 fleet inventory + health board v1** — org-scoped
+  collector board (`fleetinventory`) with healthy/stale/never_seen;
+  `GET /api/org/fleet/collectors`; hosted on `/deployment`. Residual:
+  remote config / cert rotation.
+
+- **feat(plane-a): P1-2 entity correlation graph v1** — server migration
+  039 `org_entities`/`org_entity_edges`; Upsert/List/Link/Neighbors; admin
+  APIs + `/deployment` entity card. Provenance taxonomy unchanged.
+
+- **feat(plane-a): P1-9 Phase 2 — connector catalog + capability probes** —
+  server migration 038 `org_deployment_connectors`; catalog CRUD + Test
+  connection via P1-7 capability Probe; `/deployment` shows resolved
+  capabilities + connectors.
+
+- **feat(plane-a): P0-10 Phase B — targeting, simulate, rollout UX** —
+  workspace/environment/service selectors on policy-resource publish
+  (signing-bound); agent GET query attrs; `POST …/simulate` fleet
+  preview; `/policy` rollout panel wired to P1-3 APIs.
+
+- **feat(plane-a): P1-7 Phase A — engine ratification + capability seams** —
+  designate ClickHouse T1 / Postgres control / SQLite starter / Parquet SoR
+  (harness = validation). Pure `telemetry/model` + five capability contracts +
+  topology resolver; SQLite adapter; ClickHouse/Parquet NotConfigured stubs;
+  `GET /api/org/deployment/capabilities`. Plan:
+  `docs/plans/plane-a-storage-ha-plan.md`.
+
+- **feat(plane-a): P1-9 Deployment Control Center Phase 1** — server
+  migration 037 `org_deployment_wizard`; `GET/PUT` topology APIs; web2
+  `/deployment` wizard (SQLite / ClickHouse-recommended / existing /
+  custom). Connectors, Doctor, IaC residual (P1-7 blocked). Plan:
+  `docs/plans/plane-a-deployment-control-center-plan.md`.
+
+- **feat(plane-a): P0-10 Organization Control Center Phase A** — admin
+  HTTP list/show/lint for `admission.input` + `egress.routing_guardrail`;
+  web2 `/policy` gains family tabs (Guard TOML + Plane-A JSON
+  lint→publish) with links to `/fleet-state`. Targeting/simulate/rollout
+  UX residual. Plan: `docs/plans/plane-a-p0-10-org-control-center-v1-plan.md`.
+
+- **feat(plane-a): P1-3 policy rollout + exceptions v1 (API+CLI)** —
+  server migration 036 (`org_policy_rollouts` / `org_policy_exceptions`);
+  canary delivery via `policyrollout.ResolveDelivered` on
+  `GET /api/agent/policy/{family}` (named + hash% cohort; waivers force
+  baseline); admin stage/approve/promote/halt/rollback + exception
+  routes; auto-halt from `policy_state` cohort rates; rollback republishes
+  baseline as MAX+1; CLI `observer-org policy-rollout`. UI deferred to
+  P0-10. Plan: `docs/plans/plane-a-p1-3-policy-rollout-exceptions-plan.md`.
+
+- **feat(plane-a): P1-1 trajectory explorer v1 (pagination + filters)** —
+  `GET /api/org/obs/trajectories` gains Sessions-style `limit`/`offset`/
+  `total` plus status/source/session_id/model/provider filters over the
+  pushed `obs_traces` substrate. Web2 `/trajectories` gains a filter row
+  + pager. FTS / saved views / live-tail / gateway browse / million-trace
+  remain deferred (P1-7). Plan:
+  `docs/plans/plane-a-p1-1-searchable-trajectory-explorer-plan.md`.
+
+- **feat(plane-a): P1-10 production self-obs retrofit (Phases A–D)** —
+  opt-in `[selfobs]` (default OFF) builds a credentialed OTLP emit sink
+  in `buildProxy` (Shutdown on cleanup). Routing Decide emits sampled
+  DecisionRuns (`routing_sample_n`, default 32). Admission Admit, online
+  eval (`OnlineSampler.OnScored`) + CLI `obsEvalRun`, and `observer
+  advise` emit under `system_agent`. Conformance registry Wired:true for
+  routing/advisor/admission/eval (insight-agent remains P2-7). Plan:
+  `docs/plans/plane-a-p1-10-production-retrofit-plan.md`.
+
+- **feat(plane-a): P0-5 unified policy resource v1** — org distribution for
+  `admission.input` + `egress.routing_guardrail` (agent mig 081 / server mig
+  035). Signed fetch + CAS-fenced accept, enrolment-generation fence,
+  LKG-before-listener (incl. standalone `observer proxy start`), steady-state
+  poller, layered Org ownership on the shared AdmissionService, and P0-6
+  reporter widening (`accepted_inert` / `delivered_unaccepted`). Pure
+  compilers live in `internal/policyfam/{admission,egress}`; wire in
+  `internal/orgclient` + `cmd/observer/policyresource_wire.go` +
+  `internal/orgserver/policyresource`. Codex BLOCK B1–B11 + SHOULD-FIX
+  SF1–SF8 folded (304 revalidate, LKG pin-required, cache-tree clear on
+  identity change, Cleared outcome slots, accepted_inert↔observe,
+  publish BEGIN IMMEDIATE + in-txn audit, 4KiB description cap).
+
+- **feat(dashboard): New Terminal dialog gains a model picker.** Per-tool,
+  capability-gated: a grounded `Model ModelSpec` row on the adapter's
+  `internal/integration` capability declares HOW a tool takes a model
+  (top-level flag, subcommand-scoped flag, or env var) so no consumer
+  branches on tool name. The picker is seeded from the tool's own local
+  session history (180-day window, recency-ordered) plus the row's
+  grounded known models; an invalid or unsupported value is silently
+  dropped so the tool's own default applies. goose is delivered via
+  `GOOSE_MODEL` (env-only, no flag exists); kiro-cli's `--model` lives
+  under its `chat` subcommand. openclaw and droid get no picker at all —
+  neither has a grounded seed-time model mechanism (droid's `--model`
+  exists only on its headless `droid exec`, not the interactive launch).
+
+- **feat(terminal): New Terminal launches can run inside a bubblewrap
+  filesystem sandbox (Linux + WSL2, opt-in, default off).** New
+  `internal/sandbox` (bwrap argv composition + a readiness probe) and
+  `internal/workspace` (three host-side workspace sources) packages,
+  both pure per CLAUDE.md #1 — no SQL/HTTP/os-exec, the actual `bwrap`
+  and `git` exec calls live in the one seam,
+  `cmd/observer/terminal_sandbox.go`. The private root is bwrap-only in
+  v1 (no Docker backend); it shares the host's network namespace, so
+  **this does not block or monitor egress** — a sandboxed agent can
+  still reach the network exactly like an unsandboxed one, same
+  provider creds and all. `~/.observer` is bound read-write inside the
+  sandbox on purpose, so the proxy route, hooks, and token capture are
+  unaffected. Workspaces come from one of three host-side git
+  operations before the sandbox starts — `live` (bind the real project
+  dir), `clone-local` (`git clone --no-hardlinks`, so the clone can
+  never hardlink objects back into the real repo), or `clone-remote`
+  (host-side `git clone <url>` using your ambient auth, gated by
+  `allow_remote_clone`, off by default) — plus a fourth, `worktree`,
+  that ships **off by default** because it needs the main repo's `.git`
+  bound read-write and a known pre-existing worktree-attribution bug
+  (`findGitRoot`) has to be fixed first. Only `claude-code` has a
+  grounded per-tool `SandboxSpec` (its real state directories) in v1;
+  every other adapter is honestly reported as not sandbox-launchable
+  rather than guessed at. A sandboxed launch request that can't
+  actually be satisfied (disabled, backend missing/too old, userns
+  denied, tool unmapped, workspace prep failed) **fails the launch
+  outright** — there is no silent unsandboxed fallback. New
+  `observer workspaces ls|rm <id>` CLI to inspect/clean up the managed
+  workspace tree (no automatic retention sweep yet in v1). See
+  `docs/sandboxed-terminals.md`.
+
+### Fixed
+
+- **fix(watcher): New Terminal install→launch capture for Muse/Prime (and peers).**
+  The watcher used to freeze its fsnotify root set at daemon start via
+  one-shot `Detected()`, and entered permanent idle mode when no session
+  directories existed yet. Installing Muse/Prime (or any transcript-only
+  adapter) from the New Terminal dialog and launching immediately left
+  that session invisible until a daemon restart. `Watcher.RefreshRoots`
+  now hot-adds newly-existing roots into the live watch set and Scans;
+  the dashboard kicks it (with a short retry schedule) after guided
+  install and after a successful launch; the poller's full-scan pass
+  also re-applies roots so CLI installs recover without a dashboard
+  kick. Empty `enabled_adapters = []` still detects nothing.
+
+- **fix(launchers): every `observer <tool>` launcher now faithfully
+  passes arbitrary flags through to the wrapped CLI.** `observer
+  claude --model sonnet` previously died on a silently-swallowed
+  unknown-flag rejection (exit 1, no output); passthrough only worked
+  when a positional preceded the flag or after `--`. All 24 launcher
+  verbs now parse their own wrapper-reserved flags manually
+  (`DisableFlagParsing` + a shared parser) and forward every other
+  token verbatim, in order. Wrapper-owned flags (`--resume`,
+  `--continue-from`/`--carry` and the handoff family,
+  `--attach`/`--no-attach`/`--no-proxy`, `--verify`, `--config`,
+  `--proxy`, `--<tool>-path`, codex's process-control flags,
+  copilot-cli's `--model`) keep their existing meaning and are never
+  forwarded; malformed wrapper-flag usage now errors loudly instead
+  of silently. Positional-first and `--` invocations behave
+  byte-identically to before. Known trade-off: shell completion no
+  longer suggests wrapper flag names on these subcommands (a cobra
+  `DisableFlagParsing` limitation).
+
 ## [1.30.0] — 2026-08-08
 
 ### Fixed

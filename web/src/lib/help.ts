@@ -181,6 +181,14 @@ export const HELP_REGISTRY: HelpEntry[] = [
     related: ["tab.privacy", "glossary.settings_org_share"],
   },
   {
+    id: "card.privacy_share_source",
+    category: "metric",
+    title: "Sharing keys and their source",
+    oneLiner: "Every sharing switch, the value in force, and whether you or your organisation decided it.",
+    detail: "Each row pairs this machine's own [org_client.share] setting with the value actually in force. Source reads 'You' when your organisation published nothing for that key, 'Your organisation - reduced' when it lowered the key below your setting, and 'You, locked by your organisation' when it pinned the key at the value you had already chosen. The direction is one-way by construction: an organisation can reduce or lock what a machine shares, never increase it, so there is no state in which a row shows more sharing than your own settings ask for. A key your organisation reports that this dashboard build does not recognise is still listed, without a description, rather than hidden.",
+    related: ["card.privacy_org_push", "glossary.settings_org_share", "tab.privacy"],
+  },
+  {
     id: "glossary.settings_storage",
     category: "glossary",
     title: "Storage",

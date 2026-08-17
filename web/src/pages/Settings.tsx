@@ -40,6 +40,12 @@ const TomlView = lazy(() =>
 import { fetchJSON } from "@/lib/api";
 import { markRestartPending } from "@/lib/restartPending";
 import { useApi } from "@/lib/useApi";
+import {
+  isSettingsHidden,
+  isSettingsReadOnly,
+  useGovernance,
+  type Governance,
+} from "@/lib/governance";
 import { fmtInt, fmtUSD } from "@/lib/format";
 import type {
   BackfillJob,
@@ -591,15 +597,27 @@ export function SettingsPage() {
   // source of truth, local state derives from it.
   const [searchParams, setSearchParams] = useSearchParams();
   const requested = searchParams.get("section");
-  const active: SectionId = SECTIONS.some((s) => s.id === requested)
+  // Governed nodes may have Settings sub-sections hidden or locked
+  // read-only by their organization. gov.data is {active: false, ...}
+  // (or null while loading) on an ordinary solo node, and every
+  // isSettingsHidden/isSettingsReadOnly call below is a no-op in that
+  // case — so visibleSections === SECTIONS and readOnly === false
+  // everywhere, matching today's behavior exactly.
+  const gov = useGovernance();
+  const visibleSections = SECTIONS.filter(
+    (s) => !isSettingsHidden(gov.data, s.id),
+  );
+  const fallback = visibleSections[0]?.id ?? "pricing";
+  const active: SectionId = visibleSections.some((s) => s.id === requested)
     ? (requested as SectionId)
-    : "pricing";
+    : fallback;
   const setActive = (id: SectionId) => {
     setSearchParams(id === "pricing" ? {} : { section: id }, { replace: true });
   };
   const [helpOpen, setHelpOpen] = useState(true);
   const config = useApi<ConfigResponse>("/api/config");
   const def = sectionAt(active);
+  const readOnly = isSettingsReadOnly(gov.data, active);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -617,7 +635,12 @@ export function SettingsPage() {
         )}
       >
         <aside className="border-r border-line-1 bg-bg-1 p-4">
-          <SectionNav active={active} onChange={setActive} />
+          <SectionNav
+            active={active}
+            onChange={setActive}
+            sections={visibleSections}
+            gov={gov.data}
+          />
           {config.data && (
             <div className="mt-6 rounded-2 border border-line-1 bg-bg-2 px-3 py-2 text-[10.5px] text-fg-3">
               <div className="mb-0.5 font-semibold uppercase tracking-[0.06em] text-fg-3">
@@ -648,6 +671,7 @@ export function SettingsPage() {
               loading={config.loading}
               error={config.error}
               onReload={config.reload}
+              readOnly={readOnly}
             />
           )}
           {active === "backfill" && <BackfillSection />}
@@ -661,6 +685,7 @@ export function SettingsPage() {
               loading={config.loading}
               error={config.error}
               onReload={config.reload}
+              readOnly={readOnly}
             />
           )}
           {active !== "pricing" &&
@@ -676,6 +701,7 @@ export function SettingsPage() {
                 loading={config.loading}
                 error={config.error}
                 onReload={config.reload}
+                readOnly={readOnly}
               />
             )}
         </main>
@@ -786,10 +812,18 @@ function AboutBlock({ label, body }: { label: string; body: string }) {
 function SectionNav({
   active,
   onChange,
+  sections,
+  gov,
 }: {
   active: SectionId;
   onChange: (s: SectionId) => void;
+  // Pre-filtered by the caller (governance hidden_settings already
+  // removed) — defaults to the full list so any other caller keeps
+  // today's behavior.
+  sections?: SectionDef[];
+  gov?: Governance | null;
 }) {
+  const list = sections ?? SECTIONS;
   // Plane-A (admin) sections split out of the flat config list into
   // their own labeled subgroup so the operator sees at a glance that
   // they govern an admin-hosted app's end-users, not this node's own
@@ -798,19 +832,19 @@ function SectionNav({
     {
       id: "edit",
       label: "Edit",
-      items: SECTIONS.filter((s) => s.group === "edit"),
+      items: list.filter((s) => s.group === "edit"),
     },
     {
       id: "config",
       label: "Config (read-only)",
-      items: SECTIONS.filter(
+      items: list.filter(
         (s) => s.group === "config" && s.plane !== "admin",
       ),
     },
     {
       id: "admin-plane",
       label: "Observability (admin plane)",
-      items: SECTIONS.filter((s) => s.plane === "admin"),
+      items: list.filter((s) => s.plane === "admin"),
     },
   ].filter((g) => g.items.length > 0);
   return (
@@ -845,6 +879,26 @@ function SectionNav({
                   {s.icon}
                 </span>
                 <span className="min-w-0 flex-1 truncate">{s.label}</span>
+                {isSettingsReadOnly(gov, s.id) && (
+                  <span
+                    className="shrink-0 text-fg-3"
+                    title="Managed by your organization"
+                    aria-label="Managed by your organization"
+                  >
+                    <svg
+                      width="11"
+                      height="11"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      aria-hidden
+                    >
+                      <rect x="3" y="11" width="18" height="10" rx="2" />
+                      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                    </svg>
+                  </span>
+                )}
                 <span
                   className={clsx(
                     "shrink-0 rounded-pill border px-1.5 py-px text-[9.5px] font-medium uppercase tracking-[0.04em]",
@@ -869,11 +923,13 @@ function PricingSection({
   loading,
   error,
   onReload,
+  readOnly,
 }: {
   config: ConfigResponse | null;
   loading: boolean;
   error: Error | null;
   onReload: () => void;
+  readOnly?: boolean;
 }) {
   const defaults = useApi<PricingDefaultsResponse>(
     "/api/config/pricing/defaults",
@@ -1006,7 +1062,8 @@ function PricingSection({
           <button
             type="button"
             onClick={saveAll}
-            disabled={save.state === "saving" || loading || !config}
+            disabled={save.state === "saving" || loading || !config || readOnly}
+            title={readOnly ? "Managed by your organization" : undefined}
             className="rounded-2 border border-accent/40 bg-accent-soft px-3 py-1 text-[11px] font-medium text-accent disabled:opacity-40"
           >
             {save.state === "saving" ? "Saving…" : "Save pricing"}
@@ -1811,11 +1868,13 @@ function IntelligenceSection({
   loading,
   error,
   onReload,
+  readOnly,
 }: {
   config: ConfigResponse | null;
   loading: boolean;
   error: Error | null;
   onReload: () => void;
+  readOnly?: boolean;
 }) {
   const intel = config?.config?.Intelligence;
   const [summaryModel, setSummaryModel] = useState("");
@@ -1888,7 +1947,8 @@ function IntelligenceSection({
           <button
             type="button"
             onClick={saveSection}
-            disabled={save.state === "saving" || loading || !intel}
+            disabled={save.state === "saving" || loading || !intel || readOnly}
+            title={readOnly ? "Managed by your organization" : undefined}
             className="rounded-2 border border-accent/40 bg-accent-soft px-3 py-1 text-[11px] font-medium text-accent disabled:opacity-40"
           >
             {save.state === "saving" ? "Saving…" : "Save section"}
@@ -1987,12 +2047,14 @@ function SectionView({
   loading,
   error,
   onReload,
+  readOnly,
 }: {
   section: SectionId;
   config: ConfigResponse | null;
   loading: boolean;
   error: Error | null;
   onReload: () => void;
+  readOnly?: boolean;
 }) {
   const spec = SECTION_SPECS[section];
   if (spec) {
@@ -2000,6 +2062,7 @@ function SectionView({
       <StructuredConfigSection
         spec={spec}
         config={config}
+        readOnly={readOnly}
         footer={
           section === "antigravity" ? (
             <AntigravityHelperCard />
@@ -2015,7 +2078,7 @@ function SectionView({
           ) : section === "mcp" ? (
             <MCPValueMeterCard />
           ) : section === "routing" ? (
-            <RoutingRulesEditorCard />
+            <RoutingRulesEditorCard readOnly={readOnly} />
           ) : undefined
         }
       />
@@ -2073,7 +2136,7 @@ const ROUTING_RULES_PLACEHOLDER = `# No custom rules yet. Example — route read
 #
 # Recipes: docs/model-routing.md (recipe gallery)`;
 
-function RoutingRulesEditorCard() {
+function RoutingRulesEditorCard({ readOnly }: { readOnly?: boolean }) {
   const policy = useApi<RoutingPolicyView>("/api/routing/policy");
   const [draft, setDraft] = useState<string | null>(null);
   const [lint, setLint] = useState<RoutingRulesLintResult | null>(null);
@@ -2189,7 +2252,8 @@ function RoutingRulesEditorCard() {
         <button
           type="button"
           onClick={save}
-          disabled={busy || policy.loading}
+          disabled={busy || policy.loading || readOnly}
+          title={readOnly ? "Managed by your organization" : undefined}
           className="rounded-2 bg-accent px-3 py-1.5 text-[12px] font-semibold text-accent-on transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
         >
           Save rules

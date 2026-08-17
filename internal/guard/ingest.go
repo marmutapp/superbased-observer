@@ -130,6 +130,11 @@ func classifyKind(actionType string) (policy.EventKind, bool) {
 // Guard at all; a constructed Guard always evaluates (its engine
 // returns allow immediately under ModeOff).
 func (g *Guard) EvaluateActions(inputs []ActionInput) []ActionVerdict {
+	// Load ONE snapshot for the whole batch so every Evaluate + its
+	// paired CategoryFor read the exact same engineSet (the NIT
+	// same-evaluation-snapshot contract); a concurrent ReloadOrgLayer
+	// only affects the NEXT batch.
+	es := g.set.Load()
 	var out []ActionVerdict
 	for i := range inputs {
 		in := &inputs[i]
@@ -160,7 +165,7 @@ func (g *Guard) EvaluateActions(inputs []ActionInput) []ActionVerdict {
 			RepeatCount: g.repeats.Observe(in.SessionID, in.ActionType, in.Target),
 		}
 		g.stampBudget(&ev)
-		verdict, guardErr := g.Evaluate(ev)
+		verdict, guardErr := g.evaluateWith(es, ev)
 		verdict, approved := g.applyApprovals(verdict, &ev)
 		if isBudgetRuleID(verdict.RuleID) && guardErr == nil &&
 			g.budgetAlreadyRecorded(in.SessionID, verdict.RuleID) {
@@ -176,7 +181,7 @@ func (g *Guard) EvaluateActions(inputs []ActionInput) []ActionVerdict {
 			av := ActionVerdict{
 				Input:       *in,
 				Kind:        kind,
-				Category:    g.CategoryFor(verdict.RuleID),
+				Category:    g.categoryWith(es, verdict.RuleID),
 				Verdict:     verdict,
 				TaintOrigin: taintOriginFor(verdict, taint),
 				GuardError:  guardErr != nil,

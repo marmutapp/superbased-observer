@@ -8,9 +8,9 @@ locations, both optional:
 | user | `~/.observer/guard-policy.toml` | `[guard.rules] user_policy` |
 | project | `<git root>/.observer/guard-policy.toml` | `[guard.rules] project_policy` |
 
-A third layer — the org bundle — uses the same format but is
-delivered signed by an org server and merges as a strictness floor
-(§14.2); you don't author it locally.
+A third layer — the distributed bundle — uses the same format but
+arrives signed and merges as a strictness floor (§14.2); you don't
+author it locally.
 
 Parsing is **strict**: unknown keys, unknown matcher fields, invalid
 regexes, duplicate ids and rules that could never fire are all

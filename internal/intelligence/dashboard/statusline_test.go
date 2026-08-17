@@ -36,9 +36,28 @@ func openStatusline(t *testing.T, server *Server, sessionID string) StatuslineRe
 	return got
 }
 
+// statuslineTestAnchor is the fixed instant every test in this file pins
+// Server.now to (directly, or as the starting point of a mutable fake
+// clock) instead of time.Now(). Midday UTC keeps "anchor minus a few
+// hours" landing in the same UTC calendar day and "anchor minus 36h/72h"
+// landing clearly outside it, regardless of the wall-clock time the
+// suite actually runs at.
+//
+// This replaces the prior time.Now()-based seeding, which failed
+// deterministically in the ~1-2h after UTC midnight: rows seeded at
+// time.Now().Add(-time.Hour) fall into YESTERDAY once now() itself is
+// past midnight by less than an hour, while the handler still buckets
+// "today" from s.now()'s UTC calendar day (dashboard.go's dayStart) —
+// so today_usd computed 0 against an assertion expecting a nonzero sum.
+// CI run 31228313133 hit exactly this at 00:20 UTC.
+var statuslineTestAnchor = time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
 // newStatuslineFixture opens a fresh scratch DB + store + a seed project
 // (via one Ingest call, matching the analysis_test.go convention so the
 // project/session FK rows exist before InsertAPITurn/InsertTokenEvents).
+// The returned Server has its now() seam pinned to statuslineTestAnchor;
+// tests that need the clock to actually advance (the TTL cache tests)
+// override server.now with their own mutable closure afterward.
 func newStatuslineFixture(t *testing.T) (*store.Store, *Server) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "d.db")
@@ -51,7 +70,7 @@ func newStatuslineFixture(t *testing.T) (*store.Store, *Server) {
 	root := t.TempDir()
 	if _, err := st.Ingest(context.Background(), []models.ToolEvent{{
 		SourceFile: "f", SourceEventID: "e1", SessionID: "sSeed",
-		ProjectRoot: root, Timestamp: time.Now().UTC().Add(-time.Hour),
+		ProjectRoot: root, Timestamp: statuslineTestAnchor.Add(-time.Hour),
 		Tool: models.ToolClaudeCode, ActionType: models.ActionReadFile,
 		Target: "a.go", Success: true,
 	}}, nil, store.IngestOptions{}); err != nil {
@@ -61,6 +80,7 @@ func newStatuslineFixture(t *testing.T) (*store.Store, *Server) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	server.now = func() time.Time { return statuslineTestAnchor }
 	return st, server
 }
 
@@ -86,7 +106,7 @@ func TestHandleStatuslineTile_EmptyDB(t *testing.T) {
 // a proxy-recorded api_turns row today sums straight into today_usd.
 func TestHandleStatuslineTile_TodayTotal_RecordedCost(t *testing.T) {
 	st, server := newStatuslineFixture(t)
-	now := time.Now().UTC()
+	now := statuslineTestAnchor
 	if _, err := st.InsertAPITurn(context.Background(), models.APITurn{
 		SessionID: "sSeed", Provider: models.ProviderAnthropic,
 		Model: "claude-sonnet-4-6", InputTokens: 50_000, OutputTokens: 10_000,
@@ -110,7 +130,7 @@ func TestHandleStatuslineTile_TodayTotal_RecordedCost(t *testing.T) {
 // live-corpus finding over 1,151 real rows.
 func TestHandleStatuslineTile_TodayTotal_UnrecordedPricedByEngine(t *testing.T) {
 	st, server := newStatuslineFixture(t)
-	now := time.Now().UTC()
+	now := statuslineTestAnchor
 	if _, err := st.InsertTokenEvents(context.Background(), []models.TokenEvent{{
 		SourceFile: "f.jsonl", SourceEventID: "req_unrecorded_1",
 		SessionID: "sSeed", ProjectRoot: "", Timestamp: now.Add(-time.Hour),
@@ -138,7 +158,7 @@ func TestHandleStatuslineTile_TodayTotal_UnrecordedPricedByEngine(t *testing.T) 
 // this endpoint doesn't just SUM everything.
 func TestHandleStatuslineTile_ExcludesYesterday(t *testing.T) {
 	st, server := newStatuslineFixture(t)
-	now := time.Now().UTC()
+	now := statuslineTestAnchor
 	if _, err := st.InsertAPITurn(context.Background(), models.APITurn{
 		SessionID: "sSeed", Provider: models.ProviderAnthropic,
 		Model: "claude-sonnet-4-6", InputTokens: 50_000, OutputTokens: 10_000,
@@ -160,7 +180,7 @@ func TestHandleStatuslineTile_ExcludesYesterday(t *testing.T) {
 // a second time.
 func TestHandleStatuslineTile_TodayDedupesProxyRecordedTokenUsageRow(t *testing.T) {
 	st, server := newStatuslineFixture(t)
-	now := time.Now().UTC()
+	now := statuslineTestAnchor
 	if _, err := st.InsertAPITurn(context.Background(), models.APITurn{
 		SessionID: "sSeed", Provider: models.ProviderAnthropic,
 		Model: "claude-sonnet-4-6", InputTokens: 50_000, OutputTokens: 10_000,
@@ -192,7 +212,7 @@ func TestHandleStatuslineTile_TodayDedupesProxyRecordedTokenUsageRow(t *testing.
 // standard, non-fast rates).
 func TestHandleStatuslineTile_FastTierUnrecordedPricing(t *testing.T) {
 	st, server := newStatuslineFixture(t)
-	now := time.Now().UTC()
+	now := statuslineTestAnchor
 	if _, err := st.InsertTokenEvents(context.Background(), []models.TokenEvent{{
 		SourceFile: "f.jsonl", SourceEventID: "req_fast_1",
 		SessionID: "sSeed", Timestamp: now.Add(-time.Hour),
@@ -217,7 +237,7 @@ func TestHandleStatuslineTile_FastTierUnrecordedPricing(t *testing.T) {
 // to prove session_usd doesn't inherit the day filter.
 func TestHandleStatuslineTile_SessionScoped_MatchingSession(t *testing.T) {
 	st, server := newStatuslineFixture(t)
-	now := time.Now().UTC()
+	now := statuslineTestAnchor
 	if _, err := st.InsertAPITurn(context.Background(), models.APITurn{
 		SessionID: "sScoped", Provider: models.ProviderAnthropic,
 		Model:       "claude-sonnet-4-6",
@@ -316,7 +336,15 @@ func withStatuslineTTL(tb testing.TB, ttl time.Duration) {
 // handler served from cache rather than re-running the query.
 func TestHandleStatuslineTile_CacheHitWithinTTL(t *testing.T) {
 	st, server := newStatuslineFixture(t)
-	now := time.Now().UTC()
+	// The cache check is `now.Before(entry.expiresAt)` — a mutable pinned
+	// clock (rather than newStatuslineFixture's frozen default) so this
+	// test's intent (two calls land inside the same TTL window) holds
+	// regardless of how long the test actually takes to run, not just
+	// because the wall clock happened to advance by less than the 2s
+	// default TTL.
+	current := statuslineTestAnchor
+	server.now = func() time.Time { return current }
+	now := current
 	if _, err := st.InsertAPITurn(context.Background(), models.APITurn{
 		SessionID: "sSeed", Provider: models.ProviderAnthropic,
 		Model: "claude-sonnet-4-6", InputTokens: 50_000, OutputTokens: 10_000,
@@ -358,7 +386,15 @@ func TestHandleStatuslineTile_CacheHitWithinTTL(t *testing.T) {
 func TestHandleStatuslineTile_CacheExpiresAndRecomputes(t *testing.T) {
 	withStatuslineTTL(t, 10*time.Millisecond)
 	st, server := newStatuslineFixture(t)
-	now := time.Now().UTC()
+	// Mutable pinned clock (see TestHandleStatuslineTile_CacheHitWithinTTL):
+	// the cache check is `now.Before(entry.expiresAt)`, computed entirely
+	// from server.now(). Advancing the fake clock past the TTL — rather
+	// than sleeping and relying on the real wall clock advancing under
+	// newStatuslineFixture's frozen default — is what actually exercises
+	// expiry deterministically.
+	current := statuslineTestAnchor
+	server.now = func() time.Time { return current }
+	now := current
 	if _, err := st.InsertAPITurn(context.Background(), models.APITurn{
 		SessionID: "sSeed", Provider: models.ProviderAnthropic,
 		Model: "claude-sonnet-4-6", InputTokens: 50_000, OutputTokens: 10_000,
@@ -380,7 +416,7 @@ func TestHandleStatuslineTile_CacheExpiresAndRecomputes(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(50 * time.Millisecond) // well past the 10ms injected TTL
+	current = current.Add(20 * time.Millisecond) // well past the 10ms injected TTL
 	second := openStatusline(t, server, "")
 	if !approx(second.TodayUSD, 4.00) {
 		t.Errorf("after TTL expiry today_usd must reflect the new row: got %v want 4.00", second.TodayUSD)
@@ -398,14 +434,12 @@ func TestHandleStatuslineTile_CacheExpiresAndRecomputes(t *testing.T) {
 func TestHandleStatuslineTile_DatedPricingLadder(t *testing.T) {
 	withStatuslineTTL(t, 0)
 	st, server := newStatuslineFixture(t)
-	now := time.Now().UTC()
+	now := statuslineTestAnchor
 	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-	// Keep both rows, and the boundary, safely inside "today" — clamp
-	// to the hour-of-day so this doesn't flake near midnight.
+	// statuslineTestAnchor is fixed at midday UTC, so hourOfDay is always
+	// 12h — both rows and the boundary land safely inside "today" without
+	// the real-clock near-midnight skip this test used to need.
 	hourOfDay := now.Sub(dayStart)
-	if hourOfDay < 4*time.Hour {
-		t.Skip("too close to UTC midnight for a safe same-day boundary fixture")
-	}
 	boundary := dayStart.Add(hourOfDay / 2)
 
 	engine := newLadderTestEngine(t, boundary)

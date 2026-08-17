@@ -56,8 +56,13 @@ func newCopilotCLICmd() *cobra.Command {
 			"All arguments after the subcommand are forwarded to copilot. Use\n" +
 			"`--` to separate observer flags from copilot flags. Requires a\n" +
 			"running observer proxy (`observer start`).",
-		SilenceErrors: true,
+		SilenceErrors:      true,
+		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args, done, err := launcherArgsOrDone(cmd, args)
+			if done {
+				return err
+			}
 			// Attach-by-default (attach-all-launchers): hand the PTY to the
 			// daemon when attach resolves. copilot-cli self-routes via the
 			// COPILOT_PROVIDER_* env the daemon-spawned inner launcher sets, so
@@ -170,7 +175,6 @@ func newCopilotCLICmd() *cobra.Command {
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "copilot-cli")
 	resume = registerResumeFlag(cmd, "copilot-cli")
-	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 

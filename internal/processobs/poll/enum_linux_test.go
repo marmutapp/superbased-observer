@@ -86,21 +86,32 @@ func TestProcIntField(t *testing.T) {
 }
 
 // TestReadProcSelfMetrics exercises the real /proc read path against the test
-// process itself. A short CPU burn first guarantees non-zero utime/stime so the
-// assertion does not race a too-fast run. Disk byte counters are environment-
-// dependent (page cache, WSL/container quirks), so they are logged, not
-// asserted — the reliable signals are CPU, working set, peak, and threads.
+// process itself. A CPU burn first guarantees non-zero utime/stime so the
+// assertion does not race a too-fast run — and the burn repeats until /proc
+// actually shows a tick, because a fixed 50ms wall burn can be descheduled
+// below one 10ms clock tick on a saturated machine (full-tree -race runs;
+// observed 2026-08-15) and read back 0 spuriously. If no tick accrues after
+// 5s of burning, the scheduler is starving us and the test skips honestly
+// instead of failing. Disk byte counters are environment-dependent (page
+// cache, WSL/container quirks), so they are logged, not asserted — the
+// reliable signals are CPU, working set, peak, and threads.
 func TestReadProcSelfMetrics(t *testing.T) {
-	deadline := time.Now().Add(50 * time.Millisecond)
+	starve := time.Now().Add(5 * time.Second)
 	acc := 0
-	for time.Now().Before(deadline) {
-		acc++
+	p, ok := readProc(os.Getpid())
+	for ok && p.CPUUserMs+p.CPUSystemMs <= 0 && time.Now().Before(starve) {
+		spin := time.Now().Add(50 * time.Millisecond)
+		for time.Now().Before(spin) {
+			acc++
+		}
+		p, ok = readProc(os.Getpid())
 	}
 	_ = acc
-
-	p, ok := readProc(os.Getpid())
 	if !ok {
 		t.Fatal("readProc(self) returned ok=false")
+	}
+	if p.CPUUserMs+p.CPUSystemMs <= 0 {
+		t.Skip("scheduler starvation: no CPU tick accrued after 5s of burning; skipping on this loaded machine")
 	}
 	if !p.HasMetrics {
 		t.Error("HasMetrics = false for self, want true")

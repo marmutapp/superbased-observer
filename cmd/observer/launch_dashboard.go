@@ -23,6 +23,7 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/termsvc"
 	"github.com/marmutapp/superbased-observer/internal/toolresolve"
 	"github.com/marmutapp/superbased-observer/internal/toolresolve/host"
+	"github.com/marmutapp/superbased-observer/internal/watcher"
 )
 
 // launch_dashboard.go wires the dashboard's embedded web-terminal launch
@@ -153,6 +154,15 @@ func (a *launchManagerAdapter) CreateFresh(spec dashboard.FreshLaunchSpec) (stri
 		Rows:        spec.Rows,
 		Cols:        spec.Cols,
 		Shell:       spec.Shell,
+		Model:       spec.Model,
+		// B9: the sandbox request (already fail-closed-validated by
+		// handleTerminalLaunch against the probe before this spec was built).
+		// LaunchFresh re-checks the seam is present (nil Sandboxer →
+		// ErrSandboxUnavailable) and runs Prepare before minting the run.
+		Sandbox:         spec.Sandbox,
+		WorkspaceSource: spec.WorkspaceSource,
+		WorkspaceRemote: spec.WorkspaceRemote,
+		WorkspaceBranch: spec.WorkspaceBranch,
 	})
 	if err != nil {
 		return "", mapFreshErr(err)
@@ -606,6 +616,11 @@ func (a *launchManagerAdapter) Snapshot() []dashboard.LaunchInfo {
 		if _, ok := a.svc.ProjectRoot(s.ID); ok {
 			info.HasProjectRoot = true
 		}
+		// B9 (plan §6): the "sandboxed" pill on the Terminals list/header,
+		// read from the run's in-memory sandboxed flag (no DB column — G19).
+		if sb, ok := a.svc.Sandboxed(s.ID); ok {
+			info.Sandboxed = sb
+		}
 		if runID, ok := a.svc.RunIDForHandle(s.ID); ok {
 			info.RunID = runID
 			// An attach run carries no source session at spawn — it is
@@ -859,6 +874,22 @@ func toolInstallHintSeam() func(string) ([]string, string, bool) {
 	}
 }
 
+// recentModelsSeam builds the dashboard.Options.RecentModels closure: it
+// resolves a tool NAME to its recently-used models by calling
+// store.Store.LoadRecentModelsForTool over the daemon's own database
+// (mirroring toolPreflightSeam's role — a plain func so the dashboard
+// package never needs a live *store.Store, just the returned data struct).
+// A nil database (no store wiring, e.g. an early boot path) is handled by
+// the caller passing a nil seam instead of calling this constructor —
+// dashboard.Options.RecentModels being nil is itself the honest disabled
+// state (see modelSuggestionsFor).
+func recentModelsSeam(database *sql.DB) func(context.Context, string) ([]store.RecentToolModel, error) {
+	st := store.New(database)
+	return func(ctx context.Context, tool string) ([]store.RecentToolModel, error) {
+		return st.LoadRecentModelsForTool(ctx, tool, dashboard.RecentModelsWindow, dashboard.RecentModelsLimit)
+	}
+}
+
 // allowToolInstallSeam builds the dashboard.Options.AllowToolInstall closure: a
 // LIVE read of [terminal.launch].allow_install (default true) so a config edit
 // flips the guided-install kill-switch with no daemon restart. A config-load
@@ -872,6 +903,46 @@ func allowToolInstallSeam(configPath string) func() bool {
 			return false
 		}
 		return cfg.Terminal.Launch.AllowInstall
+	}
+}
+
+// refreshWatchRootsSeam builds dashboard.Options.RefreshWatchRoots: a
+// fire-and-forget kick that re-detects adapters and hot-adds newly-
+// existing session directories into the live watcher. Retries on a short
+// schedule because Muse/Prime (and peers) typically create their
+// sessions/ tree a moment AFTER LaunchFresh returns — a single
+// immediate Scan would still miss. Fail-open: errors are logged, never
+// surfaced to the launch/install HTTP response. Nil w → nil seam.
+func refreshWatchRootsSeam(w *watcher.Watcher) func() {
+	if w == nil {
+		return nil
+	}
+	return func() {
+		go refreshWatchRootsWithRetry(w, slog.Default())
+	}
+}
+
+// refreshWatchRootsRetryDelays is the post-launch/install retry schedule.
+// Attempt 0 is immediate; later attempts cover the "sessions dir appears
+// after first tool write" window without waiting for the ~30s poller.
+var refreshWatchRootsRetryDelays = []time.Duration{0, 2 * time.Second, 8 * time.Second}
+
+func refreshWatchRootsWithRetry(w *watcher.Watcher, log *slog.Logger) {
+	if log == nil {
+		log = slog.Default()
+	}
+	for i, d := range refreshWatchRootsRetryDelays {
+		if d > 0 {
+			time.Sleep(d)
+		}
+		res, err := w.RefreshRoots(context.Background())
+		if err != nil {
+			log.Warn("watcher refresh after terminal install/launch",
+				"attempt", i+1, "err", err)
+			continue
+		}
+		log.Info("watcher refresh after terminal install/launch",
+			"attempt", i+1, "files_processed", res.FilesProcessed)
 	}
 }
 

@@ -1,7 +1,8 @@
-# Acme Copilot — an employee-copilot harness for SuperBased Observer (Plane A)
+# Acme Copilot — an employee-copilot harness for SuperBased Observer
 
 A minimal, dependency-light chatbot that stands in for a **company copilot used
-by employees**, wired end-to-end into Observer's **Plane A** governance:
+by employees**, wired end-to-end into Observer's **admission + egress
+governance**:
 
 ```
 employee ─▶ Acme Copilot (:8090)
@@ -13,12 +14,9 @@ employee ─▶ Acme Copilot (:8090)
              │                        └─ egress rule may reroute flagged traffic  ← routing
              └─ 3. OTLP span    ─▶ Observer OTLP (:4318)  ─▶ obs_traces / obs_spans (Trajectories)
                                      (optional)
-                                        │
-                        node pushes opt-in tiers ─▶ observer-org / web2 (:8443)   ← Phase 2
 ```
 
-Everything runs **natively on Windows at 127.0.0.1**. The org server (Phase 2)
-runs in Docker Desktop.
+Everything runs **natively on Windows at 127.0.0.1**.
 
 This harness is the moral equivalent of the reference `sb-chatbot` from
 `docs/admission-ollama-demo-playbook.md`, rebuilt in Node/TypeScript-friendly
@@ -34,7 +32,6 @@ ESM. Read `docs/deployment-models.md`, `docs/observability.md`, and
   `http://127.0.0.1:11434`.
 - An **`observer.exe`** you can run natively on Windows (`make build` produces
   `bin/observer`; on Windows build with `go build -o observer.exe ./cmd/observer`).
-- **Docker Desktop** — only for Phase 2 (the org server).
 
 ### ⚠️ Port-collision caveat (you already run an Observer daemon in WSL)
 
@@ -50,7 +47,7 @@ The instructions below assume the default ports are free on Windows.
 
 ---
 
-# Phase 1 — Node-local Plane A (guarded copilot, no org server)
+# Phase 1 — Node-local governance (guarded copilot)
 
 ## 1. Create the judge model in Ollama
 
@@ -284,100 +281,6 @@ webhook — `[observability.alerts]`, `observer obs alerts`. Default off.
 
 ---
 
-# Phase 2 — Connect the organization plane (observer-org / web2)
-
-Now roll the node's activity up to an **admin dashboard** an org operator sees.
-Phase 1 keeps working unchanged; org mode is purely additive and node-opt-in.
-
-## 1. Stand up the org server (Docker Desktop)
-
-From the repo root, with the binaries built and on PATH:
-
-```powershell
-observer-org quickstart
-#   ──▶ Dashboard:  http://localhost:8443
-#       Dev-auth:   curl ... -d email=admin@example.com
-#       Enrol cmd:  observer enroll http://localhost:8443 <token>
-```
-
-`quickstart` runs the dev compose stack (`deploy/observer-org/`), waits for
-`/healthz`, provisions an admin, and prints a 7-day enrolment token. It runs
-with `[server].dev_auth = true`, so you log in with an email instead of SAML.
-
-## 2. Log into web2
-
-```powershell
-curl.exe -fsSL -c cookies.txt http://localhost:8443/auth/dev/login -d email=admin@example.com
-```
-
-Then open **http://localhost:8443** in a browser.
-
-## 3. Enroll the node
-
-```powershell
-observer enroll http://localhost:8443 <token-from-quickstart>
-observer org status        # "enrolled", last/next push
-```
-
-This mints a local Ed25519 keypair, exchanges the token for a 90-day bearer
-(stored in the OS keychain), and writes an `[org_client]` block to your
-`config.toml`.
-
-## 4. Turn on the obs sharing tiers (node-side opt-in)
-
-Uncomment the Phase-2 block at the bottom of
-[`observer.config.demo.toml`](observer.config.demo.toml) — or add to
-`config.toml`:
-
-```toml
-[org_client]
-push_interval_seconds = 60
-
-[org_client.share]
-full_content = true          # ship raw bodies (demo choice); default false = hashes only
-
-[org_client.share.obs]
-summary   = true             # T1  cost/token/latency aggregate
-traces    = true             # T2  trace/span structure (needs OTLP spans → ENABLE_OTEL=1)
-content   = true             # T3  raw span bodies (needs full_content)
-admission = true             # T6  admission verdicts + policy snapshots
-```
-
-Then restart and push:
-
-```powershell
-observer start
-observer org preview         # see the EXACT content-free bytes before they leave
-observer org push-now        # force a push; prints accepted/deduped row counts
-observer org push-status     # "ok, N rows"
-```
-
-> **Privacy invariant:** every share flag lives in *your* node config. The org
-> admin has **no remote toggle** — they cannot flip `full_content` or any
-> `obs.*` tier for you. `observer org preview` shows the literal wire bytes.
-
-## 5. See it on web2
-
-As the admin at `http://localhost:8443`, the **Trajectories** nav group carries
-the Plane-A views (they render once the matching tier is shared):
-
-- **Trajectories / TraceDetail** — the trace list → span tree, with a
-  *Proxy-verified* drawer (exact cost/cache/routing per `request_id`).
-- **Analytics / Cost / End-user spend** — trends + per-end-user spend (T5).
-- **Admission** (`/trajectories/admission`) — posture tiles, a content-free
-  verdict timeline, a per-user budget overlay, and a **read-only** policy viewer
-  (there is no org-side apply — same no-remote-toggle invariant).
-
-To populate **Trajectories** (T2/T3), run the harness with tracing on:
-
-```powershell
-npm install                  # pulls the optional @opentelemetry/* packages
-$env:ENABLE_OTEL = "1"
-node app.mjs
-```
-
----
-
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -388,7 +291,6 @@ node app.mjs
 | `ask`/`deny` never blocks | you're in `mode = "observe"` — that's expected; flip to `enforce`. |
 | Everything is slow | CPU-only Ollama. Raise `ADMIT_TIMEOUT_MS`, keep judge model small, pre-warm with one benign message. |
 | Ports already bound | your WSL `observer` daemon — see the port-collision caveat at the top. |
-| web2 Trajectories empty | no OTLP spans — run with `ENABLE_OTEL=1` + `npm install`, and share `traces = true`. |
 
 ## Files of record
 
@@ -396,5 +298,4 @@ node app.mjs
 - [`observer.config.demo.toml`](observer.config.demo.toml) — the node config blocks.
 - [`.env.example`](.env.example) — harness environment overrides.
 - Concepts: `docs/deployment-models.md`, `docs/observability.md`,
-  `docs/admission-setup.md`, `docs/admission-ollama-demo-playbook.md`,
-  `docs/teams-getting-started.md`.
+  `docs/admission-setup.md`, `docs/admission-ollama-demo-playbook.md`.

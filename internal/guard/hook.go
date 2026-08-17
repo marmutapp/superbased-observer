@@ -43,7 +43,9 @@ func (g *Guard) EvaluateHook(ev policy.Event) (ActionVerdict, bool) {
 		ev.Now = time.Now().UTC()
 	}
 	ev.Taint = g.taint.Snapshot(ev.SessionID, 0, ev.Now)
-	verdict, guardErr := g.Evaluate(ev)
+	// One snapshot for the evaluate+categorize pair (NIT contract).
+	es := g.set.Load()
+	verdict, guardErr := g.evaluateWith(es, ev)
 	verdict, approved := g.applyApprovals(verdict, &ev)
 	av := ActionVerdict{
 		Input: ActionInput{
@@ -55,7 +57,7 @@ func (g *Guard) EvaluateHook(ev policy.Event) (ActionVerdict, bool) {
 			Timestamp:   ev.Now,
 		},
 		Kind:        ev.Kind,
-		Category:    g.CategoryFor(verdict.RuleID),
+		Category:    g.categoryWith(es, verdict.RuleID),
 		Verdict:     verdict,
 		TaintOrigin: taintOriginFor(verdict, ev.Taint),
 		GuardError:  guardErr != nil,

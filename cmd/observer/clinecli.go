@@ -61,8 +61,13 @@ func newClineCLICmd() *cobra.Command {
 			"to separate observer flags from cline flags. NEVER touches API keys\n" +
 			"— your provider credentials must already be in the environment.\n\n" +
 			"Requires a running observer proxy (`observer start`).",
-		SilenceErrors: true,
+		SilenceErrors:      true,
+		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args, done, err := launcherArgsOrDone(cmd, args)
+			if done {
+				return err
+			}
 			// Attach-by-default (attach-all-launchers): hand the PTY to the
 			// daemon when attach resolves. cline-cli routes via the
 			// openai-compatible provider's persisted baseUrl (applied by the
@@ -171,7 +176,6 @@ func newClineCLICmd() *cobra.Command {
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "cline-cli")
 	resume = registerResumeFlag(cmd, "cline-cli")
-	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 

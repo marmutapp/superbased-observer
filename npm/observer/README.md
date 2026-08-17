@@ -10,7 +10,7 @@
 **Claude Code cost tracking. Cursor token usage. Codex spend.
 AI coding agent observability — one local tool, proxy-accurate.**
 SuperBased captures, normalizes, and analyzes every AI
-coding tool call across **31 adapters** — Claude Code, Codex, Cursor,
+coding tool call across **33 adapters** — Claude Code, Codex, Cursor,
 Cline + Cline CLI, GitHub Copilot (VS Code) + Copilot CLI, Gemini CLI,
 OpenCode, Google Antigravity, Cowork, Nous Research's Hermes Agent,
 Kilo Code (legacy IDE extension + CLI), Aider, Goose, Devin, OpenClaw,
@@ -21,14 +21,9 @@ reconciles the *exact* tokens your provider billed (net input, cache
 JSONL-derived estimate. No telemetry, no cloud, no data leaves your
 machine.
 
-**Two planes, one binary.** Plane B is coding-agent observability —
-desktop-first: this package, capturing your own AI coding tools, with
-an optional team rollup server. Plane A is general LLM-app
-observability — admin-server-first: OTLP trace/span capture, evals,
-and an LLM-as-judge input-admission guardrail for an application you
-host. Most installs only ever use Plane B; see the [main
-repo](https://github.com/superbasedapp/observer#readme) for
-the full two-plane explainer.
+**One local binary.** SuperBased captures, normalizes, and analyzes
+every AI coding tool call on your machine: proxy-accurate cost,
+compression, cache tracking, and session handoff.
 
 <p align="center">
   <img src="https://github.com/superbasedapp/observer/raw/main/docs/assets/infographics/one-local-path.png" alt="One local path for AI coding activity" width="780">
@@ -39,7 +34,7 @@ the full two-plane explainer.
 - [Install](#install)
 - [Five-minute quickstart](#five-minute-quickstart)
 - [Zero-setup cost report: `observer usage`](#zero-setup-cost-report-observer-usage)
-- [Two planes, one binary](#two-planes-one-binary)
+- [One local binary](#one-local-binary)
 - [Per-AI-client setup](#per-ai-client-setup)
 - [Architecture in detail](#architecture-in-detail)
 - [Dashboard tour](#dashboard-tour)
@@ -220,20 +215,12 @@ opt-in (`observer init --statusline`) — never automatic. See
 [`docs/observer-statusline.md`](https://github.com/superbasedapp/observer/blob/main/docs/observer-statusline.md)
 for the full reference.
 
-## Two planes, one binary
+## One local binary
 
-Everything below this line — proxy routing, per-client capture,
-compression, cache, MCP tools — is **Plane B: coding-agent
-observability**, desktop-first. It's what this package is for: a
-local node that watches your own AI coding tools and gives you
-proxy-accurate cost and cache numbers, with an optional team rollup
-server for org-wide spend visibility. The same binary also ships
-**Plane A: general LLM-app observability**, admin-server-first — OTLP
-trace/span capture, evals, and an LLM-as-judge input-admission
-guardrail for an application *you* host, whose end users route
-through SuperBased. Most installs only ever touch Plane B; Plane A is
-opt-in and unrelated to your own coding-agent traffic. Full explainer:
-[superbased.app/docs/getting-started/two-planes](https://superbased.app/docs/getting-started/two-planes).
+Everything below this line (proxy routing, per-client capture,
+compression, cache, MCP tools) is what this package is for: a local
+node that watches your own AI coding tools and gives you
+proxy-accurate cost and cache numbers, on your own machine.
 
 ## Per-AI-client setup
 
@@ -292,6 +279,7 @@ table below is the full per-client reference.
 | **Kilo Code CLI (current)**     | (no proxy route yet — base-URL env vars are not honored; a project-scoped `kilo.json` provider `baseURL` override reaches the proxy, but the Gateway provider's model-catalog calls share that base URL and have no upstream there — see `docs/kilo-code-adapter.md`) | SQLite — `~/.local/share/kilo/kilo.db` on every OS (Kilo intentionally mirrors XDG; Windows does NOT use `%APPDATA%`). The new `@kilocode/cli` (npm) is a fork of sst/opencode and uses the same `message`/`part`/`todo` tables shape with Kilo additions (`project`, `workspace`, `event`, `session_message`, `account`, `permission`, `session_share`). Captures **token counts + model + cost** per assistant message from `message.data.tokens = {total, input, output, reasoning, cache: {read, write}}`. Tool name coverage inherits OpenCode's surface (`read` → `read_file`, `bash` → `run_command`, `websearch` → `web_search`, etc.). Tagged `Source=jsonl, Reliability=approximate`. |
 | **Gemini CLI** | (no proxy yet) | JSONL or single-object JSON — `~/.gemini/tmp/<hash>/chats/session-*.{json,jsonl}`. Dual-format dispatch: legacy single-object JSON (size-based cursor, cline-style) and proposed JSONL event records (byte-offset cursor, issue [#15292](https://github.com/google-gemini/gemini-cli/issues/15292)). Action mapping covers `read_file` / `write_file` / `edit_file` / `run_command` / `search_files` / `web_fetch` and arbitrary MCP tool calls. Project root falls back through tool-call `cwd` → `~/.gemini/history/<hash>/.git/config` worktree pointer → synthetic `[gemini-cli:<hash>]` key (promoted via ON CONFLICT DO UPDATE on `sessions.project_id` once a future scan supplies a real cwd). Tagged `Source=jsonl, Reliability=approximate`. |
 | **Hermes Agent** ([Nous Research](https://github.com/NousResearch/hermes-agent)) | (provider-routed; uses your existing `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` when set) | Hooks + SQLite — Python plugin at `~/.hermes/plugins/superbased-observer/` registers `post_tool_call` / `post_api_request` / `on_session_start` / `on_session_end` / `subagent_stop` callbacks (fire-and-forget via `observer hook hermes`); the watcher walks `~/.hermes/state.db` (schema v14, `messages.active = 1` filter) and emits `ToolEvent` + `TokenEvent` rows via `modernc.org/sqlite`. 70+ Hermes tools fold into the normalized action set (`read_file` / `write_file` / `patch` / `terminal` / `search_files` / `web_search` / `web_extract` / `browser_*` / `delegate_task` / `todo` / `clarify` / `memory` + `mcp_call` fall-through). Token bundles lifted from `post_api_request.usage{input/output/cache/reasoning_tokens}`; OpenRouter `:suffix` tails (`:free`, `:beta`, `:fast`) preserved so the dashboard distinguishes paid vs free tiers. Install via `observer init --hermes`; backfill via `observer backfill --hermes-rescan`. Tagged `Source=jsonl, Reliability=approximate`. |
+| **Junie** (JetBrains) | (no proxy yet) | Event-sourced JSONL — `~/.junie/sessions/<id>/events.jsonl` on every OS (resumes with `junie --session-id <id>`). Each line is a typed envelope (`SessionA2uxEvent` wrapping `event.agentEvent.kind`); Terminal/FileChanges/Result blocks recur under a stable `stepId` (IN_PROGRESS to COMPLETED/FAILED to a completion rebroadcast) and are collapsed by `stepId`. Captures user prompts, `run_command` / `write_file` / `edit_file` / `task_complete` actions, and per-call **model + NET input tokens + provider-stated cost** from `LlmResponseMetadataEvent.modelUsage[]`. Project root from the session's `CurrentDirectoryUpdatedEvent` with a `sessions/index.jsonl` `projectDir` fallback. Never reads `secure_credentials.json` / `trust/`. Tagged `Source=jsonl, Reliability=accurate`. |
 
 **JSONL-only** clients are captured passively by the watcher whenever
 `observer start` is running. Hooks self-heal on every `start`, so a
@@ -618,7 +606,7 @@ how well your sessions are reusing provider-cached prefixes.
 
 Two capture paths feed the same engine; both write the same three
 local-only tables (`cache_segments`, `cache_entries`, `cache_events`;
-migrations 036 + 037 — never pushed to a Teams org server, pinned by
+migrations 036 + 037 — node-local only, never leaving the machine, pinned by
 `tests/invariant/privacy_test.go::TestSelectUnpushedSinceExcludesCacheTables`):
 
 1. **Tier-1 (proxy)** — point your AI client at the local proxy
@@ -822,7 +810,7 @@ one-click install rather than failing. Dashboard launching is gated by
 `[handoff].allow_dashboard_launch` (default `true`).
 
 (The count is twenty-two *launchers*, not the adapter count — observer
-tracks 31 adapters in total, but only these twenty-two ship a
+tracks 33 adapters in total, but only these twenty-two ship a
 first-class terminal launcher.)
 
 ### Attach-by-default
@@ -1239,10 +1227,9 @@ What makes it different from standalone command-guards:
   crossings can push out through desktop toast notifications
   (`[guard.alerts] desktop = true`) and outbound webhooks — generic,
   Slack, Discord, or PagerDuty (`[[guard.cloud.webhooks]]` for guard
-  events; the org server's per-budget and per-obs-alert-rule webhook
-  columns for spend/eval alerts) — each behind its own opt-in, routed
-  through one egress worker with an endpoint allowlist and a payload
-  cap. Nothing fires until you configure it.
+  events) — each behind its own opt-in, routed through one egress
+  worker with an endpoint allowlist and a payload cap. Nothing fires
+  until you configure it.
 - **Optional process observability.** `[observer.process]` (opt-in,
   off by default) attaches the OS-level process tree — Linux eBPF or
   Windows ETW — beneath each captured session, for runtime side
@@ -1254,8 +1241,7 @@ most adapters are watcher-channel and can only flag post-hoc; the
 proxy scan only covers proxy-routed clients. The full capability
 matrix is on the dashboard's Security page, and the no-network
 invariant holds — nothing leaves your machine unless you opt into
-Teams push, OTel export, or the cloud alerting tier, each
-individually.
+OTel export or the cloud alerting tier, each individually.
 
 Quick start:
 
@@ -1267,7 +1253,7 @@ observer guard enable --enforce       # flip to enforce when ready
 ```
 
 Full reference: [superbased.app/docs/guides/security-guard](https://superbased.app/docs/guides/security-guard)
-(concepts, modes, the observe→enforce path, Teams policy merge, the honest
+(concepts, modes, the observe→enforce path, the honest
 "what guard does NOT do" list). The rule catalog, policy-authoring cookbook,
 enforce runbook, and SOC 2 / NIST compliance mapping ship as
 `docs/guard-rules.md`, `docs/guard-policy-authoring.md`,
@@ -1583,7 +1569,7 @@ handler, dashboard, MCP server, and CLI never make an outbound network
 call on observer's behalf. The only code paths that touch the network
 are the optional API proxy (which forwards **your** requests unchanged
 to the AI provider you already use) and a handful of explicit opt-in
-features (message-summary LLM, codeintel MCP, Teams org-server).
+features (message-summary LLM, codeintel MCP).
 
 The full privacy statement — what observer stores, what it reads,
 what it never stores, the explicit list of outbound-network call sites

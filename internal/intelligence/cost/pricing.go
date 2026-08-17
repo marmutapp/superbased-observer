@@ -871,6 +871,27 @@ var defaultPricing = map[string]Pricing{
 	// queries = $0.014/call) is the next-deferred surface; tracked in
 	// the prior pricing audit §B6 + post-v1.6.18 kickoff Workstream B.
 	"gemini-3.5-flash": {Input: 1.50, Output: 9, CacheRead: 0.15},
+	// Gemini 3.6 Flash — launched 2026-07-21. CORRECTED 2026-08-15:
+	// ai.google.dev now lists 3.6 Flash on the SAME introductory rate as
+	// 3.7 Flash — $0.75 / $3.75 / $0.075 through 2026-12-31, both rising
+	// to $1.50 / $7.50 / $0.15 on 2027-01-01 (the prior $1.50 row here
+	// was over-billing 2×). This row must be bumped together with the
+	// 3.7 Flash row below at the 2027-01 flip. 1M context, 64K max
+	// output. NOT covered by the "gemini-3" bare family fallback below
+	// despite the shared "gemini-3" prefix — that family carries
+	// Pro-class LC rates, so a Flash SKU needs its own exact row or it
+	// silently prices over the real rate.
+	"gemini-3.6-flash": {Input: 0.75, Output: 3.75, CacheRead: 0.075},
+	// Gemini 3.7 Flash — launched 2026-08-11. Google is running an
+	// introductory rate through 2026-12-31: $0.75 / $3.75 / $0.075.
+	// Standard rate from 2027-01-01 is $1.50 / $7.50 (== 3.6 Flash's
+	// rate above) — this exact row must be bumped to the standard rate
+	// on/after that date, mirroring the claude-sonnet-5 intro-pricing
+	// pattern elsewhere in this table. 1M context, 65,536 max output.
+	// Same family-shadow note as 3.6 Flash above: the bare "gemini-3"
+	// family fallback is Pro-class and must NOT be allowed to catch
+	// this id.
+	"gemini-3.7-flash": {Input: 0.75, Output: 3.75, CacheRead: 0.075},
 	"gemini-2.5-pro": {
 		Input: 1.25, Output: 10, CacheRead: 0.125,
 		LongContextThreshold: 200_000,
@@ -980,28 +1001,45 @@ var defaultPricing = map[string]Pricing{
 	// 2026-05-19 antigravity audit §B1.
 	"gemini-3-flash": {Input: 0.50, Output: 3, CacheRead: 0.05},
 
-	// xAI. Current line-up per docs.x.ai/developers/models (2026-07):
-	// grok-4.5 is the new flagship ($2/$6, 500k ctx); grok-build-0.1 is a
+	// xAI. Current line-up per docs.x.ai/developers/models (2026-07/08):
+	// grok-4.5 was the flagship ($2/$6, 500k ctx); grok-4.6 (2026-08)
+	// supersedes it and introduces xAI's first context-length-tiered
+	// pricing: <200K ctx bills at the same $2/$6 as 4.5, but a request
+	// whose context crosses 200K reprices the ENTIRE call at $4/$12
+	// (doubled) — modelled with the LongContextThreshold/LongContext*
+	// fields, the same mechanism already used for Gemini 2.5/3.x Pro
+	// and GPT-5.4+. Cached input is $0.50 (<200K) / $1.00 (>=200K), a
+	// real published rate (unlike 4.5, see below). grok-build-0.1 is a
 	// dedicated agentic-coding model in early access ($1/$2, 256k ctx).
-	// Both were silently falling through to the `grok` family prefix at
-	// grok-4.3's $1.25/$2.50 (under-billing grok-4.5 1.6×/2.4×) before
-	// these rows. grok-4.3 + the grok-4.20-0309-* family stay at
-	// $1.25/$2.50 (unchanged). docs.x.ai publishes no cached-input rate
-	// for grok-4.5 / grok-build-0.1, so CacheRead is left unset and
+	// These were silently falling through to the `grok` family prefix at
+	// grok-4.3's $1.25/$2.50 (under-billing 1.6×/2.4×) before these rows.
+	// grok-4.3 + the grok-4.20-0309-* family stay at $1.25/$2.50
+	// (unchanged). docs.x.ai publishes no cached-input rate for grok-4.5
+	// / grok-build-0.1, so CacheRead is left unset on those two and
 	// fillDefaults' universal 10%-of-input default applies ($0.20 /
 	// $0.10). `grok-code-fast-1` was retired 2026-05-15 and redirects to
 	// grok-4.3 pricing. The `grok` family prefix follows the current
-	// flagship (grok-4.5 $2/$6), same precedent as the kimi-k2-6 family
-	// bump.
-	"grok-4.5":         {Input: 2, Output: 6}, // flagship since 2026-07 (500k ctx); was silently falling to the `grok` family row at 4.3 rates
+	// flagship (grok-4.6's <200K tier — numerically identical to 4.5's
+	// $2/$6, but now carries the real $0.50 cached rate rather than the
+	// 10%-of-input default), same precedent as the kimi-k2-6 family
+	// bump. The family prefix intentionally does NOT carry the >=200K
+	// long-context tier — an unknown/future grok-* SKU that falls
+	// through to this row is priced at the base tier, never the
+	// doubled one.
+	"grok-4.6": {
+		Input: 2, Output: 6, CacheRead: 0.50,
+		LongContextThreshold: 200_000,
+		LongContextInput:     4, LongContextOutput: 12, LongContextCacheRead: 1.00,
+	},
+	"grok-4.5":         {Input: 2, Output: 6}, // flagship since 2026-07 (500k ctx), superseded by grok-4.6 2026-08; was silently falling to the `grok` family row at 4.3 rates
 	"grok-build-0.1":   {Input: 1, Output: 2}, // agentic-coding model, early access (256k ctx)
 	"grok-build":       {Input: 1, Output: 2}, // family prefix for future build-x SKUs
 	"grok-4.3":         {Input: 1.25, Output: 2.50},
-	"grok-4.20":        {Input: 1.25, Output: 2.50}, // covers grok-4.20-0309-* family
-	"grok-4-20":        {Input: 1.25, Output: 2.50}, // historical alias
-	"grok-code-fast-1": {Input: 1.25, Output: 2.50}, // retired 2026-05-15 → redirects to grok-4.3 rates
-	"grok-code":        {Input: 1.25, Output: 2.50}, // family prefix
-	"grok":             {Input: 2, Output: 6},       // family prefix → grok-4.5 flagship rates
+	"grok-4.20":        {Input: 1.25, Output: 2.50},            // covers grok-4.20-0309-* family
+	"grok-4-20":        {Input: 1.25, Output: 2.50},            // historical alias
+	"grok-code-fast-1": {Input: 1.25, Output: 2.50},            // retired 2026-05-15 → redirects to grok-4.3 pricing
+	"grok-code":        {Input: 1.25, Output: 2.50},            // family prefix
+	"grok":             {Input: 2, Output: 6, CacheRead: 0.50}, // family prefix → grok-4.6's base (<200K) tier
 
 	// Moonshot.
 	"kimi-k2-5": {Input: 0.60, Output: 3, CacheRead: 0.10},
@@ -1017,6 +1055,13 @@ var defaultPricing = map[string]Pricing{
 	// cache_creation charge → CacheCreation stays 0). This bare key also
 	// serves as the K3 family prefix (kimi-k3-*), winning over "kimi"
 	// longest-first.
+	//
+	// RESOLVED (2026-08-15): the $2.80/$14 figure was never a competing
+	// claim about this first-party card — it is OpenRouter's own separate
+	// listing (live at openrouter.ai/moonshotai/kimi-k3), captured
+	// accurately at the "moonshotai/kimi-k3" row below. This bare row's
+	// $3/$15/$0.30 is confirmed directly against
+	// platform.kimi.ai/docs/pricing/chat-k3 (re-fetched 2026-08-15).
 	"kimi-k3": {Input: 3, Output: 15, CacheRead: 0.30},
 	// kimi family prefix stays at K2.6 (the mainstream/cheaper generation:
 	// K2.6 and K2.7-Code both list ~$0.95/$4). NOT bumped to K3 on purpose
@@ -1047,7 +1092,23 @@ var defaultPricing = map[string]Pricing{
 	"nemotron-3-nano-30b-a3b":    {Input: 0.04, Output: 0.15},
 	"nemotron-3-ultra":           {Input: 0.50, Output: 2.50}, // shorthand id
 	"nemotron-3":                 {Input: 0.09, Output: 0.45}, // family (super as default representative)
-	"nemotron":                   {Input: 0.09, Output: 0.45}, // family
+	// Nemotron 3.5 Lightning — a DIFFERENT generation from the "nemotron-3"
+	// family above, not caught by it: "nemotron-3.5-lightning" and
+	// "nemotron-3-ultra" diverge at the character right after
+	// "nemotron-3" ('.' vs '-'), so neither prefix-matches the other, but
+	// the bare "nemotron-3" family row above WOULD still catch this id via
+	// strings.HasPrefix (both start with the literal 10-char "nemotron-3")
+	// — hence this exact row is required, not optional; without it the id
+	// silently resolves to the wrong generation's rate (0.09/0.45 vs the
+	// real 0.08/0.20). Used via OpenRouter in this project's demo; the
+	// `nvidia/` provider-qualified row below mirrors it. A `:free`-suffixed
+	// id (e.g. "nvidia/nemotron-3.5-lightning:free") never reaches this
+	// row — LookupWithSource's `:free` suffix guard resolves to known-$0
+	// BEFORE any family/exact lookup runs, so no separate :free row is
+	// needed here (same precedent as the north-mini-code / gpt-oss free
+	// rows elsewhere in this table).
+	"nemotron-3.5-lightning": {Input: 0.08, Output: 0.20},
+	"nemotron":               {Input: 0.09, Output: 0.45}, // family
 	// Nous Hermes — host-priced; flat in/out on the 3.x and 4.x lines.
 	// hermes-4 rates are the placeholder per the catalog "confirm exact"
 	// note; revisit when Nous publishes definitive numbers on Portal.
@@ -1100,6 +1161,24 @@ var defaultPricing = map[string]Pricing{
 	// `deepseek-chat` / `deepseek-reasoner` are legacy aliases that
 	// DeepSeek still resolves; both map to v4-flash.
 	"deepseek-v4-flash": {Input: 0.14, Output: 0.28, CacheRead: 0.0028},
+	// deepseek-v4-pro's CacheRead ($0.003625, 0.83% of input) mirrors
+	// v4-flash's CacheRead ratio above (0.0028/0.14 = 2%) rather than the
+	// 10%-of-input convention used elsewhere in this table — sanity-
+	// checked against the 2026-08 research pass: DeepSeek's own pricing
+	// page rate card lists both cache-hit rates directly (not derived
+	// from a percentage), and platform-api.deepseek.com's historical
+	// cache-hit pricing has consistently landed well under 10% of input
+	// (V3/V3.1 cache-hit rates were ~10-14% of a MUCH higher input rate,
+	// but V4's input rate itself dropped ~85% on 2026-05-22 while the
+	// absolute cache-hit price dropped further still) — i.e. DeepSeek
+	// prices cache hits as a near-flat low absolute rate rather than a
+	// fixed fraction of the (now much cheaper) input rate. RESOLVED
+	// 2026-08-15: $0.435 / $0.87 / $0.003625 confirmed byte-for-byte
+	// against api-docs.deepseek.com/quick_start/pricing (fetched
+	// directly). FORWARD FLAG: the same page announces a peak/off-peak
+	// overhaul effective 2026-08-16T16:00Z (off-peak $0.022/$0.66/$1.98,
+	// peak 2x) replacing this flat rate — re-verify this row after that
+	// date.
 	"deepseek-v4-pro":   {Input: 0.435, Output: 0.87, CacheRead: 0.003625},
 	"deepseek-chat":     {Input: 0.14, Output: 0.28, CacheRead: 0.0028}, // alias → v4-flash non-thinking
 	"deepseek-reasoner": {Input: 0.14, Output: 0.28, CacheRead: 0.0028}, // alias → v4-flash thinking
@@ -1127,6 +1206,7 @@ var defaultPricing = map[string]Pricing{
 	// Nvidia Nemotron 3 via OpenRouter (matches first-party canonical ids).
 	"nvidia/nemotron-3-ultra-550b-a55b": {Input: 0.50, Output: 2.50},
 	"nvidia/nemotron-3-super-120b-a12b": {Input: 0.09, Output: 0.45},
+	"nvidia/nemotron-3.5-lightning":     {Input: 0.08, Output: 0.20}, // see bare "nemotron-3.5-lightning" comment above
 	// Nous Hermes via OpenRouter (rates = first-party placeholder until
 	// Nous publishes definitive numbers — same caveat as the bare rows).
 	"nousresearch/hermes-3-llama-3.1-405b": {Input: 1.00, Output: 1.00},
@@ -1135,6 +1215,17 @@ var defaultPricing = map[string]Pricing{
 	// Alibaba Qwen via OpenRouter. qwen3.7-max + qwen3.6-* are the live
 	// catalog SKUs; qwen/* prefix differs from first-party `qwen3-*` bare
 	// ids so both can coexist.
+	//
+	// NOTE (2026-08 sweep): this OpenRouter-qualified rate ($1.25/$3.75)
+	// does NOT match either figure surfaced by the 2026-08 research pass
+	// for Qwen3.7-Max — official first-party Alibaba pricing is
+	// $2.50/$7.50 (added as the bare "qwen3.7-max" row below), and a
+	// separately-observed OpenRouter listing showed $1.475/$4.425. Left
+	// AS-IS pending re-verification against a live OpenRouter catalog
+	// pull — this row predates that research pass and may reflect an
+	// intro/promo rate OpenRouter has since changed. Flagged, not
+	// touched, to avoid overwriting a previously-verified number with an
+	// unreconciled one.
 	"qwen/qwen3.7-max":         {Input: 1.25, Output: 3.75, CacheRead: 0.25},
 	"qwen/qwen3.6-max-preview": {Input: 1.04, Output: 6.24},
 	"qwen/qwen3.6-plus":        {Input: 0.325, Output: 1.95},
@@ -1157,14 +1248,16 @@ var defaultPricing = map[string]Pricing{
 	"x-ai/grok-build-0.1":        {Input: 1.00, Output: 2.00, CacheRead: 0.20},
 	// Moonshot via OpenRouter.
 	"moonshotai/kimi-k2.6": {Input: 0.684, Output: 3.42, CacheRead: 0.144},
-	// Kimi K3 via OpenRouter (openrouter.ai/moonshotai/kimi-k3, single
-	// provider = Moonshot, fetched 2026-07-17): $3 input / $15 output,
-	// matching first-party. OpenRouter publishes NO exact cache rate (only
-	// a vague "60–80% cheaper with prompt caching" note), so CacheRead
-	// mirrors Moonshot's own first-party cache-hit rate ($0.30) — the same
-	// single upstream serves the tokens — rather than fabricating an
-	// OpenRouter-specific number.
-	"moonshotai/kimi-k3": {Input: 3, Output: 15, CacheRead: 0.30},
+	// Kimi K3 via OpenRouter (openrouter.ai/moonshotai/kimi-k3, re-fetched
+	// 2026-08-15): OpenRouter's live listing is $2.80 input / $14 output —
+	// a genuinely DIFFERENT rate from Moonshot's first-party $3/$15 card,
+	// not a data error (the earlier "$2.80/$14 variance" note on the bare
+	// kimi-k3 row was this listing). OpenRouter publishes NO exact cache
+	// rate (only a vague "60-80% cheaper with prompt caching" note), so
+	// CacheRead mirrors Moonshot's own first-party cache-hit rate ($0.30)
+	// — the same single upstream serves the tokens — rather than
+	// fabricating an OpenRouter-specific number.
+	"moonshotai/kimi-k3": {Input: 2.80, Output: 14, CacheRead: 0.30},
 
 	// --- 2026-07-23 research batch (new providers/models) ---
 
@@ -1202,24 +1295,39 @@ var defaultPricing = map[string]Pricing{
 	// the schema grows a modality split.
 	"qwen3.5-omni-plus":  {Input: 1.40, Output: 8.30},
 	"qwen3.5-omni-flash": {Input: 0.40, Output: 2.20},
-	"qwen3.7-plus":       {Input: 0.40, Output: 1.60, CacheRead: 0.04},
+	// UNVERIFIED (2026-08 sweep): OpenRouter availability for qwen3.7-plus
+	// was not directly confirmed — the alias row below is carried
+	// forward from the original DashScope-mirroring rationale, not a
+	// freshly re-verified OpenRouter listing.
+	"qwen3.7-plus": {Input: 0.40, Output: 1.60, CacheRead: 0.04},
 	// OpenRouter alias — list price. OR currently runs a 20%-off promo on
 	// top of this (not modeled; promos are time-boxed and this is the
 	// standing list rate).
 	"qwen/qwen3.7-plus": {Input: 0.40, Output: 1.60, CacheRead: 0.04},
+	// qwen3.7-max — official first-party Alibaba/DashScope rate (2026-08
+	// sweep): $2.50/$7.50, cache-read $0.25 (10%-of-input, consistent
+	// with the rest of the Qwen family). Distinct from the
+	// OpenRouter-qualified "qwen/qwen3.7-max" row above, which carries a
+	// lower, unreconciled rate — see the NOTE on that row. Before this
+	// row existed, a bare "qwen3.7-max" id fell through to the generic
+	// "qwen3"/"qwen" family fallback ($0.78/$3.90) — a real but
+	// wrong-tier (69% under-billed) rate for the actual flagship SKU.
+	"qwen3.7-max": {Input: 2.50, Output: 7.50, CacheRead: 0.25},
 	// qwen3.8-max-preview — NO official per-token rate as of 2026-07-23.
 	// Announced 2026-07-19 as a Token Plan preview only (no metered API
 	// pricing published). PLACEHOLDER anchored to qwen3.7-max's exact
-	// current OpenRouter rate ($1.25/$3.75, cache $0.25).
-	//
-	// CORRECTED post-review (2026-07-23 codex adversarial pass, P3): this
-	// is NOT preventing a $0 miss — without this row the lookup would
-	// still resolve, via the "qwen3" family fallback ($0.78/$3.90,
-	// pricing.go:844), to a real but WRONG-TIER nonzero rate. The
-	// placeholder's actual purpose is to stop that generic-family
-	// mis-price from applying to a specific, much-higher-end preview SKU.
-	// Revisit at GA and replace with the real first-party rate card.
+	// then-current OpenRouter rate ($1.25/$3.75, cache $0.25). GA'd
+	// 2026-08-03 as "qwen3.8-max" (no "-preview" suffix, a distinct id)
+	// at real, official rates — see that row below. This preview row is
+	// kept as-is (not deleted, not repointed) since historical
+	// preview-tagged sessions may still carry the "-preview" id verbatim
+	// and should keep resolving to the placeholder they actually saw,
+	// not be silently retargeted at the GA rate.
 	"qwen3.8-max-preview": {Input: 1.25, Output: 3.75, CacheRead: 0.25},
+	// qwen3.8-max — GA'd 2026-08-03. Official flagship rate: $2.00/$6.00,
+	// cache-read $0.25, 1M context. Supersedes the preview placeholder
+	// above for any id WITHOUT the "-preview" suffix.
+	"qwen3.8-max": {Input: 2, Output: 6, CacheRead: 0.25},
 
 	// Z.AI — GLM 5.2 (docs.z.ai/guides/overview/pricing, fetched
 	// 2026-07-23). Cache storage is limited-time free per the same page.
@@ -1231,8 +1339,15 @@ var defaultPricing = map[string]Pricing{
 	// MiniMax M3 — platform.minimax.io, ≤512K tier. >512K doubles ALL
 	// rates (documented, not modeled — no long-context dimension wired
 	// for MiniMax the way Anthropic/OpenAI/Gemini have one).
-	"minimax-m3":         {Input: 0.30, Output: 1.20, CacheRead: 0.06},
-	"minimax/minimax-m3": {Input: 0.30, Output: 1.20, CacheRead: 0.06},
+	//
+	// Uses the LIST rate ($0.60/$2.40), not the currently-running promo
+	// ($0.30/$1.20, described by MiniMax as "permanent" 50% off) —
+	// deliberate per repo convention that a "permanent" promo is still a
+	// promo and can revert without notice; the defensible standing rate
+	// is list. CacheRead scales with the list rate (20% of input, same
+	// ratio as the promo's $0.06/$0.30).
+	"minimax-m3":         {Input: 0.60, Output: 2.40, CacheRead: 0.12},
+	"minimax/minimax-m3": {Input: 0.60, Output: 2.40, CacheRead: 0.12},
 
 	// Tencent Hunyuan — "hy3" GA'd 2026-07-06 on TokenHub. Rates are
 	// ¥1/¥4/¥0.25-cache per 1M converted at ~7.0 CNY/USD ($0.1429/
@@ -1256,6 +1371,14 @@ var defaultPricing = map[string]Pricing{
 	// 10%-of-input floor applies rather than a fabricated exact number.
 	"step-3.5-flash":         {Input: 0.10, Output: 0.30},
 	"stepfun/step-3.5-flash": {Input: 0.10, Output: 0.30},
+	// StepFun Step 3.7 Flash — newer/distinct SKU from 3.5 Flash above
+	// (2026-08 sweep): $0.20/$1.15, 262,144 context. No cache rate
+	// published — same fillDefaults-floor treatment as 3.5 Flash. Not
+	// caught by any existing "step" family prefix (none exists in this
+	// table today), so both bare and OpenRouter-qualified exact rows are
+	// added rather than relying on a fallback.
+	"step-3.7-flash":         {Input: 0.20, Output: 1.15},
+	"stepfun/step-3.7-flash": {Input: 0.20, Output: 1.15},
 
 	// Baidu ERNIE 5.1 — Baidu's own Qianfan rate card is not directly
 	// reachable from here; this rate is the consensus of 3+ independent

@@ -70,7 +70,7 @@ func TestStripUpstreamPrefixWarnsOncePerUnknownID(t *testing.T) {
 
 	for i := 0; i < 50; i++ {
 		r := httptest.NewRequest(http.MethodPost, "/up/typo/v1/chat/completions", nil)
-		if up := p.stripUpstreamPrefix(r); up != nil {
+		if up, _ := p.stripUpstreamPrefix(r); up != nil {
 			t.Fatalf("unknown id must not resolve an upstream")
 		}
 		if r.URL.Path != "/up/typo/v1/chat/completions" {
@@ -82,7 +82,7 @@ func TestStripUpstreamPrefixWarnsOncePerUnknownID(t *testing.T) {
 	}
 
 	r := httptest.NewRequest(http.MethodPost, "/up/other/v1/chat/completions", nil)
-	if up := p.stripUpstreamPrefix(r); up != nil {
+	if up, _ := p.stripUpstreamPrefix(r); up != nil {
 		t.Fatalf("second unknown id must not resolve an upstream")
 	}
 	if got := wc.n(); got != 2 {
@@ -127,7 +127,7 @@ func TestStripUpstreamPrefixWarnCapBoundsTheDedupMap(t *testing.T) {
 	const distinct = 500
 	for i := 0; i < distinct; i++ {
 		path := fmt.Sprintf("/up/id-%d/v1/chat/completions", i)
-		if up := p.stripUpstreamPrefix(httptest.NewRequest(http.MethodPost, path, nil)); up != nil {
+		if up, _ := p.stripUpstreamPrefix(httptest.NewRequest(http.MethodPost, path, nil)); up != nil {
 			t.Fatalf("unknown id %d must not resolve an upstream", i)
 		}
 	}
@@ -139,7 +139,7 @@ func TestStripUpstreamPrefixWarnCapBoundsTheDedupMap(t *testing.T) {
 	}
 	// Routing behaviour is untouched by the cap: a known id still resolves.
 	r := httptest.NewRequest(http.MethodPost, "/up/openrouter/api/v1/chat/completions", nil)
-	if up := p.stripUpstreamPrefix(r); up == nil {
+	if up, _ := p.stripUpstreamPrefix(r); up == nil {
 		t.Error("known id stopped resolving after the warn cap was reached")
 	} else if r.URL.Path != "/api/v1/chat/completions" {
 		t.Errorf("known id path = %q, want /api/v1/chat/completions", r.URL.Path)

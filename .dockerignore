@@ -1,0 +1,30 @@
+# Applies to every image built with the REPO ROOT as context
+# (deploy/observer-edge, Dockerfile.observer-org, deploy/observer-gateway).
+# Those are all pure-Go builds; every go:embed asset lives under internal/
+# (the dashboards embed internal/*/webapp/dist, not web//web2/ directly), so
+# the web sources, distribution channels, and the private marketing/site
+# trees are dead weight in the build context (~20 GB without this file).
+# harness-gateway builds from its OWN directory context and is unaffected.
+
+.git
+.wrangler
+bin
+tmp
+marketing
+harness-gateway
+model-pricing
+website
+design
+web
+web2
+vscode
+sdk
+npm
+pypi
+docs
+browser-extension
+observer
+observer.exe
+*.log
+node_modules
+**/node_modules

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/marmutapp/superbased-observer/internal/models"
 )
@@ -22,9 +23,35 @@ import (
 // Bound at the obs wiring point (cmd/observer/obs_wire.go) so internal/proxy
 // never imports internal/obs — the reverse-import boundary. nil ⇒ admission
 // disabled, zero overhead.
+//
+// The seam is TWO-PHASE (admission-trace-linkage spec §1). Admit judges the
+// request and returns the verdict immediately, but for an ALLOWED verdict on
+// the forwarded path it may DEFER persisting its audit row and hand back an
+// opaque [AdmitToken] on [AdmitResult.Finalize]. The proxy then calls
+// FinalizeAdmission exactly once — via defer, on every exit path — with the
+// request id that finally resolved for the turn (the provider-echoed id when
+// the upstream supplied one, else the proxy's own). That is the only instant
+// at which the trace-id seed is knowable AND the row is not yet hash-locked,
+// so the gate can stamp a trace id matching the synthesized gateway trace
+// instead of mutating a chained row after the fact.
+//
+// Blocked verdicts persist inside Admit (nothing is forwarded, so no later id
+// can resolve) and return a nil Finalize token.
 type Admitter interface {
 	Admit(ctx context.Context, in AdmitInput) AdmitResult
+	// FinalizeAdmission persists a verdict Admit deferred. token is whatever
+	// Admit returned on AdmitResult.Finalize; a nil token is a no-op. It is
+	// called at most once per Admit and must be safe to call with a token it
+	// does not recognize.
+	FinalizeAdmission(ctx context.Context, token AdmitToken, resolvedRequestID string)
 }
+
+// AdmitToken is the opaque handle to an admission verdict whose audit row the
+// gate deferred. The proxy only carries it back to FinalizeAdmission — it
+// never inspects it, so no obs type crosses the reverse-import boundary
+// (precedent: AdmitRoute.DecisionID + EgressReporter.ReportEgressRealized, the
+// realized-outcome callback shape). nil ⇒ nothing to finalize.
+type AdmitToken any
 
 // AdmitInput is the plain request the proxy hands the gate. The proxy owns
 // provider-shape knowledge (it already parses these bodies), so the gate
@@ -148,6 +175,11 @@ type AdmitResult struct {
 	Reason    string
 	Criterion string
 	Route     *AdmitRoute
+	// Finalize is the opaque deferred-persist handle (see [Admitter]). Non-nil
+	// only for a verdict whose audit row the gate held back pending the
+	// resolved request id; the proxy hands it to FinalizeAdmission exactly once
+	// on the way out. nil ⇒ the gate already persisted (or persists nothing).
+	Finalize AdmitToken
 }
 
 // admit runs the pre-forward gate on a parsed request body. It returns the
@@ -181,6 +213,26 @@ func (p *Proxy) admit(ctx context.Context, provider string, body []byte, userID,
 	return res, res.Block
 }
 
+// finalizeAdmission persists a deferred admission verdict through the seam,
+// stamping the request id that finally resolved for this turn. It is a no-op
+// on a nil admitter or a nil token (a blocked verdict, an admitter that never
+// defers, or a request admission never ran on), so the non-obs paths pay
+// nothing.
+//
+// Called from serve() via defer so EVERY exit path — success, upstream error,
+// unwinding panic — finalizes exactly once with the best id resolved at that
+// point (falling back to the proxy's own request id). The insert context is
+// detached (insertTurnDetached precedent): the row must land even when the
+// client has already disconnected and cancelled the request context.
+func (p *Proxy) finalizeAdmission(handle AdmitToken, resolvedRequestID string) {
+	if p.admitter == nil || handle == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	p.admitter.FinalizeAdmission(ctx, handle, resolvedRequestID)
+}
+
 // resolveEgressTarget parses a Plane-A route's resolved target URL into an
 // upstream *url.URL, or nil when it is empty/unparseable (a statically-invalid
 // target the obs boundary already blocked in enforce, or a bare advise id that
@@ -211,12 +263,12 @@ func (p *Proxy) forwardEgressFailOpen(r *http.Request, upstream *url.URL, upstre
 	}
 	outURL := *upstream
 	outURL.Path = joinPath(upstream.Path, upstreamPath)
-	outURL.RawQuery = r.URL.RawQuery
+	outURL.RawQuery = stripHostedIdentityQueryParams(r.URL.RawQuery)
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, outURL.String(), bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, err
 	}
-	copyRequestHeaders(outReq.Header, r.Header)
+	p.copyRequestHeaders(outReq.Header, r.Header)
 	outReq.Header.Set("Accept-Encoding", "identity")
 	outReq.Host = upstream.Host
 	outReq.ContentLength = int64(len(reqBody))

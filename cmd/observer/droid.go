@@ -44,6 +44,8 @@ func newDroidCmd() *cobra.Command {
 			"is unprobed, so pointing it at the proxy would be a guess. Token\n" +
 			"capture happens via observer's local droid adapter (session JSONL +\n" +
 			"the settings.json sidecar's session-level cumulative counts).\n\n" +
+			"droid's `--model` flag is only available on the headless `droid exec`\n" +
+			"subcommand; the interactive session has no model selection.\n\n" +
 			"With --continue-from <session-id> the launcher distills a handover\n" +
 			"from that session and seeds it as droid's trailing positional prompt\n" +
 			"(delivery=inject_prompt), so droid opens an interactive session\n" +
@@ -51,8 +53,13 @@ func newDroidCmd() *cobra.Command {
 			"All arguments after the subcommand are forwarded to droid. Use `--`\n" +
 			"to separate observer flags from droid flags. NEVER touches\n" +
 			"FACTORY_API_KEY or stored auth.",
-		SilenceErrors: true,
+		SilenceErrors:      true,
+		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args, done, err := launcherArgsOrDone(cmd, args)
+			if done {
+				return err
+			}
 			// Attach gate (attach-all-launchers): default-on attach hands the PTY
 			// to the daemon. Seed-only spec (droid is launched non-proxied — no
 			// proxy env, no escape-hatch flag); incompatible when a handoff fork
@@ -150,7 +157,6 @@ func newDroidCmd() *cobra.Command {
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "droid")
 	resume = registerResumeFlag(cmd, "droid")
-	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 

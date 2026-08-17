@@ -21,6 +21,7 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/handoff"
 	"github.com/marmutapp/superbased-observer/internal/integration"
 	"github.com/marmutapp/superbased-observer/internal/remoteauth"
+	"github.com/marmutapp/superbased-observer/internal/store"
 	"github.com/marmutapp/superbased-observer/internal/termrun"
 	"github.com/marmutapp/superbased-observer/internal/termsvc"
 )
@@ -223,6 +224,39 @@ type FreshLaunchSpec struct {
 	// handleTerminalLaunch's shellPseudoTool branch, gated by
 	// [terminal.launch].allow_shell instead of allowed_tools.
 	Shell bool
+	// Model is an optional client-chosen model identifier for the New
+	// Terminal model picker (B5). It is validated server-side by
+	// handleTerminalLaunch (re-derived membership against
+	// modelSuggestionsFor's own output — never trusted verbatim from the
+	// client) before being threaded down; an invalid or unknown value is
+	// silently dropped so the launch proceeds with the tool's own
+	// default, never a 400 and never a blocked launch. The composition
+	// into argv/env happens in termsvc.LaunchFresh via
+	// integration.ModelLaunch, so the daemon's own capability registry —
+	// not this handler — decides whether a model is an arg or an env var.
+	Model string
+	// Sandbox requests a B9 filesystem-isolated launch (bwrap). By the time
+	// this reaches CreateFresh, handleTerminalLaunch has already run the
+	// fail-CLOSED sandbox validation (nil seam / unavailable verdict /
+	// unknown workspace source / missing project root / unmapped tool all
+	// refuse the launch BEFORE this spec is built) — so a true value here
+	// is a request the server has already confirmed it CAN honour. Ignored
+	// by the application service when Shell is set (sandboxing a bare
+	// shell is not v1 scope).
+	Sandbox bool
+	// WorkspaceSource selects how the sandboxed workspace is prepared:
+	// "live" (default; no copy — the workspace IS ProjectRoot),
+	// "clone-local", "clone-remote", or "worktree" (off by default).
+	// handleTerminalLaunch defaults an empty client value to "live" and
+	// validates it by MEMBERSHIP against the server's own probed Sources
+	// list before it ever reaches here. Ignored when Sandbox is false.
+	WorkspaceSource string
+	// WorkspaceRemote is the remote URL for a "clone-remote"
+	// WorkspaceSource. Ignored otherwise.
+	WorkspaceRemote string
+	// WorkspaceBranch is an optional branch to check out after clone/
+	// worktree. Ignored for "live".
+	WorkspaceBranch string
 }
 
 // ResumeLaunchSpec is the dashboard's server-derived NATIVE-resume request
@@ -302,6 +336,11 @@ type LaunchInfo struct {
 	InitialCols uint16 `json:"initial_cols,omitempty"`
 	Rows        uint16 `json:"rows,omitempty"`
 	Cols        uint16 `json:"cols,omitempty"`
+	// Sandboxed reports whether this run was launched through the B9
+	// Sandboxer seam (bwrap-isolated). In-memory only — see B9 plan §10
+	// ledger G19 (no durable "was this run sandboxed?" column exists).
+	// Drives the dashboard's "sandboxed" pill on the Terminals list/header.
+	Sandboxed bool `json:"sandboxed,omitempty"`
 }
 
 // Errors the cmd adapter maps termsession errors onto so the handler can
@@ -337,6 +376,13 @@ var (
 	// single-flight refusal (409). Prevents a POST-spam from spawning many
 	// privileged PTYs.
 	ErrLaunchSetupInFlight = errors.New("a setup session of this kind is already starting")
+	// ErrLaunchSandboxUnavailable signals a sandbox=true fresh-launch
+	// request arrived with Options.SandboxProber nil — the B9 sandbox
+	// feature is entirely absent from this daemon build/config (501). This
+	// is the A5 build-order invariant: a nil seam is fail-CLOSED, exactly
+	// like ErrLaunchUnsupported for the base PTY seam, never a silent
+	// fall-through to an unsandboxed launch.
+	ErrLaunchSandboxUnavailable = errors.New("sandboxed launch requested but the sandbox seam is not configured on this daemon")
 )
 
 // ControlDenialReason is the stable wire taxonomy for a refused remote writer
@@ -830,6 +876,88 @@ func launchableTools() []string {
 	return out
 }
 
+// RecentModelsWindow and RecentModelsLimit bound the store history query
+// behind the Options.RecentModels seam (B5): 180 days / 12 rows keeps the
+// "recent" list to genuinely-recent, genuinely-distinct choices without an
+// unbounded scan of token_usage. Exported so the cmd-side seam constructor
+// (recentModelsSeam) uses the same values the picker's semantics document —
+// one authority, not a duplicated literal.
+const (
+	RecentModelsWindow = 180 * 24 * time.Hour
+	RecentModelsLimit  = 12
+)
+
+// modelSuggestion is one entry in the New Terminal model picker's
+// suggestion list (B5). Source is "history" for a model this tool has
+// actually been launched with recently, or "known" for a model the
+// capability registry documents as a grounded example but that hasn't been
+// observed locally yet. Count/LastUsed are populated only for "history"
+// entries (omitempty — a "known" entry never fabricates usage stats).
+type modelSuggestion struct {
+	Model    string `json:"model"`
+	Count    int    `json:"count,omitempty"`
+	LastUsed string `json:"last_used,omitempty"`
+	Source   string `json:"source"`
+}
+
+// modelSuggestionsFor composes the New Terminal model picker's suggestion
+// list for tool (B5): recent usage history (via the nil-able
+// Options.RecentModels seam) followed by the capability registry's
+// grounded Known examples, deduplicated against history. It is the SINGLE
+// composition point shared by handleTerminalLaunchModels (the picker's own
+// endpoint) and handleTerminalLaunch (server-side membership validation of
+// a client-supplied model) — dispatch is on capability SHAPE
+// (ModelSpec.Kind), never tool name (CLAUDE.md #3).
+//
+// supported is false — with an empty, non-nil suggestion slice — when the
+// tool has no registry row, no launch capability, or a zero ModelSpec
+// (ModelKind ModelNone); the picker stays hidden for that row, the honest
+// floor. It is also false when the RecentModels seam itself is nil (an
+// older daemon build without the store wiring) so the endpoint and the
+// launch-time validator degrade identically to a preflight-less daemon.
+func modelSuggestionsFor(ctx context.Context, recentModels func(context.Context, string) ([]store.RecentToolModel, error), tool string) (supported bool, suggestions []modelSuggestion) {
+	suggestions = []modelSuggestion{}
+	if recentModels == nil {
+		return false, suggestions
+	}
+	cap, ok := integration.For(tool)
+	if !ok || !cap.Handoff.Launchable() || cap.Model.Kind == integration.ModelNone {
+		return false, suggestions
+	}
+
+	seen := make(map[string]bool)
+	if history, err := recentModels(ctx, tool); err == nil {
+		for _, h := range history {
+			suggestions = append(suggestions, modelSuggestion{
+				Model: h.Model, Count: h.Count, LastUsed: h.LastUsed, Source: "history",
+			})
+			seen[h.Model] = true
+		}
+	}
+	// A history load error is fail-soft here (not fail-closed): the Known
+	// list below still gives the picker something honest to show, and the
+	// endpoint's overall response is still `supported: true`.
+	for _, m := range cap.Model.Known {
+		if !seen[m] {
+			suggestions = append(suggestions, modelSuggestion{Model: m, Source: "known"})
+			seen[m] = true
+		}
+	}
+	return true, suggestions
+}
+
+// modelIsMember reports whether model appears among suggestions — the
+// server-side membership check handleTerminalLaunch applies to a
+// client-supplied model before trusting it (B5).
+func modelIsMember(suggestions []modelSuggestion, model string) bool {
+	for _, s := range suggestions {
+		if s.Model == model {
+			return true
+		}
+	}
+	return false
+}
+
 type launchRequest struct {
 	To          string `json:"to"`
 	Carry       string `json:"carry"`
@@ -1095,12 +1223,31 @@ func (s *Server) handleSessionResume(w http.ResponseWriter, r *http.Request, ses
 }
 
 // terminalLaunchRequest is the POST /api/terminal/launch body (F1). The only
-// client inputs are the tool NAME (allow-listed server-side) and an optional
-// project_root (canonicalized + allow-list-checked server-side). No argv, no
-// session id (fresh launch), no BinPath.
+// client inputs are the tool NAME (allow-listed server-side), an optional
+// project_root (canonicalized + allow-list-checked server-side), and an
+// optional model (B5, New Terminal model picker) — re-validated by
+// MEMBERSHIP against modelSuggestionsFor's own output server-side (never
+// trusted verbatim); an invalid/unknown value is silently dropped rather
+// than rejected, see handleTerminalLaunch. No argv, no session id (fresh
+// launch), no BinPath.
 type terminalLaunchRequest struct {
 	Tool        string `json:"tool"`
 	ProjectRoot string `json:"project_root"`
+	Model       string `json:"model"`
+	// Sandbox requests a B9 filesystem-isolated launch (bwrap). Unlike
+	// Model (a preference, fail-open on any problem), a true Sandbox is a
+	// SAFETY property handleTerminalLaunch validates fail-CLOSED — see the
+	// "validation inversion vs B5" comment on that handler.
+	Sandbox bool `json:"sandbox"`
+	// WorkspaceSource / WorkspaceRemote / WorkspaceBranch select and
+	// parameterize the B9 workspace-preparation mechanism for a sandboxed
+	// launch (plan §4/§5). All three are re-validated server-side —
+	// WorkspaceSource by membership against the daemon's own probed
+	// Sources list, never trusted verbatim from the client. Ignored when
+	// Sandbox is false.
+	WorkspaceSource string `json:"workspace_source"`
+	WorkspaceRemote string `json:"workspace_remote"`
+	WorkspaceBranch string `json:"workspace_branch"`
 }
 
 // terminalLaunchResponse mirrors launchResponse plus the tool label so the
@@ -1148,11 +1295,84 @@ func (s *Server) handleTerminalLaunch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Model (B5): re-derive the SAME suggestion list the picker itself
+	// showed and require membership before trusting a client-supplied
+	// value. A model that isn't in that list — including every case where
+	// the tool has no model capability at all — is silently DROPPED so the
+	// launch proceeds with the tool's own default; this is deliberate
+	// fail-open (never a 400, never a blocked launch) per the New Terminal
+	// model picker's semantics.
+	model := strings.TrimSpace(body.Model)
+	if model != "" && !isShell {
+		if _, suggestions := modelSuggestionsFor(r.Context(), s.opts.RecentModels, body.Tool); !modelIsMember(suggestions, model) {
+			model = ""
+		}
+	} else {
+		model = ""
+	}
+	// Sandbox (B9, plan §5): a client-supplied workspace_source is
+	// re-derived server-side by MEMBERSHIP against the daemon's own probed
+	// Sources list — the SAME re-derivation discipline the model check
+	// above applies — but where an unusable Model is silently DROPPED
+	// (fail-open: a model is a preference, the launch still succeeds
+	// without it), an unsatisfiable sandbox request FAILS THE LAUNCH
+	// outright (fail-closed: the caller asked for isolation, and silently
+	// handing back an unsandboxed process instead would be a safety
+	// regression, not a graceful degrade). Both rules get this comment
+	// because the two endpoints look identical at a glance and the
+	// difference is deliberate, not an oversight. See plan §7 "no
+	// unsandboxed fallback path exists in the code" (mutation proof #1).
+	workspaceSource := strings.TrimSpace(body.WorkspaceSource)
+	if workspaceSource == "" {
+		workspaceSource = "live"
+	}
+	if body.Sandbox {
+		if s.opts.SandboxProber == nil {
+			// A5: nil seam = feature absent = fail closed, exactly like the
+			// LaunchManager==nil 503 above but scoped to the sandbox
+			// sub-feature (501 — capability absent on this daemon build/
+			// config, distinct from LaunchManager's total absence).
+			http.Error(w, ErrLaunchSandboxUnavailable.Error(), http.StatusNotImplemented)
+			return
+		}
+		av := s.opts.SandboxProber.ProbeSandbox(r.Context())
+		if !av.Available {
+			http.Error(w, "sandbox unavailable ("+av.Verdict+"): "+av.Reason, statusForSandboxVerdict(av.Verdict))
+			return
+		}
+		src, ok := sandboxSourceByID(av.Sources, workspaceSource)
+		switch {
+		case !ok:
+			http.Error(w, "unknown workspace source "+workspaceSource, http.StatusBadRequest)
+			return
+		case !src.Available:
+			http.Error(w, "workspace source "+workspaceSource+" is not available: "+src.Reason, http.StatusBadRequest)
+			return
+		}
+		if workspaceSource == "live" && strings.TrimSpace(body.ProjectRoot) == "" {
+			http.Error(w, "a sandboxed terminal needs a project directory", http.StatusBadRequest)
+			return
+		}
+		toolAvail, ok := av.Tools[body.Tool]
+		switch {
+		case !ok:
+			http.Error(w, "tool "+body.Tool+" cannot be sandboxed: no grounded sandbox row for this tool", http.StatusBadRequest)
+			return
+		case !toolAvail.Available:
+			http.Error(w, "tool "+body.Tool+" cannot be sandboxed: "+toolAvail.Reason, http.StatusBadRequest)
+			return
+		}
+	}
 	handle, err := s.opts.LaunchManager.CreateFresh(FreshLaunchSpec{
-		Tool:        body.Tool,
-		Subcommand:  sub,
-		ProjectRoot: body.ProjectRoot,
-		Shell:       isShell,
+		Tool:            body.Tool,
+		Subcommand:      sub,
+		ProjectRoot:     body.ProjectRoot,
+		Shell:           isShell,
+		Model:           model,
+		Sandbox:         body.Sandbox,
+		WorkspaceSource: workspaceSource,
+		WorkspaceRemote: body.WorkspaceRemote,
+		WorkspaceBranch: body.WorkspaceBranch,
 	})
 	if err != nil {
 		switch {
@@ -1168,6 +1388,17 @@ func (s *Server) handleTerminalLaunch(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusTooManyRequests)
 		case errors.Is(err, ErrLaunchUnsupported):
 			http.Error(w, err.Error(), http.StatusNotImplemented)
+		case errors.Is(err, termsvc.ErrSandboxUnavailable):
+			// U4's own fail-closed refusal (e.g. the Sandboxer seam was
+			// removed/raced between this handler's probe check and the
+			// actual spawn) — 501, same class as ErrLaunchSandboxUnavailable
+			// above.
+			http.Error(w, err.Error(), http.StatusNotImplemented)
+		case errors.Is(err, termsvc.ErrWorkspacePrepFailed):
+			// git/clone workspace preparation failed server-side — 500 per
+			// plan §7 (the default branch below already maps to 500; this
+			// case exists so the mapping is explicit and documented).
+			http.Error(w, "workspace preparation failed: "+err.Error(), http.StatusInternalServerError)
 		default:
 			http.Error(w, "launch failed: "+err.Error(), http.StatusInternalServerError)
 		}
@@ -1177,6 +1408,63 @@ func (s *Server) handleTerminalLaunch(w http.ResponseWriter, r *http.Request) {
 		Token: handle, Tool: body.Tool, Subcommand: sub,
 		HasProjectRoot: s.hasProjectRoot(handle),
 	})
+	// Kick the watcher so a tool whose sessions directory did not exist
+	// at daemon start (just-installed Muse/Prime/…) is hot-added and
+	// scanned. Fire-and-forget; never blocks the launch response.
+	s.kickWatchRootsRefresh()
+}
+
+// kickWatchRootsRefresh invokes Options.RefreshWatchRoots when wired.
+// Fail-open: a nil seam is a no-op (standalone dashboard without watcher).
+func (s *Server) kickWatchRootsRefresh() {
+	if s.opts.RefreshWatchRoots == nil {
+		return
+	}
+	s.opts.RefreshWatchRoots()
+}
+
+// sandboxVerdictStatus maps a closed B9 sandbox verdict (plan §7) to the
+// HTTP status handleTerminalLaunch's fail-closed check refuses the launch
+// with. Table-driven per CLAUDE.md #5 (a growing if/else-if ladder is
+// refactored before it lands): verdicts describing the daemon's own
+// environment — a missing/too-old backend, an unsupported OS, or a denied
+// user-namespace sysctl — are 501 (feature absent server-side, nothing the
+// caller can fix); "disabled_by_config" is 403 (the operator switched it
+// off, an authorization refusal, not a capability gap). An unrecognised
+// verdict is NOT in this table — statusForSandboxVerdict below defaults it
+// to 501, the fail-closed floor, so a new verdict added to the probe by a
+// future change is never silently treated as available.
+var sandboxVerdictStatus = map[string]int{
+	"unsupported_platform": http.StatusNotImplemented,
+	"backend_missing":      http.StatusNotImplemented,
+	"backend_too_old":      http.StatusNotImplemented,
+	"userns_denied":        http.StatusNotImplemented,
+	"tool_unmapped":        http.StatusNotImplemented,
+	"disabled_by_config":   http.StatusForbidden,
+}
+
+// statusForSandboxVerdict resolves sandboxVerdictStatus with a fail-closed
+// default (501) for any verdict the table doesn't name.
+func statusForSandboxVerdict(verdict string) int {
+	if status, ok := sandboxVerdictStatus[verdict]; ok {
+		return status
+	}
+	return http.StatusNotImplemented
+}
+
+// sandboxSourceByID finds the SandboxSourceAvail entry matching id in a
+// probe's Sources list — the server-side membership check
+// handleTerminalLaunch applies to a client-supplied workspace_source
+// before trusting it, mirroring modelIsMember's role for the model picker.
+// ok is false when no entry matches id at all (an unrecognised source
+// name, distinct from a recognised-but-unavailable one).
+func sandboxSourceByID(sources []SandboxSourceAvail, id string) (src SandboxSourceAvail, ok bool) {
+	for _, s := range sources {
+		if s.ID == id {
+			return s, true
+		}
+	}
+	return SandboxSourceAvail{}, false
 }
 
 // handleTerminalSessions serves GET /api/terminal/sessions — the live
@@ -1263,6 +1551,43 @@ func (s *Server) handleTerminalPreflight(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, pf)
 }
 
+// terminalLaunchModelsResponse is the wire shape of
+// GET /api/terminal/launch/models — the New Terminal model picker's
+// suggestion list (B5). Supported is false (with an empty Models slice)
+// when the tool has no grounded model-selection mechanism (ModelSpec.Kind
+// ModelNone) or the tool is unknown/not launchable; the frontend treats
+// supported=false identically to a fetch error — no picker.
+type terminalLaunchModelsResponse struct {
+	Tool      string            `json:"tool"`
+	Supported bool              `json:"supported"`
+	Models    []modelSuggestion `json:"models"`
+}
+
+// handleTerminalLaunchModels serves GET /api/terminal/launch/models?tool=<name>
+// — the New Terminal model picker's suggestion list (B5, VIEW). It composes
+// recent usage history (via the nil-able Options.RecentModels seam) with the
+// capability registry's grounded Known examples through the single shared
+// modelSuggestionsFor function — the SAME composition handleTerminalLaunch
+// uses to validate a client-supplied model. A nil RecentModels seam or an
+// unknown/non-model-capable tool both resolve to supported=false rather than
+// an error status, matching the frontend's fail-soft "any problem = no
+// picker" contract (unlike preflight, which distinguishes 501/400).
+func (s *Server) handleTerminalLaunchModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	tool := strings.TrimSpace(r.URL.Query().Get("tool"))
+	if tool == "" {
+		http.Error(w, "missing tool query parameter", http.StatusBadRequest)
+		return
+	}
+	supported, suggestions := modelSuggestionsFor(r.Context(), s.opts.RecentModels, tool)
+	writeJSON(w, terminalLaunchModelsResponse{
+		Tool: tool, Supported: supported, Models: suggestions,
+	})
+}
+
 // terminalInstallRequest is the POST /api/terminal/install body. The only client
 // input is the tool NAME — used SOLELY as a registry map key to look up the
 // server-side install argv; the request never contributes argv (the injection
@@ -1327,6 +1652,10 @@ func (s *Server) handleTerminalInstall(w http.ResponseWriter, r *http.Request) {
 		"tool":    tool,
 		"command": display,
 	})
+	// Best-effort: the install script may create the tool's home/sessions
+	// tree before first launch. Even when it does not, the retry schedule
+	// behind RefreshWatchRoots is harmless. Primary kick remains post-launch.
+	s.kickWatchRootsRefresh()
 }
 
 // handleAttachSessions serves GET /api/attach/sessions — the live

@@ -56,8 +56,13 @@ func newOpencodeCmd() *cobra.Command {
 			"proxy-level api_turns). Run `observer doctor opencode` to check.\n\n" +
 			"Requires a running observer proxy. Start one with `observer\n" +
 			"start` or `observer proxy start` first.",
-		SilenceErrors: true,
+		SilenceErrors:      true,
+		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args, done, err := launcherArgsOrDone(cmd, args)
+			if done {
+				return err
+			}
 			// Attach-by-default (attach-all-launchers): when attach resolves,
 			// hand the PTY to the daemon so the dashboard can view/drive this
 			// SAME live opencode session. opencode self-routes via
@@ -151,7 +156,6 @@ func newOpencodeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "opencode")
 	resume = registerResumeFlag(cmd, "opencode")
-	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 

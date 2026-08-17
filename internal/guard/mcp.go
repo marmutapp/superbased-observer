@@ -166,6 +166,8 @@ func (g *Guard) EvaluateMCPFindings(findings []policy.MCPFinding, now time.Time)
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
+	// One snapshot for the whole finding set (NIT contract).
+	es := g.set.Load()
 	var out []ActionVerdict
 	for i := range findings {
 		f := findings[i]
@@ -177,7 +179,7 @@ func (g *Guard) EvaluateMCPFindings(findings []policy.MCPFinding, now time.Time)
 			MCPFindings: []policy.MCPFinding{f},
 			Now:         now,
 		}
-		verdict, guardErr := g.Evaluate(ev)
+		verdict, guardErr := g.evaluateWith(es, ev)
 		if verdict.Decision < policy.DecisionFlag && guardErr == nil {
 			continue
 		}
@@ -188,7 +190,7 @@ func (g *Guard) EvaluateMCPFindings(findings []policy.MCPFinding, now time.Time)
 				Timestamp: now,
 			},
 			Kind:       policy.KindConfigChange,
-			Category:   g.CategoryFor(verdict.RuleID),
+			Category:   g.categoryWith(es, verdict.RuleID),
 			Verdict:    verdict,
 			GuardError: guardErr != nil,
 		})

@@ -99,11 +99,17 @@ type gateCallSite struct {
 	beforeS bool   // the call must precede sql.Open in the same function
 }
 
+// gateCallSites holds the AGENT-side seams, which exist in every tree.
+// The org-server seams are appended by live_db_gate_orgserver_test.go's
+// init() — a separate file because it names paths under
+// internal/orgserver/, which the public source snapshot does not contain
+// (scripts/release.sh PRIVATE_ONLY_PATHS). One owner, one feed path: this
+// var is declared here and appended to in exactly that one other place.
+// Do NOT inline the org-server rows back into this literal — the pins are
+// path-based, so a missing file is a t.Fatalf, not a skip.
 var gateCallSites = []gateCallSite{
 	{filepath.Join("internal", "db", "db.go"), "Open", "GuardLiveDB", true},
 	{filepath.Join("internal", "db", "db.go"), "runMigrations", "GuardLiveDBHandle", false},
-	{filepath.Join("internal", "orgserver", "db", "db.go"), "Open", "GuardLiveDB", true},
-	{filepath.Join("internal", "orgserver", "db", "db.go"), "runMigrations", "GuardLiveDBHandle", false},
 }
 
 // TestLiveDBGate_StructuralPins is the cheap structural half: it fails if the

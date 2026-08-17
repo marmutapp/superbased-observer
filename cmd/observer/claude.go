@@ -73,8 +73,13 @@ func newClaudeCmd() *cobra.Command {
 			"and print a one-line PASS/FAIL summary without launching claude.\n\n" +
 			"Requires a running observer proxy. Start one with `observer start`\n" +
 			"or `observer proxy start` first.",
-		SilenceErrors: true,
+		SilenceErrors:      true,
+		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args, done, err := launcherArgsOrDone(cmd, args)
+			if done {
+				return err
+			}
 			return runClaudeLauncher(cmd.Context(), claudeLauncherOptions{
 				configPath:   configPath,
 				proxyURL:     proxyURL,
@@ -133,7 +138,6 @@ func newClaudeCmd() *cobra.Command {
 		cmd.Flags().StringVar(&resume, "resume", "",
 			"Resume a CLOSED claude-code session by its id: launches `claude --resume <id>`, reattaching the tool's REAL prior conversation (signed thinking blocks and all) — NOT a distilled fork. Mutually exclusive with --continue-from/--carry/--from-message/--from-time. Combine with --attach to resume into a daemon-owned session the dashboard can join. See docs/plans/session-attach-design-2026-07-19.md.")
 	}
-	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 

@@ -109,7 +109,14 @@ func newStartCmd() *cobra.Command {
 			// daemons can be detected by `observer doctor`. Two
 			// observers writing the same SQLite file race on cursor
 			// state and have silently corrupted backfill in the past.
-			cfgForLock, lockErr := config.Load(config.LoadOptions{GlobalPath: configPath})
+			// LoadGovernance rather than Load: the daemon must retain WHICH
+			// sidecar generation its own process was built from, because pinned
+			// settings are restart-bound for its own subsystems (this function
+			// reads config once). That retained identity is what makes
+			// pending_restart reachable instead of the node overclaiming
+			// `effective` the instant it writes a new pinned map (§1.6 /
+			// review M3).
+			cfgForLock, govOutcome, lockErr := config.LoadGovernance(config.LoadOptions{GlobalPath: configPath})
 			if lockErr == nil {
 				binary, _ := absoluteBinaryPath()
 				lockPath, lerr := diag.WriteLock(filepath.Dir(cfgForLock.Observer.DBPath), diag.LockInfo{
@@ -159,11 +166,107 @@ func newStartCmd() *cobra.Command {
 				autoRegisterHooks(cmd.OutOrStdout(), cmd.ErrOrStderr(), configPath)
 			}
 
-			p, pCleanup, addr, profilesReload, routingDemotions, err := buildProxy(ctx, configPath, recipeName, port, bindAddr)
+			// Org push client (Teams) — constructed only when [org_client]
+			// enabled = true, so a solo-local install never probes the OS
+			// keychain or opens an org code path. Shared with the dashboard
+			// (its enrolment endpoints) and driven by the push loop below.
+			// A construction failure is WARN-only: org mode must never block
+			// the daemon (P1).
+			//
+			// Built BEFORE buildProxy (not after, as in the original
+			// ordering) because the C1 judge relay
+			// (docs/plans/c1-judge-relay-spec-2026-08-15.md §3) needs a
+			// plain orgJudgeRelayFunc threaded INTO buildProxy so the
+			// admission/eval judge wiring inside it can use the relay. A nil
+			// orgClient (org push disabled, or construction failed) yields a
+			// nil relay func — orgJudgeRelayFuncFor is nil-safe — which the
+			// judge build treats as "no relay available" (soft fail).
+			var orgClient *orgclient.Client
+			if lockErr == nil && cfgForLock.OrgClient.Enabled {
+				c, orgCleanup, _, oerr := buildOrgClient(ctx, configPath)
+				if oerr != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "org push disabled — client init failed: %v\n", oerr)
+				} else {
+					orgClient = c
+					defer orgCleanup()
+				}
+			}
+			orgJudgeRelay := orgJudgeRelayFuncFor(orgClient)
+
+			p, pCleanup, addr, profilesReload, routingDemotions, admissionHandle, routingHandle, err := buildProxy(ctx, configPath, recipeName, port, bindAddr, orgJudgeRelay)
 			if err != nil {
 				return err
 			}
 			defer pCleanup()
+
+			// ONE daemon-lifetime gateway.providers install seam, shared by
+			// the LKG loader, the steady-state poller AND the P0-6 reporter.
+			// It must be a single instance: the handle is the only holder of
+			// the accepted org lane table's identity (version + signed
+			// BodyHash), so a second instance would report a different — and
+			// wrong — effective state than the one that installed the table
+			// (docs/plans/policy-state-v2-gateway-providers-spec-2026-08-15.md
+			// §2.2). nil when config never loaded, in which case orgClient is
+			// nil too and no call site is reached.
+			var gw *gatewayProvidersHandle
+			if lockErr == nil {
+				bootstrapUpstreams, bootstrapAutoLane := cfgForLock.Proxy.Upstreams, cfgForLock.Proxy.AutoDefaultLane
+				gw = newGatewayProvidersHandle(
+					p.SetLaneTable,
+					func() {
+						// A withdrawn/rejected org policy restores the node's
+						// own config.toml lanes, never an empty table
+						// (fail-open to the operator's own configured
+						// routing, not to "everything unrouted").
+						_ = p.SetLaneTable(bootstrapUpstreams, bootstrapAutoLane)
+					},
+					p.LaneTable,
+				)
+			}
+
+			// ONE daemon-lifetime node.governance install seam (admin-
+			// controlled Plane B, docs/plans/admin-controlled-plane-b-spec-2026-08-15.md
+			// §3), for the same one-owner reason as gw above: it holds the
+			// accepted resource's identity AND is the single place the
+			// enrolment GRANT is intersected with it, so the dashboard's
+			// route guard, GET /api/governance and the P0-6 reporter can
+			// never disagree about what this node actually applies.
+			//
+			// Its store-backed identity loader is attached below, where the
+			// daemon's long-lived DB handle exists. Until then (and forever
+			// on a build with no DB) the handle resolves to the dormant
+			// posture, which is exactly an ungranted node.
+			ngov := newNodeGovernanceHandle(nil, slog.Default())
+			if lockErr == nil {
+				// The daemon is the ONE writer of the governance sidecar
+				// (CLAUDE.md #4). Every other process — hooks, `observer
+				// serve`, every subcommand — READS it through config.Load.
+				// There is deliberately no second path in which the daemon
+				// injects its in-memory posture into its own config.Load:
+				// that would recreate the two-owner split in a subtler form,
+				// with the daemon converging a cycle earlier than everything
+				// else and reporting `effective` while the hooks were still
+				// one generation behind.
+				ngov.SetSidecar(
+					config.ResolveGovernanceSidecarPath(cfgForLock, ""),
+					version,
+					startupSidecarFrom(govOutcome),
+				)
+			}
+			// The renewal latch is per-daemon-run and in-memory (§4.3): a
+			// persisted deny latch would be a second, node-local revocation
+			// clock an admin cannot clear.
+			renewalTracker := &orgclient.RenewalTracker{}
+			if orgClient != nil {
+				orgClient.SetRenewalSink(renewalTracker.Observe)
+				if lockErr == nil {
+					orgClient.SetGovernanceSidecarPath(config.ResolveGovernanceSidecarPath(cfgForLock, ""))
+					// Share directives are LOWERING-ONLY and HOT (§2.4): the
+					// provider resolves cfg.Share ∧ Effective.Share on every
+					// push, reading the same handle the dashboard guard reads.
+					orgClient.SetShareProvider(governanceShareProvider(cfgForLock.OrgClient, ngov))
+				}
+			}
 
 			w, wCleanup, err := buildWatcher(ctx, configPath)
 			if err != nil {
@@ -180,23 +283,6 @@ func newStartCmd() *cobra.Command {
 			// tracking is disabled ([cachetrack].enabled = false → nil).
 			if eng := p.CacheEngine(); eng != nil {
 				w.SetCacheEngine(eng)
-			}
-
-			// Org push client (Teams) — constructed only when [org_client]
-			// enabled = true, so a solo-local install never probes the OS
-			// keychain or opens an org code path. Shared with the dashboard
-			// (its enrolment endpoints) and driven by the push loop below.
-			// A construction failure is WARN-only: org mode must never block
-			// the daemon (P1).
-			var orgClient *orgclient.Client
-			if lockErr == nil && cfgForLock.OrgClient.Enabled {
-				c, orgCleanup, _, oerr := buildOrgClient(ctx, configPath)
-				if oerr != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(), "org push disabled — client init failed: %v\n", oerr)
-				} else {
-					orgClient = c
-					defer orgCleanup()
-				}
 			}
 
 			// OTel exporter (Teams M4) — constructed only when [exporter.otel]
@@ -252,6 +338,12 @@ func newStartCmd() *cobra.Command {
 					return err
 				}
 				defer surfaces.close()
+				// The governance handle reads the enrolment grant through the
+				// daemon's own long-lived DB handle. It is bounded-refresh
+				// rather than event-driven because `observer enroll` writes
+				// the grant from a SEPARATE process (§2.3), which no
+				// in-process sink can observe.
+				ngov.SetIdentityLoader(governanceIdentityLoader(store.New(database)))
 				launchMgr, launchStatus := surfaces.launchMgr, surfaces.launchStatus
 				attachHostImpl = surfaces.attachHost
 				remoteCtrl := buildRemoteController(cfg, database)
@@ -261,6 +353,12 @@ func newStartCmd() *cobra.Command {
 				// assembly as `observer dashboard`.
 				wireRemoteExecuteTier(cfg, launchMgr, remoteCtrl)
 				opts := dashboard.Options{
+					// Admin-controlled Plane B (spec §3.5): the ONE seam the
+					// dashboard has onto governance. nil on an ungoverned
+					// build; here it is the daemon's single install seam, so
+					// the route guard, the SPA and the P0-6 report can never
+					// disagree about what this node applies.
+					Governance:            ngov.Effective,
 					DB:                    database,
 					DBPath:                cfg.Observer.DBPath,
 					CostEngine:            cost.NewEngine(cfg.Intelligence),
@@ -299,18 +397,35 @@ func newStartCmd() *cobra.Command {
 					// D4: the generalized-observability subsystem registers
 					// its /api/obs/* trajectory endpoints here (the single
 					// host->obs seam; nil when disabled or under no_obs).
-					ExtraRoutes: obsDashboardRoutes(ctx, cfg, configPath, database, slog.Default()),
+					// admissionHandle (gap P0-7) shares the proxy's ONE live
+					// admission service with the dashboard policy/egress editors,
+					// so an edit hot-swaps the instance the proxy enforces.
+					ExtraRoutes: obsDashboardRoutes(ctx, cfg, configPath, database, admissionHandle, slog.Default()),
 					// Embedded web-terminal launcher (docs/session-handoff.md
 					// launch section). Nil when [handoff].allow_dashboard_launch
 					// is false → endpoints 503, button hidden.
 					LaunchManager:  launchMgr,
 					TerminalStatus: launchStatus,
+					// B9 sandboxed terminals: the availability probe behind
+					// GET /api/terminal/sandbox + the fail-closed launch
+					// validation. Nil unless [terminal.sandbox].enabled →
+					// endpoint reports disabled and a sandbox request 501s.
+					SandboxProber: surfaces.sandboxProber,
 					// Tool-binary-resolution seams (tool-binary-resolution arc
 					// §5): pre-launch verdict + guided install. Plain funcs so
 					// the dashboard package never imports internal/toolresolve.
 					ToolPreflight:    toolPreflightSeam(resolvedConfigPath, allowToolInstallSeam(resolvedConfigPath)),
 					AllowToolInstall: allowToolInstallSeam(resolvedConfigPath),
 					ToolInstallHint:  toolInstallHintSeam(),
+					// After New Terminal install/launch: re-detect adapters
+					// and hot-add newly-existing session dirs into the live
+					// watcher (Muse/Prime-after-install capture gap).
+					RefreshWatchRoots: refreshWatchRootsSeam(w),
+					// New Terminal model picker (B5): recent-usage history
+					// over the daemon's own database, composed with the
+					// capability registry's Known examples by
+					// modelSuggestionsFor.
+					RecentModels: recentModelsSeam(database),
 					// Per-terminal project panel (Arc A): token→root resolver
 					// from termsvc. Nil when the launch manager is absent → 404.
 					ProjectRootResolver: projectRootResolver(launchMgr),
@@ -415,6 +530,10 @@ func newStartCmd() *cobra.Command {
 					return err
 				}
 				defer surfaces.close()
+				// Same governance identity loader as the dashboard branch:
+				// even with no dashboard to govern, the node must still
+				// report a truthful node.governance effective-state row.
+				ngov.SetIdentityLoader(governanceIdentityLoader(store.New(database)))
 				attachHostImpl = surfaces.attachHost
 			}
 
@@ -450,7 +569,40 @@ func newStartCmd() *cobra.Command {
 					addr)
 			}
 
+			// Plane-A P0-5 Phase W (plan §6.5): load a verified
+			// Last-Known-Good v1 policy resource for every v1 family into
+			// the shared admission service (admission.input,
+			// egress.routing_guardrail) AND — Phase 3, gateway config
+			// plane spec — the proxy's live lane table (gateway.providers)
+			// BEFORE the proxy listener below starts accepting traffic —
+			// run synchronously, here, ahead of the errgroup that
+			// launches ListenAndServe. Its own short-lived config+DB
+			// handle (closed immediately after) is sufficient: the
+			// org-layer identity fence itself is wired inside
+			// wireAdmission (reusing the daemon's own long-lived db) —
+			// this handle is needed only for the durable-cache
+			// read/repair path. No-op when the org rail is disabled
+			// (orgClient nil) or the node has never enrolled.
+			if orgClient != nil {
+				if pcfg, pdb, pcleanup, perr := loadConfigAndDB(ctx, configPath); perr == nil {
+					loadPolicyResourceLKG(ctx, pcfg, orgClient, store.New(pdb), admissionHandle, gw, ngov, newLogger(pcfg.Observer.LogLevel))
+					pcleanup()
+				} else {
+					fmt.Fprintf(cmd.ErrOrStderr(), "policy resource: LKG load skipped — db open failed: %v\n", perr)
+				}
+			}
+
 			g, gctx := errgroup.WithContext(ctx)
+			// The governance sidecar writer (§1.4). Unconditional and
+			// self-gating: it returns immediately when no sidecar path was
+			// attached, and on an ungranted node it writes a DORMANT file
+			// (state + empty pinned map) rather than nothing, because
+			// presence-with-empty is unambiguous while absence is
+			// indistinguishable from "the daemon never ran".
+			g.Go(func() error {
+				runGovernanceSidecarWriter(gctx, ngov)
+				return nil
+			})
 			g.Go(func() error {
 				if err := p.ListenAndServe(gctx, addr); err != nil && !errors.Is(err, context.Canceled) {
 					return fmt.Errorf("proxy: %w", err)
@@ -579,6 +731,50 @@ func newStartCmd() *cobra.Command {
 				})
 			}
 			if orgClient != nil {
+				// P0-7 router hot-reload (docs/plans/plane-a-p0-7-guard-router-
+				// hotreload-plan.md §4.4/§4.5): apply an accepted org routing
+				// policy to the LIVE router in-process, so P0-6 flips the router
+				// point pending_restart -> effective with no daemon restart. The
+				// sink fires on every accepted routing-fetch cycle (both newly-
+				// cached and already-current arms, SF7). Reload is nil-safe when
+				// routing is off (routingHandle nil / closure unset), so this
+				// registration is unconditional. It fires BEFORE the P0-6 routing
+				// outcome sink (SF8) because the sink runs inside FetchRoutingPolicy,
+				// which returns before PushLoop pokes the outcome sink.
+				orgClient.SetRoutingReloadSink(func(ctx context.Context) {
+					if rerr := routingHandle.Reload(ctx); rerr != nil {
+						fmt.Fprintf(cmd.ErrOrStderr(), "routing: org policy hot-reload failed: %v\n", rerr)
+					}
+				})
+				// P0-5 policy-resource → P0-6 reporter seam: when the
+				// policy-state reporter is enabled below, its
+				// recordPolicyResource sink is handed to the policy-resource
+				// poller so admitter/egress last-fetch slots populate.
+				var policyResourceSink policyResourceOutcomeSink
+				// P0-6 effective-policy-state reporter (docs/plans/plane-a-p0-6-
+				// effective-policy-state-plan.md §4.3): an independent daemon reporter
+				// emits a four-row desired/effective snapshot at startup + heartbeat +
+				// on-change. Gated by [org_client.share].policy_state (default off).
+				// Self-contained DB handle + the shared (memoized) process guard; the
+				// two outcome sinks are registered BEFORE the poll loops so the first
+				// fetch outcome is captured. Nil-sink no-op until registered (R6-1).
+				if cfgForLock.OrgClient.Share.PolicyState {
+					if rcfg, rdb, rcleanup, rerr := loadConfigAndDB(gctx, configPath); rerr == nil {
+						rlogger := newLogger(rcfg.Observer.LogLevel)
+						rst := store.New(rdb)
+						rguard := acquireProcessGuard(gctx, rcfg, rst, rlogger)
+						rep := buildPolicyStateReporter(orgClient, rguard, rst, admissionHandle, routingHandle, gw, ngov, rcfg, version, rlogger)
+						orgClient.SetGuardOutcomeSink(rep.recordGuard)
+						orgClient.SetRoutingOutcomeSink(rep.recordRouting)
+						policyResourceSink = rep.recordPolicyResource
+						g.Go(func() error {
+							defer rcleanup()
+							return rep.run(gctx, policyStateHeartbeat(rcfg))
+						})
+					} else {
+						fmt.Fprintf(cmd.ErrOrStderr(), "policy-state reporter disabled — db open failed: %v\n", rerr)
+					}
+				}
 				// The org push loop never propagates an error: a stuck/failing
 				// push must never cancel the proxy, watcher, or dashboard (P1).
 				// PushLoop already WARN-logs failures and stops cleanly on an
@@ -611,6 +807,37 @@ func newStartCmd() *cobra.Command {
 					runner := newPolicyBundleRunner(pcfg, store.New(pdb), plogger,
 						strings.TrimRight(pcfg.OrgClient.OrgServerURL, "/"))
 					_ = orgClient.PolicyPollLoop(gctx, cachePath, runner.onResult)
+					return nil
+				})
+				// Plane-A P0-5 Phase W (plan §6.6/§6.9): poll every v1
+				// policy-resource family whenever enrolled, independent
+				// of accept_families — applying accepted/inert bodies
+				// onto the shared admission service's Org layer
+				// (admission.input, egress.routing_guardrail) AND — Phase
+				// 3, gateway config plane spec — the proxy's live lane
+				// table (gateway.providers), clearing them on
+				// ErrNotEnrolled or an identity/generation mismatch. P1
+				// like every sibling poll loop: never propagates an
+				// error.
+				g.Go(func() error {
+					pcfg, ok := cfgForLock, lockErr == nil
+					if !ok {
+						return nil
+					}
+					runPolicyResourcePoller(gctx, pcfg, orgClient, admissionHandle, gw, ngov, policyResourceSink, newLogger(pcfg.Observer.LogLevel))
+					return nil
+				})
+				// Grant renewal (§4). P1 like every sibling loop: it never
+				// propagates an error, and a node that cannot renew simply
+				// lapses at its current expiry — which is the offboarding
+				// behaviour, not a failure.
+				g.Go(func() error {
+					rcfg, rdb, rcleanup, rerr := loadConfigAndDB(gctx, configPath)
+					if rerr != nil {
+						return nil
+					}
+					defer rcleanup()
+					runGrantRenewal(gctx, orgClient, store.New(rdb), renewalTracker, newLogger(rcfg.Observer.LogLevel))
 					return nil
 				})
 			}

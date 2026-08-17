@@ -319,6 +319,7 @@ func BuildCursorEvent(eventName string, body []byte, sc *scrub.Scrubber) (policy
 	if !evaluable {
 		return policy.Event{}, false
 	}
+	caps.Sandboxed = sandboxedChild()
 	return policy.Event{
 		Kind:        kind,
 		ActionType:  ev.ActionType,

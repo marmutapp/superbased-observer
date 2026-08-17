@@ -274,6 +274,78 @@ func TestSpecArgvModes(t *testing.T) {
 	}
 }
 
+// TestWrapArgvPrependsBeforeEverything pins the B9 isolation-wrapper argv
+// contract: a non-empty WrapArgv is prepended before EVERYTHING — including
+// BinPath — for SpecAgent (both ArgvMode shapes) and SpecShell, and is
+// IGNORED for SpecSetup (which always runs its fixed argv verbatim). An
+// empty WrapArgv leaves every shape byte-identical to the no-wrap case
+// (TestSpecArgv / TestFreshSpecArgv / TestShellSpecArgv above).
+func TestWrapArgvPrependsBeforeEverything(t *testing.T) {
+	wrap := []string{"bwrap", "--ro-bind", "/", "/", "--"}
+
+	cases := []struct {
+		name string
+		spec Spec
+		want []string
+	}{
+		{
+			"handoff (default ArgvMode) wrapped",
+			Spec{BinPath: "obs", Subcommand: "claude", SessionID: "src-1", WrapArgv: wrap},
+			[]string{"bwrap", "--ro-bind", "/", "/", "--", "obs", "claude", "--continue-from", "src-1"},
+		},
+		{
+			"fresh wrapped",
+			Spec{BinPath: "obs", Subcommand: "codex", ArgvMode: ArgvModeFresh, WrapArgv: wrap},
+			[]string{"bwrap", "--ro-bind", "/", "/", "--", "obs", "codex"},
+		},
+		{
+			"fresh wrapped with extra args tail",
+			Spec{BinPath: "obs", Subcommand: "codex", ArgvMode: ArgvModeFresh, ExtraArgs: []string{"--resume", "sess-1"}, WrapArgv: wrap},
+			[]string{"bwrap", "--ro-bind", "/", "/", "--", "obs", "codex", "--resume", "sess-1"},
+		},
+		{
+			"shell wrapped",
+			Spec{Kind: SpecShell, ShellArgv: []string{"/bin/bash"}, WrapArgv: wrap},
+			[]string{"bwrap", "--ro-bind", "/", "/", "--", "/bin/bash"},
+		},
+		{
+			"setup ignores WrapArgv",
+			Spec{Kind: SpecSetup, SetupArgv: []string{"tailscale", "login"}, WrapArgv: wrap},
+			[]string{"tailscale", "login"},
+		},
+		{
+			"empty WrapArgv unchanged (fresh)",
+			Spec{BinPath: "obs", Subcommand: "codex", ArgvMode: ArgvModeFresh},
+			[]string{"obs", "codex"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.spec.argv()
+			if !equalStr(got, tc.want) {
+				t.Fatalf("argv = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCreateValidatesWrapArgv pins the malformed-wrapper rejection: a
+// non-empty WrapArgv whose argv[0] is empty is refused with ErrInvalidSpec,
+// the same class of guard as the BinPath/Subcommand emptiness checks. A
+// present-and-well-formed WrapArgv, and an absent one, both create fine.
+func TestCreateValidatesWrapArgv(t *testing.T) {
+	m := newTestManager(t, &fakeSpawner{}, time.Now)
+	if _, err := m.Create(Spec{BinPath: "obs", Subcommand: "claude", ArgvMode: ArgvModeFresh, WrapArgv: []string{""}}); !errors.Is(err, ErrInvalidSpec) {
+		t.Fatalf("WrapArgv[0]==\"\": got %v, want ErrInvalidSpec", err)
+	}
+	if _, err := m.Create(Spec{BinPath: "obs", Subcommand: "claude", ArgvMode: ArgvModeFresh, WrapArgv: []string{"bwrap", "--"}}); err != nil {
+		t.Fatalf("well-formed WrapArgv must create, got %v", err)
+	}
+	if _, err := m.Create(Spec{BinPath: "obs", Subcommand: "claude", ArgvMode: ArgvModeFresh}); err != nil {
+		t.Fatalf("absent WrapArgv must create, got %v", err)
+	}
+}
+
 func TestOnOutputTap(t *testing.T) {
 	sp := &fakeSpawner{}
 	got := make(chan []byte, 4)

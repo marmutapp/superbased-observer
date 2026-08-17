@@ -87,7 +87,7 @@ func runRoutingCalibration(ctx context.Context, st *store.Store, cfg config.Conf
 	if err != nil {
 		return fmt.Errorf("escalation counts: %w", err)
 	}
-	demotions := computeRuleDemotions(lr.policy, rep, escalations)
+	demotions := computeRuleDemotions(*lr.policy.Load(), rep, escalations)
 	lr.SetDemotedRules(demotions)
 	for rule, why := range demotions {
 		// The loud surface (§R18.3): every demotion is a WARN the

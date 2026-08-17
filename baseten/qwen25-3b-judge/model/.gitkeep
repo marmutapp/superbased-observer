@@ -1,0 +1,6 @@
+# Intentionally empty.
+#
+# This is a Baseten "Custom Server" (docker_server) Truss: the model server is
+# the upstream vllm/vllm-openai image declared in ../config.yaml, so there is no
+# model.py / load()/predict() code here. Truss still expects the standard truss
+# directory layout, so this dir is kept as a placeholder.

@@ -165,8 +165,9 @@ func (g *Guard) budgetAlreadyRecorded(sessionID, ruleID string) bool {
 // api_request event through the real engine BEFORE the egress scan
 // (cheapest check first; a hard-mode deny skips the rest of the
 // pipeline — the request never reaches the provider). Soft breaches
-// flag once per session per rule.
-func (g *Guard) scanBudget(res *ProxyRequestResult, sessionID, target string, now time.Time) {
+// flag once per session per rule. es is the caller's already-Loaded
+// snapshot so the Evaluate+CategoryFor pair stays consistent (NIT).
+func (g *Guard) scanBudget(es *engineSet, res *ProxyRequestResult, sessionID, target string, now time.Time) {
 	ev := policy.Event{
 		Kind:      policy.KindAPIRequest,
 		Target:    target,
@@ -180,7 +181,7 @@ func (g *Guard) scanBudget(res *ProxyRequestResult, sessionID, target string, no
 		ev.Window5hUtil == 0 && ev.Window7dUtil == 0 {
 		return
 	}
-	verdict, guardErr := g.Evaluate(ev)
+	verdict, guardErr := g.evaluateWith(es, ev)
 	if verdict.Decision < policy.DecisionFlag && guardErr == nil {
 		return
 	}
@@ -198,7 +199,7 @@ func (g *Guard) scanBudget(res *ProxyRequestResult, sessionID, target string, no
 			Timestamp: now,
 		},
 		Kind:       policy.KindAPIRequest,
-		Category:   g.CategoryFor(verdict.RuleID),
+		Category:   g.categoryWith(es, verdict.RuleID),
 		Verdict:    verdict,
 		GuardError: guardErr != nil,
 	}

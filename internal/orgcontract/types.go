@@ -40,6 +40,20 @@ type EnrollResponse struct {
 	// agent ignores the unknown key. Servers without a configured policy
 	// signing key also omit it — the field is never required.
 	OrgPolicyPublicKey string `json:"org_policy_public_key,omitempty"`
+
+	// Grant is the OPTIONAL enrolment grant (admin-controlled Plane B,
+	// docs/plans/admin-controlled-plane-b-spec-2026-08-15.md §2.3/§2.4):
+	// the bounded authority this organization is OFFERING the enrolling
+	// node. omitempty on both sides of the compat invariant: a
+	// pre-governance server omits it (the node enrols ungoverned, exactly
+	// as today), and a pre-governance agent ignores the unknown key.
+	//
+	// It is an OFFER, not a fact: the node writes a grant row only after
+	// (a) the org policy key was pinned in this same enrolment, (b) the
+	// signature verifies under that key, and (c) a human confirmed it on a
+	// TTY (or --accept-governance was passed). Any of those failing means
+	// the node enrols WITHOUT governance and says so loudly.
+	Grant *EnrolmentGrant `json:"grant,omitempty"`
 }
 
 // BearerClaims is the JSON envelope signed with the server's Ed25519 key.
@@ -177,6 +191,83 @@ type PolicyBundle struct {
 	PublicKey string `json:"public_key"`
 	// SignedAt is the RFC3339 instant the bundle was signed (audit metadata;
 	// not part of the signed message — Version is the integrity anchor).
+	SignedAt string `json:"signed_at"`
+	// Description is the operator's note for the version history.
+	Description string `json:"description,omitempty"`
+}
+
+// SignedPolicyResource is the P0-5 unified, family-tagged, signed org
+// policy resource (docs/plane-a/unified-policy-resource.md §6;
+// docs/plans/plane-a-p0-5-unified-policy-resource-v1-plan.md §4.1). It
+// generalizes PolicyBundle (guard, family-implicit) into a family-tagged
+// shape any of the seven policy rails (§3 of the design doc) can eventually
+// ride, while v1 ships exactly two: admission.input and
+// egress.routing_guardrail.
+//
+// Distribution mirrors PolicyBundle: GET /api/agent/policy/{family}, strong
+// ETag (over the SIGNING MESSAGE digest, not Body alone — §4.4), 304 on
+// If-None-Match. Trust model: Signature covers
+// PolicyResourceSigningMessage(ID, Version, Family, CompilerVersion,
+// BodyHash, SelectorsJSON, RequiredCapabilities) under the org's dedicated
+// policy-resource signing key (domain-separated from PolicyBundle's key use
+// — signing.go's sbo-policy-resource-v1 domain — even when both rails share
+// literal key bytes). PublicKey rides in every response so verification is
+// self-contained; it counts as trusted only once TOFU-pinned (the guard
+// model, unified-policy-resource.md §7 gate 2).
+//
+// v1 fields are a DELIBERATE SUBSET of the design doc's full §6 shape:
+// Selectors ships pre-serialized as SelectorsJSON, now carrying a real
+// (canonical, grammar-checked) targeting predicate — P0-10 Phase B, see
+// selectors.go and SelectorsJSON's own comment below; Rollout/RollbackTarget/
+// Provenance are not part of this milestone (residual R2, plan §10). Adding
+// any of those later is additive (CLAUDE.md #6): new fields join the
+// signing message under the SAME domain-separation discipline, never a
+// silent Body reinterpretation.
+type SignedPolicyResource struct {
+	// ID is the immutable resource identity. v1 uses the literal "default"
+	// (plan v8 fork 4) — one resource per family, no per-selector targeting
+	// yet.
+	ID string `json:"id"`
+	// Version is monotonic per ID. Rollback = republish old content as a
+	// new HIGHER version, never a decrement.
+	Version int64 `json:"version"`
+	// Family selects the compiler + eligible enforcement points (design
+	// doc §3 closed enum). v1: "admission.input" | "egress.routing_guardrail".
+	Family string `json:"family"`
+	// CompilerVersion pins the family compiler that produced Body, so a
+	// decision's engine version is provable in evidence later (design §8.6).
+	CompilerVersion string `json:"compiler_version"`
+	// Body is the family's native spec as CANONICAL JSON (policyfam's
+	// CompileBody output) — never the publisher's raw submitted bytes.
+	Body string `json:"body"`
+	// BodyHash is hex(SHA-256(Body)) — the dedup + effective-hash
+	// reconciliation identity (design §4.3).
+	BodyHash string `json:"body_hash"`
+	// RequiredCapabilities are the capability tokens an enforcement point
+	// must advertise to accept this version (design §2 `required_capabilities`).
+	// Normalized (sorted, deduped, grammar-checked) as part of the signing
+	// message — see signing.go.
+	RequiredCapabilities []string `json:"required_capabilities,omitempty"`
+	// SelectorsJSON is the pre-serialized §2 targeting predicate over the
+	// CLOSED workspace|environment|service vocabulary (selectors.go). The
+	// match-all predicate is the literal "{}"; a targeted resource carries
+	// the canonical encoding CanonicalSelectorsJSON produces (compact,
+	// sorted keys, no empty values), bounded by
+	// MaxPolicyResourceSelectorsBytes. It is part of the signing message, so
+	// tampering with it invalidates the signature; the agent additionally
+	// re-derives the canonical form and rejects any non-canonical spelling
+	// (closed_envelope_violation) before evaluating it, keeping the field's
+	// grammar closed even though its VALUE is now open (P0-10 Phase B;
+	// docs/plans/policy-targeting-rollback-design-2026-08-13.md §2).
+	SelectorsJSON string `json:"selectors_json"`
+	// Signature is base64url(Ed25519 signature) over
+	// PolicyResourceSigningMessage(...).
+	Signature string `json:"signature"`
+	// PublicKey is the base64url Ed25519 public half of the signing key.
+	PublicKey string `json:"public_key"`
+	// SignedAt is the RFC3339 instant the resource was signed — UNTRUSTED
+	// display metadata, not part of the signed message (Version + BodyHash
+	// are the integrity anchors).
 	SignedAt string `json:"signed_at"`
 	// Description is the operator's note for the version history.
 	Description string `json:"description,omitempty"`
@@ -751,6 +842,128 @@ type ObsEvalItemRow struct {
 type ObsEvalItemBatch struct {
 	Items  []ObsEvalItemRow `json:"items"`
 	Cursor ObsCursor        `json:"cursor"`
+}
+
+// PolicyStateRow is ONE effective-state claim for one (enforcement_point,
+// family) pair. Hash/version/enum/timestamp ONLY. Attribution (OrgID/UserEmail)
+// is SERVER-STAMPED and MUST be empty on the wire (R2-S2). Pinned aggregate-only
+// by TestPolicyStateRowWireShapeIsHashOnly.
+//
+// This is the P0-6 "effective policy state" reverse-channel row
+// (docs/plans/plane-a-p0-6-effective-policy-state-plan.md §2.1). It ships on
+// the dedicated POST /api/agent/policy-ack endpoint inside PolicyStateReport —
+// NOT on the PushEnvelope slice, so the orgpush.go privacy sentinel is
+// untouched.
+type PolicyStateRow struct {
+	OrgID     string `json:"org_id"`     // empty-on-wire; server-stamped from claims.Aud
+	UserEmail string `json:"user_email"` // empty-on-wire; server-stamped via memberByID(claims.Sub) (R3-B6)
+
+	Family           string `json:"family"`            // §3 family enum (§2.4 mapping)
+	EnforcementPoint string `json:"enforcement_point"` // proxy-admitter|proxy-egress|guard|router
+
+	DesiredVersion int64 `json:"desired_version"` // last-fetched (or rejected) version
+	RunningVersion int64 `json:"running_version"` // version EFFECTIVE in the live decision path (0 = nothing running)
+
+	// EffectiveHash is the per-point hex identity (§2.4). ORG-RAIL points
+	// (guard/router): EMPTY when RunningVersion==0 (first install /
+	// not-yet-loaded / disabled) (R3-B2/R5-B2). LOCAL points
+	// (admitter/egress): a live 64-hex hash at version 0 (local_effective),
+	// empty when the feature is off (R5-B1).
+	EffectiveHash string `json:"effective_hash"`
+
+	Status string `json:"status"` // effective|accepted_inert|pending_restart|delivered_unaccepted|stale_lkg|break_glass|none
+	Reason string `json:"reason"` // bounded enum code (§3), never free text (never PolicyResult.Detail)
+
+	RestartRequired bool   `json:"restart_required"` // HasOrgRail && RunningVersion < CachedAcceptedVersion (independent of Status)
+	Mode            string `json:"mode"`             // off|observe|enforce — NORMALIZED (advise->observe)
+	LastSeen        string `json:"last_seen"`        // RFC3339 — point liveness at report time
+}
+
+// PolicyStateReport is the POST /api/agent/policy-ack body. AgentVersion is
+// build metadata, grammar-constrained server-side (R3-S4). Rows is the snapshot
+// across all four points. ReportSeq is a strictly increasing per-daemon ordering
+// key (R3-B7, made RESTART-SAFE in R4-B6), carried INSIDE the signed body so it is
+// tamper-evident; the server orders latest-wins on ReportSeq (strict >) with a
+// ts-gated reset-recovery fallback (§2.6).
+type PolicyStateReport struct {
+	AgentVersion string           `json:"agent_version"`
+	ReportSeq    int64            `json:"report_seq"` // persisted monotonic counter; strictly increasing per daemon, restart-safe (R4-B6); MUST be > 0
+	Rows         []PolicyStateRow `json:"rows"`
+}
+
+// Policy-state Status enum (§3.3) — the CLOSED set of effective-state statuses a
+// PolicyStateRow may carry. Server-validated: any other value is a 400. The
+// deferred statuses are enum-defined but NEVER populated this milestone (the
+// server REJECTS them until P1-3/P0-10 implement them, R4-B5).
+const (
+	StatusEffective           = "effective"
+	StatusAcceptedInert       = "accepted_inert"
+	StatusPendingRestart      = "pending_restart"
+	StatusDeliveredUnaccepted = "delivered_unaccepted"
+	StatusStaleLKG            = "stale_lkg"
+	StatusBreakGlass          = "break_glass" // P1-3/P0-10 — enum-defined, NOT populated this milestone
+	StatusNone                = "none"
+)
+
+// Policy-state Reason enum (§3.3) — the CLOSED set of reason codes. A Reason is
+// a typed code, never free text (never PolicyResult.Detail). Server-validated
+// against the status<->reason pairing (§5.3). The deferred reasons are
+// enum-defined but NEVER populated this milestone (R4-B5).
+const (
+	ReasonOK                      = "ok"
+	ReasonNotPreauthorized        = "not_preauthorized" // P0-5 — populated: admission.input/egress.routing_guardrail org-rail accepted_inert (§7.2)
+	ReasonModeObserve             = "mode_observe"
+	ReasonRestartRequired         = "restart_required"
+	ReasonSigInvalid              = "sig_invalid"
+	ReasonKeyPinMismatch          = "key_pin_mismatch"
+	ReasonVersionDowngrade        = "version_downgrade"
+	ReasonLintFailed              = "lint_failed"
+	ReasonCapabilityMismatch      = "capability_mismatch" // P0-5 — populated: admission.input/egress.routing_guardrail org-rail delivered_unaccepted (§7.2)
+	ReasonControlPlaneUnreachable = "control_plane_unreachable"
+	ReasonInconsistentObservation = "inconsistent_observation" // R2-B6
+	ReasonLocalEffective          = "local_effective"          // R4-B1 — local point (admitter/egress) running a locally-configured effective policy; no org rail
+	ReasonBreakGlassActive        = "break_glass_active"       // P1-3/P0-10 — enum-defined, NOT populated this milestone
+	ReasonNoPolicy                = "no_policy"
+	// ReasonVersionReplay is the P0-5 SignedPolicyResource accept-gate
+	// rejection (plan §6.3/§6.5/§7.2): the incoming resource's version
+	// equals the durable replay floor but its full signing-message digest
+	// does not match the durably recorded one. A missing cache never
+	// weakens this check — an equal-version envelope must always prove its
+	// identity against the durable digest, not merely its version number.
+	ReasonVersionReplay = "version_replay" // P0-5 — enabled with SignedPolicyResource accept path
+	// ReasonSelectorMismatch is the P0-10 Phase B targeting-corroboration
+	// rejection (docs/plans/policy-targeting-rollback-design-2026-08-13.md
+	// §2): the delivered resource's signed selectors name an attribute value
+	// that CONTRADICTS this node's locally-configured attribute
+	// ([org_client.policy] node_workspace/node_environment/node_service). The
+	// prior LKG stays installed. It pairs with delivered_unaccepted for the
+	// admitter/egress points (never router), and it deliberately does NOT
+	// reuse capability_mismatch: a server/agent attribute disagreement is a
+	// rollout-targeting defect, and folding it into the capability bucket
+	// would corrupt auto-halt diagnostics.
+	ReasonSelectorMismatch = "selector_mismatch" // P0-10 Phase B — org/agent targeting disagreement
+)
+
+// RowIsOrgRailState classifies a (status, reason) pair as org-rail or local
+// (P0-5 Phase S §7.0/§7.5 dual-mode discriminator). It is the single shared
+// predicate for both the server-side PolicyAck validator
+// (internal/orgserver/api) and the fleet-rollup reconciler
+// (internal/orgserver/rollup) — proxy-admitter/proxy-egress rows now reach
+// the full status set and must be classified by what they actually report,
+// not by which enforcement point sent them. Guard/router rows are always
+// org-rail in practice (they have no local overlay to report), but this
+// function classifies purely on the status/reason shape so a caller never
+// needs a point-identity branch of its own.
+func RowIsOrgRailState(status, reason string) bool {
+	switch status {
+	case StatusDeliveredUnaccepted, StatusAcceptedInert, StatusEffective,
+		StatusStaleLKG, StatusPendingRestart:
+		return true
+	case StatusNone:
+		return reason == ReasonInconsistentObservation
+	default:
+		return false
+	}
 }
 
 // RoutingPolicyDoc is the §R19.1 org-distributed policy document. The

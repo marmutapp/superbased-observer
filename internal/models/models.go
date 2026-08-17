@@ -394,6 +394,44 @@ const (
 	// the envelope publishes no reasoning-token count. Sessions carry a
 	// provider-reported `usage.cost` breakdown.
 	ToolPrimeAgent = "prime-agent"
+	// ToolDeepSeek is DeepSeek Harness ("deepseek"; npm package
+	// "@deepseek-ai/dsh", launched web-only via `npx @deepseek-ai/dsh
+	// web` — a local GUI at http://127.0.0.1:3080, no separate
+	// terminal/TUI mode). Its own event-sourced parser (not a §2.1 retag):
+	// sessions live at ~/.dsh/sessions/<cwd-slug>/session-<uuid>/
+	// session.jsonl.zstd, identical path on WSL and native Windows, and
+	// the file is REWRITTEN WHOLE on every flush (full recompress, not an
+	// append) — internal/adapter/deepseek re-decodes the entire file each
+	// poll rather than streaming from a byte offset. Envelope shape
+	// {"type","seq","time","data":{...}}; assistant/message carries a
+	// data.usage SIBLING of data.message with {inputTokens,outputTokens,
+	// cacheReadTokens?} already NET of cache (confirmed live: an
+	// inputTokens smaller than that row's cacheReadTokens). Scope is
+	// deliberately usage-capture only: no proxy, no hooks, no MCP, no
+	// terminal/remote — see the package doc for the full record-shape
+	// reference and the honest known-gaps list (Windows sessions are
+	// backfill-only; sub-agent rollup is ungrounded).
+	ToolDeepSeek = "deepseek"
+	// ToolJunie is JetBrains Junie ("junie"), the TUI coding agent
+	// embedded in JetBrains IDEs. Own event-sourced parser (not a §2.1
+	// retag): sessions live at ~/.junie/sessions/<session-id>/
+	// events.jsonl, one JSON envelope per line ({"kind",...} at the top
+	// level, with agent-facing UI updates wrapped in a
+	// SessionA2uxEvent{"event":{"kind",...}}). Blocks (Terminal /
+	// FileChanges / Result) are collapsed by their stable `stepId`: the
+	// SAME id recurs across IN_PROGRESS -> terminal-status transitions
+	// and is REBROADCAST once more, byte-identical, at outer task
+	// completion — the parser keys on stepId and updates in place rather
+	// than emitting duplicates. Project root resolves from the first
+	// non-empty CurrentDirectoryUpdatedEvent.currentDirectory seen in the
+	// stream (empty on early occurrences, populated later), falling back
+	// to the sibling ~/.junie/sessions/index.jsonl's projectDir keyed by
+	// session id. Token usage comes from LlmResponseMetadataEvent.
+	// modelUsage[], one entry per model, already NET of cache (no gross
+	// subtraction needed). No proxy, no hooks, no MCP, no verified
+	// interactive-seed/resume contract — see the package doc for the full
+	// record-shape reference and the honest known-gaps list.
+	ToolJunie = "junie"
 )
 
 // Normalized action types. See spec §5. Adapters map their tool-specific

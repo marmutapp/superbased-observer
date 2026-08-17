@@ -146,11 +146,10 @@ website/keys/
 # unaffected. Exceptions re-included via negation patterns: docs/assets/
 # (README screenshots/infographics referenced from the public README and
 # the npm package page) and the customer-facing docs linked from those
-# READMEs — the Teams trio, docs/compression-modes.md, the
-# deployment-models/remote-access/session-handoff/cache-tracking quartet,
-# and the guard-rules/guard-policy-authoring/guard-compliance/
-# guard-enforce-runbook quartet (all linked from the public README;
-# 2026-07-30 hygiene-review fix).
+# READMEs — docs/compression-modes.md, the remote-access/session-handoff/
+# cache-tracking trio, and the guard-rules/guard-policy-authoring/
+# guard-compliance/guard-enforce-runbook quartet (all linked from the
+# public README; 2026-07-30 hygiene-review fix).
 /AGENTS.md
 /CLAUDE.md
 /PROGRESS.md
@@ -158,9 +157,6 @@ website/keys/
 /superbased-final-spec-v2.md
 /docs/*
 !/docs/assets/
-!/docs/teams-getting-started.md
-!/docs/teams-architecture.md
-!/docs/teams-operations.md
 !/docs/compression-modes.md
 !/docs/proxy-live-test-recipe.md
 !/docs/codex-shared-app-server-gotcha.md
@@ -175,7 +171,6 @@ website/keys/
 !/docs/recipes/codex-variant.toml
 !/docs/vscode-extension.md
 !/docs/vscode-extension-user-guide.md
-!/docs/deployment-models.md
 !/docs/remote-access.md
 !/docs/session-handoff.md
 !/docs/cache-tracking.md
@@ -197,3 +192,42 @@ website/keys/
 /marketing/
 /tmp/
 /website/
+
+# Enterprise surface — the org/Teams rollup server and the general-
+# observability (Plane A) engine, plus their binaries, deployment
+# manifests and admin dashboard. This repo is the individual-developer
+# Plane B surface: local capture, proxy, dashboard, MCP, guard. These
+# entries are belt-and-braces (the paths are absent from this tree
+# entirely), so a file dropped in by accident is not committed.
+/cmd/observer-org/
+/cmd/observer-org-bridge-agent/
+/cmd/observer-org-pi-agent/
+/cmd/observer-edge/
+/internal/orgserver/
+/internal/obs/
+/internal/edge/
+/deploy/
+/web2/
+/charts/
+/Dockerfile.observer-org
+# Makefile.private holds every make target whose INPUTS are private-only
+# paths (cmd/observer-org*, cmd/observer-edge, web2/, deploy/, docs/,
+# website/). The shared Makefile pulls it in with `-include` (leading
+# dash = tolerate absence), so the public tree's `make build` builds
+# exactly what README.md documents.
+/Makefile.private
+# The adapter-count manifest generator: writes into website/tools/,
+# which is private, and its drift test reads the committed manifest.
+/tools/toolcountgen/
+# Private CI + release pipelines. ci.yml stays (it is the public
+# contributor gate); ci-private.yml holds the five jobs whose inputs are
+# private-only paths.
+/.github/workflows/ci-private.yml
+/.github/workflows/npm-release.yml
+/.github/workflows/teams-golden-path.yml
+/.github/workflows/ghcr-mirror.yml
+/.github/workflows/obs-eval.yml
+/.github/workflows/website-deploy.yml
+# The org-plane half of the copilot harness walkthrough. Its Phase-1
+# sibling (examples/copilot-harness/README.md) stays public.
+/examples/copilot-harness/README-orgplane.md

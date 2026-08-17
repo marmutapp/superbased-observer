@@ -42,14 +42,21 @@ func newGrokCmd() *cobra.Command {
 			"proxy lane is unprobed. Token capture happens via observer's local\n" +
 			"grok adapter (session bundles + the sid-correlated unified.jsonl\n" +
 			"token log), not the proxy.\n\n" +
+			"grok supports a top-level `--model` flag to select which model\n" +
+			"the session uses (pass it after `--` with your other grok args).\n\n" +
 			"With --continue-from <session-id> the launcher distills a handover\n" +
 			"from that session and seeds it as grok's trailing positional prompt\n" +
 			"(delivery=inject_prompt), so Grok opens an interactive session\n" +
 			"pre-loaded with the mission. See docs/session-handoff.md.\n\n" +
 			"All arguments after the subcommand are forwarded to grok. Use `--`\n" +
 			"to separate observer flags from grok flags. NEVER touches API keys.",
-		SilenceErrors: true,
+		SilenceErrors:      true,
+		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args, done, err := launcherArgsOrDone(cmd, args)
+			if done {
+				return err
+			}
 			// Attach gate (attach-all-launchers): default-on attach hands the PTY
 			// to the daemon. Seed-only spec (grok is launched non-proxied — no
 			// proxy env, no escape-hatch flag); grok's headless surface is
@@ -127,7 +134,6 @@ func newGrokCmd() *cobra.Command {
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "grok")
 	resume = registerResumeFlag(cmd, "grok")
-	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 

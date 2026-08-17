@@ -203,6 +203,53 @@ func TestTerminalInstallHappyPath(t *testing.T) {
 	}
 }
 
+// TestTerminalInstallKicksWatchRootsRefresh pins that a successful guided
+// install invokes Options.RefreshWatchRoots (the Muse/Prime-after-install
+// capture seam). Fail-open: a nil seam must not panic — covered by the
+// happy-path test above which leaves the seam unset.
+func TestTerminalInstallKicksWatchRootsRefresh(t *testing.T) {
+	lm := &fakeLaunchManager{}
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "observer.db")
+	database, err := openTestDB(context.Background(), db.Options{Path: dbPath})
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte("[observer]\ndb_path = \""+filepath.ToSlash(dbPath)+"\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rc, _ := newReadyRemoteController(t)
+	kicked := make(chan struct{}, 1)
+	s, err := New(Options{
+		DB:               database,
+		ConfigPath:       cfgPath,
+		Remote:           rc,
+		LaunchManager:    lm,
+		AllowToolInstall: func() bool { return true },
+		ToolInstallHint:  codexHint,
+		RefreshWatchRoots: func() {
+			select {
+			case kicked <- struct{}{}:
+			default:
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := postInstall(t, s.Handler(), "codex")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("install = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	select {
+	case <-kicked:
+	default:
+		t.Fatal("RefreshWatchRoots was not kicked after successful install")
+	}
+}
+
 // TestTerminalInstallDisabledGate pins the kill-switch: allow_install off ⇒ 403
 // whose message names the exact config key the operator must flip.
 func TestTerminalInstallDisabledGate(t *testing.T) {

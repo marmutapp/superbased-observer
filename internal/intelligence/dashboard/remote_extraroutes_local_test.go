@@ -78,7 +78,7 @@ func TestPatternHasUnsafeMethod(t *testing.T) {
 // capability actually enforced is the one on the MORE-SPECIFIC matched pattern.
 func TestServeMuxShadowing(t *testing.T) {
 	s := newRemoteTestServer(t, Options{})
-	mux, capMap := s.registerRoutes(nil)
+	mux, capMap, _ := s.registerRoutes(nil)
 
 	cases := []struct {
 		name        string

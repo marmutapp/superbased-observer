@@ -96,7 +96,7 @@ prewarm_targets = []
 	}
 
 	// Build the proxy the way `observer start` does.
-	p, cleanup, _, _, _, err := buildProxy(ctx, configPath, "", 0, "127.0.0.1")
+	p, cleanup, _, _, _, _, _, err := buildProxy(ctx, configPath, "", 0, "127.0.0.1", nil)
 	if err != nil {
 		t.Fatalf("buildProxy: %v", err)
 	}
@@ -205,7 +205,7 @@ enabled = false
 		t.Fatalf("write config: %v", err)
 	}
 
-	p, cleanup, _, _, _, err := buildProxy(ctx, configPath, "", 0, "127.0.0.1")
+	p, cleanup, _, _, _, _, _, err := buildProxy(ctx, configPath, "", 0, "127.0.0.1", nil)
 	if err != nil {
 		t.Fatalf("buildProxy: %v", err)
 	}

@@ -77,6 +77,15 @@ type Watcher struct {
 	// skipModifiedBefore gates the historic scan's WalkDir callback.
 	// See Options.SkipModifiedBefore.
 	skipModifiedBefore time.Time
+
+	// Live fsnotify state, owned by Watch and mutated by RefreshRoots /
+	// applyDetectedRoots under liveMu. fsw is non-nil only while Watch is
+	// inside its event loop; RefreshRoots is a no-op hot-add when Watch
+	// has not started yet (Scan still runs).
+	liveMu    sync.Mutex
+	fsw       *fsnotify.Watcher
+	byRoot    map[string]adapter.Adapter
+	refreshCh chan struct{} // buffered 1; nudges Watch to re-apply + Scan
 }
 
 // Options configures New.
@@ -161,7 +170,78 @@ func New(s *store.Store, r *adapter.Registry, opts Options) *Watcher {
 		warningDedup:       newWarningDeduper(warningTTL),
 		maxFileBytes:       opts.MaxFileBytes,
 		skipModifiedBefore: opts.SkipModifiedBefore,
+		refreshCh:          make(chan struct{}, 1),
 	}
+}
+
+// RefreshRoots re-runs adapter detection, hot-adds any newly-existing
+// watch roots into the live fsnotify set, and performs an immediate Scan.
+//
+// This is the seam behind the New Terminal install→launch capture gap:
+// tools installed while the daemon is already running (Muse, Prime Agent,
+// and any other adapter whose sessions directory appears only after first
+// use) were invisible to Watch because detection + addRecursive ran once
+// at start. Callers (dashboard launch/install) invoke this fail-open;
+// repeated calls are cheap and idempotent.
+//
+// When Watch is not yet running, hot-add is skipped and only Scan runs
+// (Detected roots that exist are still walked). A pending refresh signal
+// is still queued so the next Watch loop iteration applies roots as soon
+// as fsnotify is live.
+func (w *Watcher) RefreshRoots(ctx context.Context) (ScanResult, error) {
+	added := w.applyDetectedRoots()
+	if added > 0 {
+		w.logger.Info("watcher.RefreshRoots: hot-added watch roots", "count", added)
+	}
+	select {
+	case w.refreshCh <- struct{}{}:
+	default:
+	}
+	return w.Scan(ctx)
+}
+
+// applyDetectedRoots adds every currently-Detected adapter root that is
+// not already in byRoot to the live fsnotify watcher. Returns the number
+// of newly added roots. No-op when Watch is not running (fsw == nil).
+func (w *Watcher) applyDetectedRoots() int {
+	w.liveMu.Lock()
+	defer w.liveMu.Unlock()
+	if w.fsw == nil || w.byRoot == nil {
+		return 0
+	}
+	added := 0
+	for _, a := range w.registry.Detected(w.allow) {
+		for _, root := range a.WatchPaths() {
+			if root == "" {
+				continue
+			}
+			if _, ok := w.byRoot[root]; ok {
+				continue
+			}
+			if err := addRecursive(w.fsw, root); err != nil {
+				w.logger.Warn("watcher.applyDetectedRoots: add path",
+					"adapter", a.Name(), "root", root, "err", err)
+				continue
+			}
+			w.byRoot[root] = a
+			added++
+			w.logger.Info("watcher: hot-added watch root",
+				"adapter", a.Name(), "root", root)
+		}
+	}
+	return added
+}
+
+// snapshotByRoot returns a copy of the live root→adapter map for
+// lock-free event dispatch.
+func (w *Watcher) snapshotByRoot() map[string]adapter.Adapter {
+	w.liveMu.Lock()
+	defer w.liveMu.Unlock()
+	out := make(map[string]adapter.Adapter, len(w.byRoot))
+	for k, v := range w.byRoot {
+		out[k] = v
+	}
+	return out
 }
 
 // SetCacheEngine wires the per-process cachetrack.Engine through to the
@@ -271,35 +351,49 @@ type ScanResult struct {
 
 // Watch starts an fsnotify watch on every detected adapter's roots (plus an
 // initial Scan) and keeps ingesting until ctx is cancelled.
+//
+// Unlike the pre-RefreshRoots idle path, an empty Detected set at start no
+// longer parks forever on ctx.Done: the event loop + poller always run so
+// RefreshRoots (and the poller's periodic applyDetectedRoots) can hot-add
+// roots when a tool is installed after the daemon starts. An empty
+// enabled_adapters allow-list still yields nothing to watch — Detected
+// stays empty — so ephemeral/benchmark configs that pin `[]` remain safe.
 func (w *Watcher) Watch(ctx context.Context) error {
-	detected := w.registry.Detected(w.allow)
-	if len(detected) == 0 {
-		w.logger.Info("watcher.Watch: no adapters detected — entering idle mode")
-		<-ctx.Done()
-		return nil
-	}
-
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("watcher.Watch: fsnotify.NewWatcher: %w", err)
 	}
-	defer fsw.Close()
+	defer func() {
+		w.liveMu.Lock()
+		w.fsw = nil
+		w.byRoot = nil
+		w.liveMu.Unlock()
+		_ = fsw.Close()
+	}()
 
-	// Map root → adapter, so events can be dispatched.
-	byRoot := map[string]adapter.Adapter{}
-	for _, a := range detected {
-		for _, root := range a.WatchPaths() {
-			if err := addRecursive(fsw, root); err != nil {
-				w.logger.Warn("watcher.Watch: add path", "root", root, "err", err)
-				continue
-			}
-			byRoot[root] = a
-		}
+	w.liveMu.Lock()
+	w.fsw = fsw
+	w.byRoot = map[string]adapter.Adapter{}
+	w.liveMu.Unlock()
+
+	if n := w.applyDetectedRoots(); n == 0 {
+		w.logger.Info("watcher.Watch: no adapters detected yet — waiting for RefreshRoots / poller re-detect")
 	}
 
 	// Initial scan, so existing files are caught up before watching.
 	if _, err := w.Scan(ctx); err != nil {
 		return err
+	}
+
+	// Drain any RefreshRoots signal that arrived before fsw was live so
+	// we don't leave a stale nudge that would only re-Scan once.
+	select {
+	case <-w.refreshCh:
+		_ = w.applyDetectedRoots()
+		if _, err := w.Scan(ctx); err != nil {
+			return err
+		}
+	default:
 	}
 
 	// Polling fallback. fsnotify is documented to drop events on busy or
@@ -309,7 +403,9 @@ func (w *Watcher) Watch(ctx context.Context) error {
 	// growing JSONL until the user clicks Run All. The poller is the
 	// safety net: every tick re-checks every known parse_cursors row,
 	// and every 15th tick re-scans the watch roots to discover never-
-	// seen files (Create-event drops are the same bug class).
+	// seen files (Create-event drops are the same bug class) AND
+	// applyDetectedRoots so a tool installed mid-daemon is eventually
+	// fsnotify-wired even without a dashboard kick.
 	//
 	// processFile is idempotent (cursor + the (source_file,
 	// source_event_id) UNIQUE index), so racing fsnotify and the poller
@@ -337,6 +433,11 @@ func (w *Watcher) Watch(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-w.refreshCh:
+			_ = w.applyDetectedRoots()
+			if _, err := w.Scan(ctx); err != nil && ctx.Err() == nil {
+				w.logger.Warn("watcher.Watch: refresh scan failed", "err", err)
+			}
 		case err, ok := <-fsw.Errors:
 			if !ok {
 				return nil
@@ -349,7 +450,7 @@ func (w *Watcher) Watch(ctx context.Context) error {
 			if ev.Op&(fsnotify.Write|fsnotify.Create) == 0 {
 				continue
 			}
-			a := adapterForPath(byRoot, ev.Name)
+			a := adapterForPath(w.snapshotByRoot(), ev.Name)
 			if a == nil || !a.IsSessionFile(ev.Name) {
 				// New directory created under a watched root? Try to watch it.
 				if ev.Op&fsnotify.Create != 0 {
@@ -572,6 +673,11 @@ func (w *Watcher) runPoller(ctx context.Context) {
 		case <-ticker.C:
 			tickCount++
 			if tickCount%pollFullScanEvery == 0 {
+				// Hot-add any roots that appeared since Watch started
+				// (dashboard install, CLI install of a new tool, …)
+				// before walking — otherwise Scan finds files but
+				// live fsnotify still misses Create/Write on the new tree.
+				_ = w.applyDetectedRoots()
 				if _, err := w.Scan(ctx); err != nil && ctx.Err() == nil {
 					w.logger.Warn("watcher.poll: full scan failed", "err", err)
 				}

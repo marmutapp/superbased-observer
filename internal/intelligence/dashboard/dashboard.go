@@ -52,6 +52,12 @@ type ExtraRoute struct {
 	// (TestExtraRoutesRejectedWithoutCapabilityMetadata). On a loopback-only
 	// dashboard (the default) the zero value is tolerated (nothing is exposed).
 	Capability Capability
+	// Section is the node-dashboard nav section this route belongs to, for
+	// the admin-controlled Plane-B governance guard (governance.go). The
+	// zero value (SectionNone) means "no single page owns this route", which
+	// is never hidden — the same fail-open default an unmapped built-in
+	// route gets.
+	Section Section
 }
 
 type Options struct {
@@ -84,6 +90,12 @@ type Options struct {
 	// http.HandlerFunc only; this package never learns the subsystem's
 	// types (decision D4). Empty/nil by default.
 	ExtraRoutes []ExtraRoute
+	// Governance is the admin-controlled Plane-B posture provider
+	// (governance.go). NIL on every solo node and every ungoverned build,
+	// in which case the governance route guard is not installed at all and
+	// GET /api/governance answers with the dormant posture. Non-nil only
+	// when cmd/observer wired a node.governance install seam.
+	Governance GovernanceProvider
 	// MonthlyBudgetUSD surfaces on the Analysis tab as a spend-budget
 	// progress tile. Zero hides the budget readout. Sourced from
 	// `intelligence.monthly_budget_usd` in config.toml.
@@ -214,6 +226,17 @@ type Options struct {
 	// surface is zero by construction); the tool name is only a registry map
 	// key. Nil-able; a miss (ok=false) means no grounded install command → 400.
 	ToolInstallHint func(tool string) (argv []string, display string, ok bool)
+	// RecentModels, when non-nil, resolves a tool NAME to its recently-used
+	// models for the New Terminal model picker (B5) — the dashboard's seam
+	// onto store.Store.LoadRecentModelsForTool, defined as a plain func
+	// (like ToolPreflight) so the dashboard's Options struct carries no
+	// hard dependency on a live *store.Store (CLAUDE.md #2; the return type
+	// store.RecentToolModel is a plain data struct, not the store itself).
+	// A nil seam is the honest disabled state: both
+	// GET /api/terminal/launch/models and handleTerminalLaunch's model
+	// membership check degrade to "unsupported" exactly like an older
+	// daemon build without the store wiring — see modelSuggestionsFor.
+	RecentModels func(ctx context.Context, tool string) ([]store.RecentToolModel, error)
 	// ProjectRootResolver, when non-nil, backs the per-terminal project panel
 	// (GET /api/terminal/project/<token>...). It resolves a live launch token
 	// (LaunchInfo.ID / PTY handle) to the canonical project root the run was
@@ -255,6 +278,26 @@ type Options struct {
 	// remote_audit store seam; nil (the default) disables auditing. Never
 	// carries a secret.
 	RemoteAudit func(RemoteAuditRecord)
+	// SandboxProber, when non-nil, backs the B9 sandboxed-terminal probe
+	// surface: GET /api/terminal/sandbox (fail-soft, always 200 — see
+	// handleTerminalSandbox) AND handleTerminalLaunch's fail-CLOSED
+	// sandbox validation (a requested sandbox=true with a nil seam refuses
+	// the launch with 501, never a silent unsandboxed fallback — B9 plan
+	// §12 amendment A5). Injected by cmd (U5) from the daemon's real bwrap
+	// probe; nil (the default) is the honest disabled state, matching the
+	// LaunchManager/BuildHandoff seam pattern (CLAUDE.md #2).
+	SandboxProber SandboxProber
+	// RefreshWatchRoots, when non-nil, is invoked fail-open after a guided
+	// tool install (POST /api/terminal/install) and after a successful New
+	// Terminal launch (POST /api/terminal/launch). It asks the daemon's
+	// watcher to re-detect adapters, hot-add newly-existing session
+	// directories into the live fsnotify set, and Scan — closing the
+	// "install Muse/Prime from New Terminal then launch → session not
+	// captured" gap. cmd wires a short retry schedule because the sessions
+	// directory often appears a moment AFTER launch returns (the tool
+	// creates it on first write). Nil (the default) is the honest disabled
+	// state for `observer dashboard` without a co-located watcher.
+	RefreshWatchRoots func()
 }
 
 // TerminalSessionLink is the resolved identity of a live terminal launch token
@@ -528,8 +571,13 @@ func New(opts Options) (*Server, error) {
 // remotely-exposed handler (remoteGuardedHandler) uses the same registry with
 // the capability enforcement layered on.
 func (s *Server) Handler() http.Handler {
-	mux, _ := s.registerRoutes(nil)
-	return mux
+	mux, _, sections := s.registerRoutes(nil)
+	// Admin-controlled Plane B (spec §3.5): the governance route guard rides
+	// HERE, on the loopback path — not beside capMap in remoteAuthz, which
+	// this very function is the proof of, since it discards capMap. With a
+	// nil Governance provider this returns the bare mux, so an ungoverned
+	// build's handler chain is unchanged.
+	return s.governanceGuard(mux, sections, mux)
 }
 
 // sessionSubRouteCapabilities is the DECLARED (documentation + test) suffix→
@@ -605,18 +653,56 @@ func patternHasUnsafeMethod(pattern string) bool {
 // endpoint that also has a mutating verb is protected without a second entry.
 // CapabilityExecute routes (the terminal PTY bridge) require Execute for EVERY
 // method incl. the GET upgrade. CapabilityPublic routes need no auth.
-func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[string]Capability) {
+func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[string]Capability, map[string]Section) {
 	mux := http.NewServeMux()
 	capMap := map[string]Capability{}
-	reg := func(pattern string, cap Capability, h http.HandlerFunc) {
+	// sectionMap is the parallel route -> nav-section registry the
+	// admin-controlled Plane-B governance guard consults (governance.go).
+	// It is authored AT the registration site for exactly the reason capMap
+	// is: a hand-maintained side table of 172 routes drifts, and here a
+	// drifted entry silently leaks a page an organization believes it hid.
+	sectionMap := map[string]Section{}
+	reg := func(pattern string, cap Capability, section Section, h http.HandlerFunc) {
 		mux.HandleFunc(pattern, h)
 		capMap[pattern] = cap
+		sectionMap[pattern] = section
 	}
 	// React/Vite dashboard at root (Phase 8 cutover). Returns the SPA shell for
 	// any non-API path so React Router can render client-side routes. Public:
 	// the shell carries no data; every data surface is a View route below.
 	mux.Handle(webapp.MountPath, webapp.Handler())
 	capMap[webapp.MountPath] = CapabilityPublic
+	// The SPA shell itself is never a governed section: it carries no data,
+	// and a governed node must still be able to LOAD the app that tells it
+	// which pages its organization hid.
+	sectionMap[webapp.MountPath] = SectionNone
+
+	// Section aliases (governance.go). Every reg() call names the nav
+	// section its route belongs to, or secNone for a cross-cutting route
+	// that no single page owns — secNone is NEVER hidden (the D-D default).
+	const (
+		secNone        = SectionNone
+		secLive        = SectionLive
+		secSessions    = SectionSessions
+		secActions     = SectionActions
+		secSecurity    = SectionSecurity
+		secSearch      = SectionSearch
+		secCost        = SectionCost
+		secAnalysis    = SectionAnalysis
+		secTools       = SectionTools
+		secCompression = SectionCompression
+		secCache       = SectionCache
+		secSuggestions = SectionSuggestions
+		secRouting     = SectionRouting
+		secBenchmarks  = SectionBenchmarks
+		secDiscovery   = SectionDiscovery
+		secPatterns    = SectionPatterns
+		secPolicies    = SectionPolicies
+		secPrivacy     = SectionPrivacy
+		secTerminals   = SectionTerminals
+		secRemote      = SectionRemote
+		secSettings    = SectionSettings
+	)
 
 	const V = CapabilityView
 	const X = CapabilityExecute
@@ -640,62 +726,62 @@ func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[st
 	// is kept and the method-aware requirement auto-escalates the unsafe method
 	// to Execute, which is the intended tier.
 
-	reg("/api/status", V, s.handleStatus)
-	reg("/api/status/scoped", V, s.handleStatusScoped)
-	reg("/api/codex/support", V, s.handleCodexSupport)
-	reg("/api/cowork/reconcile", V, s.handleCoworkReconcile)
+	reg("/api/status", V, secNone, s.handleStatus)
+	reg("/api/status/scoped", V, secNone, s.handleStatusScoped)
+	reg("/api/codex/support", V, secNone, s.handleCodexSupport)
+	reg("/api/cowork/reconcile", V, secNone, s.handleCoworkReconcile)
 	// Setup POST writes AI-client config → whole-route Local (the GET status
 	// read is refused remotely too — fail-safe). codex-hooks is GET-only.
-	reg("/api/setup/codex", L, s.handleSetupCodex)
-	reg("/api/setup/codex-hooks", V, s.handleSetupCodexHooks)
-	reg("/api/setup/claude", L, s.handleSetupClaude)
-	reg("/api/cost", V, s.handleCost)
-	reg("/api/discover", V, s.handleDiscover)
-	reg("/api/suggestions", V, s.handleSuggestions)
-	reg("/api/suggestions/state", L, s.handleSuggestionState)
-	reg("/api/routing/status", V, s.handleRoutingStatus)
-	reg("/api/routing/decisions", V, s.handleRoutingDecisions)
-	reg("/api/routing/savings", V, s.handleRoutingSavings)
-	reg("/api/routing/tiers", V, s.handleRoutingTiers)
-	reg("/api/routing/health", V, s.handleRoutingHealth)
-	reg("/api/routing/shadow", V, s.handleRoutingShadow)
-	reg("/api/routing/simulate", V, s.handleRoutingSimulate)
+	reg("/api/setup/codex", L, secSettings, s.handleSetupCodex)
+	reg("/api/setup/codex-hooks", V, secSettings, s.handleSetupCodexHooks)
+	reg("/api/setup/claude", L, secSettings, s.handleSetupClaude)
+	reg("/api/cost", V, secCost, s.handleCost)
+	reg("/api/discover", V, secDiscovery, s.handleDiscover)
+	reg("/api/suggestions", V, secSuggestions, s.handleSuggestions)
+	reg("/api/suggestions/state", L, secSuggestions, s.handleSuggestionState)
+	reg("/api/routing/status", V, secRouting, s.handleRoutingStatus)
+	reg("/api/routing/decisions", V, secRouting, s.handleRoutingDecisions)
+	reg("/api/routing/savings", V, secRouting, s.handleRoutingSavings)
+	reg("/api/routing/tiers", V, secRouting, s.handleRoutingTiers)
+	reg("/api/routing/health", V, secRouting, s.handleRoutingHealth)
+	reg("/api/routing/shadow", V, secRouting, s.handleRoutingShadow)
+	reg("/api/routing/simulate", V, secRouting, s.handleRoutingSimulate)
 	// routing apply POST WRITES per-AI-tool routing config files → whole-route
 	// Local (§9.3). revert is POST-only Local.
-	reg("/api/routing/apply", L, s.handleRoutingApply)
-	reg("/api/routing/apply/revert", L, s.handleRoutingApplyRevert)
-	reg("/api/routing/apply/ledger", V, s.handleRoutingApplyLedger)
-	reg("/api/routing/policy", V, s.handleRoutingPolicy)
-	reg("/api/routing/policy/lint", V, s.handleRoutingPolicyLint)
-	reg("/api/verbosity/aggregate", V, s.handleVerbosityAggregate)
-	reg("/api/sessions", V, s.handleSessions)
-	reg("/api/sessions/calendar", V, s.handleSessionsCalendar)
+	reg("/api/routing/apply", L, secRouting, s.handleRoutingApply)
+	reg("/api/routing/apply/revert", L, secRouting, s.handleRoutingApplyRevert)
+	reg("/api/routing/apply/ledger", V, secRouting, s.handleRoutingApplyLedger)
+	reg("/api/routing/policy", V, secRouting, s.handleRoutingPolicy)
+	reg("/api/routing/policy/lint", V, secRouting, s.handleRoutingPolicyLint)
+	reg("/api/verbosity/aggregate", V, secAnalysis, s.handleVerbosityAggregate)
+	reg("/api/sessions", V, secSessions, s.handleSessions)
+	reg("/api/sessions/calendar", V, secSessions, s.handleSessionsCalendar)
 	// Session classification (plan §4). The vocabulary + per-tag rollup is a
 	// pure read (View); vocabulary MANAGEMENT (rename/delete across every
 	// session) is a whole-route Execute mutation — the same tier as the
 	// per-session /tags sub-route, and for the same reason (user-authored
 	// review metadata a paired remote owner legitimately drives).
-	reg("/api/sessions/tags", V, s.handleSessionsTags)
-	reg("/api/sessions/tags/manage", X, s.handleSessionsTagsManage)
+	reg("/api/sessions/tags", V, secSessions, s.handleSessionsTags)
+	reg("/api/sessions/tags/manage", X, secSessions, s.handleSessionsTagsManage)
 	// /api/session/ keeps a View base — its many GET sub-route reads must work
 	// remotely — while its mutating sub-routes resolve explicitly via
 	// sessionSubRouteCapabilities (§9.1): /handoff + /launch are Execute (a
 	// paired remote owner legitimately drives them), which the method-aware
 	// requirement produces for their POST. No Local-class sub-route exists under
 	// /api/session/; TestSessionSubRouteCapabilities enumerates and pins this.
-	reg("/api/session/", V, s.handleSessionDetail)
+	reg("/api/session/", V, secSessions, s.handleSessionDetail)
 	// Terminal PTY bridge: the GET upgrade is View-reachable by a paired device;
 	// the writer role is still gated in-band by the §4.δ execute conjunction.
-	reg("/ws/launch/", V, s.handleLaunchWS)
+	reg("/ws/launch/", V, secTerminals, s.handleLaunchWS)
 	// launch admin: GET lists launched terminals (View); the DELETE terminates
 	// one — a per-session op a paired owner legitimately drives (Execute).
 	// Bare View + method-aware auto-escalation gives DELETE→Execute (§9.3) while
 	// preserving the handler's own 405 for other methods.
-	reg("/api/launch/", V, s.handleLaunchAdmin)
+	reg("/api/launch/", V, secTerminals, s.handleLaunchAdmin)
 	// Terminal cockpit surface (terminal-product-exploitation plan §9).
 	// Fresh-agent launch is EXECUTE (it starts a new process — the
 	// privilege-expansion feature); the session list is VIEW (metadata only).
-	reg("/api/terminal/launch", X, s.handleTerminalLaunch)
+	reg("/api/terminal/launch", X, secTerminals, s.handleTerminalLaunch)
 	// Pre-launch binary-resolution verdict (tool-binary-resolution arc). LOCAL —
 	// resolving the binary runs a $SHELL -lc login-shell PATH capture (a
 	// side-effecting local exec) AND reveals absolute binary paths + home-dir
@@ -704,13 +790,26 @@ func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[st
 	// 2026-07-23 review pass). The exact pattern is MORE specific than the
 	// /api/terminal/ catch-all below, so mux precedence routes it here (not to
 	// handleTerminalStatus).
-	reg("/api/terminal/launch/preflight", L, s.handleTerminalPreflight)
+	reg("/api/terminal/launch/preflight", L, secTerminals, s.handleTerminalPreflight)
+	// New Terminal model picker (B5). VIEW — unlike preflight (which runs a
+	// local $SHELL PATH capture and reveals binary/home-dir layout), this
+	// reads only token_usage history + the capability registry's Known
+	// list: informational, non-sensitive, the same posture as
+	// /api/terminal/sessions and /api/models. The more-specific pattern
+	// takes mux precedence over /api/terminal/launch above.
+	reg("/api/terminal/launch/models", V, secTerminals, s.handleTerminalLaunchModels)
+	// B9 sandbox probe (plan §5). VIEW, FAIL-SOFT (always 200) — the same
+	// posture as the model-picker endpoint above: informational, reads only
+	// the daemon's cached probe result + the [terminal.sandbox] config, no
+	// side effects. Distinct from the fail-CLOSED validation inside
+	// handleTerminalLaunch, which actually refuses a launch.
+	reg("/api/terminal/sandbox", V, secTerminals, s.handleTerminalSandbox)
 	// Guided one-click install (tool-binary-resolution arc). LOCAL + confirm-
 	// token-gated, EXACTLY like the Tailscale setup handlers: it spawns a
 	// grounded, compile-time-constant install command in a visible local-only
 	// PTY — a machine-reaching mutation a remote principal must never drive.
-	reg("/api/terminal/install", L, s.handleTerminalInstall)
-	reg("/api/terminal/sessions", V, s.handleTerminalSessions)
+	reg("/api/terminal/install", L, secTerminals, s.handleTerminalInstall)
+	reg("/api/terminal/sessions", V, secTerminals, s.handleTerminalSessions)
 	// Live-joinable session list (session-attach design Phase 2, "Jump in"):
 	// every LIVE, non-setup daemon-owned PTY run of any valid terminal_run kind
 	// (fresh/handoff/attach/resume) a dashboard tab can join as an extra seat.
@@ -718,35 +817,35 @@ func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[st
 	// /api/terminal/sessions; remote callers see attach/resume rows gated by
 	// [remote].allow_terminal_view (built now), with fresh/handoff the
 	// non-sensitive floor.
-	reg("/api/attach/sessions", V, s.handleAttachSessions)
+	reg("/api/attach/sessions", V, secTerminals, s.handleAttachSessions)
 	// F4 agent status: point-in-time (GET /api/terminal/<handle>/status) via the
 	// prefix route, and the multiplexed live stream — both VIEW (read-only). The
 	// Per-terminal project panel (Arc A): git tree + read-only file explorer
 	// rooted at the terminal's server-resolved project root. VIEW (GET-only);
 	// the more-specific pattern takes mux precedence over /api/terminal/ below,
 	// and its own handler re-gates remote-exposed callers on allow_terminal_view.
-	reg("/api/terminal/project/", V, s.handleTerminalProject)
+	reg("/api/terminal/project/", V, secTerminals, s.handleTerminalProject)
 	// Per-terminal session cockpit (Session Cockpit): resolves a live launch
 	// token to its run identity and, once correlated, its observer session id +
 	// link confidence. VIEW (GET-only, metadata only); the more-specific prefix
 	// takes mux precedence over /api/terminal/ below, and its own handler
 	// re-gates remote-exposed callers on allow_terminal_view (identically for
 	// known and unknown tokens — no token oracle).
-	reg("/api/terminal/session/", V, s.handleTerminalSession)
+	reg("/api/terminal/session/", V, secTerminals, s.handleTerminalSession)
 	// exact /launch + /sessions patterns above take mux precedence.
-	reg("/api/terminal/", V, s.handleTerminalStatus)
-	reg("/ws/terminal/status", V, s.handleTerminalStatusWS)
-	reg("/api/process/findings", V, s.handleProcessFindings)
-	reg("/api/process/network/", V, s.handleProcessNetworkDetail)
+	reg("/api/terminal/", V, secTerminals, s.handleTerminalStatus)
+	reg("/ws/terminal/status", V, secTerminals, s.handleTerminalStatusWS)
+	reg("/api/process/findings", V, secSecurity, s.handleProcessFindings)
+	reg("/api/process/network/", V, secSecurity, s.handleProcessNetworkDetail)
 	// enable-capture WRITES config.toml (turns on [observer.process] + fixes a
 	// non-runnable backend) → whole-route Local, like /api/config/section/.
-	reg("/api/process/enable-capture", L, s.handleProcessEnableCapture)
+	reg("/api/process/enable-capture", L, secSettings, s.handleProcessEnableCapture)
 	// Elevated-ETW-capturer setup DETECTION (ETW dashboard plan §E2). VIEW: it
 	// reads config, runs the same read-only `schtasks /Query` probe
 	// `observer init` runs, and reads the daemon's own published health record.
 	// It registers nothing and spawns nothing — the elevation broker that does
 	// is a separate Local + confirm-token route.
-	reg("/api/process/etw/status", V, s.handleProcessETWStatus)
+	reg("/api/process/etw/status", V, secSettings, s.handleProcessETWStatus)
 	// The elevation BROKER (ETW dashboard plan §E3): spawns a fixed,
 	// server-derived `powershell.exe … Start-Process schtasks.exe -Verb RunAs`
 	// in a local-only setup PTY so Windows shows the operator a UAC prompt.
@@ -754,123 +853,123 @@ func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[st
 	// /api/terminal/install — a machine-reaching mutation a remote principal
 	// must never drive, and a consent dialog that can only be approved on the
 	// machine itself.
-	reg("/api/process/etw/register", L, s.handleProcessETWRegister)
-	reg("/api/actions", V, s.handleActions)
-	reg("/api/live", V, s.handleLive)
-	reg("/api/search", V, s.handleSearch)
-	reg("/api/budget", V, s.handleBudget)
+	reg("/api/process/etw/register", L, secSettings, s.handleProcessETWRegister)
+	reg("/api/actions", V, secActions, s.handleActions)
+	reg("/api/live", V, secLive, s.handleLive)
+	reg("/api/search", V, secSearch, s.handleSearch)
+	reg("/api/budget", V, secCost, s.handleBudget)
 	// Announcements are admin-authored banner copy (release-embedded today,
 	// org-distributed later) — nothing about this install, nothing sensitive,
 	// so View: a remote viewer should see the same banner the owner does.
-	reg("/api/announcements", V, s.handleAnnouncements)
+	reg("/api/announcements", V, secNone, s.handleAnnouncements)
 	// experiments POST CREATES an A/B experiment (management) → whole-route
 	// Local. stop is POST-only management.
-	reg("/api/experiments", L, s.handleExperiments)
-	reg("/api/experiments/stop", L, s.handleExperimentStop)
-	reg("/api/experiments/report", V, s.handleExperimentReport)
+	reg("/api/experiments", L, secNone, s.handleExperiments)
+	reg("/api/experiments/stop", L, secNone, s.handleExperimentStop)
+	reg("/api/experiments/report", V, secNone, s.handleExperimentReport)
 	// scrub-test POST computes a scrub over submitted text — no persistence, no
 	// machine reach; it is a read-only compute, so View (auto-escalation is
 	// harmless here, §9.3).
-	reg("/api/privacy/scrub-test", V, s.handlePrivacyScrubTest)
-	reg("/api/demo", V, s.handleDemo)
+	reg("/api/privacy/scrub-test", V, secPrivacy, s.handlePrivacyScrubTest)
+	reg("/api/demo", V, secSettings, s.handleDemo)
 	// demo start/stop flip the WHOLE install into/out of demo mode — a local
 	// owner-state toggle, never a remote viewer's to flip (Local, §9.3).
-	reg("/api/demo/start", L, s.handleDemoStart)
-	reg("/api/demo/stop", L, s.handleDemoStop)
-	reg("/api/storage", V, s.handleStorage)
-	reg("/api/storage/vacuum", L, s.handleStorageVacuum)
-	reg("/api/storage/backup", L, s.handleStorageBackup)
-	reg("/api/report/monthly", V, s.handleReportMonthly)
-	reg("/api/actions/day-counts", V, s.handleActionsDayCounts)
-	reg("/api/action/", V, s.handleActionDetail)
-	reg("/api/file/state", V, s.handleFileState)
-	reg("/api/patterns", V, s.handlePatterns)
-	reg("/api/patterns/timeseries", V, s.handlePatternsTimeseries)
-	reg("/api/suggest", V, s.handleSuggestPreview)
-	reg("/api/suggest/write", L, s.handleSuggestWrite)
-	reg("/api/timeseries/cost", V, s.handleTimeseriesCost)
-	reg("/api/timeseries/tokens-by-model", V, s.handleTimeseriesTokensByModel)
-	reg("/api/timeseries/actions", V, s.handleTimeseriesActions)
-	reg("/api/models", V, s.handleModels)
-	reg("/api/tools", V, s.handleTools)
-	reg("/api/tools/breakdown", V, s.handleToolsBreakdown)
-	reg("/api/compression/events", V, s.handleCompressionEvents)
-	reg("/api/compression/timeseries", V, s.handleCompressionTimeseries)
-	reg("/api/compression/by-model", V, s.handleCompressionByModel)
-	reg("/api/compression/retrieval", V, s.handleCompressionRetrieval)
-	reg("/api/compression/rolling-cost", V, s.handleCompressionRollingCost)
-	reg("/api/compaction/events", V, s.handleCompactionEvents)
-	reg("/api/guard/summary", V, s.handleGuardSummary)
-	reg("/api/guard/events", V, s.handleGuardEvents)
-	reg("/api/guard/conformance", V, s.handleGuardConformance)
-	reg("/api/guard/rules", V, s.handleGuardRules)
-	reg("/api/guard/simulate", V, s.handleGuardSimulate)
+	reg("/api/demo/start", L, secSettings, s.handleDemoStart)
+	reg("/api/demo/stop", L, secSettings, s.handleDemoStop)
+	reg("/api/storage", V, secSettings, s.handleStorage)
+	reg("/api/storage/vacuum", L, secSettings, s.handleStorageVacuum)
+	reg("/api/storage/backup", L, secSettings, s.handleStorageBackup)
+	reg("/api/report/monthly", V, secCost, s.handleReportMonthly)
+	reg("/api/actions/day-counts", V, secActions, s.handleActionsDayCounts)
+	reg("/api/action/", V, secActions, s.handleActionDetail)
+	reg("/api/file/state", V, secActions, s.handleFileState)
+	reg("/api/patterns", V, secPatterns, s.handlePatterns)
+	reg("/api/patterns/timeseries", V, secPatterns, s.handlePatternsTimeseries)
+	reg("/api/suggest", V, secSuggestions, s.handleSuggestPreview)
+	reg("/api/suggest/write", L, secSuggestions, s.handleSuggestWrite)
+	reg("/api/timeseries/cost", V, secCost, s.handleTimeseriesCost)
+	reg("/api/timeseries/tokens-by-model", V, secAnalysis, s.handleTimeseriesTokensByModel)
+	reg("/api/timeseries/actions", V, secAnalysis, s.handleTimeseriesActions)
+	reg("/api/models", V, secNone, s.handleModels)
+	reg("/api/tools", V, secTools, s.handleTools)
+	reg("/api/tools/breakdown", V, secTools, s.handleToolsBreakdown)
+	reg("/api/compression/events", V, secCompression, s.handleCompressionEvents)
+	reg("/api/compression/timeseries", V, secCompression, s.handleCompressionTimeseries)
+	reg("/api/compression/by-model", V, secCompression, s.handleCompressionByModel)
+	reg("/api/compression/retrieval", V, secCompression, s.handleCompressionRetrieval)
+	reg("/api/compression/rolling-cost", V, secCompression, s.handleCompressionRollingCost)
+	reg("/api/compaction/events", V, secCompression, s.handleCompactionEvents)
+	reg("/api/guard/summary", V, secSecurity, s.handleGuardSummary)
+	reg("/api/guard/events", V, secSecurity, s.handleGuardEvents)
+	reg("/api/guard/conformance", V, secSecurity, s.handleGuardConformance)
+	reg("/api/guard/rules", V, secSecurity, s.handleGuardRules)
+	reg("/api/guard/simulate", V, secSecurity, s.handleGuardSimulate)
 	// guard approvals: the POST APPROVES a dangerous-command request — a security
 	// consent, never a remote viewer's decision. Whole-route Local (§9.3). The
 	// DELETE reject is Local (approvals/ subtree).
-	reg("/api/guard/approvals", L, s.handleGuardApprovals)
-	reg("/api/guard/approvals/", L, s.handleGuardApprovalDelete)
-	reg("/api/guard/mcp", V, s.handleGuardMCP)
-	reg("/api/guard/mcp/approve", L, s.handleGuardMCPApprove)
+	reg("/api/guard/approvals", L, secSecurity, s.handleGuardApprovals)
+	reg("/api/guard/approvals/", L, secSecurity, s.handleGuardApprovalDelete)
+	reg("/api/guard/mcp", V, secSecurity, s.handleGuardMCP)
+	reg("/api/guard/mcp/approve", L, secSecurity, s.handleGuardMCPApprove)
 	// guard policy PUT WRITES the guard policy → whole-route Local. policy/backup
 	// writes a backup to disk → Local.
-	reg("/api/guard/policy", L, s.handleGuardPolicy)
-	reg("/api/guard/policy/lint", V, s.handleGuardPolicyLint)
-	reg("/api/guard/policy/backup", L, s.handleGuardPolicyBackup)
-	reg("/api/guard/evidence", L, s.handleGuardEvidence)
-	reg("/api/guard/evidence/download", V, s.handleGuardEvidenceDownload)
-	reg("/api/guard/budget", V, s.handleGuardBudget)
-	reg("/api/cache/status", V, s.handleCacheStatus)
-	reg("/api/cache/overview", V, s.handleCacheOverview)
-	reg("/api/cache/timeseries", V, s.handleCacheTimeseries)
-	reg("/api/cache/health", V, s.handleCacheHealth)
-	reg("/api/cache/events", V, s.handleCacheEvents)
-	reg("/api/cache/entry-states", V, s.handleCacheEntryStates)
-	reg("/api/benchmarks", V, s.handleBenchmarks)
-	reg("/api/benchmarks/", V, s.handleBenchmarkDetail)
-	reg("/api/projects", V, s.handleProjects)
-	reg("/api/export.xlsx", V, s.handleExportXLSX)
-	reg("/api/analysis/headline", V, s.handleAnalysisHeadline)
-	reg("/api/statusline", V, s.handleStatuslineTile)
-	reg("/api/analysis/trend", V, s.handleAnalysisTrend)
-	reg("/api/analysis/movers", V, s.handleAnalysisMovers)
-	reg("/api/analysis/top-sessions", V, s.handleAnalysisTopSessions)
-	reg("/api/analysis/routing-suggestions", V, s.handleAnalysisRoutingSuggestions)
-	reg("/api/analysis/cost-by-hour", V, s.handleAnalysisCostByHour)
-	reg("/api/analysis/cost-by-dow-hour", V, s.handleAnalysisCostByDowHour)
-	reg("/api/analysis/cache-savings-trend", V, s.handleAnalysisCacheSavingsTrend)
+	reg("/api/guard/policy", L, secPolicies, s.handleGuardPolicy)
+	reg("/api/guard/policy/lint", V, secPolicies, s.handleGuardPolicyLint)
+	reg("/api/guard/policy/backup", L, secPolicies, s.handleGuardPolicyBackup)
+	reg("/api/guard/evidence", L, secSecurity, s.handleGuardEvidence)
+	reg("/api/guard/evidence/download", V, secSecurity, s.handleGuardEvidenceDownload)
+	reg("/api/guard/budget", V, secSecurity, s.handleGuardBudget)
+	reg("/api/cache/status", V, secCache, s.handleCacheStatus)
+	reg("/api/cache/overview", V, secCache, s.handleCacheOverview)
+	reg("/api/cache/timeseries", V, secCache, s.handleCacheTimeseries)
+	reg("/api/cache/health", V, secCache, s.handleCacheHealth)
+	reg("/api/cache/events", V, secCache, s.handleCacheEvents)
+	reg("/api/cache/entry-states", V, secCache, s.handleCacheEntryStates)
+	reg("/api/benchmarks", V, secBenchmarks, s.handleBenchmarks)
+	reg("/api/benchmarks/", V, secBenchmarks, s.handleBenchmarkDetail)
+	reg("/api/projects", V, secNone, s.handleProjects)
+	reg("/api/export.xlsx", V, secNone, s.handleExportXLSX)
+	reg("/api/analysis/headline", V, secAnalysis, s.handleAnalysisHeadline)
+	reg("/api/statusline", V, secNone, s.handleStatuslineTile)
+	reg("/api/analysis/trend", V, secAnalysis, s.handleAnalysisTrend)
+	reg("/api/analysis/movers", V, secAnalysis, s.handleAnalysisMovers)
+	reg("/api/analysis/top-sessions", V, secAnalysis, s.handleAnalysisTopSessions)
+	reg("/api/analysis/routing-suggestions", V, secAnalysis, s.handleAnalysisRoutingSuggestions)
+	reg("/api/analysis/cost-by-hour", V, secAnalysis, s.handleAnalysisCostByHour)
+	reg("/api/analysis/cost-by-dow-hour", V, secAnalysis, s.handleAnalysisCostByDowHour)
+	reg("/api/analysis/cache-savings-trend", V, secAnalysis, s.handleAnalysisCacheSavingsTrend)
 	// /api/config GET is a config READ (owner-trusted; §2A). Every config WRITE
 	// is whole-route Local: pricing PUT, the generic section PUT, reload, profile
 	// create, backup restore POST, profile mutate/delete. (Whole-route Local
 	// rather than method-split — see the mechanism note above — so the GET
 	// metadata/profile reads are refused remotely too, which is fail-safe.)
-	reg("/api/config", V, s.handleConfig)
-	reg("/api/config/pricing", L, s.handleConfigPricing)
-	reg("/api/config/pricing/defaults", V, s.handleConfigPricingDefaults)
-	reg("/api/config/section/", L, s.handleConfigSection)
-	reg("/api/config/backup", L, s.handleConfigBackup)
-	reg("/api/config/reload", L, s.handleConfigReload)
-	reg("/api/config/profiles", L, s.handleConfigProfiles)
-	reg("/api/config/profiles/", L, s.handleConfigProfile)
-	reg("/api/tools/status", V, s.handleToolsStatus)
-	reg("/api/tools/launch", L, s.handleToolsLaunch)
-	reg("/api/setup/hooks", L, s.handleSetupHooks)
-	reg("/api/setup/mcp", L, s.handleSetupMCP)
-	reg("/api/health/doctor", V, s.handleHealthDoctor)
-	reg("/api/health/failures", V, s.handleHealthFailures)
-	reg("/api/mcp/value", V, s.handleMCPValue)
-	reg("/api/admin/restart", L, s.handleAdminRestart)
-	reg("/api/admin/antigravity-bridge.exe", V, s.handleAntigravityBridge)
-	reg("/api/scan/run", L, s.handleScanRun)
-	reg("/api/backfill/status", V, s.handleBackfillStatus)
-	reg("/api/backfill/run", L, s.handleBackfillRun)
-	reg("/api/prune/run", L, s.handlePruneRun)
-	reg("/api/backfill/jobs", V, s.handleBackfillJobsList)
-	reg("/api/backfill/jobs/", V, s.handleBackfillJob)
-	reg("/api/health/watcher", V, s.handleWatcherHealth)
-	reg("/api/enrolment/status", V, s.handleEnrolmentStatus)
-	reg("/api/enrolment/last-payload", V, s.handleEnrolmentLastPayload)
-	reg("/api/enrolment/unenroll", L, s.handleEnrolmentUnenroll)
+	reg("/api/config", V, secSettings, s.handleConfig)
+	reg("/api/config/pricing", L, secSettings, s.handleConfigPricing)
+	reg("/api/config/pricing/defaults", V, secSettings, s.handleConfigPricingDefaults)
+	reg("/api/config/section/", L, secSettings, s.handleConfigSection)
+	reg("/api/config/backup", L, secSettings, s.handleConfigBackup)
+	reg("/api/config/reload", L, secSettings, s.handleConfigReload)
+	reg("/api/config/profiles", L, secSettings, s.handleConfigProfiles)
+	reg("/api/config/profiles/", L, secSettings, s.handleConfigProfile)
+	reg("/api/tools/status", V, secSettings, s.handleToolsStatus)
+	reg("/api/tools/launch", L, secSettings, s.handleToolsLaunch)
+	reg("/api/setup/hooks", L, secSettings, s.handleSetupHooks)
+	reg("/api/setup/mcp", L, secSettings, s.handleSetupMCP)
+	reg("/api/health/doctor", V, secSettings, s.handleHealthDoctor)
+	reg("/api/health/failures", V, secSettings, s.handleHealthFailures)
+	reg("/api/mcp/value", V, secSettings, s.handleMCPValue)
+	reg("/api/admin/restart", L, secNone, s.handleAdminRestart)
+	reg("/api/admin/antigravity-bridge.exe", V, secNone, s.handleAntigravityBridge)
+	reg("/api/scan/run", L, secSettings, s.handleScanRun)
+	reg("/api/backfill/status", V, secSettings, s.handleBackfillStatus)
+	reg("/api/backfill/run", L, secSettings, s.handleBackfillRun)
+	reg("/api/prune/run", L, secSettings, s.handlePruneRun)
+	reg("/api/backfill/jobs", V, secSettings, s.handleBackfillJobsList)
+	reg("/api/backfill/jobs/", V, secSettings, s.handleBackfillJob)
+	reg("/api/health/watcher", V, secNone, s.handleWatcherHealth)
+	reg("/api/enrolment/status", V, secSettings, s.handleEnrolmentStatus)
+	reg("/api/enrolment/last-payload", V, secSettings, s.handleEnrolmentLastPayload)
+	reg("/api/enrolment/unenroll", L, secSettings, s.handleEnrolmentUnenroll)
 	// Mints a one-time enrolment token for a teammate through the org server
 	// this node is already enrolled with. EXECUTE, not Local: it is a real
 	// mutation (it creates a credential on the org server) so it must never
@@ -879,92 +978,97 @@ func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[st
 	// vocabulary-management writes. It reaches the ORG server, never this
 	// machine's config or filesystem, which is what separates it from the
 	// Local tier.
-	reg("/api/enrolment/invite", X, s.handleEnrolmentInvite)
+	reg("/api/enrolment/invite", X, secSettings, s.handleEnrolmentInvite)
 	// Remote-access management surface (dashboard-management-surface plan §9).
 	// Reads are View (a paired remote owner may see state/audit/sessions — never
 	// the secret, §11); mutations are Local (arm/disarm/rotate + session revoke
 	// are owner-loopback-only, never a remote principal's to drive).
-	reg("/api/remote/config", V, s.handleRemoteConfig)
-	reg("/api/remote/enable", L, s.handleRemoteEnable)
-	reg("/api/remote/disable", L, s.handleRemoteDisable)
-	reg("/api/remote/rotate", L, s.handleRemoteRotate)
-	reg("/api/remote/add-device", L, s.handleRemoteAddDevice)
+	reg("/api/remote/config", V, secRemote, s.handleRemoteConfig)
+	reg("/api/remote/enable", L, secRemote, s.handleRemoteEnable)
+	reg("/api/remote/disable", L, secRemote, s.handleRemoteDisable)
+	reg("/api/remote/rotate", L, secRemote, s.handleRemoteRotate)
+	reg("/api/remote/add-device", L, secRemote, s.handleRemoteAddDevice)
 	// Flip [remote].allow_terminal on an armed controller WITHOUT rotating the
 	// pairing secret or dropping paired devices (Local; owner-loopback only).
-	reg("/api/remote/allow-terminal", L, s.handleRemoteSetAllowTerminal)
+	reg("/api/remote/allow-terminal", L, secRemote, s.handleRemoteSetAllowTerminal)
 	// Flip [remote].allow_terminal_view — the independent READ opt-in that lets a
 	// remote paired device SEE / read-only-subscribe to a remote-sensitive
 	// (attach/resume) terminal (§3.2). Strictly weaker than allow_terminal
 	// (write). Local; owner-loopback only; hot-reloads the live VIEW gate.
-	reg("/api/remote/allow-terminal-view", L, s.handleRemoteSetAllowTerminalView)
+	reg("/api/remote/allow-terminal-view", L, secRemote, s.handleRemoteSetAllowTerminalView)
 	// Flip the post-authorization remote writer policy. Credential validation,
 	// allow_terminal, TLS, pairing, and allow_terminal_view remain independent.
 	// Local; owner-loopback only; hot-reloads for the next acquire.
-	reg("/api/remote/allow-remote-takeover", L, s.handleRemoteSetAllowRemoteTakeover)
+	reg("/api/remote/allow-remote-takeover", L, secRemote, s.handleRemoteSetAllowRemoteTakeover)
 	// Flip [remote].revoke_standing_on_takeover — the OPT-IN hardening that
 	// makes a LOCAL writer takeover of a standing-credential remote writer also
 	// revoke standing access (default false = seamless). Local; owner-loopback
 	// only; no live gate (the takeover hook reads the persisted value).
-	reg("/api/remote/standing-revoke-on-takeover", L, s.handleRemoteSetRevokeStandingOnTakeover)
+	reg("/api/remote/standing-revoke-on-takeover", L, secRemote, s.handleRemoteSetRevokeStandingOnTakeover)
 	// Terminal Workspace dock-grid layout (migration 073, node-local): READ is
 	// View (a remote paired device renders the shared grid read-only); SAVE is
 	// Local (arranging the grid is an owner action). Two single-purpose paths
 	// per the whole-route classification rule above.
-	reg("/api/terminal/workspace-layout", V, s.handleWorkspaceLayoutGet)
-	reg("/api/terminal/workspace-layout/save", L, s.handleWorkspaceLayoutSave)
+	reg("/api/terminal/workspace-layout", V, secTerminals, s.handleWorkspaceLayoutGet)
+	reg("/api/terminal/workspace-layout/save", L, secTerminals, s.handleWorkspaceLayoutSave)
 	// Execute-tier LOCAL approval (§4.γ/§6): mints a single-use terminal-control
 	// capability + bound confirm for a target device+handle, returned in the
 	// response body only. Owner-loopback-only (Local) — a remote principal can
 	// never self-approve.
-	reg("/api/remote/approve-execute", L, s.handleRemoteApproveExecute)
+	reg("/api/remote/approve-execute", L, secRemote, s.handleRemoteApproveExecute)
 	// Standing terminal-control secret (standing-terminal-access §B). The status
 	// GET is a metadata-only View read (never the secret); mint (enable/rotate)
 	// and revoke are owner-loopback-only Local mutations — the raw secret rides
 	// the mint POST response body only.
-	reg("/api/remote/standing-terminal", V, s.handleStandingTerminalStatus)
-	reg("/api/remote/standing-terminal/mint", L, s.handleStandingTerminalMint)
-	reg("/api/remote/standing-terminal/revoke", L, s.handleStandingTerminalRevoke)
-	reg("/api/remote/audit", V, s.handleRemoteAudit)
-	reg("/api/remote/sessions", V, s.handleRemoteSessions)
-	reg("/api/remote/sessions/revoke-all", L, s.handleRemoteSessionsRevokeAll)
-	reg("/api/remote/sessions/", L, s.handleRemoteSessionRevoke)
-	reg("/api/remote/selfcheck", V, s.handleRemoteSelfcheck)
+	reg("/api/remote/standing-terminal", V, secRemote, s.handleStandingTerminalStatus)
+	reg("/api/remote/standing-terminal/mint", L, secRemote, s.handleStandingTerminalMint)
+	reg("/api/remote/standing-terminal/revoke", L, secRemote, s.handleStandingTerminalRevoke)
+	reg("/api/remote/audit", V, secRemote, s.handleRemoteAudit)
+	reg("/api/remote/sessions", V, secRemote, s.handleRemoteSessions)
+	reg("/api/remote/sessions/revoke-all", L, secRemote, s.handleRemoteSessionsRevokeAll)
+	reg("/api/remote/sessions/", L, secRemote, s.handleRemoteSessionRevoke)
+	reg("/api/remote/selfcheck", V, secRemote, s.handleRemoteSelfcheck)
 	// Tailnet detection + serve-command guidance (P1). Read-only View: runs
 	// `tailscale status --json` via internal/tailnet and generates the
 	// `tailscale serve` string — Observer never execs `tailscale up|serve`.
-	reg("/api/remote/tailscale/status", V, s.handleRemoteTailscaleStatus)
-	reg("/api/remote/tailscale/serve", L, s.handleRemoteTailscaleServe)
+	reg("/api/remote/tailscale/status", V, secRemote, s.handleRemoteTailscaleStatus)
+	reg("/api/remote/tailscale/serve", L, secRemote, s.handleRemoteTailscaleServe)
 	// One-time Tailscale operator grant, run in the in-dashboard PTY so the
 	// user types their sudo password once (dashboard-tailnet-guided-setup §B).
 	// Local (owner-loopback only) + confirm-gated, like the arm verbs; the
 	// spawned session is local-writer-only at the lease seam.
-	reg("/api/remote/tailscale/operator-grant", L, s.handleRemoteTailscaleOperatorGrant)
+	reg("/api/remote/tailscale/operator-grant", L, secRemote, s.handleRemoteTailscaleOperatorGrant)
 	// Interactive `tailscale up` login, run in the in-dashboard PTY so the auth
 	// URL it prints is shown right there (dashboard-tailnet-guided-setup v2).
 	// Local (owner-loopback only) + confirm-gated; the spawned session is
 	// SpecSetup → local-writer-only. sudo-vs-not is resolved server-side.
-	reg("/api/remote/tailscale/login", L, s.handleRemoteTailscaleLogin)
+	reg("/api/remote/tailscale/login", L, secRemote, s.handleRemoteTailscaleLogin)
 	// Guided Tailscale install on Linux (official install.sh via sudo), run in
 	// the in-dashboard PTY (dashboard-tailnet-guided-setup v2). Local +
 	// confirm-gated; refused off-Linux or when tailscale is already present.
-	reg("/api/remote/tailscale/install", L, s.handleRemoteTailscaleInstall)
+	reg("/api/remote/tailscale/install", L, secRemote, s.handleRemoteTailscaleInstall)
 	// Terminal launch-policy management (P1). Whole-route Local (owner-loopback
 	// only): the GET mints the confirm token + reads [terminal.launch], the PUT
 	// writes the privilege-expanding allow_fresh_agent/allowed_tools/
 	// allowed_project_roots block. The runs history is a metadata-only View read.
-	reg("/api/terminal/policy", L, s.handleTerminalPolicy)
-	reg("/api/terminal/runs", V, s.handleTerminalRuns)
+	reg("/api/terminal/policy", L, secTerminals, s.handleTerminalPolicy)
+	reg("/api/terminal/runs", V, secTerminals, s.handleTerminalRuns)
 	// Runtime bounds (max_concurrent / idle_timeout) — a Local write that
 	// live-applies to the PTY manager with no restart, unlike the start-captured
 	// launch policy above.
-	reg("/api/terminal/limits", L, s.handleTerminalLimits)
+	reg("/api/terminal/limits", L, secTerminals, s.handleTerminalLimits)
 	// ExtraRoutes lets a separable subsystem (e.g. internal/obs) register its
 	// own /api/* handlers WITHOUT this package importing it (decision D4). Each
 	// MUST carry a Capability; New() rejects an unclassified ExtraRoute when a
 	// RemoteController is present (plan §4.1 fail-closed). Empty by default.
+	// Admin-controlled Plane B: the node's own governance posture. VIEW and
+	// secNone — it is registered UNCONDITIONALLY and can never be hidden,
+	// because it is how the SPA learns what was hidden and by whom (T8's
+	// "never a silent absence" rule, at the API level).
+	reg("/api/governance", V, secNone, s.handleGovernance)
 	for _, rt := range s.opts.ExtraRoutes {
 		if rt.Pattern != "" && rt.Handler != nil {
-			reg(rt.Pattern, rt.Capability, rt.Handler)
+			reg(rt.Pattern, rt.Capability, rt.Section, rt.Handler)
 		}
 	}
 	// The RemoteController's own routes (/api/remote/pair, /whoami, /logout)
@@ -972,11 +1076,15 @@ func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[st
 	if remote != nil {
 		for _, rt := range remote.Routes() {
 			if rt.Pattern != "" && rt.Handler != nil {
-				reg(rt.Pattern, rt.Capability, rt.Handler)
+				// The controller's own pairing/whoami/logout routes are auth
+				// plumbing, not a page: SectionNone, never hidden. Hiding the
+				// Remote PAGE must not break the pairing handshake a remote
+				// device needs to reach anything at all.
+				reg(rt.Pattern, rt.Capability, SectionNone, rt.Handler)
 			}
 		}
 	}
-	return mux, capMap
+	return mux, capMap, sectionMap
 }
 
 // browserGuard defends the dashboard's loopback single-user deployment against

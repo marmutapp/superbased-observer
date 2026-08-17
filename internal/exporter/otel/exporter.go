@@ -61,6 +61,28 @@ type Exporter struct {
 func New(cfg Config, src TurnSource, resolver ProjectResolver, logger *slog.Logger) (*Exporter, error) {
 	cfg = cfg.withEnvOverrides()
 
+	tp, err := NewTracerProvider(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("otel.New: %w", err)
+	}
+	return newExporter(cfg, src, resolver, logger, tp), nil
+}
+
+// NewTracerProvider builds a batching OTLP/HTTP TracerProvider from an
+// ALREADY-RESOLVED Config. It does NOT apply withEnvOverrides — env-var
+// resolution stays inside Exporter.New (governing only the api_turns exporter);
+// a caller that must keep the endpoint scheme authoritative over OTEL_* env
+// (e.g. internal/selfobs/emit's credential-bearing path) constructs its own
+// Config and relies on WithEndpointURL, whose explicit scheme sets the insecure
+// flag AFTER the SDK layers the env config (verified against the vendored
+// otlptracehttp v1.43.0: NewHTTPConfig applies env first, then explicit options,
+// and WithEndpointURL sets Traces.Insecure = scheme != "https").
+//
+// A full-URL Endpoint (with a scheme) is passed via WithEndpointURL so the
+// scheme decides plaintext-vs-TLS; a bare host:port goes through WithEndpoint
+// and WithInsecure is added only when cfg.Insecure. cfg.Headers is applied via
+// WithHeaders when non-empty and cfg.HTTPClient via WithHTTPClient when non-nil.
+func NewTracerProvider(cfg Config) (*sdktrace.TracerProvider, error) {
 	opts := []otlptracehttp.Option{}
 	if strings.Contains(cfg.Endpoint, "://") {
 		opts = append(opts, otlptracehttp.WithEndpointURL(cfg.Endpoint))
@@ -70,16 +92,22 @@ func New(cfg Config, src TurnSource, resolver ProjectResolver, logger *slog.Logg
 	if cfg.Insecure {
 		opts = append(opts, otlptracehttp.WithInsecure())
 	}
+	if len(cfg.Headers) > 0 {
+		opts = append(opts, otlptracehttp.WithHeaders(cfg.Headers))
+	}
+	if cfg.HTTPClient != nil {
+		opts = append(opts, otlptracehttp.WithHTTPClient(cfg.HTTPClient))
+	}
 
 	client, err := otlptracehttp.New(context.Background(), opts...)
 	if err != nil {
-		return nil, fmt.Errorf("otel.New: build OTLP exporter: %w", err)
+		return nil, fmt.Errorf("otel.NewTracerProvider: build OTLP exporter: %w", err)
 	}
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(client),
 		sdktrace.WithResource(newResource(cfg.ServiceName)),
 	)
-	return newExporter(cfg, src, resolver, logger, tp), nil
+	return tp, nil
 }
 
 // newExporter wires an Exporter around an already-built TracerProvider. It is

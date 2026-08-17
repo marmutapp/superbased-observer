@@ -1,0 +1,49 @@
+# Truss config for the Baseten judge deployment: Qwen 2.5 3B Instruct served
+# through vLLM's OpenAI-compatible server (a "Custom Server" / docker_server
+# Truss — no model.py, the vLLM image IS the server).
+#
+# Deploy:  truss push --promote   (from this directory; see README.md)
+#
+# The deployment exposes /v1/chat/completions, so the Baseten production sync
+# route becomes an OpenAI-compatible base URL:
+#   https://model-<id>.api.baseten.co/environments/production/sync/v1
+# which is exactly what Observer's [observability.judge].base_url wants.
+#
+# BUDGET: autoscaling min_replica = 0 (scale-to-zero) is set on the production
+# deployment after push (scripts/demo-baseten.sh + the README curl). Idle GPU
+# minutes then cost ~0; `scripts/demo-baseten.sh down` deactivates it outright.
+model_name: qwen25-3b-judge
+
+# vLLM's official OpenAI-compatible server image. Baseten runs it as-is.
+base_image:
+  image: vllm/vllm-openai:latest
+
+# Custom-server spec: start the vLLM OpenAI server and tell Baseten which
+# in-container endpoints to health-probe and forward predictions to.
+docker_server:
+  # Qwen/Qwen2.5-3B-Instruct is an UNGATED HF repo — no HF token/secret needed.
+  # vLLM downloads the weights at container start. --served-model-name fixes the
+  # value clients must pass as the request "model" field (matches the judge
+  # config's `model`). --max-model-len is trimmed to 8192 (judge prompts are
+  # tiny) to cut KV-cache memory + speed cold starts.
+  start_command: sh -c "vllm serve Qwen/Qwen2.5-3B-Instruct --served-model-name Qwen/Qwen2.5-3B-Instruct --host 0.0.0.0 --port 8000 --max-model-len 8192 --gpu-memory-utilization 0.9"
+  readiness_endpoint: /health
+  liveness_endpoint: /health
+  predict_endpoint: /v1/chat/completions
+  server_port: 8000
+
+# Smallest adequate GPU: L4 (24 GB) is Baseten's own reference accelerator for
+# Qwen 2.5 3B. A 3B model in fp16 is ~6 GB of weights; L4 fits it with room for
+# the KV cache and is cheaper than A10G. Do NOT bump to A100/H100 for a 3B.
+resources:
+  accelerator: L4
+  use_gpu: true
+
+runtime:
+  predict_concurrency: 128
+
+# Give a slow cold start (image pull + weight download) room before the health
+# probe gives up.
+health_checks:
+  restart_threshold_seconds: 1800
+  stop_traffic_threshold_seconds: 600

@@ -774,3 +774,111 @@ func TestProcessFileWarningDedupTTLZeroDisabled(t *testing.T) {
 		t.Errorf("warn count = %d, want 4 (dedup disabled); got %v", len(warns), warns)
 	}
 }
+
+// TestRefreshRootsHotAddsAfterEmptyStart pins the New Terminal
+// install→launch capture gap: Watch starts with no existing session
+// directory (Detected empty), a tool is "installed" (mkdir + session
+// file appear), RefreshRoots hot-adds the root and Scans, and the
+// session is ingested — without restarting the daemon.
+func TestRefreshRootsHotAddsAfterEmptyStart(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	dbPath := filepath.Join(t.TempDir(), "w.db")
+	database, err := db.Open(ctx, db.Options{Path: dbPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	s := store.New(database)
+
+	// Watch root does NOT exist yet — mimics Muse/Prime sessions/ before
+	// first install+launch while the daemon is already running.
+	parent := t.TempDir()
+	watchRoot := filepath.Join(parent, "sessions")
+
+	reg := adapter.NewRegistry()
+	reg.Register(claudecode.NewWithOptions(nil, watchRoot))
+
+	w := New(s, reg, Options{
+		Logger: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
+		NativePredicate: map[string]func(string) bool{
+			"claude-code": claudecode.IsNativeTool,
+		},
+		Debounce:     50 * time.Millisecond,
+		PollInterval: 0, // fsnotify + RefreshRoots only for this test
+	})
+
+	watchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- w.Watch(watchCtx) }()
+
+	// Give Watch time to enter the event loop with zero roots.
+	time.Sleep(100 * time.Millisecond)
+
+	body, err := os.ReadFile(filepath.Join("..", "..", "testdata", "claudecode", "simple-session.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(watchRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONL(t, watchRoot, "session.jsonl", body)
+
+	// Without RefreshRoots the empty-start Watch would never see this
+	// tree (the pre-fix idle path parked forever; even with a live
+	// loop, byRoot was frozen at start). RefreshRoots is the kick.
+	res, err := w.RefreshRoots(ctx)
+	if err != nil {
+		t.Fatalf("RefreshRoots: %v", err)
+	}
+	if res.FilesProcessed < 1 {
+		t.Fatalf("RefreshRoots files processed = %d, want >= 1", res.FilesProcessed)
+	}
+	n, _ := s.CountActions(ctx)
+	if n < 1 {
+		t.Fatalf("actions after RefreshRoots = %d, want >= 1", n)
+	}
+
+	// Idempotent: a second kick must not error or double-count via UNIQUE.
+	if _, err := w.RefreshRoots(ctx); err != nil {
+		t.Fatalf("second RefreshRoots: %v", err)
+	}
+	n2, _ := s.CountActions(ctx)
+	if n2 != n {
+		t.Errorf("second RefreshRoots changed action count %d → %d", n, n2)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watcher did not exit")
+	}
+}
+
+// TestRefreshRootsBeforeWatchStillScans covers the race where a dashboard
+// launch kick arrives before Watch has published fsw: hot-add is skipped
+// but Scan still walks Detected roots that exist.
+func TestRefreshRootsBeforeWatchStillScans(t *testing.T) {
+	t.Parallel()
+	w, s, root := setup(t)
+	body, err := os.ReadFile(filepath.Join("..", "..", "testdata", "claudecode", "simple-session.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeJSONL(t, root, "session.jsonl", body)
+
+	res, err := w.RefreshRoots(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.FilesProcessed != 1 {
+		t.Errorf("files processed = %d, want 1", res.FilesProcessed)
+	}
+	n, _ := s.CountActions(context.Background())
+	if n != 4 {
+		t.Errorf("actions = %d, want 4", n)
+	}
+}

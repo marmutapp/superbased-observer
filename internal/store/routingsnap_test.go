@@ -104,6 +104,50 @@ func TestRoutingRefresher_BreakerLifecycle(t *testing.T) {
 	}
 }
 
+// TestRoutingRefresher_ReloadPolicyFailedPublishLeavesBreakersOnV1 pins
+// P0-7 SHOULD-FIX 2: publish's computeHealth mutates breaker memory in
+// place; a mid-publish failure must RESTORE the pre-mutation breakers
+// (along with policy + slow), not leave the half-applied breaker state
+// behind. Mutation-ready: dropping the breakers restore in ReloadPolicy
+// leaves the open breaker from the failed publish's health pass.
+func TestRoutingRefresher_ReloadPolicyFailedPublishLeavesBreakersOnV1(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestStore(t)
+	base := time.Now().UTC()
+	// v1 state: no breaker open (healthy empty map after a clean refresh
+	// with no error traffic).
+	r := testRefresher(t, s, routing.Policy{}, base)
+	if err := r.RefreshNow(context.Background()); err != nil {
+		t.Fatalf("RefreshNow(v1): %v", err)
+	}
+	if len(r.breakers) != 0 {
+		t.Fatalf("precondition: v1 breakers = %d entries, want empty", len(r.breakers))
+	}
+
+	// Seed an error storm that computeHealth will open a breaker for,
+	// THEN arm the publish-fail seam so ReloadPolicy's publish mutates
+	// breakers and then fails — the restore must put us back to empty.
+	for i := 0; i < 4; i++ {
+		seedTurn(t, s, "s1", "claude-haiku-4-5", base.Add(-time.Duration(i)*time.Minute), 0, 429, 0, 0)
+	}
+	r.testFailPublishAfterHealth = func() error {
+		return context.DeadlineExceeded
+	}
+	err := r.ReloadPolicy(context.Background(), routing.Policy{})
+	if err == nil {
+		t.Fatal("ReloadPolicy with armed publish-fail seam = nil error, want failure")
+	}
+	r.testFailPublishAfterHealth = nil
+
+	if len(r.breakers) != 0 {
+		t.Fatalf("after failed ReloadPolicy: breakers = %d entries (%v), want empty (v1 restored); publish's computeHealth mutation leaked", len(r.breakers), r.breakers)
+	}
+	// Snapshot must still be the pre-reload one (publish never committed).
+	if snap := r.Current(); snap == nil {
+		t.Fatal("published snapshot was cleared by a failed ReloadPolicy")
+	}
+}
+
 // TestRoutingRefresher_DegradedBelowOpenRate pins the degraded band:
 // error rate in [0.25, 0.5) marks degraded, not open.
 func TestRoutingRefresher_DegradedBelowOpenRate(t *testing.T) {

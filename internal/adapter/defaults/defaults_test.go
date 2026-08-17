@@ -112,6 +112,17 @@ var shapeFixturePathByAdapter = map[string]string{
 	// exactly what this test proves, since the same bare shape is claude
 	// -code's, codex's, pi's and openclaw's too.
 	"prime-agent": "/tmp/foreign/.prime/agent/sessions/019f0000-1111-7222-8333-444444444444.jsonl",
+	// junie (JetBrains Junie) — fixed basename events.jsonl under
+	// .junie/sessions/<session-id>/. The shape predicate binds the
+	// `/.junie/sessions/` segment plus the exact basename, which is what
+	// rejects the sibling index.jsonl / state.json / transcript.md entries.
+	"junie": "/tmp/foreign/.junie/sessions/session-260816-220304-lrfz/events.jsonl",
+	// deepseek (DeepSeek Harness) — session.jsonl.zstd under
+	// .dsh/sessions/<cwd-slug>/session-<uuid>/. The shape predicate binds
+	// the `/.dsh/sessions/` segment plus the exact basename (whole-file
+	// zstd, rewritten on every flush — never a bare .jsonl), which is what
+	// rejects the off-limits .credentials.yaml / settings.yaml siblings.
+	"deepseek": "/tmp/foreign/.dsh/sessions/--tmp-foreign--/session-019f0000-1111-7222-8333-444444444444/session.jsonl.zstd",
 	// chatgpt-web — hook-only browser adapter with NO watch paths and an
 	// IsSessionFile that always returns false. Any shaped path is rejected
 	// (there is no on-disk session file), so the reject test passes and the

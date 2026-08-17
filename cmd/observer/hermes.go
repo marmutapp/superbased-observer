@@ -54,7 +54,7 @@ const hermesDefaultKeyEnv = "OPENROUTER_API_KEY"
 // the equivalent config landed an api_turns row (verified 2026-06-27,
 // provider=openai, nvidia/nemotron-…:free, HTTP 200).
 //
-// NEVER writes a secret: [REDACTED] provider's `key_env` is the NAME of an env
+// NEVER writes a secret; the provider's `key_env` is the NAME of an env
 // var (default OPENROUTER_API_KEY), which hermes resolves at runtime — the
 // key stays in your environment. The write is ADDITIVE: only the
 // `providers.observer` entry is touched, so your top-level `model:` block
@@ -96,7 +96,7 @@ func newHermesCmd() *cobra.Command {
 			"because chat's own parser re-declares `--model`/`--provider` and\n" +
 			"would otherwise discard top-level values.\n\n" +
 			"The provider entry is merged in ADDITIVELY — your top-level `model:`\n" +
-			"block and other providers are preserved. NEVER writes a secret: [REDACTED] " +
+			"block and other providers are preserved. NEVER writes a secret; the " +
 			"provider's `key_env` is the NAME `" + hermesDefaultKeyEnv + "` (override\n" +
 			"with --key-env), which hermes resolves from your environment at\n" +
 			"runtime. Export your OpenRouter key under that name before running.\n\n" +
@@ -105,8 +105,13 @@ func newHermesCmd() *cobra.Command {
 			"arguments after the subcommand are forwarded to hermes. Use `--` to\n" +
 			"separate observer flags from hermes flags. Requires a running\n" +
 			"observer proxy (`observer start`).",
-		SilenceErrors: true,
+		SilenceErrors:      true,
+		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args, done, err := launcherArgsOrDone(cmd, args)
+			if done {
+				return err
+			}
 			// Attach-by-default (attach-all-launchers): hand the PTY to the
 			// daemon when attach resolves. hermes routes via the `observer`
 			// provider in ~/.hermes/config.yaml (written by the daemon-spawned
@@ -258,7 +263,6 @@ func newHermesCmd() *cobra.Command {
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "hermes")
 	resume = registerResumeFlag(cmd, "hermes")
-	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 

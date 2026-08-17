@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/marmutapp/superbased-observer/internal/models"
@@ -98,25 +99,67 @@ func TestWriteAdmissionRefusalShapes(t *testing.T) {
 	})
 }
 
-// fakeAdmitter is a test Admitter that records the text it saw.
+// fakeAdmitter is a test Admitter that records the text it saw. It also models
+// the two-phase persist contract: unless persistAtAdmit is set it returns a
+// finalize handle and records the (single) FinalizeAdmission call, so tests can
+// assert the deferred row lands exactly once with the resolved request id.
 type fakeAdmitter struct {
-	block    bool
-	reason   string
-	called   bool
-	gotText  string
-	gotUser  string
-	gotReqID string
-	gotModel string
-	route    *AdmitRoute
+	mu             sync.Mutex
+	block          bool
+	reason         string
+	called         bool
+	gotText        string
+	gotUser        string
+	gotReqID       string
+	gotModel       string
+	route          *AdmitRoute
+	persistAtAdmit bool // when true, Admit returns no finalize handle
+
+	finalizeCalls  int
+	finalizeReqIDs []string
+	finalizeTokens []AdmitToken
 }
 
+// admitHandle is the opaque value the fake hands back as its finalize token.
+type admitHandle struct{ id string }
+
 func (f *fakeAdmitter) Admit(_ context.Context, in AdmitInput) AdmitResult {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.called = true
 	f.gotText = in.Text
 	f.gotUser = in.User
 	f.gotReqID = in.RequestID
 	f.gotModel = in.Model
-	return AdmitResult{Block: f.block, Reason: f.reason, Criterion: "AD-100", Route: f.route}
+	res := AdmitResult{Block: f.block, Reason: f.reason, Criterion: "AD-100", Route: f.route}
+	// A blocked verdict persists inside Admit (nothing is forwarded), exactly
+	// like the real obs adapter — no finalize handle travels back.
+	if !f.persistAtAdmit && !f.block {
+		res.Finalize = &admitHandle{id: in.RequestID}
+	}
+	return res
+}
+
+func (f *fakeAdmitter) FinalizeAdmission(_ context.Context, handle AdmitToken, resolvedRequestID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.finalizeCalls++
+	f.finalizeReqIDs = append(f.finalizeReqIDs, resolvedRequestID)
+	f.finalizeTokens = append(f.finalizeTokens, handle)
+}
+
+// finalized returns the recorded finalize calls under the fake's lock.
+func (f *fakeAdmitter) finalized() (int, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.finalizeCalls, append([]string(nil), f.finalizeReqIDs...)
+}
+
+// finalizedTokens returns the handles the proxy carried back, under the lock.
+func (f *fakeAdmitter) finalizedTokens() []AdmitToken {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]AdmitToken(nil), f.finalizeTokens...)
 }
 
 // TestProxyEgressRouteUpstream proves the P6 proxy application: an enforce-mode
@@ -141,14 +184,14 @@ func TestProxyEgressRouteUpstream(t *testing.T) {
 		Action: "route_upstream", UpstreamID: "local", TargetURL: targetUp.URL,
 		TargetShape: "anthropic", OnUnavailable: "deny", MustUseTarget: true,
 	}}
-	p, err := New(Options{AnthropicUpstream: defaultUp.URL, Sink: &fakeSink{}, Admitter: adm})
+	p, err := New(Options{AnthropicUpstream: defaultUp.URL, Upstreams: map[string]string{"hosted": defaultUp.URL}, Sink: &fakeSink{}, Admitter: adm})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	ts := httptest.NewServer(p.Handler())
 	defer ts.Close()
 
-	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/messages",
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/up/hosted/v1/messages",
 		strings.NewReader(`{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
@@ -180,14 +223,14 @@ func TestProxyEgressRouteModelSplice(t *testing.T) {
 	defer up.Close()
 
 	adm := &fakeAdmitter{route: &AdmitRoute{Action: "route_model", Model: "claude-3-5-haiku-20241022"}}
-	p, err := New(Options{AnthropicUpstream: up.URL, Sink: &fakeSink{}, Admitter: adm})
+	p, err := New(Options{AnthropicUpstream: up.URL, Upstreams: map[string]string{"hosted": up.URL}, Sink: &fakeSink{}, Admitter: adm})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	ts := httptest.NewServer(p.Handler())
 	defer ts.Close()
 
-	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/messages",
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/up/hosted/v1/messages",
 		strings.NewReader(`{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
@@ -212,14 +255,14 @@ func TestProxyAdmissionEstablishesRequestIDAndModel(t *testing.T) {
 	defer anthUp.Close()
 
 	adm := &fakeAdmitter{block: false}
-	p, err := New(Options{AnthropicUpstream: anthUp.URL, Sink: &fakeSink{}, Admitter: adm})
+	p, err := New(Options{AnthropicUpstream: anthUp.URL, Upstreams: map[string]string{"hosted": anthUp.URL}, Sink: &fakeSink{}, Admitter: adm})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	ts := httptest.NewServer(p.Handler())
 	defer ts.Close()
 
-	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/messages",
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/up/hosted/v1/messages",
 		strings.NewReader(`{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
@@ -273,7 +316,9 @@ func TestProxyAdmissionThreadsUserHeader(t *testing.T) {
 
 	adm := &fakeAdmitter{block: false}
 	p, err := New(Options{
-		AnthropicUpstream: anthUp.URL, Sink: &fakeSink{}, Admitter: adm,
+		AnthropicUpstream: anthUp.URL,
+		Upstreams:         map[string]string{"hosted": anthUp.URL},
+		Sink:              &fakeSink{}, Admitter: adm,
 		AdmissionUserHeader: "X-Superbased-User",
 	})
 	if err != nil {
@@ -282,7 +327,7 @@ func TestProxyAdmissionThreadsUserHeader(t *testing.T) {
 	ts := httptest.NewServer(p.Handler())
 	defer ts.Close()
 
-	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/messages",
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/up/hosted/v1/messages",
 		strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Superbased-User", "alice@example.com")
@@ -308,14 +353,14 @@ func TestProxyAdmissionBlocksBeforeForward(t *testing.T) {
 	defer anthUp.Close()
 
 	adm := &fakeAdmitter{block: true, reason: "off-scope request"}
-	p, err := New(Options{AnthropicUpstream: anthUp.URL, Sink: &fakeSink{}, Admitter: adm})
+	p, err := New(Options{AnthropicUpstream: anthUp.URL, Upstreams: map[string]string{"hosted": anthUp.URL}, Sink: &fakeSink{}, Admitter: adm})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	ts := httptest.NewServer(p.Handler())
 	defer ts.Close()
 
-	resp, err := http.Post(ts.URL+"/v1/messages", "application/json",
+	resp, err := http.Post(ts.URL+"/up/hosted/v1/messages", "application/json",
 		strings.NewReader(`{"messages":[{"role":"user","content":"do the forbidden thing"}]}`))
 	if err != nil {
 		t.Fatalf("post: %v", err)
@@ -346,14 +391,14 @@ func TestProxyAdmissionObserveForwards(t *testing.T) {
 	defer anthUp.Close()
 
 	adm := &fakeAdmitter{block: false}
-	p, err := New(Options{AnthropicUpstream: anthUp.URL, Sink: &fakeSink{}, Admitter: adm})
+	p, err := New(Options{AnthropicUpstream: anthUp.URL, Upstreams: map[string]string{"hosted": anthUp.URL}, Sink: &fakeSink{}, Admitter: adm})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	ts := httptest.NewServer(p.Handler())
 	defer ts.Close()
 
-	resp, err := http.Post(ts.URL+"/v1/messages", "application/json",
+	resp, err := http.Post(ts.URL+"/up/hosted/v1/messages", "application/json",
 		strings.NewReader(`{"messages":[{"role":"user","content":"a fine question"}]}`))
 	if err != nil {
 		t.Fatalf("post: %v", err)
@@ -367,5 +412,192 @@ func TestProxyAdmissionObserveForwards(t *testing.T) {
 	}
 	if !adm.called {
 		t.Error("admitter was not consulted")
+	}
+}
+
+// --- two-phase Admit/Finalize (admission-trace-linkage spec §1/§4) --------
+
+// TestProxyAdmissionFinalizesWithProviderEchoedRequestID proves the deferred
+// persist contract on the allowed+forwarded path: the proxy calls
+// FinalizeAdmission exactly once, and with the PROVIDER-echoed request id (the
+// same value stamped on the api_turn and used to seed the synthesized trace),
+// not the pre-forward proxy id admit() saw. Reverting the finalize wiring in
+// serve() fails this on finalizeCalls == 0.
+func TestProxyAdmissionFinalizesWithProviderEchoedRequestID(t *testing.T) {
+	anthUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_provider_echo","model":"claude-opus-4-8",` +
+			`"content":[{"type":"text","text":"ok"}],` +
+			`"usage":{"input_tokens":3,"output_tokens":2}}`))
+	}))
+	defer anthUp.Close()
+
+	adm := &fakeAdmitter{}
+	p, err := New(Options{AnthropicUpstream: anthUp.URL, Upstreams: map[string]string{"hosted": anthUp.URL}, Sink: &fakeSink{}, Admitter: adm})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ts := httptest.NewServer(p.Handler())
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/up/hosted/v1/messages", "application/json",
+		strings.NewReader(`{"model":"claude-opus-4-8","messages":[{"role":"user","content":"a fine question"}]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	calls, ids := adm.finalized()
+	if calls != 1 {
+		t.Fatalf("FinalizeAdmission called %d times, want exactly 1 (the deferred row must land once)", calls)
+	}
+	if ids[0] != "msg_provider_echo" {
+		t.Errorf("finalized with request id %q, want the provider-echoed %q — the admission row would not share the api_turn's id (nor its synthesized trace id)", ids[0], "msg_provider_echo")
+	}
+	if adm.gotReqID == "msg_provider_echo" {
+		t.Error("admit() already saw the provider id; the test no longer proves the pre-forward/post-forward divergence")
+	}
+	// The handle must round-trip unchanged: the proxy carries it, never
+	// reconstructs it (no obs type crosses the seam for it to rebuild).
+	tokens := adm.finalizedTokens()
+	h, ok := tokens[0].(*admitHandle)
+	if !ok || h.id != adm.gotReqID {
+		t.Errorf("finalize handle = %#v, want the exact value Admit returned", tokens[0])
+	}
+}
+
+// TestProxyAdmissionBlockedVerdictDoesNotFinalize proves a blocked verdict
+// persists inside Admit and never travels to FinalizeAdmission — nothing is
+// forwarded, so no later request id can resolve for it.
+func TestProxyAdmissionBlockedVerdictDoesNotFinalize(t *testing.T) {
+	anthUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("upstream was forwarded to despite a blocking verdict")
+	}))
+	defer anthUp.Close()
+
+	adm := &fakeAdmitter{block: true, reason: "off-scope"}
+	p, err := New(Options{AnthropicUpstream: anthUp.URL, Upstreams: map[string]string{"hosted": anthUp.URL}, Sink: &fakeSink{}, Admitter: adm})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ts := httptest.NewServer(p.Handler())
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/up/hosted/v1/messages", "application/json",
+		strings.NewReader(`{"messages":[{"role":"user","content":"do a bad thing"}]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", resp.StatusCode)
+	}
+	if calls, _ := adm.finalized(); calls != 0 {
+		t.Errorf("FinalizeAdmission called %d times on a blocked verdict, want 0", calls)
+	}
+}
+
+// TestProxyAdmissionFinalizesOnUpstreamError is the defer fail-safe: an
+// upstream that cannot be reached still yields exactly one finalize, falling
+// back to the proxy's own request id (no lost row, no double insert).
+func TestProxyAdmissionFinalizesOnUpstreamError(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close() // nothing is listening now: the forward fails at the transport
+
+	adm := &fakeAdmitter{}
+	p, err := New(Options{AnthropicUpstream: deadURL, Upstreams: map[string]string{"hosted": deadURL}, Sink: &fakeSink{}, Admitter: adm})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ts := httptest.NewServer(p.Handler())
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/up/hosted/v1/messages", "application/json",
+		strings.NewReader(`{"messages":[{"role":"user","content":"a fine question"}]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (upstream unreachable)", resp.StatusCode)
+	}
+
+	calls, ids := adm.finalized()
+	if calls != 1 {
+		t.Fatalf("FinalizeAdmission called %d times on the upstream-error path, want exactly 1", calls)
+	}
+	if ids[0] != adm.gotReqID {
+		t.Errorf("finalized with %q, want the proxy request id %q (the only id that ever resolved)", ids[0], adm.gotReqID)
+	}
+}
+
+// TestProxyAdmissionSkippedOffLane proves the lane gate still holds under the
+// two-phase seam: a default-lane request never admits, so nothing finalizes.
+func TestProxyAdmissionSkippedOffLane(t *testing.T) {
+	anthUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer anthUp.Close()
+
+	adm := &fakeAdmitter{}
+	p, err := New(Options{AnthropicUpstream: anthUp.URL, Sink: &fakeSink{}, Admitter: adm})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ts := httptest.NewServer(p.Handler())
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/v1/messages", "application/json",
+		strings.NewReader(`{"messages":[{"role":"user","content":"plane-B coding turn"}]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if adm.called {
+		t.Error("admitter ran on a default (Plane-B) lane")
+	}
+	if calls, _ := adm.finalized(); calls != 0 {
+		t.Errorf("FinalizeAdmission called %d times off-lane, want 0", calls)
+	}
+}
+
+// TestProxyAdmissionNonDeferringGateNeverFinalizes covers the other half of the
+// seam contract: a gate that persists inside Admit returns no handle, and the
+// proxy must then never call FinalizeAdmission (a nil handle is a no-op, not a
+// finalize with nothing to write).
+func TestProxyAdmissionNonDeferringGateNeverFinalizes(t *testing.T) {
+	anthUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","model":"claude-opus-4-8","content":[{"type":"text","text":"ok"}],` +
+			`"usage":{"input_tokens":3,"output_tokens":2}}`))
+	}))
+	defer anthUp.Close()
+
+	adm := &fakeAdmitter{persistAtAdmit: true}
+	p, err := New(Options{AnthropicUpstream: anthUp.URL, Upstreams: map[string]string{"hosted": anthUp.URL}, Sink: &fakeSink{}, Admitter: adm})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ts := httptest.NewServer(p.Handler())
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/up/hosted/v1/messages", "application/json",
+		strings.NewReader(`{"messages":[{"role":"user","content":"a fine question"}]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if !adm.called {
+		t.Fatal("admitter was not consulted")
+	}
+	if calls, _ := adm.finalized(); calls != 0 {
+		t.Errorf("FinalizeAdmission called %d times for a gate that returned no handle, want 0", calls)
 	}
 }

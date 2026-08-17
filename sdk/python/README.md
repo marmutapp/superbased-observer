@@ -1,14 +1,10 @@
-# SuperBased Observer — Python SDK
+# SuperBased Observer - Python SDK
 
-**Instrument your own LLM app once, and get local, proxy-accurate cost +
-cache visibility, evals, and input guardrails — no data leaves the
-machine.** A thin convenience layer over OpenTelemetry, this SDK sends your
-custom app / agent traces to a local SuperBased Observer via OTLP, so they
-show up on the admin dashboard's **Trajectories** view alongside the same
-cost/cache engine that powers Observer's coding-agent mode.
+A thin convenience layer over OpenTelemetry. This SDK sends your custom
+app / agent traces to a local SuperBased Observer via OTLP.
 
-> **Provisional package name** (`superbased-observer-sdk`, import `superbased`)
-> — the main Observer distribution already owns the `superbased-observer` name
+> **Provisional package name** (`superbased-observer-sdk`, import `superbased`),
+> the main Observer distribution already owns the `superbased-observer` name
 > on PyPI/npm. Final SDK naming is an open decision (plan §15 Q1).
 
 ## Install
@@ -60,7 +56,7 @@ superbased.shutdown()    # flush before a short-lived process exits
 
 Prompt/response bodies are captured **by default** when you pass them to the
 span helpers (`llm_span(..., prompt=...)`, `set_usage(..., prompt=..., response=...)`,
-or `set_content(span, prompt=..., response=...)` — the last also takes
+or `set_content(span, prompt=..., response=...)`, the last also takes
 `tool_args=` / `tool_result=` for TOOL spans). Observer persists them subject
 to your node's content-retention posture.
 
@@ -82,11 +78,11 @@ from openinference.instrumentation.langchain import LangChainInstrumentor
 LangChainInstrumentor().instrument()
 ```
 
-## Admission check (input guardrails)
+## Pre-flight check
 
-`admit()` posts an incoming user message to the co-resident Observer node's
-input-admission gate (`docs/guardrails.md`) and returns an allow/flag/ask/deny
-`Verdict` — call it at your app's front door before running the agent:
+`admit()` posts a message to an optional pre-flight check endpoint on your
+Observer deployment and returns an allow/flag/ask/deny `Verdict`. Call it at
+your app's front door before running the agent:
 
 ```python
 v = superbased.admit(user_message, user="alice", session="s1")
@@ -96,9 +92,8 @@ if not v.allowed:
 
 Defaults to `http://127.0.0.1:8081/api/obs/admission/check` (the local node
 dashboard's port; override with `endpoint=` or `$SUPERBASED_ADMISSION_ENDPOINT`).
-Fails **open** on any transport error — an unreachable Observer never blocks
-your app; the judged decision itself (a local Ollama model, a custom-remote
-model, or a gateway/provider model) is entirely the server's own config.
+Fails **open** on any transport error: an unreachable Observer never blocks
+your app.
 
 ## How it maps
 
@@ -110,12 +105,12 @@ proxy's `api_turns` when no explicit `request_id` is set.
 
 ## Design test
 
-Anything this SDK does, a stock OTel exporter pointed at Observer does too —
+Anything this SDK does, a stock OTel exporter pointed at Observer does too;
 see [`examples/raw_otlp.py`](examples/raw_otlp.py). The SDK is pure ergonomics;
 direct third-party OTLP exporters are a supported tier (plan §15 Q2).
 
 ## Echo-guard caveat
 
-Never set the resource attribute `sbo.emitted_by=observer` — that is
-Observer's own marker for telemetry it emitted, and any resource carrying it is
+Never set the resource attribute `sbo.emitted_by=observer`; it is Observer's
+own marker for telemetry it emitted, and any resource carrying it is
 **dropped** at ingestion. The SDK sets `sbo.sdk="superbased-python"` instead.

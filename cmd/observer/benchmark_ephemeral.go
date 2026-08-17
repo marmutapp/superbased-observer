@@ -30,8 +30,9 @@ import (
 // The correlation seam for claude-code is HOOKS + PROXY, not the watcher (the
 // sandbox transcripts live under the per-attempt temp home the watcher never
 // sees — see benchmark_provision.go::prepareClaude). So the ephemeral watcher
-// runs with an EMPTY enabled-adapters allow-list: it enters idle mode and never
-// scans (or ingests) the operator's real ~/.claude etc. into the throwaway DB.
+// runs with an EMPTY enabled-adapters allow-list: Detected stays empty so the
+// watcher never scans (or ingests) the operator's real ~/.claude etc. into the
+// throwaway DB.
 
 // isolatedDaemonDriver is implemented by a HarnessDriver whose Preflight
 // requires a dedicated isolated observer daemon (its own small DB). The runner
@@ -137,7 +138,7 @@ func startEphemeralDaemon(ctx context.Context) (*ephemeralDaemon, error) {
 	// run-ctx cancel / ctrl-c) stops the proxy+watcher.
 	dctx, cancel := context.WithCancel(ctx)
 
-	p, pCleanup, addr, _, _, err := buildProxy(dctx, configPath, "", 0, "127.0.0.1")
+	p, pCleanup, addr, _, _, _, _, err := buildProxy(dctx, configPath, "", 0, "127.0.0.1", nil)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("build proxy: %w", err)
@@ -221,16 +222,16 @@ func (d *ephemeralDaemon) Close() {
 // writeEphemeralBenchmarkConfig writes a minimal, isolated config.toml: its own
 // DB in the temp dir, a free proxy port, retention prune off, code-intel and
 // conversation compression off (fast + measures raw billed tokens), and an
-// EMPTY watch allow-list so the watcher idles instead of scanning the
-// operator's real session dirs into the throwaway DB.
+// EMPTY watch allow-list so Detected stays empty and the watcher never
+// scans the operator's real session dirs into the throwaway DB.
 func writeEphemeralBenchmarkConfig(configPath, dbPath string, port int) error {
 	cfg := config.Default()
 	cfg.Observer.DBPath = dbPath
 	cfg.Observer.LogLevel = "error"
 	cfg.Observer.Retention.PruneOnStartup = false
-	// Empty allow-list ⇒ registry.Detected returns nothing ⇒ the watcher enters
-	// idle mode and never scans/ingests the operator's real dirs. The
-	// claude-code correlation seam is hooks+proxy, not the watcher.
+	// Empty allow-list ⇒ registry.Detected returns nothing ⇒ the watcher
+	// never scans/ingests the operator's real dirs. The claude-code
+	// correlation seam is hooks+proxy, not the watcher.
 	cfg.Observer.Watch.EnabledAdapters = []string{}
 	cfg.Proxy.Port = port
 	cfg.CodeIntel.Enabled = false

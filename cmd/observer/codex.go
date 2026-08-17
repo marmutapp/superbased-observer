@@ -83,8 +83,13 @@ func newCodexCmd() *cobra.Command {
 			"`--detect-only` to inspect without running codex, or\n" +
 			"`--no-app-server-check` to silence. See\n" +
 			"docs/codex-shared-app-server-gotcha.md.",
-		SilenceErrors: true,
+		SilenceErrors:      true,
+		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args, done, err := launcherArgsOrDone(cmd, args)
+			if done {
+				return err
+			}
 			return runCodexLauncher(cmd.Context(), codexLauncherOptions{
 				configPath:       configPath,
 				proxyURL:         proxyURL,
@@ -153,7 +158,6 @@ func newCodexCmd() *cobra.Command {
 		cmd.Flags().StringVar(&resume, "resume", "",
 			"Resume a CLOSED codex session by its id: launches `codex resume <id>`, reattaching the tool's REAL prior session — NOT a distilled fork. Composes with proxy routing (`codex -c openai_base_url=… resume <id>`). Mutually exclusive with --continue-from/--carry/--from-message/--from-time. Combine with --attach to resume into a daemon-owned session the dashboard can join. See docs/plans/session-attach-design-2026-07-19.md.")
 	}
-	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 

@@ -603,6 +603,32 @@ var forbiddenCacheTables = []string{
 	// team-level "who's near their cap" view, if ever built, is a separate
 	// opt-in AGGREGATE wire shape, never this table.
 	"limit_snapshots",
+	// Plane-A P0-5 unified policy resource, agent-side scoped persistence
+	// (migration 081, docs/plans/plane-a-p0-5-unified-policy-resource-v1-plan.md
+	// §6.2/§6.9/§6.10): org_enrolment_generation is the durable
+	// cross-process enrolment fence (survives unenrol, carries a tombstone
+	// bit) and org_policy_resource_state is the per-(org_key, family)
+	// replay floor + last-verified-envelope identity. Both are RECEIVED,
+	// generation-scoped control-plane state — like org_routing_policies
+	// above, round-tripping either back onto the wire is pure noise even
+	// setting aside that a generation counter and a replay floor reveal
+	// nothing useful to the server it didn't already know, but the
+	// underlying resource content (family bodies) could. internal/store/
+	// policyresource.go is their one owner; orgpush.go must never read
+	// them.
+	"org_enrolment_generation",
+	"org_policy_resource_state",
+	// Admin-controlled Plane B, the ENROLMENT GRANT (migration 082,
+	// docs/plans/admin-controlled-plane-b-spec-2026-08-15.md §2.4). It
+	// records the bounded authority THIS machine handed to the
+	// organization: consent mode, the consenting local actor, the signed
+	// offer, the key pin. The org already knows what it offered; what it
+	// must never receive back on the push wire is the node's own consent
+	// record, which names a local user and is the developer's evidence of
+	// what they agreed to — evidence whose whole value is that it lives on
+	// their machine, under their control, deletable by `observer unenroll`.
+	// internal/store/orggrant.go is its one owner.
+	"org_enrolment_grant",
 	// Session-handoff records (migration 055,
 	// docs/plans/session-handoff-plan-2026-07-03.md §5) are NODE-LOCAL:
 	// which tool a user moved a session to, when, at what fork point and
@@ -781,6 +807,284 @@ var forbiddenCacheTables = []string{
 	// (TestSessionClassificationPinnedOutOfPush).
 	"session_tags",
 	"session_annotations",
+}
+
+// forbiddenGatewayTables names the SERVER-SIDE gateway tables that MUST NEVER be
+// referenced as a string literal in internal/store/orgpush.go. Unlike the
+// node-local forbiddenCacheTables above, these live in the ORG SERVER's DB — but
+// the same source-level sentinel applies: the node→server push seam
+// (SelectUnpushedSince) must never name them, because they are SERVER-ONLY ingest
+// state the node never possesses. gateway_wal is the P0-9 durable-edge WAL — a
+// server-only ingest queue whose payload holds mapped telemetry the node never
+// possesses; naming it on the push wire would be nonsensical AND a boundary
+// violation. Walked by TestSelectUnpushedSinceExcludesCacheTables alongside
+// forbiddenCacheTables.
+var forbiddenGatewayTables = []string{
+	"gateway_wal",
+	// The P1-2/P1-10 generic trace/span attribute-retention tier (server
+	// migration 033) makes gateway_span carry retained OTLP attributes, and it
+	// references the content-addressed gateway_resource/gateway_scope envelopes;
+	// gateway_trace holds synthesized trace summaries. All four are SERVER-ONLY
+	// gateway ingest tables (mig 026/027) that the NODE never possesses, so their
+	// names must never appear on the org-push wire either.
+	"gateway_resource",
+	"gateway_scope",
+	"gateway_span",
+	"gateway_trace",
+}
+
+// forbiddenOrgControlPlaneTables are SERVER-ONLY P1-4/P1-7/P1-9 control-plane
+// tables that must never appear in orgpush.go string literals.
+var forbiddenOrgControlPlaneTables = []string{
+	"org_intelligence_config",
+	"insight_playbook",
+	"insight_run",
+	"insight_recommendation",
+	"org_fleet_upgrade_cohorts",
+	"org_fleet_cohort_members",
+	"org_fleet_self_telemetry",
+	"org_fleet_remote_config",
+	"org_fleet_cert_events",
+	"org_deployment_wizard",
+	"org_deployment_connectors",
+	// org_agent_policy_attributes (server migration 044) is the AUTHORITATIVE
+	// per-subject policy-targeting binding: it decides which policy version a
+	// node is served, and it exists precisely BECAUSE the node must not be the
+	// one asserting those attributes. It is control-plane state the node never
+	// possesses, so naming it on the node->server push wire would be both
+	// nonsensical and a boundary violation. Pinned as a fixed expected member
+	// by TestForbiddenOrgControlPlaneTablesExpectedSet below.
+	"org_agent_policy_attributes",
+	// The WS3 insight-harness trio (server migration 045). org_llm_provider is
+	// the org's registered LLM connections and org_secret holds the SEALED
+	// credential bodies those connections resolve — a credential store that the
+	// node neither possesses nor may ever be shipped. insight_run_step is the
+	// server-side audited step trace of an insight run (which query the agent
+	// asked for, which model answered, what it cost). All three are org
+	// control-plane state with no agent counterpart, so naming any of them on
+	// the node->server push wire would be both nonsensical and a boundary
+	// violation. Pinned as fixed expected members by
+	// TestForbiddenOrgControlPlaneTablesExpectedSet below.
+	"org_llm_provider",
+	"org_secret",
+	"insight_run_step",
+	// The fleet remote-config mutation trail (server migration 046). It
+	// records WHICH ADMIN changed a collector's remote config, in which org —
+	// server-side attribution for a control-plane mutation the node never
+	// makes and never sees. Naming it on the node->server push wire would be
+	// both nonsensical and a boundary violation. Pinned as a fixed expected
+	// member by TestForbiddenOrgControlPlaneTablesExpectedSet below.
+	"org_fleet_config_events",
+	// The WS2 guided-setup settings store (server migration 047). Its rows
+	// hold the org's storage-connection settings and a secretref pointing at a
+	// SEALED credential body in org_secret — org control-plane configuration
+	// the node neither possesses nor may ever be shipped. Naming it on the
+	// node->server push wire would be both nonsensical and a boundary
+	// violation. Pinned as a fixed expected member by
+	// TestForbiddenOrgControlPlaneTablesExpectedSet below.
+	"org_setup_setting",
+	// The WS1.4 project display-label store (server migration 048). Rows are
+	// ADMIN-AUTHORED display strings for a project hash — org-side naming the
+	// node never possesses and must never be asked for. The node ships the
+	// hash and only the hash; a seam in orgpush.go that named this table would
+	// mean the label had become node data (or, worse, that the wire had grown
+	// a raw-path counterpart), which is exactly the inversion the hash posture
+	// exists to prevent. Pinned as a fixed expected member by
+	// TestForbiddenOrgControlPlaneTablesExpectedSet below.
+	"org_project_labels",
+	// The dashboard-registered external harness agent registry (server
+	// migration 049). Rows are org control-plane configuration (an admin's
+	// choice of which pre-placed binary answers an agent id) with no agent
+	// counterpart — the node never registers, resolves, or executes these,
+	// it only ever sees the resulting "external:<id>" agent id the same way
+	// it would a TOML entry. Naming it on the node->server push wire would be
+	// both nonsensical and a boundary violation. Pinned as a fixed expected
+	// member by TestForbiddenOrgControlPlaneTablesExpectedSet below.
+	"org_external_agent",
+	// Datasets foundation (server migration 051, wave item B): reference-only
+	// trace/span membership for evals and experiments. Org control-plane
+	// state with no agent counterpart — the node neither builds nor reads
+	// datasets. Pinned as fixed expected members below.
+	"org_dataset",
+	"org_dataset_item",
+	// LLM job runner + annotations (server migration 052, wave items C/D):
+	// deterministic single-shot job state and metadata-class trace labels,
+	// org control-plane only — the node never runs or reads these.
+	"org_trace_annotation",
+	"org_llm_job",
+	"org_llm_job_item",
+	// Guardrailed chat (server migration 053, wave item F): chat transcripts
+	// and proposal state are org control-plane content with no agent
+	// counterpart — the node never sees the assistant conversation.
+	"org_chat_session",
+	"org_chat_message",
+	// Plane-B admin intelligence (server migrations 057-059 + the P2 harness
+	// trio reserved by the spec's §2.3 nine-table pin;
+	// docs/plans/plane-b-admin-intelligence-and-enforcement-spec-2026-08-15.md).
+	// All are org control-plane state with no agent counterpart: the coding
+	// intelligence config document, session-referencing dataset membership,
+	// the single-shot job runner's state, session annotations, and the
+	// Plane-B playbook/run tables. The node never builds, runs, or reads any
+	// of them; naming one on the node->server push wire would be a boundary
+	// violation. The content-adjacent trio (job, job_item, annotation) is
+	// additionally pinned as fixed expected members below.
+	"org_coding_intel_config",
+	"org_coding_dataset",
+	"org_coding_dataset_item",
+	"org_coding_job",
+	"org_coding_job_item",
+	"org_coding_annotation",
+	"org_coding_playbook",
+	"org_coding_run",
+	"org_coding_run_step",
+	// Self-Improving Policy Plane P0 (server migrations 061-065;
+	// docs/plans/self-improving-policy-evolution-p0-build-plan-2026-08-16.md).
+	// All five are org control-plane state with no agent counterpart: the
+	// per-(org,family,target) evolution config, the review-run ledger, the
+	// candidate-proposal store (proposed_body + LLM-authored rationale), the
+	// hash-chained approve/reject audit, and the manual-Apply outcome record.
+	// The node never builds, runs, or reads any of them; naming one on the
+	// node->server push wire would be a boundary violation. The two
+	// content-bearing tables (proposal, decision — where LLM-authored text
+	// lands) are additionally pinned as fixed expected members below.
+	"org_policy_evolution_config",
+	"org_policy_evolution_run",
+	"org_policy_evolution_proposal",
+	"org_policy_evolution_decision",
+	"org_policy_evolution_applied",
+}
+
+// TestForbiddenOrgControlPlaneTablesExpectedSet is the NON-GAMEABLE membership
+// pin for the org control-plane sentinel, mirroring
+// TestForbiddenGatewayTablesExpectedSet. Merely APPENDING a name to
+// forbiddenOrgControlPlaneTables is trivially removable without any test
+// failing, which would silently stop TestSelectUnpushedSinceExcludesCacheTables
+// from guarding that name out of orgpush.go. A FIXED expected subset must
+// therefore remain present: deleting any of these names fails HERE, by name.
+func TestForbiddenOrgControlPlaneTablesExpectedSet(t *testing.T) {
+	want := []string{
+		"org_agent_policy_attributes",
+		"org_intelligence_config",
+		"org_fleet_upgrade_cohorts",
+		"org_fleet_remote_config",
+		"org_deployment_wizard",
+		// WS3 insight harness (server migration 045). org_secret in particular
+		// is a SEALED CREDENTIAL store: dropping it from the sentinel would
+		// stop the orgpush.go guard from ever noticing a seam that named it.
+		"org_llm_provider",
+		"org_secret",
+		"insight_run_step",
+		// Fleet mutation attribution (server migration 046): the audit trail
+		// of who reconfigured which collector. Server-only control-plane
+		// state with no agent counterpart.
+		"org_fleet_config_events",
+		// WS2 guided setup (server migration 047): the settings store whose
+		// secret_ref column points at a SEALED org_secret body. Dropping it
+		// from the sentinel would stop the orgpush.go guard from ever noticing
+		// a seam that named it.
+		"org_setup_setting",
+		// WS1.4 project labels (server migration 048): org-side display names
+		// for hashed project identities. Dropping it from the sentinel would
+		// stop the orgpush.go guard from noticing a seam that tried to carry
+		// project naming — in either direction — on the agent wire.
+		"org_project_labels",
+		// Dashboard-registered external harness agents (server migration
+		// 049): org control-plane configuration with no agent counterpart.
+		// Dropping it from the sentinel would stop the orgpush.go guard from
+		// noticing a seam that named it.
+		"org_external_agent",
+		// Datasets foundation (server migration 051): dataset membership is
+		// org-side only; dropping these would stop the guard from noticing a
+		// seam that tried to carry dataset state on the agent wire.
+		"org_dataset",
+		"org_dataset_item",
+		// LLM jobs + annotations (server migration 052): job/annotation
+		// state stays org-side; dropping these would stop the guard from
+		// noticing a seam that named them.
+		"org_trace_annotation",
+		"org_llm_job",
+		"org_llm_job_item",
+		// Guardrailed chat (server migration 053): transcripts stay
+		// org-side; dropping these would stop the guard from noticing a
+		// seam that named them.
+		"org_chat_session",
+		"org_chat_message",
+		// Plane-B admin intelligence (server migrations 057-059): the
+		// content-adjacent trio — job state, per-item results, and session
+		// annotations are the rows an LLM's output lands in. Dropping any of
+		// them from the sentinel would stop the orgpush.go guard from
+		// noticing a seam that named them.
+		"org_coding_job",
+		"org_coding_job_item",
+		"org_coding_annotation",
+		// Self-Improving Policy Plane P0 (server migrations 061-065): the
+		// content-bearing pair. org_policy_evolution_proposal holds the
+		// candidate proposed_body + LLM-authored rationale, and
+		// org_policy_evolution_decision holds the approve/reject reason —
+		// the rows an LLM's output lands in. Dropping either from the
+		// sentinel would stop the orgpush.go guard from noticing a seam
+		// that named them.
+		"org_policy_evolution_proposal",
+		"org_policy_evolution_decision",
+	}
+	have := make(map[string]struct{}, len(forbiddenOrgControlPlaneTables))
+	for _, n := range forbiddenOrgControlPlaneTables {
+		have[n] = struct{}{}
+	}
+	for _, w := range want {
+		if _, ok := have[w]; !ok {
+			t.Errorf("expected server-side control-plane table %q is missing from forbiddenOrgControlPlaneTables — "+
+				"the privacy sentinel would no longer guard it out of orgpush.go", w)
+		}
+	}
+}
+
+// TestForbiddenGatewayTablesExpectedSet is the NON-GAMEABLE membership pin: a
+// FIXED expected set (gateway_wal + the four gateway ingest tables the P1-2/P1-10
+// retention tier touches) must be a SUBSET of forbiddenGatewayTables. Merely
+// APPENDING a name is removable without a failure (the original TestGatewayWAL…
+// only checked gateway_wal), so REMOVING any of these names from
+// forbiddenGatewayTables fails HERE — which in turn would stop
+// TestSelectUnpushedSinceExcludesCacheTables from guarding that name in
+// orgpush.go. Mut 10 (drop gateway_span from forbiddenGatewayTables) fails this
+// assertion by name.
+func TestForbiddenGatewayTablesExpectedSet(t *testing.T) {
+	want := []string{
+		"gateway_wal",
+		"gateway_resource",
+		"gateway_scope",
+		"gateway_span",
+		"gateway_trace",
+	}
+	have := make(map[string]struct{}, len(forbiddenGatewayTables))
+	for _, n := range forbiddenGatewayTables {
+		have[n] = struct{}{}
+	}
+	for _, w := range want {
+		if _, ok := have[w]; !ok {
+			t.Errorf("expected server-side gateway table %q is missing from forbiddenGatewayTables — "+
+				"the privacy sentinel would no longer guard it out of orgpush.go", w)
+		}
+	}
+}
+
+// TestGatewayWALPinnedOutOfPush pins gateway_wal (server migration 032, Plane-A
+// P0-9 durable-edge WAL) at the source level: its name is in the
+// forbiddenGatewayTables sentinel, so TestSelectUnpushedSinceExcludesCacheTables
+// fails the build if it ever appears as a string literal in orgpush.go. There is
+// no end-to-end seed arm because the table lives in the ORG SERVER's DB, not the
+// agent store the push seam reads — the source-level pin is the guarantee.
+func TestGatewayWALPinnedOutOfPush(t *testing.T) {
+	found := false
+	for _, n := range forbiddenGatewayTables {
+		if n == "gateway_wal" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("gateway_wal is not in forbiddenGatewayTables — the source-level sentinel is missing")
+	}
 }
 
 // TestRemoteAuditTablePinnedOutOfPush pins the remote-access audit log
@@ -1021,6 +1325,67 @@ func TestSessionClassificationPinnedOutOfPush(t *testing.T) {
 	}
 }
 
+// TestPolicyResourceTablesPinnedOutOfPush pins the Plane-A P0-5 unified
+// policy resource tables (migration 081, plan §6.2/§6.9/§6.10) out of the
+// org-push wire two ways: (1) both table names are in the forbidden-name
+// sentinel set (so TestSelectUnpushedSinceExcludesCacheTables fails the
+// build if either appears as a string literal in orgpush.go), and (2) an
+// end-to-end assertion that seeded rows in both tables never cross the wire
+// — even under full_content, the maximum disclosure surface. The rows carry
+// no *_hash counterpart because they are never pushed at all.
+func TestPolicyResourceTablesPinnedOutOfPush(t *testing.T) {
+	// (1) both names pinned in the sentinel set.
+	for _, name := range []string{"org_enrolment_generation", "org_policy_resource_state"} {
+		found := false
+		for _, n := range forbiddenCacheTables {
+			if n == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("%s is not in forbiddenCacheTables — the source-level sentinel is missing", name)
+		}
+	}
+
+	// (2) end-to-end: seeded generation + state rows never ride the wire.
+	const secOrgKey = "secret-orgkey-perspicacious-zz"
+	ctx := context.Background()
+	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "agent.db")})
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	st := store.New(database)
+	seed(ctx, t, st)
+
+	if _, err := st.BumpEnrolmentGeneration(ctx, secOrgKey, false); err != nil {
+		t.Fatalf("BumpEnrolmentGeneration: %v", err)
+	}
+	err = st.WithPolicyResourceFence(ctx, secOrgKey, "admission.input", func(_ context.Context, fence store.PolicyResourceFence) (*store.PolicyResourceCommit, error) {
+		return &store.PolicyResourceCommit{
+			Generation: fence.Generation, FloorVersion: 1, LastVersion: 1,
+			BodyHash: secOrgKey, MsgDigest: secOrgKey,
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("WithPolicyResourceFence: %v", err)
+	}
+
+	batch, err := st.SelectUnpushedSince(ctx, store.PushCursor{}, 1<<20, "org-1", "dev@x",
+		store.ShareOptions{FullContent: true}, store.ScopeOptions{})
+	if err != nil {
+		t.Fatalf("SelectUnpushedSince: %v", err)
+	}
+	raw, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatalf("marshal batch: %v", err)
+	}
+	if bytes.Contains(raw, []byte(secOrgKey)) {
+		t.Error("policy-resource state leaked into the push payload — the tables must never be pushed")
+	}
+}
+
 // TestObsEgressHasNoOrgProviderSeam pins the G22 privacy posture structurally
 // (design §7/§8): v1 ships NO egress org tier, so store.ObsOrgProviders must
 // carry no Egress provider — obs_egress_decisions can never be composed onto
@@ -1080,6 +1445,22 @@ func TestSelectUnpushedSinceExcludesCacheTables(t *testing.T) {
 					pos.Filename, pos.Line, name)
 			}
 		}
+		for _, name := range forbiddenGatewayTables {
+			if strings.Contains(lit.Value, name) {
+				pos := fset.Position(lit.Pos())
+				t.Errorf("%s:%d: forbidden server-side gateway table name %q appears in string literal — "+
+					"gateway_wal is a SERVER-ONLY ingest queue (P0-9 durable-edge WAL); it MUST NOT enter the push wire path",
+					pos.Filename, pos.Line, name)
+			}
+		}
+		for _, name := range forbiddenOrgControlPlaneTables {
+			if strings.Contains(lit.Value, name) {
+				pos := fset.Position(lit.Pos())
+				t.Errorf("%s:%d: forbidden org control-plane table name %q appears in string literal — "+
+					"P1-4/P1-7/P1-9 control-plane tables are SERVER-ONLY and MUST NOT enter the push wire path",
+					pos.Filename, pos.Line, name)
+			}
+		}
 		return true
 	})
 }
@@ -1123,6 +1504,35 @@ func TestRoutingSummaryWireShapeIsAggregateOnly(t *testing.T) {
 		name := typ.Field(i).Name
 		if !allowed[name] {
 			t.Errorf("RoutingSummaryRow gained non-aggregate field %q — the §R19.4 wire shape is counts + dollars by tier/reason ONLY", name)
+		}
+	}
+}
+
+// TestPolicyStateRowWireShapeIsHashOnly pins the P0-6 effective-state row
+// (docs/plans/plane-a-p0-6-effective-policy-state-plan.md §2.1/§5.1): the
+// PolicyStateRow that rides POST /api/agent/policy-ack may carry ONLY the 12
+// allow-listed hash/version/enum/timestamp fields — no Body/TOML/Path/Detail/
+// Message/Excerpt/Tenant/EndUser/Prompt or any free-text field, forever. A new
+// field fails loudly. Modeled on TestRoutingSummaryWireShapeIsAggregateOnly.
+func TestPolicyStateRowWireShapeIsHashOnly(t *testing.T) {
+	t.Parallel()
+	allowed := map[string]bool{
+		"OrgID": true, "UserEmail": true, // server-stamped attribution (empty-on-wire)
+		"Family": true, "EnforcementPoint": true, // closed enums
+		"DesiredVersion": true, "RunningVersion": true, // integer versions
+		"EffectiveHash": true,                 // per-point hex digest
+		"Status":        true, "Reason": true, // closed enums (Reason a typed code, never Detail)
+		"RestartRequired": true, "Mode": true, // bool + closed enum
+		"LastSeen": true, // RFC3339 liveness
+	}
+	typ := reflect.TypeOf(orgcontract.PolicyStateRow{})
+	if typ.NumField() != len(allowed) {
+		t.Errorf("PolicyStateRow has %d fields, want exactly %d (§2.1 12-field allow-list, R4-NIT)", typ.NumField(), len(allowed))
+	}
+	for i := 0; i < typ.NumField(); i++ {
+		name := typ.Field(i).Name
+		if !allowed[name] {
+			t.Errorf("PolicyStateRow gained non-allow-listed field %q — the P0-6 §2.1 wire shape is hash/version/enum/timestamp ONLY", name)
 		}
 	}
 }

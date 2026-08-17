@@ -223,6 +223,7 @@ func BuildClaudeCodeEvent(body []byte) (policy.Event, bool) {
 		Caps:      claudeCodePreToolCaps,
 		Now:       time.Now().UTC(),
 	}
+	ev.Caps.Sandboxed = sandboxedChild()
 	if shape, ok := claudeToolShape[p.ToolName]; ok {
 		ev.Kind = shape.kind
 		ev.ActionType = shape.actionType

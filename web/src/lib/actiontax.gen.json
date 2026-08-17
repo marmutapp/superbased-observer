@@ -353,6 +353,18 @@
         "meta"
       ]
     },
+    "deepseek": {
+      "categories": [
+        "file",
+        "cmd",
+        "search",
+        "web",
+        "agent",
+        "skill",
+        "user",
+        "meta"
+      ]
+    },
     "devin": {
       "categories": [
         "file",

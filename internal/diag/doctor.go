@@ -135,6 +135,7 @@ func Run(ctx context.Context, opts DoctorOptions) Report {
 		r.add(c)
 	}
 	r.add(checkOrgEnrolment(ctx, opts.DB, opts.Config))
+	r.add(checkGovernance(ctx, opts.DB, opts.Config, homeOverride))
 	r.add(checkProcessObservability(ctx, opts.DB, opts.Config))
 	r.add(checkHandoffReaders(ctx, opts.DB))
 	r.add(checkClaudeCodeTeams(opts.Config))
@@ -173,6 +174,17 @@ func (r Report) Filter(tool string) Report {
 // 2026-06-02 teams test couldn't answer without reading source.
 func checkOrgEnrolment(ctx context.Context, database *sql.DB, cfg config.Config) Check {
 	if !cfg.OrgClient.Enabled {
+		// Tracker #41: "disabled" is only innocuous on a machine that never
+		// enrolled. An enrolment row with the rail off means the node LOOKS
+		// enrolled to its operator (and to the org that minted the token)
+		// while pushing nothing and polling no policy — silently ungoverned.
+		var enrolled int
+		if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM org_enrolment`).Scan(&enrolled); err == nil && enrolled > 0 {
+			return Check{
+				Name: "org enrolment", Status: StatusWarn,
+				Message: "enrolled but [org_client] enabled = false — the org rail is NOT running (no push, no policy poll); set enabled = true in config.toml or run `observer unenroll`",
+			}
+		}
 		return Check{Name: "org enrolment", Status: StatusOK, Message: "[org_client] disabled (solo-local mode)"}
 	}
 	// Schema-meta-driven enrolment / cursor / last-push readout. We
@@ -215,6 +227,16 @@ func checkOrgEnrolment(ctx context.Context, database *sql.DB, cfg config.Config)
 		shareStatus = StatusWarn
 	}
 	details = append(details, "share mode:    "+shareMsg)
+	// Tracker #41 second half: the push loop reads the enrolment row's URL
+	// from the DB, but the guard policy-bundle runner and the disclosure
+	// surfaces read [org_client].org_server_url from config — enrolled with
+	// the key unset leaves the guard's org layer silently unwired.
+	if strings.TrimSpace(cfg.OrgClient.OrgServerURL) == "" {
+		details = append(details, fmt.Sprintf(
+			"config gap:    [org_client].org_server_url is unset — the org guard-policy layer cannot poll; add org_server_url = %q to config.toml", orgURL,
+		))
+		shareStatus = worseStatus(shareStatus, StatusWarn)
+	}
 	if len(cfg.OrgClient.Share.TargetActionAllowlist) > 0 {
 		details = append(details, fmt.Sprintf("target allow:  %v", cfg.OrgClient.Share.TargetActionAllowlist))
 	}

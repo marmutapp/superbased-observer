@@ -1,0 +1,19 @@
+package hook
+
+import (
+	"os"
+
+	"github.com/marmutapp/superbased-observer/internal/sandbox"
+)
+
+// sandboxedChild reports whether THIS hook process is running inside a B9
+// sandbox, read from the OBSERVER_SANDBOX marker its parent (the sandboxed
+// `observer <verb>` child, itself inside the bwrap boundary) exported. Hooks
+// are spawned by the AI tool ITSELF, inside the boundary, so they inherit the
+// marker and this self-report is truthful; the proxy lane (the daemon,
+// outside any boundary) never sets it, so proxy-sourced events stay
+// unstamped (Sandboxed=false, an honest zero — spec §6 observability
+// posture). sandbox.EnvMarker is the single owner of the wire constant.
+func sandboxedChild() bool {
+	return os.Getenv(sandbox.EnvMarker) == "1"
+}

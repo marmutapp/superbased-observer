@@ -2474,6 +2474,69 @@ export type ToolPreflight = {
   can_install: boolean;
 };
 
+// ModelSuggestion is one entry in ToolModels.models — either a model the tool
+// has actually been launched with before ("history", carrying the observed
+// count + last-used timestamp) or a model SuperBased knows the tool supports
+// but has no local usage for ("known"). `count`/`last_used` are present only
+// for source "history".
+export type ModelSuggestion = {
+  model: string;
+  count?: number;
+  last_used?: string;
+  source: "history" | "known";
+};
+
+// ToolModels is the reply from GET /api/terminal/launch/models?tool=<name> —
+// the model-picker suggestion list for the New-Terminal dialog (B5). When
+// `supported` is false the tool has no concept of a selectable model and
+// `models` is empty; the dialog renders no picker in that case. Server order
+// is preserved verbatim (history entries first, then known entries).
+export type ToolModels = {
+  tool: string;
+  supported: boolean;
+  models: ModelSuggestion[];
+};
+
+// SandboxSourceAvail is one entry of SandboxAvailability.sources — whether a
+// given workspace source ("live" | "clone-local" | "clone-remote" |
+// "worktree") is currently usable for a sandboxed launch, and why not when it
+// isn't (e.g. clone-remote reporting available:false because
+// allow_remote_clone is unset).
+export type SandboxSourceAvail = {
+  id: string;
+  available: boolean;
+  reason?: string;
+};
+
+// SandboxToolAvail is one entry of SandboxAvailability.tools, keyed by tool
+// name — whether that tool has a grounded SandboxSpec registry row it can be
+// launched under a sandbox with (v1 grounds only claude-code; every other
+// launchable tool carries an honest reason instead).
+export type SandboxToolAvail = {
+  available: boolean;
+  reason?: string;
+};
+
+// SandboxAvailability is the reply from GET /api/terminal/sandbox (B9) — the
+// New-Terminal dialog's sandbox probe, mirroring the B5 ToolModels fail-soft
+// pattern (always 200, even when the feature is fully off). `verdict` is a
+// closed vocabulary: "available" | "unsupported_platform" | "backend_missing"
+// | "backend_too_old" | "userns_denied" | "tool_unmapped" |
+// "disabled_by_config" | "workspace_prep_failed". `reason` names the exact
+// gap in human terms (which sysctl is denied, which bwrap version was found,
+// …) so the dialog's disabled copy can quote it verbatim rather than being
+// generic.
+export type SandboxAvailability = {
+  available: boolean;
+  verdict?: string;
+  reason?: string;
+  backend?: string;
+  backend_version?: string;
+  home_mode?: string;
+  sources?: SandboxSourceAvail[];
+  tools?: Record<string, SandboxToolAvail>;
+};
+
 // AttachInfo is one row of GET /api/attach/sessions — a LIVE, non-setup
 // daemon-owned terminal run the dashboard can join as a second seat over the
 // existing /ws/launch/<token> bridge (docs/plans/session-attach-design-2026-07-19.md

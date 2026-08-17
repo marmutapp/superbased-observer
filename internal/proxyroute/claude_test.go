@@ -229,6 +229,64 @@ func TestUnregisterClaudeCode_PreservesThirdParty(t *testing.T) {
 	}
 }
 
+// TestUnregisterClaudeCode_PreservesOtherPortLoopback pins ledger
+// B5.25: a registrar built for one proxy port (a scratch node on
+// 18820) must NOT strip a loopback route another install owns
+// (the real daemon's :8820). This is the exact incident shape from
+// 2026-08-15, where a scratch `observer unenroll` removed the real
+// ~/.claude/settings.json ANTHROPIC_BASE_URL.
+func TestUnregisterClaudeCode_PreservesOtherPortLoopback(t *testing.T) {
+	r, home := newRegistrar(t, 18820, false)
+	dir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.MarshalIndent(map[string]any{
+		"env": map[string]any{"ANTHROPIC_BASE_URL": "http://127.0.0.1:8820"},
+	}, "", "  ")
+	if err := os.WriteFile(filepath.Join(dir, "settings.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	res := r.UnregisterClaudeCode()
+	if res.Error != nil {
+		t.Fatalf("unregister: %v", res.Error)
+	}
+	if res.Added {
+		t.Errorf("must not remove another install's loopback route: %+v", res)
+	}
+	if !res.AlreadySet || res.BaseURL != "http://127.0.0.1:8820" {
+		t.Errorf("expected AlreadySet with preserved BaseURL, got %+v", res)
+	}
+	settings := readClaudeSettings(t, home)
+	env := settings["env"].(map[string]any)
+	if env["ANTHROPIC_BASE_URL"] != "http://127.0.0.1:8820" {
+		t.Errorf("other install's route mutated: %v", env["ANTHROPIC_BASE_URL"])
+	}
+}
+
+// TestUnregisterClaudeCode_RemovesLocalhostSpelling: the port match
+// keys on the port, not the host spelling — a localhost URL on the
+// registrar's own port is still ours to remove.
+func TestUnregisterClaudeCode_RemovesLocalhostSpelling(t *testing.T) {
+	r, home := newRegistrar(t, 8820, false)
+	dir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.MarshalIndent(map[string]any{
+		"env": map[string]any{"ANTHROPIC_BASE_URL": "http://localhost:8820"},
+	}, "", "  ")
+	if err := os.WriteFile(filepath.Join(dir, "settings.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	res := r.UnregisterClaudeCode()
+	if res.Error != nil || !res.Added {
+		t.Fatalf("expected removal of own-port localhost route: %+v", res)
+	}
+}
+
 // TestUnregisterClaudeCode_AbsentFile: no settings.json → noop, no
 // error, AlreadySet=true.
 func TestUnregisterClaudeCode_AbsentFile(t *testing.T) {

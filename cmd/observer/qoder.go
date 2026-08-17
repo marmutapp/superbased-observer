@@ -40,6 +40,8 @@ func newQoderCmd() *cobra.Command {
 			"so there is no proxy lane. Session capture happens via observer's\n" +
 			"local qoder adapter; qoder's local stores carry no model or token\n" +
 			"data (server-side only).\n\n" +
+			"qoder supports a top-level `--model` flag to select which model\n" +
+			"the session uses (pass it after `--` with your other qoder args).\n\n" +
 			"With --continue-from <session-id> the launcher distills a handover\n" +
 			"from that session and seeds it via qoder's -i/--prompt-interactive\n" +
 			"flag (delivery=inject_prompt), so Qoder executes the mission prompt\n" +
@@ -47,8 +49,13 @@ func newQoderCmd() *cobra.Command {
 			"All arguments after the subcommand are forwarded to qodercli. Use\n" +
 			"`--` to separate observer flags from qoder flags. NEVER touches API\n" +
 			"keys or auth state.",
-		SilenceErrors: true,
+		SilenceErrors:      true,
+		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args, done, err := launcherArgsOrDone(cmd, args)
+			if done {
+				return err
+			}
 			// Attach gate (attach-all-launchers): default-on attach hands the PTY
 			// to the daemon. Seed-only spec (qoder is native-exempt — no proxy
 			// env, no escape-hatch flag); incompatible when a handoff fork is
@@ -133,7 +140,6 @@ func newQoderCmd() *cobra.Command {
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "qoder")
 	resume = registerResumeFlag(cmd, "qoder")
-	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 

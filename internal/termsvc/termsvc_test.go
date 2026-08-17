@@ -225,6 +225,92 @@ func TestLaunchFreshSuccessMintsRun(t *testing.T) {
 	}
 }
 
+// TestLaunchFreshModelComposition pins the B5 New Terminal model picker's
+// composition seam inside LaunchFresh: given a non-empty FreshRequest.Model,
+// the tool's capability-registry ModelSpec decides whether it lands on
+// LaunchRequest.ExtraArgs, ExtraEnv, both, or neither — dispatch on
+// capability SHAPE (ModelSpec.Kind), never tool name.
+func TestLaunchFreshModelComposition(t *testing.T) {
+	tests := []struct {
+		name          string
+		tool          string
+		model         string
+		wantExtraArgs []string
+		wantExtraEnv  []string
+	}{
+		{
+			// claude-code: ModelSpec{Kind: ModelArg, Flag: "--model"}.
+			name:          "ModelArg tool composes --model flag",
+			tool:          "claude-code",
+			model:         "opus",
+			wantExtraArgs: []string{"--model", "opus"},
+		},
+		{
+			// goose: ModelSpec{Kind: ModelEnv, EnvVar: "GOOSE_MODEL"}.
+			name:         "ModelEnv tool composes an env var, no argv",
+			tool:         "goose",
+			model:        "gpt-5",
+			wantExtraEnv: []string{"GOOSE_MODEL=gpt-5"},
+		},
+		{
+			// kiro-cli: ModelSpec{Kind: ModelArg, Flag: "--model", Lead: []string{"chat"}}.
+			name:          "ModelArg tool with a Lead prefix composes lead+flag+value",
+			tool:          "kiro-cli",
+			model:         "claude-3.7",
+			wantExtraArgs: []string{"chat", "--model", "claude-3.7"},
+		},
+		{
+			// openclaw: ModelSpec{Kind: ModelNone} — explicit no-op.
+			name:  "ModelNone tool drops the model, launch still succeeds",
+			tool:  "openclaw",
+			model: "some-model",
+		},
+		{
+			name:  "empty model leaves the launch untouched",
+			tool:  "claude-code",
+			model: "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := newFakeRecorder()
+			l := &fakeLauncher{handle: "H-MODEL"}
+			svc := newService(t, Policy{AllowFresh: true, AllowedTools: []string{tc.tool}}, rec, l, nil)
+
+			res, err := svc.LaunchFresh(context.Background(), FreshRequest{
+				Tool: tc.tool, Subcommand: tc.tool, Model: tc.model,
+			})
+			if err != nil {
+				t.Fatalf("LaunchFresh: %v", err)
+			}
+			if res.Handle != "H-MODEL" {
+				t.Fatalf("result = %+v", res)
+			}
+			if !stringSlicesEqual(l.lastReq.ExtraArgs, tc.wantExtraArgs) {
+				t.Errorf("ExtraArgs = %v, want %v", l.lastReq.ExtraArgs, tc.wantExtraArgs)
+			}
+			if !stringSlicesEqual(l.lastReq.ExtraEnv, tc.wantExtraEnv) {
+				t.Errorf("ExtraEnv = %v, want %v", l.lastReq.ExtraEnv, tc.wantExtraEnv)
+			}
+		})
+	}
+}
+
+// stringSlicesEqual treats nil and empty as equal (LaunchFresh leaves
+// ExtraArgs/ExtraEnv nil rather than an empty-but-non-nil slice when there's
+// nothing to compose).
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestLaunchShellSuccessMintsRun(t *testing.T) {
 	rec := newFakeRecorder()
 	l := &fakeLauncher{handle: "SHELLHANDLE"}

@@ -47,8 +47,13 @@ func newAntigravityCmd() *cobra.Command {
 			"the mission. See docs/session-handoff.md.\n\n" +
 			"All arguments after the subcommand are forwarded to agy. Use `--`\n" +
 			"to separate observer flags from agy flags. NEVER touches API keys.",
-		SilenceErrors: true,
+		SilenceErrors:      true,
+		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args, done, err := launcherArgsOrDone(cmd, args)
+			if done {
+				return err
+			}
 			// Attach gate (attach-all-launchers): default-on attach hands the PTY
 			// to the daemon. Seed-only spec (agy is native-exempt — no proxy env,
 			// no escape-hatch flag). No -p/--prompt headless predicate: this
@@ -130,7 +135,6 @@ func newAntigravityCmd() *cobra.Command {
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "antigravity-cli")
 	resume = registerResumeFlag(cmd, "antigravity-cli")
-	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 

@@ -5,6 +5,12 @@ import { TitleWithHelp } from "@/components/HelpInd";
 import { useApi } from "@/lib/useApi";
 import { fetchJSON } from "@/lib/api";
 import { fmtBytes, fmtInt } from "@/lib/format";
+import {
+  type GovernanceShareKey,
+  shareSourceLabel,
+  shareSourceOf,
+  useGovernance,
+} from "@/lib/governance";
 import type { ConfigResponse } from "@/lib/types";
 
 // Privacy center (P6.5): one page answering "what does the observer
@@ -89,6 +95,7 @@ export function PrivacyPage() {
       </ChartShell>
 
       <ScrubTesterCard scrubbingEnabled={secrets?.EnableScrubbing ?? true} />
+      <SharingSourceCard config={cfg.data?.config as Record<string, any> | undefined} />
       <OrgPushCard />
     </div>
   );
@@ -161,6 +168,163 @@ function ScrubTesterCard({ scrubbingEnabled }: { scrubbingEnabled: boolean }) {
           </pre>
         )}
       </div>
+    </ChartShell>
+  );
+}
+
+// SHARE_ROWS is the sharing posture this page explains, one row per
+// [org_client.share] key, paired with the wire key the org rail names it by.
+//
+// It is a display table, not a vocabulary: the organisation's own vocabulary
+// is served by the org server, and SharingSourceCard renders ANY key the
+// governance endpoint reports that is missing here rather than dropping it.
+// So a new org-side key is visible on day one, worst case without a friendly
+// label - never invisible.
+const SHARE_ROWS: { key: string; field: string; label: string; help: string; list?: true }[] = [
+  {
+    key: "full_content",
+    field: "FullContent",
+    label: "Full file paths and command text",
+    help: "Off means only sha256 hashes and counts cross the wire.",
+  },
+  {
+    key: "target_action_allowlist",
+    field: "TargetActionAllowlist",
+    label: "Action types allowed to ship a raw target",
+    help: "A per-action exception to the hash-only default.",
+    list: true,
+  },
+  {
+    key: "routing_summary",
+    field: "RoutingSummary",
+    label: "Routing summary rollup",
+    help: "Counts and dollars by tier and reason. Never the decision rows.",
+  },
+  {
+    key: "policy_state",
+    field: "PolicyState",
+    label: "Effective-policy-state reports",
+    help: "Which policy version this machine is running. Content-free.",
+  },
+];
+
+// shareValueText renders a share value for the table without ever printing
+// "true"/"false" at a developer. A list-shaped key reads "none" when empty,
+// because "not shared" would describe the key itself rather than its
+// contents.
+function shareValueText(v: unknown, list?: boolean): string {
+  if (Array.isArray(v)) return v.length ? v.join(", ") : "none";
+  if (typeof v === "boolean") return v ? "shared" : "not shared";
+  if (v === undefined || v === null) return list ? "none" : "not shared";
+  return String(v);
+}
+
+// SharingSourceCard is the Privacy page's Source column: for every sharing
+// key, what this machine's own config asks for, what is actually in force,
+// and which of the two decided it.
+//
+// The direction is one-way by construction. An organisation can reduce what a
+// machine shares, or lock it at the level the operator already chose. It can
+// never raise it - there is no wire shape, no authority token and no code
+// path that does, and there is no string in this component that says
+// otherwise.
+function SharingSourceCard({ config }: { config: Record<string, any> | undefined }) {
+  const gov = useGovernance();
+  const enrol = useApi<EnrolStatus>("/api/enrolment/status");
+  const local = config?.OrgClient?.Share as Record<string, unknown> | undefined;
+  const orgKeys = Object.keys(gov.data?.share ?? {});
+  const known = new Set(SHARE_ROWS.map((r) => r.key));
+  const extra = orgKeys.filter((k) => !known.has(k));
+
+  const rows: {
+    key: string;
+    label: string;
+    help: string;
+    list?: boolean;
+    local: unknown;
+    row: GovernanceShareKey | null;
+  }[] = [
+    ...SHARE_ROWS.map((r) => ({
+      key: r.key,
+      label: r.label,
+      help: r.help,
+      list: r.list,
+      local: local?.[r.field],
+      row: shareSourceOf(gov.data, r.key),
+    })),
+    ...extra.map((k) => ({
+      key: k,
+      label: k,
+      help: "This sharing key is newer than this dashboard build, so it has no description here yet.",
+      local: undefined,
+      row: shareSourceOf(gov.data, k),
+    })),
+  ];
+
+  return (
+    <ChartShell
+      title={<TitleWithHelp text="Sharing keys and their source" helpId="card.privacy_share_source" />}
+      sub="Each sharing switch, what it is set to, and who decided. An organisation can reduce or lock what this machine shares; it can never increase it."
+    >
+      {enrol.data && !enrol.data.enrolled && (
+        <p className="pb-2 text-[11.5px] text-fg-2">
+          This machine is not enrolled in any organisation, so nothing below is shared with anyone. The settings are
+          what would apply if you enrolled.
+        </p>
+      )}
+      <div className="overflow-x-auto">
+        <table className="w-full text-[12px]">
+          <thead>
+            <tr className="border-b border-line-1 text-left text-[10.5px] uppercase tracking-wide text-fg-3">
+              <th className="py-1.5 pr-3 font-medium">Setting</th>
+              <th className="py-1.5 pr-3 font-medium">Your setting</th>
+              <th className="py-1.5 pr-3 font-medium">In force</th>
+              <th className="py-1.5 font-medium">Source</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-line-1">
+            {rows.map((r) => {
+              const effective = r.row ? r.row.effective : r.local;
+              const governed = !!r.row && r.row.source !== "you";
+              return (
+                <tr key={r.key}>
+                  <td className="py-1.5 pr-3 align-top">
+                    <div className="text-fg-1">{r.label}</div>
+                    <div className="font-mono text-[10.5px] text-fg-3">{r.key}</div>
+                    <div className="text-[11px] text-fg-3">{r.help}</div>
+                  </td>
+                  <td className="py-1.5 pr-3 align-top text-fg-2">{shareValueText(r.local, r.list)}</td>
+                  <td className="py-1.5 pr-3 align-top text-fg-2">{shareValueText(effective, r.list)}</td>
+                  <td className="py-1.5 align-top">
+                    {governed ? (
+                      <Pill variant="info">{shareSourceLabel(r.row)}</Pill>
+                    ) : (
+                      <span className="text-fg-2">{shareSourceLabel(null)}</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <p className="pt-2 text-[11px] text-fg-3">
+        Change your own settings in{" "}
+        <Link to="/settings?section=org" className="font-medium text-accent hover:text-accent-strong">
+          Settings &rarr; Organisation
+        </Link>
+        . A row sourced to your organisation is applied on this machine and its control there is read-only; running{" "}
+        <span className="font-mono">observer unenroll</span> removes it.
+      </p>
+      {gov.error && (
+        <p
+          className="pt-1 text-[11px] text-fg-3"
+          title="GET /api/governance did not answer, so any organisation directive cannot be shown."
+        >
+          The governance posture could not be read, so every row shows your own setting as the source. Reload to try
+          again.
+        </p>
+      )}
     </ChartShell>
   );
 }

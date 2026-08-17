@@ -117,7 +117,7 @@ func TestEnroll_Success(t *testing.T) {
 
 	bs := &memBearerStore{}
 	c := newTestClient(t, s, bs)
-	enr, err := c.Enroll(context.Background(), srv.URL, "tok_id.secret")
+	enr, _, err := c.Enroll(context.Background(), srv.URL, "tok_id.secret")
 	if err != nil {
 		t.Fatalf("Enroll: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestEnroll_AuthFailure(t *testing.T) {
 
 	bs := &memBearerStore{}
 	c := newTestClient(t, s, bs)
-	_, err := c.Enroll(context.Background(), srv.URL, "bad")
+	_, _, err := c.Enroll(context.Background(), srv.URL, "bad")
 	if !errors.Is(err, ErrAuthFailed) {
 		t.Fatalf("Enroll error = %v, want ErrAuthFailed", err)
 	}

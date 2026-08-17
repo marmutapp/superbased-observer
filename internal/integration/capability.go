@@ -334,6 +334,57 @@ type ResumeSpec struct {
 	IDMechanism string
 }
 
+// ModelKind names HOW a model is selected at fresh-launch time (the
+// dashboard New Terminal model picker, B5). Consumers dispatch on this
+// shape, never on tool name (CLAUDE.md #3).
+type ModelKind string
+
+const (
+	// ModelNone (zero value): no grounded seed-time model-selection
+	// mechanism. The honest floor — never a fabricated capability; a tool
+	// with ModelNone gets no picker.
+	ModelNone ModelKind = ""
+	// ModelArg: the model is delivered as an argv token appended to the
+	// observer launcher's args — Lead... (if any) + Flag + value — which
+	// the launcher's B6 flag-passthrough (DisableFlagParsing +
+	// launcherArgsOrDone) forwards to the wrapped tool unmodified.
+	ModelArg ModelKind = "arg"
+	// ModelEnv: the model is delivered as EnvVar=value in the child
+	// process environment, for tools whose model selection has no argv
+	// flag reachable from the launcher's default (interactive) entry
+	// point.
+	ModelEnv ModelKind = "env"
+)
+
+// ModelSpec declares the seed-time model-selection contract for a tool. It
+// is meaningful only when Kind != ModelNone; a zero value (Kind ==
+// ModelNone) means "no grounded seed-time model mechanism" — never a
+// fabricated capability. It mirrors the ResumeSpec descriptor discipline:
+// grounded delivery data, not a tool-name branch, so the boundary composer
+// (ModelLaunch) builds the exact args/env without consumers ever switching
+// on tool identity (CLAUDE.md #3).
+type ModelSpec struct {
+	// Kind names the delivery mechanism (arg / env / none).
+	Kind ModelKind
+	// Flag is the argv flag used when Kind == ModelArg (almost always
+	// "--model"; ModelLaunch defaults to "--model" when empty).
+	Flag string
+	// Lead is leading argv tokens required before Flag, e.g. kiro-cli's
+	// ["chat"] (its --model flag exists only on the chat subcommand).
+	// Usually nil. Meaningful for both ModelArg and ModelEnv (a tool may
+	// need a leading subcommand even when the model rides in the
+	// environment).
+	Lead []string
+	// EnvVar is the environment variable name used when Kind == ModelEnv
+	// (e.g. "GOOSE_MODEL"). Non-empty when Kind == ModelEnv.
+	EnvVar string
+	// Known lists grounded known-good model values (from --help examples
+	// or docs) offered in addition to local history in the picker. May be
+	// empty — an empty Known list is honest when no example was grounded,
+	// never a reason to fabricate one.
+	Known []string
+}
+
 // BinaryNames lists the executable spellings a launcher looks for, split by
 // host OS. Unix carries the plain binary name(s) resolved on a Linux/macOS
 // PATH (usually one, e.g. "claude"); Windows carries the LAUNCHABLE shim
@@ -455,6 +506,37 @@ type Vocabulary struct {
 	// Note documents an honest zero (why this adapter has no native tool
 	// vocabulary at all) or a partial-coverage caveat. REQUIRED when
 	// InTaxonomy is false; optional otherwise.
+	Note string
+}
+
+// SandboxSpec declares the HOME-RELATIVE state a tool needs at its REAL
+// path inside a filesystem sandbox (B9 sandboxed terminals,
+// docs/plans/b9-sandboxed-terminals-implementation-plan-2026-08-08.md §2).
+// The sandbox tmpfs-blinds the user's home and punches back exactly this
+// state, nothing else — auth, config and transcripts stay writable while
+// every other tool's credentials and every other repo stay hidden. Every
+// entry is HOME-RELATIVE (never absolute) and is validated well-formed by
+// TestSandboxPathsWellFormed (registry_coverage_test.go): no absolute path,
+// no `..` segment, no leading `-`, no NUL/whitespace/control byte, and
+// never `.` or `""`.
+//
+// The zero value (StateRW, StateRO and Note all empty) means "no grounded
+// sandbox row" — the tool is NOT sandbox-launchable. That is a valid final
+// answer for a launchable tool ONLY when Note explains the honest zero
+// (TestSandboxDeclaredForEveryLaunchableAdapter enforces this); it is never
+// silently left blank. v1 grounds only claude-code (plan amendment A3); all
+// other launchable tools carry the Note fallback until a per-tool probe
+// grounds their state-dir list (ledger G21).
+type SandboxSpec struct {
+	// StateRW lists dirs/files the tool must WRITE at runtime: auth,
+	// config, transcripts. Bound rw (bind-try) inside the sandbox.
+	StateRW []string
+	// StateRO lists dirs the tool only READS: versioned installs, shared
+	// caches. Bound read-only (ro-bind-try) inside the sandbox.
+	StateRO []string
+	// Note is REQUIRED when both StateRW and StateRO are empty (the
+	// honest zero) — it must say why the row is unmapped, never left
+	// silently blank.
 	Note string
 }
 

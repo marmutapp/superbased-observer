@@ -30,6 +30,7 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/proxy"
 	"github.com/marmutapp/superbased-observer/internal/routing"
 	"github.com/marmutapp/superbased-observer/internal/routingconfig"
+	"github.com/marmutapp/superbased-observer/internal/selfobs/emit"
 	"github.com/marmutapp/superbased-observer/internal/store"
 )
 
@@ -61,11 +62,52 @@ func newProxyStartCmd() *cobra.Command {
 			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer cancel()
 
-			p, cleanup, addr, _, _, err := buildProxy(ctx, configPath, "", port, bindAddr)
+			// Built BEFORE buildProxy so the C1 judge relay func
+			// (docs/plans/c1-judge-relay-spec-2026-08-15.md §3) can be threaded
+			// into the admission judge build — the org client (and its bearer/
+			// signing-key access) must exist before admission wiring runs.
+			var relay orgJudgeRelayFunc
+			oc, orgCleanup, ocEnabled, ocErr := buildOrgClient(ctx, configPath)
+			if ocErr != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "policy resource: org client init failed (LKG/poller skipped): %v\n", ocErr)
+			} else if ocEnabled && oc != nil {
+				defer orgCleanup()
+				relay = orgJudgeRelayFuncFor(oc)
+			}
+
+			p, cleanup, addr, _, _, admissionHandle, _, err := buildProxy(ctx, configPath, "", port, bindAddr, relay)
 			if err != nil {
 				return err
 			}
 			defer cleanup()
+
+			// Plane-A P0-5 §6.5 / R2-B3: standalone `observer proxy start` must
+			// load verified LKG BEFORE binding the listener, and run the
+			// policy-resource poller — same org-rail posture as `observer start`.
+			// gw wires the gateway.providers family (Phase 3, gateway config
+			// plane spec) onto this proxy's own SetLaneTable, same as the
+			// full `observer start` path.
+			if ocErr == nil && ocEnabled && oc != nil {
+				if pcfg, pdb, pcleanup, perr := loadConfigAndDB(ctx, configPath); perr == nil {
+					bootstrapUpstreams, bootstrapAutoLane := pcfg.Proxy.Upstreams, pcfg.Proxy.AutoDefaultLane
+					gw := newGatewayProvidersHandle(
+						p.SetLaneTable,
+						func() { _ = p.SetLaneTable(bootstrapUpstreams, bootstrapAutoLane) },
+						p.LaneTable,
+					)
+					// node.governance (admin-controlled Plane B) is passed
+					// nil here on purpose: `observer proxy start` runs no
+					// dashboard, so there is no surface for a governance
+					// body to govern. The family is still polled and
+					// reported; nothing is applied. Every call through the
+					// nil handle is a no-op by construction.
+					loadPolicyResourceLKG(ctx, pcfg, oc, store.New(pdb), admissionHandle, gw, nil, newLogger(pcfg.Observer.LogLevel))
+					pcleanup()
+					go runPolicyResourcePoller(ctx, pcfg, oc, admissionHandle, gw, nil, nil, newLogger(pcfg.Observer.LogLevel))
+				} else {
+					fmt.Fprintf(cmd.ErrOrStderr(), "policy resource: LKG/poller skipped — db open failed: %v\n", perr)
+				}
+			}
 
 			// buildProxy opens the DB without the integrity probe (fast bind);
 			// run the one-time quick_check + path-hash backfill in the
@@ -90,13 +132,26 @@ func newProxyStartCmd() *cobra.Command {
 // address + the compression-profiles hot-reload hook (nil when conversation
 // compression is disabled at boot — the master switch stays restart-gated)
 // + the live router's demotion accessor (nil when routing is not wired;
-// `observer start` hands it to the same-process dashboard, R2.4).
+// `observer start` hands it to the same-process dashboard, R2.4)
+// + the shared admission handle (gap P0-7): an opaque carrier for the ONE
+// *obs.AdmissionService the proxy's admitter enforces, so `observer start` can
+// hand the SAME live instance to the dashboard's policy/egress editors instead
+// of the dashboard building a second, split instance. Nil when admission is
+// disabled; discarded by `observer proxy` and the benchmark harness.
 // The db is closed by the cleanup.
 //
 // recipeName is the deprecated `--recipe` alias: it no longer overlays
 // the Load() chain (Track R, P2.2) — it maps onto the [profiles] table
 // for this run via applyRecipeAliasToProfiles. Pass "" everywhere new.
-func buildProxy(ctx context.Context, configPath, recipeName string, portOverride int, bindAddr string) (*proxy.Proxy, func(), string, func(), func() map[string]string, error) {
+//
+// relay is the C1 judge-relay func (docs/plans/c1-judge-relay-spec-2026-08-15.md
+// §3), built by the caller from its own orgclient.Client instance (which must
+// therefore be constructed BEFORE calling buildProxy) and threaded through to
+// the admission judge build. Pass nil where no orgclient instance is in scope
+// (the benchmark harness) — admission then behaves exactly as it did before
+// C1 for a config that doesn't set use_org_relay, and soft-fails honestly
+// (judge=nil, hosting="org_relay", one logged warning) for one that does.
+func buildProxy(ctx context.Context, configPath, recipeName string, portOverride int, bindAddr string, relay orgJudgeRelayFunc) (*proxy.Proxy, func(), string, func(), func() map[string]string, *obsAdmissionHandle, *RoutingStateHandle, error) {
 	loadFresh := func() (config.Config, error) {
 		cfg, err := config.Load(config.LoadOptions{GlobalPath: configPath})
 		if err != nil {
@@ -109,10 +164,10 @@ func buildProxy(ctx context.Context, configPath, recipeName string, portOverride
 	}
 	cfg, err := loadFresh()
 	if err != nil {
-		return nil, nil, "", nil, nil, fmt.Errorf("load config: %w", err)
+		return nil, nil, "", nil, nil, nil, nil, fmt.Errorf("load config: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(cfg.Observer.DBPath), 0o755); err != nil {
-		return nil, nil, "", nil, nil, fmt.Errorf("ensure db dir: %w", err)
+		return nil, nil, "", nil, nil, nil, nil, fmt.Errorf("ensure db dir: %w", err)
 	}
 	// No integrity probe here: this is a long-running daemon open. The multi-GB
 	// PRAGMA quick_check is deferred off the readiness path and run once via
@@ -120,7 +175,7 @@ func buildProxy(ctx context.Context, configPath, recipeName string, portOverride
 	// standalone). See db.Options.IntegrityCheck.
 	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath})
 	if err != nil {
-		return nil, nil, "", nil, nil, fmt.Errorf("open db %s: %w", cfg.Observer.DBPath, err)
+		return nil, nil, "", nil, nil, nil, nil, fmt.Errorf("open db %s: %w", cfg.Observer.DBPath, err)
 	}
 	s := store.New(database)
 
@@ -130,7 +185,7 @@ func buildProxy(ctx context.Context, configPath, recipeName string, portOverride
 	}
 	if port <= 0 || port > 65535 {
 		_ = database.Close()
-		return nil, nil, "", nil, nil, fmt.Errorf("proxy: port %d out of range", port)
+		return nil, nil, "", nil, nil, nil, nil, fmt.Errorf("proxy: port %d out of range", port)
 	}
 
 	logger := newLogger(cfg.Observer.LogLevel)
@@ -161,6 +216,7 @@ func buildProxy(ctx context.Context, configPath, recipeName string, portOverride
 		ChatGPTUpstream:   cfg.Proxy.ChatGPTUpstream,
 		GeminiUpstream:    cfg.Proxy.GeminiUpstream,
 		Upstreams:         cfg.Proxy.Upstreams,
+		AutoDefaultLane:   cfg.Proxy.AutoDefaultLane,
 		ForceChatGPTHTTP:  cfg.Proxy.ForceChatGPTHTTP,
 		PrewarmTargets:    cfg.Proxy.PrewarmTargets,
 		Sink:              s,
@@ -239,36 +295,37 @@ func buildProxy(ctx context.Context, configPath, recipeName string, portOverride
 	// when guard is disabled/off or every [guard.proxy] + [guard.mcp]
 	// feature is off: opts.Guard stays nil and the proxy is
 	// byte-identical to the pre-guard baseline.
-	if cfg.Guard.Proxy.EgressScan || cfg.Guard.Proxy.ResponseScan || cfg.Guard.Proxy.InjectionHeuristics ||
-		cfg.Guard.MCP.Pinning || cfg.Guard.MCP.PoisoningHeuristics {
-		if g := acquireProcessGuard(ctx, cfg, s, logger); g != nil {
-			// §9.2: the proxy is also where MCP tool declarations are
-			// observed (the tools array in request bodies) — the
-			// adapter forwards them to the mcpsec runner off-path.
-			mcpRunner := newMCPSecRunner(configGuardMCP{
-				Pinning:             cfg.Guard.MCP.Pinning,
-				PoisoningHeuristics: cfg.Guard.MCP.PoisoningHeuristics,
-			}, s, g, logger)
-			opts.Guard = guardScannerAdapter{g: g, st: s, logger: logger, mcp: mcpRunner}
-			logger.Info("guard: proxy seams wired",
-				"egress_scan", cfg.Guard.Proxy.EgressScan,
-				"egress_action", cfg.Guard.Proxy.EgressAction,
-				"response_scan", cfg.Guard.Proxy.ResponseScan,
-				"injection_heuristics", cfg.Guard.Proxy.InjectionHeuristics,
-				"mcp_pinning", cfg.Guard.MCP.Pinning)
-		}
+	wireGuardProxy(ctx, cfg, s, &opts, logger)
+	// P1-10: construct the self-obs sink once for the proxy lifetime.
+	// Handed to wireRouting for Decide sampling; Shutdown on cleanup.
+	selfObsSink, selfObsCleanup, serr := buildSelfObsSink(cfg, logger)
+	if serr != nil {
+		logger.Warn("selfobs: sink build failed — using Nop", "err", serr)
+		selfObsSink = emit.Nop()
+		selfObsCleanup = func() {}
 	}
-	routingDemotions := wireRouting(ctx, cfg, s, &opts, logger)
+	routingDemotions, routingStateHandle := wireRouting(ctx, cfg, s, &opts, logger, selfObsSink)
 
 	// Pre-forward input-admission gate (admission spec §6.2). No-op unless
 	// [observability.admission] is enabled; bound here so internal/proxy
-	// never imports internal/obs (obs_wire.go owns the adapter).
-	wireAdmission(ctx, cfg, database, &opts, logger)
+	// never imports internal/obs (obs_wire.go owns the adapter). The returned
+	// handle carries the ONE admission service (gap P0-7) so `observer start`
+	// can share it with the dashboard editors; nil when admission is off.
+	admissionHandle := wireAdmission(ctx, cfg, database, relay, &opts, logger, selfObsSink)
+
+	// The gateway rail (docs/observability.md "proxy turn (automatic)"):
+	// synthesizes a Plane-A trace for every proxied LLM turn when
+	// [observability].proxy_turn_traces is on. No-op (opts.ObsSink stays
+	// nil) unless [observability] itself is enabled. Placed after
+	// wireAdmission so it can lift opts.AdmissionUserHeader when admission
+	// left it unset.
+	wireObsProxyTurns(ctx, cfg, database, &opts, logger)
 
 	p, err := proxy.New(opts)
 	if err != nil {
+		selfObsCleanup()
 		_ = database.Close()
-		return nil, nil, "", nil, nil, err
+		return nil, nil, "", nil, nil, nil, nil, err
 	}
 	// §R12.3 optional active prober — OFF by default (no gratuitous
 	// network). When enabled it re-fires the prewarm HEADs on the
@@ -294,8 +351,47 @@ func buildProxy(ctx context.Context, configPath, recipeName string, portOverride
 		logger.Info("routing: active upstream prober enabled", "interval", interval)
 	}
 	addr := net.JoinHostPort(bindAddr, strconv.Itoa(port))
-	cleanup := func() { _ = database.Close() }
-	return p, cleanup, addr, profilesReload, routingDemotions, nil
+	cleanup := func() {
+		selfObsCleanup()
+		_ = database.Close()
+	}
+	return p, cleanup, addr, profilesReload, routingDemotions, admissionHandle, routingStateHandle, nil
+}
+
+// wireGuardProxy wires the Guard proxy seams (guard spec §8 / G9, §9.2 / G10)
+// onto opts: egress scan + injection heuristics on the request path,
+// tool_use inspection on the response path, and MCP tool-declaration
+// observation feeding the pin diff. The Guard instance is the per-process
+// shared one (guardwire.go) — in the `observer start` assembly buildProxy
+// runs FIRST, so the instance acquired here is the same one wireGuard hands
+// the watcher store, making taint state daemon-wide (the cachetrack
+// single-engine precedent). No-op when guard is disabled/off or every
+// [guard.proxy] + [guard.mcp] feature is off: opts.Guard stays nil and the
+// proxy is byte-identical to the pre-guard baseline. Extracted from
+// buildProxy to keep its cyclomatic complexity in check.
+func wireGuardProxy(ctx context.Context, cfg config.Config, s *store.Store, opts *proxy.Options, logger *slog.Logger) {
+	if !(cfg.Guard.Proxy.EgressScan || cfg.Guard.Proxy.ResponseScan || cfg.Guard.Proxy.InjectionHeuristics ||
+		cfg.Guard.MCP.Pinning || cfg.Guard.MCP.PoisoningHeuristics) {
+		return
+	}
+	g := acquireProcessGuard(ctx, cfg, s, logger)
+	if g == nil {
+		return
+	}
+	// §9.2: the proxy is also where MCP tool declarations are
+	// observed (the tools array in request bodies) — the
+	// adapter forwards them to the mcpsec runner off-path.
+	mcpRunner := newMCPSecRunner(configGuardMCP{
+		Pinning:             cfg.Guard.MCP.Pinning,
+		PoisoningHeuristics: cfg.Guard.MCP.PoisoningHeuristics,
+	}, s, g, logger)
+	opts.Guard = guardScannerAdapter{g: g, st: s, logger: logger, mcp: mcpRunner}
+	logger.Info("guard: proxy seams wired",
+		"egress_scan", cfg.Guard.Proxy.EgressScan,
+		"egress_action", cfg.Guard.Proxy.EgressAction,
+		"response_scan", cfg.Guard.Proxy.ResponseScan,
+		"injection_heuristics", cfg.Guard.Proxy.InjectionHeuristics,
+		"mcp_pinning", cfg.Guard.MCP.Pinning)
 }
 
 // wireCacheTrack wires the Tier-1 cache-observation engine (spec §8 / §11) onto
@@ -347,11 +443,21 @@ func wireCacheTrack(cfg config.Config, s *store.Store, opts *proxy.Options, logg
 // same-process dashboard can surface calibration demotions — they are
 // in-memory state only a live router can answer for. Nil when routing
 // is not wired.
-func wireRouting(ctx context.Context, cfg config.Config, s *store.Store, opts *proxy.Options, logger *slog.Logger) func() map[string]string {
+func wireRouting(ctx context.Context, cfg config.Config, s *store.Store, opts *proxy.Options, logger *slog.Logger, selfObsSink emit.Sink) (func() map[string]string, *RoutingStateHandle) {
 	if !cfg.Routing.Enabled || cfg.Routing.Mode == "off" {
-		return nil
+		return nil, nil
 	}
-	spec := routingconfig.Spec(cfg.Routing)
+	// localSpec is the IMMUTABLE node-local spec (BEFORE org composition),
+	// retained on the liveRouter so P0-7 ReloadOrgPolicy can reproduce this
+	// construction exactly (plan §4 B5). spec is the working copy composition
+	// mutates below.
+	localSpec := routingconfig.Spec(cfg.Routing)
+	spec := localSpec
+	// composedOrgVersion is the org routing-policy version actually COMPOSED
+	// into the live policy (0 when none / a compose failure fell back to
+	// local). It is the RoutingStateHandle's runningVersion — the org-layer
+	// running identity for the P0-6 reporter (R5-B2).
+	var composedOrgVersion int64
 	// §R19.1 org policy composition: the cached (signature-verified)
 	// org document's hard constraints intersect in; its soft rules
 	// rank under local. The cache never carries an enforce switch —
@@ -364,6 +470,7 @@ func wireRouting(ctx context.Context, cfg config.Config, s *store.Store, opts *p
 			logger.Warn("routing: org policy body unusable; continuing with local policy", "err", cerr)
 		} else {
 			spec = composed
+			composedOrgVersion = orgPol.Version
 			logger.Info("routing: org policy composed", "version", orgPol.Version)
 		}
 	}
@@ -423,7 +530,28 @@ func wireRouting(ctx context.Context, cfg config.Config, s *store.Store, opts *p
 	}
 	logger.Info("routing: Channel B wired",
 		"mode", cfg.Routing.Mode, "policy", policy.Name, "hash", policy.Hash())
-	return lr.DemotedRules
+	// P0-6 router read handle (§4.2): capture the org-layer running identity.
+	// effectiveHash is the live policy hash ONLY when an org policy was
+	// composed (composedOrgVersion > 0); local-only routing reports version 0
+	// + empty hash so the reader resolves none/no_policy (R5-B2).
+	handle := &RoutingStateHandle{}
+	init := routingState{mode: cfg.Routing.Mode}
+	if composedOrgVersion > 0 {
+		init.version = composedOrgVersion
+		init.hash = policy.Hash()
+	}
+	handle.store(init)
+	// P0-7 hot-reload wiring (plan §4.4 decision A): retain the immutable
+	// local spec + the state handle on the router, and hang the reload
+	// closure off the handle so start.go can register the org reload sink
+	// without a new buildProxy return value (arity frozen at 8).
+	lr.localSpec = localSpec
+	lr.handle = handle
+	handle.reload = lr.ReloadOrgPolicy
+	if cfg.SelfObs.Enabled {
+		lr.SetSelfObs(selfObsSink, cfg.SelfObs.RoutingSampleN)
+	}
+	return lr.DemotedRules, handle
 }
 
 // pipelineAdapter bridges conversation.Pipeline (no context parameter —

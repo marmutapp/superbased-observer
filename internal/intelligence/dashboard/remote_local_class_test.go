@@ -89,8 +89,12 @@ var expectedClassification = map[string]string{
 	// Mints a credential on the ORG server (never touching this machine's
 	// config or filesystem) — a real mutation at the Execute tier, the same
 	// class as /api/sessions/tags/manage.
-	"/api/enrolment/invite":        "X",
-	"/api/enrolment/status":        "V",
+	"/api/enrolment/invite": "X",
+	"/api/enrolment/status": "V",
+	// Admin-controlled Plane B: the node's own governance posture. VIEW —
+	// it is metadata about what this machine's organization hid, and a
+	// paired remote owner sees the same managed dashboard the owner does.
+	"/api/governance":              "V",
 	"/api/enrolment/unenroll":      "L",
 	"/api/experiments":             "L",
 	"/api/experiments/report":      "V",
@@ -202,6 +206,8 @@ var expectedClassification = map[string]string{
 	"/api/terminal/install":               "L", // spawns the registry-constant install command in a local-only setup PTY — owner-local only
 	"/api/terminal/launch":                "X",
 	"/api/terminal/launch/preflight":      "L", // runs a $SHELL -lc login-shell PATH capture + reveals binary paths/home layout — owner-local only (reclassified V→L, 2026-07-23 review)
+	"/api/terminal/launch/models":         "V", // reads token_usage model history + registry Known list only — same posture as /api/models (B5 model picker)
+	"/api/terminal/sandbox":               "V", // B9 fail-soft sandbox probe — reads the daemon's cached bwrap probe result + [terminal.sandbox] config only, same posture as /api/terminal/launch/models
 	"/api/terminal/limits":                "L",
 	"/api/terminal/policy":                "L",
 	"/api/terminal/project/":              "V",
@@ -228,7 +234,7 @@ var expectedClassification = map[string]string{
 // the build.
 func TestFullRegistryClassification(t *testing.T) {
 	s := newRemoteTestServer(t, Options{})
-	_, capMap := s.registerRoutes(nil)
+	_, capMap, _ := s.registerRoutes(nil)
 
 	for pattern, cap := range capMap {
 		want, ok := expectedClassification[pattern]
@@ -322,7 +328,7 @@ var mutationRoutes = []string{
 // fail-closed.
 func TestNoConfigMutationRouteIsPlainView(t *testing.T) {
 	s := newRemoteTestServer(t, Options{})
-	_, capMap := s.registerRoutes(nil)
+	_, capMap, _ := s.registerRoutes(nil)
 	for _, pattern := range mutationRoutes {
 		cap, ok := capMap[pattern]
 		if !ok {
@@ -348,7 +354,7 @@ func TestLocalRoutesRefusedOnRemoteListener(t *testing.T) {
 	cookie, csrf := pairSession(t, remoteH, enc)
 	mc := rc.(*remoteController)
 
-	_, capMap := s.registerRoutes(nil)
+	_, capMap, _ := s.registerRoutes(nil)
 	type probe struct{ method, path string }
 	var locals []probe
 	for pattern, cap := range capMap {

@@ -121,6 +121,11 @@ func ConformanceMatrix() []ConformanceEntry {
 		// the post-hoc watcher row is its only guard surface — same
 		// shape as muse.
 		models.ToolPrimeAgent,
+		// deepseek + junie: watcher-path adapters (compressed-JSONL and
+		// event-sourced-JSONL tails respectively), registry Hook HookNone
+		// for both, so the post-hoc watcher row is their only guard
+		// surface — same shape as muse/prime-agent.
+		models.ToolDeepSeek, models.ToolJunie,
 	} {
 		entries = append(entries, watcherEntry(client))
 	}

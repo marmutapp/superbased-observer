@@ -49,12 +49,19 @@ func newKiloCmd() *cobra.Command {
 			"All arguments after the subcommand are forwarded to kilo. Use `--`\n" +
 			"to separate observer flags from kilo flags:\n" +
 			"    observer kilo -- run \"summarize the diff\"\n\n" +
+			"kilo supports a top-level `--model` flag to select which model\n" +
+			"the session uses (pass it after `--` with your other kilo args).\n\n" +
 			"With --continue-from <session-id> the launcher distills a handover\n" +
 			"from that session and seeds it via kilo's --prompt flag, opening\n" +
 			"the interactive TUI seeded with that first prompt (the headless\n" +
 			"one-shot form is the `run` subcommand). See docs/session-handoff.md.",
-		SilenceErrors: true,
+		SilenceErrors:      true,
+		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args, done, err := launcherArgsOrDone(cmd, args)
+			if done {
+				return err
+			}
 			// Attach gate (attach-all-launchers): default-on attach hands the PTY
 			// to the daemon so the dashboard can drive this session. Seed-only
 			// spec — kilo-code-cli is native-exempt, so NO proxy env, NO
@@ -132,7 +139,6 @@ func newKiloCmd() *cobra.Command {
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
 	attach, noAttach = registerAttachFlags(cmd, "kilo-code-cli")
 	resume = registerResumeFlag(cmd, "kilo-code-cli")
-	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 

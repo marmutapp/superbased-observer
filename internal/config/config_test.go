@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -211,6 +212,120 @@ func TestValidateRejectsBadLogLevel(t *testing.T) {
 	}
 }
 
+// TestValidateProxyUpstreamsRejectsReservedAutoID pins the gateway config
+// plane spec Phase 2 rule: "auto" is a reserved virtual lane id — a
+// [proxy.upstreams] entry literally keyed "auto" is a config validation
+// error, since Proxy.SetUpstreams routes "auto" through resolveAutoLane
+// rather than treating it as a real configured lane.
+func TestValidateProxyUpstreamsRejectsReservedAutoID(t *testing.T) {
+	t.Parallel()
+	c := Default()
+	c.Proxy.Upstreams = map[string]string{"auto": "https://openrouter.ai/api"}
+	if err := Validate(c); err == nil {
+		t.Fatal("expected error for proxy.upstreams containing the reserved id \"auto\"")
+	}
+}
+
+// TestValidateProxyAutoDefaultLaneMustNameConfiguredLane pins the Phase 2
+// rule that auto_default_lane, when set, must name a lane actually present
+// in proxy.upstreams — an unresolvable default is a config mistake caught
+// at validation time, not a runtime fail-open case.
+func TestValidateProxyAutoDefaultLaneMustNameConfiguredLane(t *testing.T) {
+	t.Parallel()
+
+	t.Run("naming an unconfigured lane is rejected", func(t *testing.T) {
+		c := Default()
+		c.Proxy.Upstreams = map[string]string{"openrouter": "https://openrouter.ai/api"}
+		c.Proxy.AutoDefaultLane = "does-not-exist"
+		if err := Validate(c); err == nil {
+			t.Fatal("expected error for auto_default_lane naming a lane absent from proxy.upstreams")
+		}
+	})
+
+	t.Run("naming a configured lane is accepted", func(t *testing.T) {
+		c := Default()
+		c.Proxy.Upstreams = map[string]string{"openrouter": "https://openrouter.ai/api"}
+		c.Proxy.AutoDefaultLane = "openrouter"
+		if err := Validate(c); err != nil {
+			t.Fatalf("auto_default_lane naming a configured lane should validate: %v", err)
+		}
+	})
+
+	t.Run("unset (empty) is accepted", func(t *testing.T) {
+		c := Default()
+		c.Proxy.Upstreams = map[string]string{"openrouter": "https://openrouter.ai/api"}
+		if err := Validate(c); err != nil {
+			t.Fatalf("unset auto_default_lane should validate: %v", err)
+		}
+	})
+}
+
+// TestValidateJudgeUseOrgRelayAmbiguousTransport pins the C1 judge relay spec
+// §3 validation rule: use_org_relay=true combined with a non-empty base_url
+// OR api_key_env on the SAME resolved judge block is a config error (the
+// relay ignores both — ambiguous transport). Checked on both
+// [observability.judge] and its [observability.admission.judge] override,
+// independently, since Validate loops over both blocks.
+func TestValidateJudgeUseOrgRelayAmbiguousTransport(t *testing.T) {
+	t.Parallel()
+
+	t.Run("use_org_relay alone is fine", func(t *testing.T) {
+		c := Default()
+		c.Observability.Judge.UseOrgRelay = true
+		if err := Validate(c); err != nil {
+			t.Fatalf("use_org_relay=true with no base_url/api_key_env should validate: %v", err)
+		}
+	})
+
+	t.Run("base_url alone (no relay) is fine", func(t *testing.T) {
+		c := Default()
+		c.Observability.Judge.BaseURL = "http://127.0.0.1:11434/v1"
+		if err := Validate(c); err != nil {
+			t.Fatalf("base_url alone should validate: %v", err)
+		}
+	})
+
+	t.Run("use_org_relay + base_url on the shared judge block is rejected", func(t *testing.T) {
+		c := Default()
+		c.Observability.Judge.UseOrgRelay = true
+		c.Observability.Judge.BaseURL = "http://127.0.0.1:11434/v1"
+		if err := Validate(c); err == nil {
+			t.Fatal("expected error for use_org_relay=true + base_url set on the same block")
+		}
+	})
+
+	t.Run("use_org_relay + api_key_env on the shared judge block is rejected", func(t *testing.T) {
+		c := Default()
+		c.Observability.Judge.UseOrgRelay = true
+		c.Observability.Judge.APIKeyEnv = "SOME_KEY"
+		if err := Validate(c); err == nil {
+			t.Fatal("expected error for use_org_relay=true + api_key_env set on the same block")
+		}
+	})
+
+	t.Run("use_org_relay + base_url on the admission override block is rejected", func(t *testing.T) {
+		c := Default()
+		c.Observability.Admission.Judge.UseOrgRelay = true
+		c.Observability.Admission.Judge.BaseURL = "http://127.0.0.1:11434/v1"
+		if err := Validate(c); err == nil {
+			t.Fatal("expected error for use_org_relay=true + base_url set on the admission override block")
+		}
+	})
+
+	t.Run("use_org_relay on admission override, base_url only on the shared block, is fine", func(t *testing.T) {
+		// The two fields must be ambiguous on the SAME resolved block — this
+		// case sets UseOrgRelay on the admission override and BaseURL only on
+		// the unrelated shared block, so Validate's per-block loop must not
+		// cross-contaminate the two.
+		c := Default()
+		c.Observability.Admission.Judge.UseOrgRelay = true
+		c.Observability.Judge.BaseURL = "http://127.0.0.1:11434/v1"
+		if err := Validate(c); err != nil {
+			t.Fatalf("use_org_relay on one block + base_url only on the other should validate: %v", err)
+		}
+	})
+}
+
 // TestValidateBrowserIngestTimeoutCap pins the finding-2 guard: the browser
 // ingest deadline bounds the daemon's end-to-end DB work (db.Open +
 // store.Ingest, started before db.Open), and it MUST stay below the native
@@ -251,6 +366,119 @@ func TestValidateBrowserIngestTimeoutCap(t *testing.T) {
 	// A zero / unset value resolves to the default (not the clamp).
 	if got := (BrowserConfig{}).IngestTimeout(); got != defaultBrowserIngestTimeoutMS*time.Millisecond {
 		t.Errorf("IngestTimeout(unset) = %v, want default %dms", got, defaultBrowserIngestTimeoutMS)
+	}
+}
+
+// TestValidateOrgClientPolicy pins [org_client.policy]'s two rules (plan
+// §6.4): every listed family must be in the v1 closed set, and
+// preauthorize_enforce must be a subset of accept_families.
+func TestValidateOrgClientPolicy(t *testing.T) {
+	t.Parallel()
+
+	// Default (both empty) always validates.
+	if err := Validate(Default()); err != nil {
+		t.Fatalf("Default() failed validation: %v", err)
+	}
+
+	// A supported family in both lists, correctly subset, validates.
+	c := Default()
+	c.OrgClient.Policy.AcceptFamilies = []string{"admission.input", "egress.routing_guardrail"}
+	c.OrgClient.Policy.PreauthorizeEnforce = []string{"admission.input"}
+	if err := Validate(c); err != nil {
+		t.Fatalf("valid accept/preauthorize lists failed validation: %v", err)
+	}
+
+	// Unsupported family in accept_families is rejected.
+	c = Default()
+	c.OrgClient.Policy.AcceptFamilies = []string{"not.a.family"}
+	if err := Validate(c); err == nil {
+		t.Fatal("expected error for unsupported accept_families entry")
+	}
+
+	// Unsupported family in preauthorize_enforce is rejected, even if it's
+	// (nonsensically) also in accept_families.
+	c = Default()
+	c.OrgClient.Policy.AcceptFamilies = []string{"not.a.family"}
+	c.OrgClient.Policy.PreauthorizeEnforce = []string{"not.a.family"}
+	if err := Validate(c); err == nil {
+		t.Fatal("expected error for unsupported preauthorize_enforce entry")
+	}
+
+	// preauthorize_enforce NOT a subset of accept_families is rejected, even
+	// though both families are individually supported.
+	c = Default()
+	c.OrgClient.Policy.AcceptFamilies = []string{"admission.input"}
+	c.OrgClient.Policy.PreauthorizeEnforce = []string{"egress.routing_guardrail"}
+	if err := Validate(c); err == nil {
+		t.Fatal("expected error: preauthorize_enforce must be a subset of accept_families")
+	}
+}
+
+// TestValidateOrgClientPolicyNodeAttrs pins the P0-10 Phase B node targeting
+// attributes: each key is optional, but a value that could never corroborate
+// (padded, oversize, control characters) is rejected at load rather than
+// silently never matching.
+func TestValidateOrgClientPolicyNodeAttrs(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{name: "all three unset (the default)", mutate: func(*Config) {}},
+		{
+			name: "all three set to plain values",
+			mutate: func(c *Config) {
+				c.OrgClient.Policy.NodeWorkspace = "acme"
+				c.OrgClient.Policy.NodeEnvironment = "prod"
+				c.OrgClient.Policy.NodeService = "billing-api"
+			},
+		},
+		{
+			name:   "only one set",
+			mutate: func(c *Config) { c.OrgClient.Policy.NodeEnvironment = "staging" },
+		},
+		{
+			name:    "leading whitespace",
+			mutate:  func(c *Config) { c.OrgClient.Policy.NodeWorkspace = " acme" },
+			wantErr: "node_workspace",
+		},
+		{
+			name:    "trailing whitespace",
+			mutate:  func(c *Config) { c.OrgClient.Policy.NodeEnvironment = "prod\n" },
+			wantErr: "node_environment",
+		},
+		{
+			name:    "oversize",
+			mutate:  func(c *Config) { c.OrgClient.Policy.NodeService = strings.Repeat("a", 129) },
+			wantErr: "over the 128-byte maximum",
+		},
+		{
+			name:    "control character",
+			mutate:  func(c *Config) { c.OrgClient.Policy.NodeService = "api\x07x" },
+			wantErr: "control character",
+		},
+		{
+			name:   "at the size limit is fine",
+			mutate: func(c *Config) { c.OrgClient.Policy.NodeService = strings.Repeat("a", 128) },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := Default()
+			tc.mutate(&c)
+			err := Validate(c)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Validate err = %v, want containing %q", err, tc.wantErr)
+			}
+		})
 	}
 }
 
@@ -1155,5 +1383,69 @@ func TestDashboardOrgAnnouncementsDefaults(t *testing.T) {
 	cfg := write(t, "[dashboard]\norg_announcements = false\n")
 	if cfg.Dashboard.OrgAnnouncements {
 		t.Error("org_announcements = false must override the default")
+	}
+}
+
+// TestTerminalSandboxDefaults pins the B9 [terminal.sandbox] defaults (plan
+// §5): the master switch defaults OFF, but the mechanism knobs are seeded
+// to the documented v1 shape so flipping just `enabled = true` yields a
+// usable config rather than zeros. Mirrors TestProcessObservabilityDefaults'
+// "default-off feature with non-zero seeded sub-defaults" shape and
+// TestPredictDefaults' partial-merge check.
+func TestTerminalSandboxDefaults(t *testing.T) {
+	t.Parallel()
+	s := Default().Terminal.Sandbox
+	if s.Enabled {
+		t.Error("terminal.sandbox.enabled must default to false")
+	}
+	if s.Backend != "bwrap" {
+		t.Errorf("terminal.sandbox.backend default = %q, want bwrap", s.Backend)
+	}
+	if s.HomeMode != "tmpfs" {
+		t.Errorf("terminal.sandbox.home_mode default = %q, want tmpfs", s.HomeMode)
+	}
+	if s.DefaultOn {
+		t.Error("terminal.sandbox.default_on must default to false")
+	}
+	if s.AllowRemoteClone {
+		t.Error("terminal.sandbox.allow_remote_clone must default to false")
+	}
+	if len(s.RemoteAllowedHosts) != 0 {
+		t.Errorf("terminal.sandbox.remote_allowed_hosts default = %v, want empty", s.RemoteAllowedHosts)
+	}
+	if s.AllowWorktreeSource {
+		t.Error("terminal.sandbox.allow_worktree_source must default to false")
+	}
+	if s.WorkspacesDir != "" {
+		t.Errorf("terminal.sandbox.workspaces_dir default = %q, want empty", s.WorkspacesDir)
+	}
+	if s.WorkspaceRetentionDays != 0 {
+		t.Errorf("terminal.sandbox.workspace_retention_days default = %d, want 0", s.WorkspaceRetentionDays)
+	}
+	if len(s.MaskPaths) != 0 || len(s.ExtraROBinds) != 0 || len(s.ExtraRWBinds) != 0 {
+		t.Errorf("terminal.sandbox bind-list defaults should be empty, got mask=%v ro=%v rw=%v", s.MaskPaths, s.ExtraROBinds, s.ExtraRWBinds)
+	}
+	if s.PrepTimeoutSeconds != 300 {
+		t.Errorf("terminal.sandbox.prep_timeout_seconds default = %d, want 300", s.PrepTimeoutSeconds)
+	}
+
+	// Partial-merge: a [terminal.sandbox] section setting ONLY enabled=true
+	// keeps the seeded mechanism defaults (backend/home_mode/timeout), the
+	// same partial-merge discipline as [terminal.launch].allow_install and
+	// [predict].
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte("[terminal.sandbox]\nenabled = true\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := Load(LoadOptions{GlobalPath: cfgPath})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Terminal.Sandbox.Enabled {
+		t.Error("enabled=true should override")
+	}
+	if cfg.Terminal.Sandbox.Backend != "bwrap" || cfg.Terminal.Sandbox.HomeMode != "tmpfs" || cfg.Terminal.Sandbox.PrepTimeoutSeconds != 300 {
+		t.Errorf("partial [terminal.sandbox] lost mechanism defaults: %+v", cfg.Terminal.Sandbox)
 	}
 }

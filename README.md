@@ -57,7 +57,6 @@ reference: [`docs/one-shot-usage-report.md`](docs/one-shot-usage-report.md).
 - [Integrations — the stable contract to build against](#integrations--the-stable-contract-to-build-against)
 - [API proxy — accurate token capture + compression](#api-proxy--accurate-token-capture--compression)
 - [Architecture](#architecture)
-- [Teams & Org Visibility](#teams--org-visibility)
 - [Security & control layer (guard)](#security--control-layer-guard)
 - [CLI reference](#cli-reference)
 - [Configuration](#configuration)
@@ -84,11 +83,10 @@ can't give you, in order of how much they matter:
    console has no incentive to run against itself.
 2. **Local-first, by construction.** The watcher, proxy, dashboard,
    MCP server, and CLI make zero outbound calls on your behalf — no
-   telemetry, no analytics, no remote reporting. An optional team
-   rollup server ships only hashed metadata by default; raw content
-   ships only when **the node** opts in, never a remote admin toggle.
+   telemetry, no analytics, no remote reporting. Everything SuperBased
+   captures is written to your own database and stays there.
    Full details: [`PRIVACY.md`](PRIVACY.md).
-3. **One capture layer, every tool you actually use.** 31 adapters —
+3. **One capture layer, every tool you actually use.** 33 adapters —
    Claude Code, Codex, Cursor, Cline + Cline CLI, GitHub Copilot +
    Copilot CLI, Gemini CLI, OpenCode, Google Antigravity, Cowork,
    Hermes Agent, Kilo Code, Aider, Goose, Devin, Qoder, Crush, Grok,
@@ -107,17 +105,10 @@ can't give you, in order of how much they matter:
 Raw token counting across tools is table stakes here — it's the
 substrate the accurate-cost layer above is built on, not the pitch.
 
-**Two planes, one binary.** **Plane B** is coding-agent observability
-— desktop-first: capture, proxy-accurate cost, compression, cache
-tracking, and session handoff for every AI coding tool on your
-machine, with an optional team rollup server for org-wide spend.
-**Plane A** is general LLM-app observability — admin-server-first:
-OTLP trace/span capture, evals, and an LLM-as-judge input-admission
-guardrail for an application *you* host, whose end users route
-through SuperBased. Most solo developers only ever touch Plane B; teams
-add Plane A when they're also running an LLM-powered product. Full
-explainer: [superbased.app/docs/getting-started/two-planes](https://superbased.app/docs/getting-started/two-planes)
-(or [docs/deployment-models.md](docs/deployment-models.md) if you're reading this in the repo).
+**One local binary.** SuperBased captures, normalizes, and analyzes AI
+coding tool activity on your own machine: proxy-accurate cost,
+compression, cache tracking, and session handoff for every AI coding
+tool you run.
 
 <p align="center">
   <img src="docs/assets/screenshots/04-cost.png" alt="Cost tab — proxy-accurate per-model token buckets and dollar cost" width="900">
@@ -442,7 +433,7 @@ click-through opens the per-turn Cache panel.
 
 **How it's captured.** Two paths feed the same engine, both writing
 to NODE-LOCAL `cache_segments` / `cache_entries` / `cache_events`
-tables (migrations 036+037, never pushed to a Teams org server):
+tables (migrations 036+037, node-local only, never leaving the machine):
 
 - **Tier-1 (proxy)** — point your AI client at `127.0.0.1:8820` and
   the cachetrack engine reads each turn's `cache_read_input_tokens` +
@@ -541,29 +532,6 @@ Every session with activity in the last 15 minutes, refreshing on a
 5-second tick: lifetime cost, tokens, turns, and a streaming action
 feed per session. The fastest way to confirm the proxy is capturing
 while you work.
-
-### Trajectories & Evals — observe an LLM app you host
-
-*General observability — [Plane A](https://superbased.app/docs/getting-started/two-planes). Distinct
-from the coding-agent usage above: this observes an LLM **application**
-you run at the admin level, whose **end-users** route through SuperBased.*
-
-<p align="center">
-  <img src="docs/assets/screenshots/13-trajectories.png" alt="Trajectories — OTLP trace and span capture (general-observability plane)" width="900">
-</p>
-
-Point any OpenTelemetry-instrumented app or agent at the local OTLP
-endpoint (or route it through the proxy) and its trace/span graph is
-captured into node-local `obs_*` tables — enriched with the proxy's
-**exact** cost and cache numbers wherever a span matches a proxied turn
-(the join no external observability tool can make). You **view**
-trajectories and eval-run health on the **admin dashboard** (`web2`, the
-Trajectories nav group) — the node/developer dashboard stays focused on
-your own coding-agent activity. Capture is local and node-opt-in, and
-the same plane adds per-end-user budgets + an input-admission guardrail
-judged by a local, custom-remote, or gateway LLM (see
-[superbased.app/docs/getting-started/two-planes](https://superbased.app/docs/getting-started/two-planes#plane-a--general-observability-of-a-hosted-llm-app)
-for the Plane A guardrail model).
 
 ### Session detail — drill into one session
 
@@ -960,7 +928,7 @@ your client through the proxy — the one-click button path in the
 
 ```
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│ Claude Code  │     │    Cursor    │     │    Codex     │    ... 31 adapters total
+│ Claude Code  │     │    Cursor    │     │    Codex     │    ... 33 adapters total
 └──────┬───────┘     └──────┬───────┘     └──────┬───────┘
        │ JSONL              │ hook events        │ rollout files
        ▼                    ▼                    ▼
@@ -1005,50 +973,6 @@ use.
 
 ---
 
-## Teams & Org Visibility
-
-For teams, an optional **`observer-org`** server gives admins org-wide
-visibility — per-developer and per-team spend, project rollups, and budgets —
-without changing the solo-local experience at all. It is purely additive: a
-developer who never enrols sees a byte-identical local tool. Developers opt in
-with `observer enroll --link <magic-link>`, after which the agent pushes
-**hash/metadata-only** rollup rows (signed, gzipped, deduplicated) to the
-server. The default v1.8.0+ posture ships sha256 hashes of command targets,
-filesystem paths, and git remotes — never the raw values; a per-node opt-in
-(`[org_client.share].full_content = true`) lets a developer choose to share
-full content, but the org admin **cannot flip this remotely**.
-
-<p align="center">
-  <img src="docs/assets/screenshots/org-overview.png" alt="observer-org dashboard — organisation-wide spend and activity rollup, aggregated from hash-by-default rows" width="900">
-</p>
-
-Authentication is SAML SSO for humans, SCIM 2.0 for provisioning, and Ed25519
-bearers for agents; no prompts, command bodies, full assistant responses, or
-file contents ever leave the machine — even in the opt-in full-content mode,
-only the small set of fields the agent already stores in metadata-only mode
-gets expanded. The server ships as a signed Docker image
-(`ghcr.io/superbasedapp/observer-org`) and a Helm chart (`charts/observer-org/`).
-
-Local-in-5-minutes: `observer-org quickstart` brings up a dev compose stack,
-provisions an admin, mints an enrolment token, and prints a ready-to-share
-magic link. `observer org status` / `preview` / `backfill` give the developer
-full visibility into what their agent is shipping.
-
-Independently, each agent can export per-turn LLM spans to your own
-OpenTelemetry collector (`gen_ai.*` + `sbo.*` attributes, off by default).
-
-- **[Getting started](docs/teams-getting-started.md)** — `observer-org
-  quickstart` for local-in-5-minutes; production SAML/SCIM bring-up.
-- **[Architecture](docs/teams-architecture.md)** — components, runtime data
-  flow, the v1.8.0 privacy posture, source map.
-- **[Operations](docs/teams-operations.md)** — backup/restore, key rotation,
-  upgrades, troubleshooting, `scrub-content` for legacy DBs.
-- **Local test plan** — an internal 7-phase evaluator plan covering local
-  bring-up end to end in ~15 minutes (source-repo reference, not shipped in
-  this distribution).
-
----
-
 ## Security & control layer (guard)
 
 The guard evaluates every captured agent action against a table-driven policy
@@ -1062,13 +986,13 @@ until you flip enforce, and `observer guard simulate --since 168h` replays
 your real history against current policy first so you know exactly what
 enforce would have done.
 
-Teams installs can distribute an Ed25519-signed org policy bundle that merges
-as a strictness floor (escalate-only — the server can never weaken node
-policy), with fleet rollups and RBAC on the org dashboard. Audit rows export
-as JSONL/CEF for SIEM ingestion, and `observer guard report` renders a
-compliance evidence pack mapped to SOC 2 / NIST 800-53. The no-network
-invariant holds: nothing leaves the machine unless you opt into Teams push,
-the OTel feed, or the cloud alerting tier individually.
+Guard policy is entirely local: built-in rules plus your own TOML rules, a
+hash-chained audit table, and pre-execution blocking on the channels that
+support it. Audit rows export as JSONL/CEF for SIEM ingestion, and
+`observer guard report` renders a compliance evidence pack mapped to
+SOC 2 / NIST 800-53. The no-network invariant holds: nothing leaves the
+machine unless you opt into the OTel feed or the cloud alerting tier
+individually.
 
 Optional **process observability** (`[observer.process]`, opt-in, off by
 default) attaches the OS-level process tree — Linux eBPF or Windows ETW —
@@ -1078,9 +1002,8 @@ can't see (a spawned binary, an unexpected child process).
 **Alerting.** Guard verdicts and budget/obs-alert crossings can push out
 through desktop toast notifications (`[guard.alerts] desktop = true`) and
 outbound webhooks — generic, Slack, Discord, or PagerDuty
-(`[[guard.cloud.webhooks]]` for guard events; the org server's per-budget
-and per-obs-alert-rule webhook columns for spend/eval alerts) — each behind
-its own opt-in, routed through one egress worker with an endpoint allowlist
+(`[[guard.cloud.webhooks]]` for guard events) — each behind its own
+opt-in, routed through one egress worker with an endpoint allowlist
 and a payload cap. Nothing fires until you configure it.
 
 Every routine guard workflow also runs from the dashboard's Security page
@@ -1089,8 +1012,8 @@ lint-gated policy editor, budget guardrails, evidence downloads) — see the
 [Dashboard tour](#dashboard-tour) above.
 
 - **[Operator guide](https://superbased.app/docs/guides/security-guard)** —
-  concepts, modes, the observe→enforce path, Teams policy merge, and the
-  honest "what guard does NOT do" list.
+  concepts, modes, the observe→enforce path, and the honest "what guard
+  does NOT do" list.
 - **Rule catalog, policy authoring, enforce runbook, compliance mapping** —
   every built-in rule ID, the TOML matcher vocabulary with a worked
   7-recipe cookbook, the observe→enforce rollout runbook, and the SOC 2

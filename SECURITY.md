@@ -62,9 +62,11 @@ than a hosted product's, but it's still real:
 - The MCP server (stdio subprocess) — tool definitions, path-safety
   gates on file-reading tools, and anything that could be used to
   exfiltrate data the operator didn't ask for.
-- Org-server deployments (`observer-org`) — auth, tenant isolation,
-  and the privacy posture around what a node ships versus what it
-  keeps local.
+- Node-side org enrolment: the enrolment exchange, the local key
+  material it mints, and the privacy posture around what an enrolled
+  node ships versus what it keeps local. (Deployments of the org
+  rollup server itself are not part of this repository; report those
+  privately through the same channels.)
 - The secrets-scrubbing pipeline — cases where scrubbing silently
   fails to redact something it claims to handle.
 

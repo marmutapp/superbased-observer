@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 
@@ -62,6 +64,11 @@ type Config struct {
 	// Observability is the [observability] surface — the generalized
 	// observability subsystem (internal/obs). OPT-IN: default false.
 	Observability ObservabilityConfig `toml:"observability"`
+	// SelfObs is the [selfobs] surface — Plane-A P1-10 platform self-
+	// observability emission (ADR-0004). OPT-IN: default enabled=false.
+	// When enabled with endpoint+credential, decision components emit
+	// system_agent OTLP runs through emit.Sink to the org gateway.
+	SelfObs SelfObsConfig `toml:"selfobs"`
 	// AggregateShare is the [aggregate_share] surface — the opt-in aggregate
 	// rail (docs/plans/g25-optin-aggregate-rail-design-2026-07-11.md). OPT-IN,
 	// default OFF in every path (zero value AND the loader's partial-merge
@@ -255,6 +262,28 @@ type RemoteNotifyConfig struct {
 // with no [observability] section keeps the subsystem off and creates no
 // obs_* tables. The subsystem is additionally compiled out by the no_obs
 // build tag for minimal distributions (decision D2).
+// SelfObsConfig is the [selfobs] surface (P1-10 production retrofit,
+// docs/plans/plane-a-p1-10-production-retrofit-plan.md). LOCAL-ONLY.
+// Default OFF — emission is a credential-bearing OTLP call to the org
+// gateway and must never fire without operator consent + keys.
+type SelfObsConfig struct {
+	// Enabled gates sink construction. false ⇒ emit.Nop().
+	Enabled bool `toml:"enabled"`
+	// Endpoint is the OTLP/HTTP gateway endpoint (host:port or full URL).
+	Endpoint string `toml:"endpoint"`
+	// KeyID / Secret compose the ingest credential; Token (if set) wins.
+	KeyID  string `toml:"key_id"`
+	Secret string `toml:"secret"`
+	Token  string `toml:"token"`
+	// Insecure permits plaintext http:// (default requires https://).
+	Insecure bool `toml:"insecure"`
+	// ServiceName overrides the OTLP resource service.name.
+	ServiceName string `toml:"service_name"`
+	// RoutingSampleN controls routing Decide emission: 0 = off, 1 = every
+	// decide, N = 1-of-N sample (plan fork 1; default 32).
+	RoutingSampleN int `toml:"routing_sample_n"`
+}
+
 type ObservabilityConfig struct {
 	// Enabled gates the whole subsystem: the OTLP /v1/traces receiver,
 	// the obs_* schema (applied only when true), ingestion, the
@@ -296,6 +325,30 @@ type ObservabilityConfig struct {
 	// value, same partial-merge rule as the other observability blocks). The
 	// obs_egress_decisions audit table is node-local, never pushed.
 	Egress ObservabilityEgressConfig `toml:"egress"`
+
+	// ProxyTurnTraces is the "gateway rail" (docs/observability.md "proxy
+	// turn (automatic)"): when true (and Enabled is true), a proxied LLM
+	// turn that arrived on an explicit /up/<id> upstream lane — the lane a
+	// co-resident hosted app is pointed at (e.g. Open WebUI via
+	// /up/openrouter) — is synthesized into an obs_traces/obs_spans pair
+	// (chat.turn/chat.completions) at insert time, so it appears in the org
+	// Trajectory explorer without the app instrumenting anything.
+	//
+	// PLANE BOUNDARY: synthesis covers ONLY /up/<id> lane traffic. The
+	// default provider lanes (ANTHROPIC_BASE_URL, codex base_url, gemini)
+	// carry Plane-B coding agents, whose rail is api_turns → sessions → the
+	// coding-agent org rollups; they must never appear in the Hosted Apps
+	// (Plane A) Trajectory explorer. An earlier all-lanes default mixed the
+	// two planes (operator-reported, 2026-08-13) and was reversed. Residual:
+	// a coding agent deliberately routed through a /up/ lane (hermes →
+	// OpenRouter) still synthesizes; disable this key or give that agent a
+	// dedicated upstream id if that matters for your deployment.
+	//
+	// Default() seeds it true so the loader's partial-merge keeps it true
+	// for an existing [observability] section that only sets `enabled` (the
+	// CacheTrack partial-merge rule); it has no effect while Enabled is
+	// false.
+	ProxyTurnTraces bool `toml:"proxy_turn_traces"`
 }
 
 // ObservabilityEgressConfig is the [observability.egress] surface (G22, design
@@ -444,6 +497,16 @@ type ObservabilityJudgeConfig struct {
 	// fields, so it is never sent remotely). 0 = omit. Its effect depends on
 	// the local host honoring the field on its /v1/chat/completions endpoint.
 	NumCtx int `toml:"num_ctx"`
+	// UseOrgRelay routes the judge call through the org server's
+	// POST /api/agent/judge instead of an OpenAI-compatible endpoint held
+	// locally (C1 judge relay, docs/plans/c1-judge-relay-spec-2026-08-15.md
+	// §3). The gateway never holds a judge-provider credential in this mode —
+	// the org server resolves its own sealed provider credential. Model stays
+	// optional under relay: it rides as an optional model_hint (recorded
+	// only; the org's provider selection decides the actual model).
+	// Validated mutually exclusive with a non-empty BaseURL/APIKeyEnv on the
+	// same resolved block (ambiguous transport).
+	UseOrgRelay bool `toml:"use_org_relay"`
 }
 
 // ObservabilityAdmissionConfig is the [observability.admission] surface
@@ -1128,6 +1191,15 @@ type TerminalConfig struct {
 	// Attach is the session-attach block (session-attach design Phase 1).
 	// Default-on: the attach socket is AF_UNIX owner-only 0600.
 	Attach TerminalAttachConfig `toml:"attach"`
+	// Sandbox is the [terminal.sandbox] block — B9 filesystem-isolated
+	// terminals (docs/plans/b9-sandboxed-terminals-implementation-plan-2026-08-08.md
+	// §5). Default-off (Enabled=false): sandboxing is new machinery that
+	// spawns a daemon-side bwrap process tree and (for clone sources)
+	// daemon-side git, so it stays a conscious opt-in like
+	// [terminal.launch].AllowFreshAgent, distinct from that block because
+	// sandboxing only SHRINKS execution authority (fs isolation) rather
+	// than expanding it.
+	Sandbox TerminalSandboxConfig `toml:"sandbox"`
 }
 
 // TerminalAttachConfig is the [terminal.attach] block — session attach
@@ -1242,6 +1314,70 @@ type TerminalLaunchConfig struct {
 	// This is NOT "a project Observer has seen" — observed roots are learned
 	// from tool data and may be stale or attacker-influenced.
 	AllowedProjectRoots []string `toml:"allowed_project_roots"`
+}
+
+// TerminalSandboxConfig is the [terminal.sandbox] block — B9 filesystem-
+// isolated terminals (docs/plans/b9-sandboxed-terminals-implementation-plan-2026-08-08.md
+// §5). Separate from [terminal.launch] (the consent-gated AUTHORIZATION
+// block for who may launch what): this block is MECHANISM — bwrap
+// namespace composition, workspace preparation, and the honesty knobs
+// around them. It only ever SHRINKS execution authority (tmpfs-home +
+// selective binds), except the two knobs called out below which EXPAND
+// it and are their own default-off/empty gates, mirroring the
+// AllowShell-shaped-gate discipline elsewhere in [terminal].
+type TerminalSandboxConfig struct {
+	// Enabled is the master opt-in for the whole sandbox feature. Default
+	// FALSE: this is new daemon-spawned machinery (bwrap + git), so it
+	// stays a conscious opt-in even though the mechanism itself only
+	// shrinks authority.
+	Enabled bool `toml:"enabled"`
+	// Backend names the isolation mechanism. "bwrap" is the only value in
+	// v1 (Linux + WSL2, bubblewrap >= 0.4.0).
+	Backend string `toml:"backend"`
+	// HomeMode selects how $HOME is treated inside the sandbox: "tmpfs"
+	// (default — blinds the real home, then punches back exactly the
+	// tool's SandboxSpec state) or "readonly" (an escape hatch that omits
+	// the tmpfs, leaving the whole home readable read-only).
+	HomeMode string `toml:"home_mode"`
+	// DefaultOn pre-checks the dashboard "Run in sandbox" toggle. Default
+	// FALSE.
+	DefaultOn bool `toml:"default_on"`
+	// AllowRemoteClone is the opt-in for the `clone-remote` workspace
+	// source: the DAEMON runs `git clone <url>` with the operator's own
+	// ambient auth before the sandbox starts. Default FALSE — an
+	// authority-EXPANDING knob (daemon-initiated network git), gated like
+	// [terminal.launch].AllowShell.
+	AllowRemoteClone bool `toml:"allow_remote_clone"`
+	// RemoteAllowedHosts restricts AllowRemoteClone to these hosts. Empty
+	// (the default) means any host is allowed once AllowRemoteClone is
+	// true.
+	RemoteAllowedHosts []string `toml:"remote_allowed_hosts"`
+	// AllowWorktreeSource is the opt-in for the `worktree` workspace
+	// source (`git worktree add`), off by default per plan §4/D6: it
+	// needs the main repo's .git bound rw and attributes the session to
+	// the MAIN repo root, not the workspace (ledger G18).
+	AllowWorktreeSource bool `toml:"allow_worktree_source"`
+	// WorkspacesDir overrides where prepared workspaces are minted.
+	// Empty (the default) uses `<observer dir>/workspaces`.
+	WorkspacesDir string `toml:"workspaces_dir"`
+	// WorkspaceRetentionDays is the sweep horizon for prepared workspaces
+	// (full repo copies, not small). 0 (the default) keeps them forever —
+	// B7 needs workspaces to persist past run exit.
+	WorkspaceRetentionDays int `toml:"workspace_retention_days"`
+	// MaskPaths lists extra paths to `--tmpfs`-mask inside the sandbox, on
+	// top of the auto-detected foreign-OS mount roots (e.g. /mnt/c on
+	// WSL). Empty by default.
+	MaskPaths []string `toml:"mask_paths"`
+	// ExtraROBinds is a config escape hatch of additional read-only binds.
+	// Empty by default.
+	ExtraROBinds []string `toml:"extra_ro_binds"`
+	// ExtraRWBinds is a config escape hatch of additional read-write
+	// binds — EXPANDS write authority inside the sandbox. Empty by
+	// default.
+	ExtraRWBinds []string `toml:"extra_rw_binds"`
+	// PrepTimeoutSeconds bounds workspace-preparation subprocesses (git
+	// clone/worktree). Default 300.
+	PrepTimeoutSeconds int `toml:"prep_timeout_seconds"`
 }
 
 // TerminalStatusConfig is the [terminal.status] block — agent-status
@@ -1622,6 +1758,12 @@ type OrgClientConfig struct {
 	// with the guard enabled — the daemon starts no poll loop
 	// otherwise.
 	PolicyPollIntervalSeconds int `toml:"policy_poll_interval_seconds"`
+	// PolicyStateHeartbeatSeconds is the cadence of the P0-6 effective-
+	// policy-state reporter's heartbeat POST (docs/plans/
+	// plane-a-p0-6-effective-policy-state-plan.md §4.3). Default 300 (5m).
+	// Content-free: only meaningful when [org_client.share].policy_state is
+	// set — the reporter goroutine is not launched otherwise.
+	PolicyStateHeartbeatSeconds int `toml:"policy_state_heartbeat_seconds"`
 	// MaxPushBytes caps the uncompressed JSON size of a single batch.
 	// Default 1 MiB; the client clamps to MaxPushBytesCeiling (16 MiB).
 	MaxPushBytes int64 `toml:"max_push_bytes"`
@@ -1639,6 +1781,69 @@ type OrgClientConfig struct {
 	// zero value = all projects. Combine with Share to narrow what
 	// crosses the wire from both axes.
 	Scope OrgClientScopeConfig `toml:"scope"`
+	// Policy is [org_client.policy] — the Plane-A P0-5 unified policy
+	// resource acceptance configuration (plan §6.4). See
+	// OrgClientPolicyConfig.
+	Policy OrgClientPolicyConfig `toml:"policy"`
+}
+
+// OrgClientPolicyConfig is [org_client.policy] — the Plane-A P0-5 unified
+// policy resource acceptance configuration
+// (docs/plans/plane-a-p0-5-unified-policy-resource-v1-plan.md §6.4).
+//
+// RESTART REQUIRED: both lists are read once when the daemon constructs its
+// policy-resource fetch options at start (Phase W wires the read site —
+// internal/orgclient.PolicyResourceOptions.AcceptFamilies/
+// PreauthorizeEnforce); changing this section takes effect on the next
+// `observer start`, not on a running daemon.
+//
+// The v1 closed family enum is "admission.input" | "egress.routing_guardrail"
+// | "gateway.providers" | "node.governance"
+// (internal/policyfam.SupportedFamilies is the source of truth; duplicated
+// here as literal strings rather than importing policyfam, matching this
+// codebase's convention of each boundary owning its own copy of a small
+// closed enum — see internal/policystate/collector.go and
+// internal/policyfam/families.go, which do the same).
+type OrgClientPolicyConfig struct {
+	// AcceptFamilies is the closed set of families this node installs into
+	// its durable cache. Default empty = accept nothing: every family is
+	// still polled and reported (plan §6.6 — polling is independent of
+	// this list), but nothing is durably cached/installed until an
+	// operator opts a family in here.
+	AcceptFamilies []string `toml:"accept_families"`
+	// PreauthorizeEnforce MUST be a subset of AcceptFamilies — config.Validate
+	// rejects a config where it is not. A family listed here whose
+	// delivered body requests the family's "enforce" posture installs
+	// live-enforceable; a family in AcceptFamilies but NOT here installs
+	// inert (EnforceAllowed=false, InertReason=not_preauthorized) whenever
+	// its body requests enforce — the signed body and its BodyHash are
+	// never rewritten to reflect this, only the local enforcement gate is.
+	PreauthorizeEnforce []string `toml:"preauthorize_enforce"`
+
+	// NodeWorkspace / NodeEnvironment / NodeService are this node's
+	// targeting attributes over the closed selector vocabulary
+	// (internal/orgcontract.Selectors), used by the P0-10 Phase B
+	// policy-targeting rail
+	// (docs/plans/policy-targeting-rollback-design-2026-08-13.md §2).
+	//
+	// CORROBORATION ONLY — NOT AUTHORIZATION. The org server resolves the
+	// AUTHORITATIVE attributes from the verified bearer's identity and
+	// decides which resource a node is served; these values are never
+	// presented to the server as a claim, and setting them can only make
+	// this node install LESS (a delivered envelope whose signed selectors
+	// contradict a value configured here is rejected selector_mismatch,
+	// keeping the prior last-known-good policy). Setting them cannot
+	// acquire a policy the server did not already choose to serve.
+	//
+	// Each key is independently optional. An attribute left empty is
+	// "unknown to this node": a signed selector naming it is accepted and
+	// logged as uncorroborated rather than blocking, so a fleet that has
+	// not configured attributes yet keeps working across the upgrade.
+	//
+	// RESTART REQUIRED, like the two lists above.
+	NodeWorkspace   string `toml:"node_workspace"`
+	NodeEnvironment string `toml:"node_environment"`
+	NodeService     string `toml:"node_service"`
 }
 
 // OrgClientScopeConfig restricts which projects (by root path) feed
@@ -1688,7 +1893,8 @@ type OrgClientScopeConfig struct {
 // PLANE BOUNDARY (docs/deployment-models.md; audit finding M1). This
 // one struct carries flags for BOTH deployment planes. Grouped below:
 //   - Plane B (this node's OWN coding-agent usage → org admin):
-//     FullContent, TargetActionAllowlist, AdminManaged, RoutingSummary.
+//     FullContent, TargetActionAllowlist, AdminManaged, RoutingSummary,
+//     PolicyState.
 //   - Plane A (general observability of an admin/org-hosted LLM app whose
 //     END-USERS route through Observer): ObsSummary, ObsTraces, ObsContent,
 //     ObsEvalSummary.
@@ -1716,6 +1922,13 @@ type OrgClientShareConfig struct {
 	// the org admin cannot force it (model-routing spec §R26.4 +
 	// the share-mode posture).
 	RoutingSummary bool `toml:"routing_summary"`
+	// PolicyState opts the P0-6 effective-policy-state reverse channel
+	// (docs/plans/plane-a-p0-6-effective-policy-state-plan.md §2.3) onto a
+	// dedicated POST /api/agent/policy-ack. CONTENT-FREE — the report carries
+	// only hash/version/enum/timestamp rows (attribution empty-on-wire,
+	// server-stamped). Its own consent toggle, default false, node-side only
+	// — the org admin cannot force it (the share-mode posture).
+	PolicyState bool `toml:"policy_state"`
 	// --- Plane A: general observability of an admin/org-hosted LLM app ---
 	// Org-tier observability opt-ins now live under the nested
 	// [org_client.share.obs] sub-table (Obs below) so the config namespace
@@ -1781,6 +1994,9 @@ const (
 	// DefaultPolicyPollIntervalSeconds is the default org policy-bundle
 	// poll cadence (1 hour — guard spec §14.2).
 	DefaultPolicyPollIntervalSeconds = 3600
+	// DefaultPolicyStateHeartbeatSeconds is the default P0-6 effective-
+	// policy-state reporter heartbeat cadence (5 minutes).
+	DefaultPolicyStateHeartbeatSeconds = 300
 	// DefaultKeychainID is the default keychain service handle.
 	DefaultKeychainID = "sbo-org-bearer-v1"
 )
@@ -2254,6 +2470,14 @@ type ProxyConfig struct {
 	// Empty/unset → only the fixed three upstreams exist (current
 	// behavior; fail-open). LOCAL-ONLY — never distributed to org nodes.
 	Upstreams map[string]string `toml:"upstreams"`
+	// AutoDefaultLane names the Upstreams lane id the virtual `/up/auto/`
+	// lane falls back to (gateway config plane spec Phase 2) when the
+	// request's top-level model has no `<lane>/` prefix matching a
+	// configured lane. Must name a key present in Upstreams when set
+	// (validated below); "" means no default — an unresolvable auto
+	// request falls through exactly like an unknown /up/<id> today
+	// (fixed upstream, warn-once). LOCAL-ONLY — never distributed.
+	AutoDefaultLane string `toml:"auto_default_lane"`
 }
 
 // DashboardConfig controls the local analytics dashboard listener. LOCAL-ONLY
@@ -2753,7 +2977,7 @@ func Default() Config {
 				PollIntervalSeconds: 2,
 				MaxFileSizeMB:       50,
 				EnabledAdapters: []string{
-					"claude-code", "codex", "cline", "cline-cli", "roo-code", "cursor", "copilot", "copilot-cli", "cowork", "opencode", "openclaw", "pi", "gemini-cli", "antigravity", "antigravity-cli", "hermes", "kilo-code", "kilo-code-cli", "qwen-code", "kiro-cli", "crush", "kimi-code", "grok", "devin", "qoder", "aider", "goose", "chatgpt-web", "claude-web", "perplexity-web", "gemini-web", "copilot-web", "droid", "open-interpreter", "command-code", "muse", "prime-agent",
+					"claude-code", "codex", "cline", "cline-cli", "roo-code", "cursor", "copilot", "copilot-cli", "cowork", "opencode", "openclaw", "pi", "gemini-cli", "antigravity", "antigravity-cli", "hermes", "kilo-code", "kilo-code-cli", "qwen-code", "kiro-cli", "crush", "kimi-code", "grok", "devin", "qoder", "aider", "goose", "chatgpt-web", "claude-web", "perplexity-web", "gemini-web", "copilot-web", "droid", "open-interpreter", "command-code", "muse", "prime-agent", "deepseek", "junie",
 				},
 			},
 			Freshness: FreshnessConfig{
@@ -2849,11 +3073,12 @@ func Default() Config {
 		// Org client is OFF by default (solo-local invariant). The defaults
 		// below only take effect once a user sets [org_client] enabled = true.
 		OrgClient: OrgClientConfig{
-			Enabled:                   false,
-			PushIntervalSeconds:       DefaultPushIntervalSeconds,
-			PolicyPollIntervalSeconds: DefaultPolicyPollIntervalSeconds,
-			MaxPushBytes:              DefaultMaxPushBytes,
-			KeychainID:                DefaultKeychainID,
+			Enabled:                     false,
+			PushIntervalSeconds:         DefaultPushIntervalSeconds,
+			PolicyPollIntervalSeconds:   DefaultPolicyPollIntervalSeconds,
+			PolicyStateHeartbeatSeconds: DefaultPolicyStateHeartbeatSeconds,
+			MaxPushBytes:                DefaultMaxPushBytes,
+			KeychainID:                  DefaultKeychainID,
 		},
 		// OTel exporter is OFF by default (solo-local invariant). The
 		// defaults below only take effect once a user sets
@@ -3037,6 +3262,20 @@ func Default() Config {
 			// guided-install kill-switch defaults ON — the consent is the
 			// dashboard click, so this only lets an operator turn it OFF.
 			Launch: TerminalLaunchConfig{AllowInstall: true},
+			// Sandbox (B9): the master switch stays off, but the mechanism
+			// defaults are seeded so an operator flipping just `enabled =
+			// true` gets the documented v1 shape (bwrap, tmpfs home, 300s
+			// prep timeout) rather than an unusable all-zero block.
+			Sandbox: TerminalSandboxConfig{
+				Enabled:                false,
+				Backend:                "bwrap",
+				HomeMode:               "tmpfs",
+				DefaultOn:              false,
+				AllowRemoteClone:       false,
+				AllowWorktreeSource:    false,
+				WorkspaceRetentionDays: 0,
+				PrepTimeoutSeconds:     300,
+			},
 		},
 		// Benchmark (the Benchmarks Harness) is CLI-driven; the only default
 		// is the retention horizon for the node-local benchmark_* tables.
@@ -3084,6 +3323,20 @@ func Default() Config {
 		// alone must yield advise mode on the value template, never
 		// zero-valued strings.
 		Routing: defaultRouting(),
+		SelfObs: SelfObsConfig{
+			Enabled:        false,
+			RoutingSampleN: 32,
+		},
+		// Observability itself defaults OFF (Enabled: false, the zero
+		// value — unlike CacheTrack this subsystem has real setup cost:
+		// the obs_* schema + OTLP receiver). ProxyTurnTraces is seeded
+		// true so that once an operator DOES flip Enabled on, an
+		// [observability] section that only sets `enabled = true`
+		// still gets the gateway rail (the CacheTrack partial-merge
+		// rule) rather than silently landing on a zero-valued false.
+		Observability: ObservabilityConfig{
+			ProxyTurnTraces: true,
+		},
 		// Guard (security & control layer, guard spec §16) is
 		// default-ON in OBSERVE mode (D2): local, deterministic,
 		// flags + alerts but never blocks until the operator flips
@@ -3282,6 +3535,16 @@ type LoadOptions struct {
 	ProjectPath string
 	// Env is the environment lookup function. Defaults to os.Getenv.
 	Env func(string) string
+	// GovernanceSidecar overrides the governance sidecar path (admin-
+	// controlled Plane B, Phase 1b §1.3). Empty means "resolve the default
+	// beside the DB". Set to config.NoGovernanceSidecar to disable the read
+	// entirely — used by the solo-parity invariant test and by
+	// `observer config show --local`.
+	GovernanceSidecar string
+	// GovernanceNow overrides the clock the sidecar's expiry rule is
+	// evaluated against. Nil means time.Now. Injected so the offboarding
+	// rule is testable without sleeping.
+	GovernanceNow func() time.Time
 }
 
 // Load merges defaults ← global TOML ← project TOML ← environment overrides.
@@ -3303,7 +3566,30 @@ func ResolveGlobalPath(override string) (string, error) {
 	return filepath.Join(home, ".observer", "config.toml"), nil
 }
 
+// Load merges defaults ← global TOML ← project TOML ← env ← GOVERNANCE.
+//
+// Governance is LAST for one honest reason: last-writer-wins is the only
+// merge order in which a pinned value is the value the process actually
+// uses. It is NOT an anti-escape control — the sidecar's own location is
+// derived from Observer.DBPath, which is settable from the global TOML, a
+// project TOML and the env, so pointing db_path elsewhere yields no sidecar
+// in one line. §1.8 concedes that class honestly.
+//
+// Load NEVER fails because of governance (review B4): if the merged config
+// fails Validate WITH the overlay, the whole overlay is discarded and the
+// ungoverned config is returned. A governance-caused Load error would turn
+// every hook invocation on every node into an early return with a stderr
+// line, losing fleet-wide ingest for a policy typo.
 func Load(opts LoadOptions) (Config, error) {
+	cfg, _, err := LoadGovernance(opts)
+	return cfg, err
+}
+
+// LoadGovernance is Load plus the record of what the governance sidecar did.
+// The disclosure surfaces (`observer org grant show`, `observer doctor
+// governance`) and the daemon's startup identity (§1.6, pending_restart) use
+// the outcome; every other caller uses Load and ignores it.
+func LoadGovernance(opts LoadOptions) (Config, GovernanceOutcome, error) {
 	if opts.Env == nil {
 		opts.Env = os.Getenv
 	}
@@ -3326,13 +3612,13 @@ func Load(opts LoadOptions) (Config, error) {
 	}
 	globalMeta, err := mergeTOMLFile(&cfg, globalPath)
 	if err != nil {
-		return Config{}, err
+		return Config{}, GovernanceOutcome{}, err
 	}
 	metas := []toml.MetaData{globalMeta}
 	if opts.ProjectPath != "" {
 		projMeta, err := mergeTOMLFile(&cfg, opts.ProjectPath)
 		if err != nil {
-			return Config{}, err
+			return Config{}, GovernanceOutcome{}, err
 		}
 		metas = append(metas, projMeta)
 	}
@@ -3370,10 +3656,37 @@ func Load(opts LoadOptions) (Config, error) {
 	cfg.Observer.DBPath = expandHome(cfg.Observer.DBPath)
 	cfg.Compression.Conversation.Stash.Dir = expandHome(cfg.Compression.Conversation.Stash.Dir)
 
-	if err := Validate(cfg); err != nil {
-		return Config{}, err
+	// Governance overlay — the LAST merge step (§1.3). Everything above is
+	// the ungoverned config; the overlay is applied to a COPY so a
+	// Validate failure can fall back to it without re-parsing.
+	now := time.Now
+	if opts.GovernanceNow != nil {
+		now = opts.GovernanceNow
 	}
-	return cfg, nil
+	file, gout := readGovernanceSidecar(cfg, opts.GovernanceSidecar, now())
+	if file == nil {
+		if err := Validate(cfg); err != nil {
+			return Config{}, gout, err
+		}
+		return cfg, gout, nil
+	}
+	governed := cfg
+	applyGovernancePins(&governed, file.Pinned, &gout)
+	if err := Validate(governed); err != nil {
+		// Review B4: a well-formed, correctly-typed pinned value that
+		// Validate rejects must NEVER make Load fail. Six of the nine
+		// hook.go config.Load sites return before db.Open, so the fleet
+		// would lose ingest and the developer would see a stderr line on
+		// every tool call. Discard the WHOLE overlay, record why, and
+		// return the ungoverned config.
+		gout.Discarded, gout.DiscardErr = true, err.Error()
+		gout.Applied = nil
+		if verr := Validate(cfg); verr != nil {
+			return Config{}, gout, verr
+		}
+		return cfg, gout, nil
+	}
+	return governed, gout, nil
 }
 
 // deprecationEmit guards one-per-process printing of config deprecation
@@ -3564,6 +3877,26 @@ func migrateLegacyOrgShareObs(cfg *Config, metas []toml.MetaData) []string {
 }
 
 // Validate checks semantic constraints on cfg.
+// validateObservabilityJudges checks the admission budget floors and both
+// [observability.judge] blocks (shared + admission override): tuning fields
+// non-negative, and the C1 relay's ambiguous-transport rule — use_org_relay
+// combined with base_url/api_key_env on the SAME raw block is an error, since
+// the relay ignores both (docs/plans/c1-judge-relay-spec-2026-08-15.md §3).
+func validateObservabilityJudges(cfg Config) error {
+	if b := cfg.Observability.Admission.Budget; b.PerUser5hUSD < 0 || b.PerUserWeeklyUSD < 0 || b.PerUserMonthlyUSD < 0 {
+		return errors.New("config: observability.admission.budget.per_user_*_usd must be >= 0")
+	}
+	for _, jc := range []ObservabilityJudgeConfig{cfg.Observability.Judge, cfg.Observability.Admission.Judge} {
+		if jc.TimeoutMS < 0 || jc.MaxTokens < 0 || jc.NumCtx < 0 {
+			return errors.New("config: observability judge timeout_ms/max_tokens/num_ctx must be >= 0")
+		}
+		if jc.UseOrgRelay && (jc.BaseURL != "" || jc.APIKeyEnv != "") {
+			return errors.New("config: observability judge use_org_relay=true is ambiguous with base_url/api_key_env set on the same block — the relay ignores both")
+		}
+	}
+	return nil
+}
+
 func Validate(cfg Config) error {
 	if cfg.Observer.DBPath == "" {
 		return errors.New("config: observer.db_path is required")
@@ -3582,6 +3915,9 @@ func Validate(cfg Config) error {
 	if cfg.Proxy.Enabled && (cfg.Proxy.Port <= 0 || cfg.Proxy.Port > 65535) {
 		return fmt.Errorf("config: proxy.port %d out of range", cfg.Proxy.Port)
 	}
+	if err := validateProxyUpstreams(cfg.Proxy); err != nil {
+		return err
+	}
 	if err := validateDashboard(cfg.Dashboard); err != nil {
 		return err
 	}
@@ -3594,6 +3930,43 @@ func Validate(cfg Config) error {
 	if err := validateRemote(cfg.Remote); err != nil {
 		return err
 	}
+	if err := validateCacheWarmAndBrowser(cfg); err != nil {
+		return err
+	}
+	if err := validateGuard(cfg.Guard); err != nil {
+		return err
+	}
+	if err := validateObservabilityJudges(cfg); err != nil {
+		return err
+	}
+	if err := validateObservabilityAlerts(cfg.Observability.Alerts); err != nil {
+		return err
+	}
+	if err := cfg.Email.Validate(); err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	if err := cfg.Digest.Validate(); err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	if err := validateProcessObs(cfg.Observer.Process); err != nil {
+		return err
+	}
+	if err := validateAggregateShare(cfg.AggregateShare); err != nil {
+		return err
+	}
+	if err := validateTerminal(cfg.Terminal); err != nil {
+		return err
+	}
+	if err := validateOrgClientPolicy(cfg.OrgClient.Policy); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateCacheWarmAndBrowser checks [cachewarm] keepwarm mode and the
+// [browser] ceiling/timeout bounds. Extracted from Validate to keep that
+// function under the gocyclo threshold after [org_client.policy] landed.
+func validateCacheWarmAndBrowser(cfg Config) error {
 	if cfg.CacheWarm.Enabled {
 		switch cfg.CacheWarm.Keepwarm.Mode {
 		case "", "off", "advise", "enforce":
@@ -3614,34 +3987,95 @@ func Validate(cfg Config) error {
 		// than silently clamp, so the operator learns their setting is unsafe.
 		return fmt.Errorf("config: browser.ingest_timeout_ms %d exceeds the maximum %d (it must stay below the native-messaging host's 40000ms reply cap so a slow ingest is never killed mid-write)", cfg.Browser.IngestTimeoutMS, maxBrowserIngestTimeoutMS)
 	}
-	if err := validateGuard(cfg.Guard); err != nil {
-		return err
+	return nil
+}
+
+// policyResourceSupportedFamilies is the v1 closed family enum — see
+// OrgClientPolicyConfig's doc comment for why this is a local copy rather
+// than an internal/policyfam import.
+var policyResourceSupportedFamilies = map[string]bool{
+	"admission.input":          true,
+	"egress.routing_guardrail": true,
+	// Config plane Phase 3 (gateway-config-plane spec): the signed provider
+	// lane-table family. Missing from this local copy until 2026-08-15, which
+	// made accept_families reject the family and every gateway resource land
+	// delivered_unaccepted — the sync test in policyfam_sync_test.go now pins
+	// this map to policyfam.SupportedFamilies so the next family can't repeat
+	// the drift.
+	"gateway.providers": true,
+	// Admin-controlled Plane B (docs/plans/admin-controlled-plane-b-spec-2026-08-15.md
+	// Phase 1a): the node-governance family. Added here in the SAME change
+	// as policyfam.FamilyNodeGovernance — policyfam_sync_test.go fails the
+	// build otherwise, which is the drift gate gateway.providers taught us
+	// to want.
+	"node.governance": true,
+}
+
+// validateOrgClientPolicy checks [org_client.policy]: every listed family
+// must be one of the v1 closed set, and preauthorize_enforce must be a
+// subset of accept_families (plan §6.4 — preauthorizing enforcement for a
+// family the node doesn't even accept is a config mistake, not a valid
+// "half-opted-in" state).
+func validateOrgClientPolicy(p OrgClientPolicyConfig) error {
+	accepted := make(map[string]bool, len(p.AcceptFamilies))
+	for _, f := range p.AcceptFamilies {
+		if !policyResourceSupportedFamilies[f] {
+			return fmt.Errorf("config: org_client.policy.accept_families contains unsupported family %q (want one of admission.input, egress.routing_guardrail, gateway.providers, node.governance)", f)
+		}
+		accepted[f] = true
 	}
-	if b := cfg.Observability.Admission.Budget; b.PerUser5hUSD < 0 || b.PerUserWeeklyUSD < 0 || b.PerUserMonthlyUSD < 0 {
-		return errors.New("config: observability.admission.budget.per_user_*_usd must be >= 0")
-	}
-	for _, jc := range []ObservabilityJudgeConfig{cfg.Observability.Judge, cfg.Observability.Admission.Judge} {
-		if jc.TimeoutMS < 0 || jc.MaxTokens < 0 || jc.NumCtx < 0 {
-			return errors.New("config: observability judge timeout_ms/max_tokens/num_ctx must be >= 0")
+	for _, f := range p.PreauthorizeEnforce {
+		if !policyResourceSupportedFamilies[f] {
+			return fmt.Errorf("config: org_client.policy.preauthorize_enforce contains unsupported family %q (want one of admission.input, egress.routing_guardrail, gateway.providers, node.governance)", f)
+		}
+		if !accepted[f] {
+			return fmt.Errorf("config: org_client.policy.preauthorize_enforce contains %q, which is not in accept_families (preauthorize_enforce must be a subset of accept_families)", f)
 		}
 	}
-	if err := validateObservabilityAlerts(cfg.Observability.Alerts); err != nil {
-		return err
+	attrs := []struct {
+		key   string
+		value string
+	}{
+		{"node_workspace", p.NodeWorkspace},
+		{"node_environment", p.NodeEnvironment},
+		{"node_service", p.NodeService},
 	}
-	if err := cfg.Email.Validate(); err != nil {
-		return fmt.Errorf("config: %w", err)
+	for _, a := range attrs {
+		if err := validatePolicyNodeAttr(a.key, a.value); err != nil {
+			return err
+		}
 	}
-	if err := cfg.Digest.Validate(); err != nil {
-		return fmt.Errorf("config: %w", err)
+	return nil
+}
+
+// maxPolicyNodeAttrBytes bounds one [org_client.policy] node attribute. The
+// value must match an org-side attribute exactly to corroborate anything, so
+// a long value is a config mistake, not a use case.
+const maxPolicyNodeAttrBytes = 128
+
+// validatePolicyNodeAttr checks one node targeting attribute: optional, but
+// when set it must be a bounded, single-line, non-padded string. The
+// comparison against a signed selector is byte-exact after the server's own
+// trim, so a value with surrounding whitespace or an embedded control
+// character could never corroborate — rejecting it loudly at load beats
+// silently never matching.
+func validatePolicyNodeAttr(key, value string) error {
+	if value == "" {
+		return nil
 	}
-	if err := validateProcessObs(cfg.Observer.Process); err != nil {
-		return err
+	if len(value) > maxPolicyNodeAttrBytes {
+		return fmt.Errorf("config: org_client.policy.%s is %d bytes, over the %d-byte maximum", key, len(value), maxPolicyNodeAttrBytes)
 	}
-	if err := validateAggregateShare(cfg.AggregateShare); err != nil {
-		return err
+	if strings.TrimSpace(value) != value {
+		return fmt.Errorf("config: org_client.policy.%s %q has leading or trailing whitespace (it must match the org-side attribute exactly)", key, value)
 	}
-	if err := validateTerminal(cfg.Terminal); err != nil {
-		return err
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("config: org_client.policy.%s is not valid UTF-8", key)
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("config: org_client.policy.%s %q contains a control character", key, value)
+		}
 	}
 	return nil
 }
@@ -3677,6 +4111,33 @@ func validateTerminal(c TerminalConfig) error {
 		if d < 0 {
 			return fmt.Errorf("config: terminal.idle_timeout %q must not be negative (use \"0\" to disable idle reaping)", c.IdleTimeout)
 		}
+	}
+	if err := validateTerminalSandbox(c.Sandbox); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateTerminalSandbox checks semantic constraints on the [terminal.sandbox]
+// block (B9). Runs unconditionally (not gated on Enabled) so a typo'd
+// backend/home_mode is caught at load time even before an operator flips the
+// master switch on.
+func validateTerminalSandbox(c TerminalSandboxConfig) error {
+	switch c.Backend {
+	case "", "bwrap":
+	default:
+		return fmt.Errorf("config: terminal.sandbox.backend %q not in {bwrap}", c.Backend)
+	}
+	switch c.HomeMode {
+	case "", "tmpfs", "readonly":
+	default:
+		return fmt.Errorf("config: terminal.sandbox.home_mode %q not in {tmpfs, readonly}", c.HomeMode)
+	}
+	if c.WorkspaceRetentionDays < 0 {
+		return errors.New("config: terminal.sandbox.workspace_retention_days must be >= 0")
+	}
+	if c.PrepTimeoutSeconds < 0 {
+		return errors.New("config: terminal.sandbox.prep_timeout_seconds must be >= 0")
 	}
 	return nil
 }
@@ -3986,6 +4447,25 @@ func validateObservabilityAlerts(a ObservabilityAlertsConfig) error {
 		}
 		if r.WindowMinutes < 0 || r.CooldownMinutes < 0 {
 			return fmt.Errorf("config: observability.alerts.rules[%d] window_minutes/cooldown_minutes must be >= 0", i)
+		}
+	}
+	return nil
+}
+
+// validateProxyUpstreams enforces the gateway config plane spec's two
+// [proxy.upstreams]/auto_default_lane invariants: "auto" is a reserved
+// virtual lane id (Phase 2 — it can never be a real configured lane,
+// since Proxy.SetUpstreams routes it through resolveAutoLane, not the
+// upstream map), and a configured auto_default_lane must name a lane
+// that actually exists in upstreams (an unresolvable default is a config
+// mistake, not a runtime fail-open case).
+func validateProxyUpstreams(p ProxyConfig) error {
+	if _, reserved := p.Upstreams["auto"]; reserved {
+		return errors.New(`config: proxy.upstreams "auto" is a reserved lane id (the virtual auto lane) and cannot be configured directly`)
+	}
+	if p.AutoDefaultLane != "" {
+		if _, ok := p.Upstreams[p.AutoDefaultLane]; !ok {
+			return fmt.Errorf("config: proxy.auto_default_lane %q must name a lane configured in proxy.upstreams", p.AutoDefaultLane)
 		}
 	}
 	return nil

@@ -74,14 +74,14 @@ func TestEgressEnforceMatrix(t *testing.T) {
 			Action: "route_upstream", UpstreamID: "local", TargetURL: target.URL,
 			TargetShape: "anthropic", MustUseTarget: true, OnUnavailable: "deny", DecisionID: 7,
 		}}
-		p, err := New(Options{AnthropicUpstream: defaultUp.URL, Sink: &fakeSink{}, Admitter: adm, EgressReporter: rep})
+		p, err := New(Options{AnthropicUpstream: defaultUp.URL, Upstreams: map[string]string{"hosted": defaultUp.URL}, Sink: &fakeSink{}, Admitter: adm, EgressReporter: rep})
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
 		ts := httptest.NewServer(p.Handler())
 		defer ts.Close()
 
-		resp := postMessages(t, ts.URL)
+		resp := postMessages(t, ts.URL+"/up/hosted")
 		body, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		if !targetHit.Load() {
@@ -115,7 +115,7 @@ func TestEgressEnforceMatrix(t *testing.T) {
 		adm := &fakeAdmitter{route: &AdmitRoute{
 			Action: "route_upstream", UpstreamID: "local", TargetURL: target.URL, TargetShape: "anthropic", DecisionID: 9,
 		}}
-		p, err := New(Options{AnthropicUpstream: defaultUp.URL, Sink: &fakeSink{}, Admitter: adm})
+		p, err := New(Options{AnthropicUpstream: defaultUp.URL, Upstreams: map[string]string{"hosted": defaultUp.URL}, Sink: &fakeSink{}, Admitter: adm})
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
@@ -126,7 +126,7 @@ func TestEgressEnforceMatrix(t *testing.T) {
 		gz := gzip.NewWriter(&buf)
 		_, _ = gz.Write([]byte(`{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}`))
 		_ = gz.Close()
-		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/messages", &buf)
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/up/hosted/v1/messages", &buf)
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Content-Encoding", "gzip")
 		resp, err := http.DefaultClient.Do(req)
@@ -167,7 +167,7 @@ func TestEgressEnforceMatrix(t *testing.T) {
 			Action: "route_upstream", UpstreamID: "local", TargetURL: target.URL,
 			TargetShape: "anthropic", MustUseTarget: true, OnUnavailable: "deny", DecisionID: 11,
 		}}
-		p, err := New(Options{AnthropicUpstream: defaultUp.URL, Sink: &fakeSink{}, Admitter: adm, EgressReporter: rep})
+		p, err := New(Options{AnthropicUpstream: defaultUp.URL, Upstreams: map[string]string{"hosted": defaultUp.URL}, Sink: &fakeSink{}, Admitter: adm, EgressReporter: rep})
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
@@ -179,7 +179,7 @@ func TestEgressEnforceMatrix(t *testing.T) {
 		ts := httptest.NewServer(p.Handler())
 		defer ts.Close()
 
-		resp := postMessages(t, ts.URL)
+		resp := postMessages(t, ts.URL+"/up/hosted")
 		_, _ = io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusForbidden {
@@ -218,7 +218,7 @@ func TestEgressEnforceMatrix(t *testing.T) {
 			Action: "route_upstream", UpstreamID: "beta", TargetURL: target.URL,
 			TargetShape: "anthropic", OnUnavailable: "fail_open", DecisionID: 13,
 		}}
-		p, err := New(Options{AnthropicUpstream: defaultUp.URL, Sink: &fakeSink{}, Admitter: adm, EgressReporter: rep})
+		p, err := New(Options{AnthropicUpstream: defaultUp.URL, Upstreams: map[string]string{"hosted": defaultUp.URL}, Sink: &fakeSink{}, Admitter: adm, EgressReporter: rep})
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
@@ -229,7 +229,7 @@ func TestEgressEnforceMatrix(t *testing.T) {
 		ts := httptest.NewServer(p.Handler())
 		defer ts.Close()
 
-		resp := postMessages(t, ts.URL)
+		resp := postMessages(t, ts.URL+"/up/hosted")
 		_, _ = io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
@@ -264,14 +264,14 @@ func TestEgressEnforceMatrix(t *testing.T) {
 			Action: "route_upstream", UpstreamID: "local", TargetURL: deadURL,
 			TargetShape: "anthropic", MustUseTarget: true, OnUnavailable: "deny", DecisionID: 15,
 		}}
-		p, err := New(Options{AnthropicUpstream: defaultUp.URL, Sink: &fakeSink{}, Admitter: adm, EgressReporter: rep})
+		p, err := New(Options{AnthropicUpstream: defaultUp.URL, Upstreams: map[string]string{"hosted": defaultUp.URL}, Sink: &fakeSink{}, Admitter: adm, EgressReporter: rep})
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
 		ts := httptest.NewServer(p.Handler())
 		defer ts.Close()
 
-		resp := postMessages(t, ts.URL)
+		resp := postMessages(t, ts.URL+"/up/hosted")
 		_, _ = io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusForbidden {
@@ -313,14 +313,14 @@ func TestEgressEnforceMatrix(t *testing.T) {
 			Action: "route_upstream", UpstreamID: "beta", TargetURL: deadURL,
 			TargetShape: "anthropic", OnUnavailable: "fail_open", DecisionID: 17,
 		}}
-		p, err := New(Options{AnthropicUpstream: defaultUp.URL, Sink: &fakeSink{}, Admitter: adm, EgressReporter: rep})
+		p, err := New(Options{AnthropicUpstream: defaultUp.URL, Upstreams: map[string]string{"hosted": defaultUp.URL}, Sink: &fakeSink{}, Admitter: adm, EgressReporter: rep})
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
 		ts := httptest.NewServer(p.Handler())
 		defer ts.Close()
 
-		resp := postMessages(t, ts.URL)
+		resp := postMessages(t, ts.URL+"/up/hosted")
 		_, _ = io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {

@@ -15,6 +15,15 @@ import (
 // validator is conservative and fails closed.
 var ErrProjectRootDenied = errors.New("termsvc: project root not permitted")
 
+// ErrManagedWorkspaceDenied is returned by ValidateManagedWorkspace when a
+// prepared B9 sandbox workspace path does not canonicalize to (or under) the
+// daemon's configured managed-workspace root, or the managed root itself is
+// unset (a misconfiguration — treated as fail-closed, never a wildcard
+// accept). It is the narrower, B9-specific sibling of ErrProjectRootDenied:
+// ValidateProjectRoot gates WHICH repo may be copied FROM, this gates where a
+// freshly prepared managed workspace may land.
+var ErrManagedWorkspaceDenied = errors.New("termsvc: sandbox workspace path not permitted")
+
 // ValidateProjectRoot authorizes a client-influenced project_root against the
 // operator-configured allow-list (plan §F1 project-root authorization). It is
 // deliberately strict:
@@ -66,6 +75,47 @@ func ValidateProjectRoot(requested string, allowedRoots []string) (string, error
 		}
 	}
 	return "", fmt.Errorf("%w: %q is not within any allowed_project_roots entry", ErrProjectRootDenied, requested)
+}
+
+// ValidateManagedWorkspace authorizes a B9 sandbox-prepared workspace path
+// (plan §4/§5): the prepared directory must canonicalize strictly under the
+// daemon's configured managed-workspace root (managedRoot, e.g.
+// `<observerDir>/workspaces`). It reuses the SAME canonicalization
+// (canonicalDir — filepath.Abs + EvalSymlinks, requiring the path to exist as
+// a directory) and containment check (isUnderOrEqual) that ValidateProjectRoot
+// uses, so the two validators stay behaviourally aligned without either
+// weakening the other.
+//
+// An empty managedRoot is treated as a misconfiguration and rejected
+// (fail-closed, plan §7): there is no sense in which "no managed root
+// configured" should accept an arbitrary path. Both path and managedRoot are
+// canonicalized independently so a misconfigured or symlinked managedRoot
+// still resolves to its real identity before the containment check runs.
+//
+// It returns the canonical path for the caller to adopt as the run's
+// Dir/ProjectRootHash source, matching ValidateProjectRoot's contract.
+func ValidateManagedWorkspace(path, managedRoot string) (string, error) {
+	if strings.TrimSpace(managedRoot) == "" {
+		return "", fmt.Errorf("%w: no managed workspace root is configured", ErrManagedWorkspaceDenied)
+	}
+	if strings.TrimSpace(path) == "" {
+		return "", fmt.Errorf("%w: empty workspace path", ErrManagedWorkspaceDenied)
+	}
+	if err := rejectDangerousPath(path); err != nil {
+		return "", fmt.Errorf("%w: %w", ErrManagedWorkspaceDenied, err)
+	}
+	canonical, err := canonicalDir(path)
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", ErrManagedWorkspaceDenied, err)
+	}
+	rootCanonical, err := canonicalDir(managedRoot)
+	if err != nil {
+		return "", fmt.Errorf("%w: managed root: %w", ErrManagedWorkspaceDenied, err)
+	}
+	if !isUnderOrEqual(canonical, rootCanonical) {
+		return "", fmt.Errorf("%w: %q is not within the managed workspace root", ErrManagedWorkspaceDenied, path)
+	}
+	return canonical, nil
 }
 
 // rejectDangerousPath rejects UNC / device / network / NUL-bearing paths
