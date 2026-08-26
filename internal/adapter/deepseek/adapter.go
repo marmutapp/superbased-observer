@@ -14,6 +14,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 
 	"github.com/marmutapp/superbased-observer/internal/adapter"
+	"github.com/marmutapp/superbased-observer/internal/adapter/cacheobs"
 	"github.com/marmutapp/superbased-observer/internal/contentcap"
 	"github.com/marmutapp/superbased-observer/internal/git"
 	"github.com/marmutapp/superbased-observer/internal/models"
@@ -162,6 +163,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 		rootCache:   map[string]string{},
 		toolIdx:     map[string]int{},
 		unknownTool: map[string]bool{},
+		cacheAcc:    cacheobs.New(MaxBlocksPerSession),
 	}
 
 	scanner := bufio.NewScanner(bytes.NewReader(plain))
@@ -222,9 +224,18 @@ type parseState struct {
 	cwd string
 	// branch is the git branch, resolved alongside the project root.
 	branch string
+	// remote is the normalized git remote, resolved alongside the
+	// project root (see projectRoot).
+	remote string
 	// model is the most recent model id seen (from assistant/message),
 	// used to stamp tool events that carry no model of their own.
 	model string
+	// cacheAcc accumulates the session's running Tier-2 content-block
+	// delta for cachetrack observation, drained on every assistant/
+	// message's usage (see emitTokens). One accumulator per parse call
+	// mirrors the whole-file-rescan contract: every changed poll
+	// re-derives the same deterministic observations from the top.
+	cacheAcc *cacheobs.Accumulator
 }
 
 // handle dispatches one decoded envelope onto the appropriate emit path.
@@ -267,6 +278,7 @@ func (st *parseState) projectRoot() string {
 	st.rootCache[cwd] = info.Root
 	if st.branch == "" {
 		st.branch = info.Branch
+		st.remote = git.NormalizeRemote(info.Remote)
 	}
 	return info.Root
 }
@@ -279,6 +291,7 @@ func (st *parseState) base(env *rawEnvelope) models.ToolEvent {
 		ProjectRoot: st.projectRoot(),
 		Timestamp:   parseTimestamp(env.Time),
 		GitBranch:   st.branch,
+		GitRemote:   st.remote,
 		Tool:        models.ToolDeepSeek,
 		Success:     true,
 	}
@@ -297,6 +310,7 @@ func (st *parseState) emitUserMessage(env *rawEnvelope, res *adapter.ParseResult
 	if d.Source.Kind != sourceKindUser {
 		return
 	}
+	st.cacheAcc.ObserveBlocks(accumulateCacheBlocks(d.Content, d.Role))
 	text := joinText(d.Content)
 	if strings.TrimSpace(text) == "" {
 		return
@@ -323,6 +337,8 @@ func (st *parseState) emitAssistantMessage(env *rawEnvelope, res *adapter.ParseR
 	if d.Message.Source.Model != "" {
 		st.model = d.Message.Source.Model
 	}
+
+	st.cacheAcc.ObserveBlocks(accumulateCacheBlocks(d.Message.Content, d.Message.Role))
 
 	text := joinText(d.Message.Content)
 	if strings.TrimSpace(text) != "" {
@@ -387,6 +403,7 @@ func (st *parseState) applyToolResult(env *rawEnvelope, res *adapter.ParseResult
 		res.Warnings = append(res.Warnings, fmt.Sprintf("seq %d: malformed tool/result data: %v", env.Seq, err))
 		return
 	}
+	st.cacheAcc.ObserveBlocks(accumulateCacheBlocks(d.Message.Content, "tool"))
 	for _, block := range d.Message.Content {
 		if block.Type != "tool-result" || block.ToolCallID == "" {
 			continue
@@ -445,6 +462,7 @@ func (st *parseState) emitTokens(env *rawEnvelope, u *assistantUsage, res *adapt
 		SessionID:       st.sessionID,
 		ProjectRoot:     st.projectRoot(),
 		GitBranch:       st.branch,
+		GitRemote:       st.remote,
 		Timestamp:       parseTimestamp(env.Time),
 		Tool:            models.ToolDeepSeek,
 		Model:           st.model,
@@ -457,6 +475,11 @@ func (st *parseState) emitTokens(env *rawEnvelope, u *assistantUsage, res *adapt
 		Source:      models.TokenSourceJSONL,
 		Reliability: models.ReliabilityApproximate,
 	})
+
+	messageID := "tok:" + strconv.FormatInt(env.Seq, 10)
+	if obs := emitCacheObservation(st.cacheAcc, st.path, st.sessionID, messageID, st.model, parseTimestamp(env.Time), u); obs != nil {
+		res.CacheObservations = append(res.CacheObservations, *obs)
+	}
 }
 
 // joinText concatenates every text-shaped block's text, in order.

@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/marmutapp/superbased-observer/internal/codeintel"
 	"github.com/marmutapp/superbased-observer/internal/config"
@@ -39,6 +40,10 @@ type Options struct {
 	// ServerName, ServerVersion are echoed to clients during initialize.
 	ServerName    string
 	ServerVersion string
+	// ToolCallTimeout bounds one tools/call invocation. Database-backed tools
+	// receive the deadline through context, ensuring a stalled query cannot
+	// pin a WAL read snapshot indefinitely. Zero disables the deadline.
+	ToolCallTimeout time.Duration
 	// ExtraTools lets callers add custom tools on top of the built-in set.
 	ExtraTools []Tool
 	// CostEngine optionally overrides the built-in cost engine (pricing table
@@ -145,10 +150,11 @@ type SignalRecorder interface {
 // Server is the MCP stdio JSON-RPC server. Safe for concurrent use after
 // Run; Run itself is single-threaded (reads stdio serially).
 type Server struct {
-	db      *sql.DB
-	logger  *slog.Logger
-	name    string
-	version string
+	db              *sql.DB
+	logger          *slog.Logger
+	name            string
+	version         string
+	toolCallTimeout time.Duration
 
 	mu    sync.RWMutex
 	tools map[string]Tool
@@ -164,11 +170,12 @@ func New(opts Options) (*Server, error) {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	s := &Server{
-		db:      opts.DB,
-		logger:  logger,
-		name:    defaultIfEmpty(opts.ServerName, "observer"),
-		version: defaultIfEmpty(opts.ServerVersion, "dev"),
-		tools:   map[string]Tool{},
+		db:              opts.DB,
+		logger:          logger,
+		name:            defaultIfEmpty(opts.ServerName, "observer"),
+		version:         defaultIfEmpty(opts.ServerVersion, "dev"),
+		toolCallTimeout: opts.ToolCallTimeout,
+		tools:           map[string]Tool{},
 	}
 	engine := opts.CostEngine
 	if engine == nil {
@@ -375,7 +382,18 @@ func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (a
 	if !ok {
 		return nil, &rpcError{Code: errMethodNotFound, Message: "unknown tool: " + p.Name}
 	}
-	result, err := tool.Invoke(ctx, p.Arguments)
+	callCtx := ctx
+	var cancel context.CancelFunc
+	if s.toolCallTimeout > 0 {
+		callCtx, cancel = context.WithTimeout(ctx, s.toolCallTimeout)
+		defer cancel()
+	}
+	result, err := tool.Invoke(callCtx, p.Arguments)
+	if errors.Is(callCtx.Err(), context.DeadlineExceeded) {
+		s.logger.Warn("mcp: tool call exceeded read-transaction watchdog deadline",
+			"tool", p.Name, "timeout", s.toolCallTimeout)
+		err = fmt.Errorf("tool call timed out after %s: %w", s.toolCallTimeout, callCtx.Err())
+	}
 	if err != nil {
 		// Tool errors are returned as in-band tool-result errors (isError=true),
 		// not JSON-RPC transport errors — per MCP spec, so the model can see

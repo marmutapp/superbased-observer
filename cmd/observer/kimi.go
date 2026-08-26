@@ -6,6 +6,8 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+
+	"github.com/marmutapp/superbased-observer/internal/config"
 )
 
 // newKimiCmd implements `observer kimi` — launches Moonshot AI's kimi-code
@@ -18,12 +20,13 @@ import (
 // session's project root.
 //
 // NON-PROXIED on purpose. kimi-code's openai-compat endpoint lives in
-// ~/.kimi-code/config.toml (a NEVER-READ file — plaintext API key);
-// OPENAI_BASE_URL/KIMI_BASE_URL are documented for the Python kimi-cli but
-// unconfirmed on the live kimi-code install (RouteStatusProbeRequired in the
-// integration registry). Token capture happens via observer's local
-// kimi-code wire.jsonl adapter, not the proxy. The launcher execs `kimi`
-// with the caller's own environment — it never sets an API key or base URL.
+// ~/.kimi-code/config.toml (a NEVER-READ file — plaintext API key) and is
+// PROMOTED in the integration registry (routable_now, live-verified
+// 2026-07-09): routing flows through the `observer init` config writer's
+// additive [providers.openai].base_url entry, NOT through this launcher.
+// Token capture happens via observer's local kimi-code wire.jsonl adapter,
+// not the proxy. The launcher execs `kimi` with the caller's own
+// environment — it never sets an API key or base URL.
 func newKimiCmd() *cobra.Command {
 	var (
 		configPath   string
@@ -131,7 +134,13 @@ func newKimiCmd() *cobra.Command {
 				}
 			}
 
-			return runSeedOnlyLaunch("kimi", bin, args, continueDir)
+			// Best-effort attribution config: a load failure just disables
+			// the launch seed (recordLaunchSeed treats "" as off).
+			dbPath := ""
+			if cfg, cErr := config.Load(config.LoadOptions{GlobalPath: configPath}); cErr == nil {
+				dbPath = cfg.Observer.DBPath
+			}
+			return runSeedOnlyLaunchSeeded(dbPath, "kimi-code", "kimi", bin, args, continueDir)
 		},
 	}
 	cmd.Flags().StringVar(&configPath, "config", "", "Path to config.toml (defaults to ~/.observer/config.toml); used to resolve the source session for --continue-from")

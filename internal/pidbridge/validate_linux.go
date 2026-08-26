@@ -9,6 +9,12 @@ import (
 	"strings"
 )
 
+// platformCanValidate reports that this build's platform can answer
+// liveness + identity questions about local processes (/proc is
+// introspectable), so the resolver may gate bridge hits on
+// [ValidateLocalProcess].
+const platformCanValidate = true
+
 // ValidateLocalProcess reports whether pid names a live process on THIS
 // host whose identity matches execHint — the guard the watcher/SQLite
 // attribution path applies before seeding session_pid_bridge from an

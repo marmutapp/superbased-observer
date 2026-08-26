@@ -223,11 +223,17 @@ function shareValueText(v: unknown, list?: boolean): string {
 // key, what this machine's own config asks for, what is actually in force,
 // and which of the two decided it.
 //
-// The direction is one-way by construction. An organisation can reduce what a
-// machine shares, or lock it at the level the operator already chose. It can
-// never raise it - there is no wire shape, no authority token and no code
-// path that does, and there is no string in this component that says
-// otherwise.
+// The direction depends on the tenancy, and this card says WHICH ONE this
+// machine is on rather than making one claim for both:
+//
+//   Individual / BYO - one-way by construction. An organisation can reduce
+//   what this machine shares, or lock it at the level the operator already
+//   chose. It cannot raise it: the raise no-ops without managed enrolment.
+//
+//   Managed (Enterprise-Managed Tenancy) - the organisation can also turn
+//   sharing ON remotely, for the tiers it was granted at enrolment. That is
+//   the deal a managed enrolment makes, and a row it raised is labelled as
+//   its decision, not the developer's.
 function SharingSourceCard({ config }: { config: Record<string, any> | undefined }) {
   const gov = useGovernance();
   const enrol = useApi<EnrolStatus>("/api/enrolment/status");
@@ -264,7 +270,11 @@ function SharingSourceCard({ config }: { config: Record<string, any> | undefined
   return (
     <ChartShell
       title={<TitleWithHelp text="Sharing keys and their source" helpId="card.privacy_share_source" />}
-      sub="Each sharing switch, what it is set to, and who decided. An organisation can reduce or lock what this machine shares; it can never increase it."
+      sub={
+        gov.data?.managed
+          ? "Each sharing switch, what it is set to, and who decided. This machine is managed by your organisation, so it can reduce, lock, or increase what is shared - every row it decided is marked below."
+          : "Each sharing switch, what it is set to, and who decided. An organisation can reduce or lock what this machine shares; on an unmanaged machine like this one it cannot increase it."
+      }
     >
       {enrol.data && !enrol.data.enrolled && (
         <p className="pb-2 text-[11.5px] text-fg-2">
@@ -297,7 +307,12 @@ function SharingSourceCard({ config }: { config: Record<string, any> | undefined
                   <td className="py-1.5 pr-3 align-top text-fg-2">{shareValueText(effective, r.list)}</td>
                   <td className="py-1.5 align-top">
                     {governed ? (
-                      <Pill variant="info">{shareSourceLabel(r.row)}</Pill>
+                      // A raise is the one direction that shares MORE than
+                      // the operator asked for, so it does not read as
+                      // routine policy the way a reduce or a lock does.
+                      <Pill variant={r.row?.source === "org_raised" ? "warn" : "info"}>
+                        {shareSourceLabel(r.row)}
+                      </Pill>
                     ) : (
                       <span className="text-fg-2">{shareSourceLabel(null)}</span>
                     )}

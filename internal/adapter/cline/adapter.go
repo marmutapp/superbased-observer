@@ -202,13 +202,14 @@ func (m *rawMessage) resolvedModel() string {
 // Anthropic providers) OR Cline 3.89.2's `metrics` (non-Anthropic
 // providers). Returns ok=false when neither is present (a turn that emitted
 // no token accounting). model is the already-resolved model string.
-func tokenEventFor(msg *rawMessage, path, sessionID, projectRoot, gitBranch, toolID, model string, ts time.Time, idx int) (models.TokenEvent, bool) {
+func tokenEventFor(msg *rawMessage, path, sessionID, projectRoot, gitBranch, gitRemote, toolID, model string, ts time.Time, idx int) (models.TokenEvent, bool) {
 	ev := models.TokenEvent{
 		SourceFile:    path,
 		SourceEventID: fmt.Sprintf("tk:%s:%d", filepath.Base(filepath.Dir(path)), idx),
 		SessionID:     sessionID,
 		ProjectRoot:   projectRoot,
 		GitBranch:     gitBranch,
+		GitRemote:     gitRemote,
 		Timestamp:     ts,
 		Tool:          toolID,
 		Model:         model,
@@ -276,7 +277,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 	}
 
 	toolID, sessionID := toolFromPath(path), sessionIDFromPath(path)
-	projectRoot, gitBranch := a.inferProjectContext(path)
+	projectRoot, gitBranch, gitRemote := a.inferProjectContext(path)
 	pending := map[string]int{}
 
 	for i := range msgs {
@@ -287,7 +288,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 		ts := parseMilliTimestamp(msg.Ts)
 		model := msg.resolvedModel()
 
-		if ev, ok := tokenEventFor(msg, path, sessionID, projectRoot, gitBranch, toolID, model, ts, i); ok {
+		if ev, ok := tokenEventFor(msg, path, sessionID, projectRoot, gitBranch, gitRemote, toolID, model, ts, i); ok {
 			res.TokenEvents = append(res.TokenEvents, ev)
 		}
 
@@ -299,7 +300,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 		// skipped by extractUserPrompt so they don't masquerade as prompts.
 		if msg.Role == "user" {
 			if prompt := extractUserPrompt(blocks); prompt != "" {
-				res.ToolEvents = append(res.ToolEvents, a.userPromptEvent(path, toolID, sessionID, projectRoot, gitBranch, model, ts, i, prompt))
+				res.ToolEvents = append(res.ToolEvents, a.userPromptEvent(path, toolID, sessionID, projectRoot, gitBranch, gitRemote, model, ts, i, prompt))
 			}
 		}
 
@@ -336,7 +337,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 				// toolID-derived, so all three minted the class.
 				reasoning = appendReasoning(reasoning, txt)
 			case "tool_use":
-				evt := a.toolUseEvent(path, toolID, sessionID, projectRoot, gitBranch, model, ts, block)
+				evt := a.toolUseEvent(path, toolID, sessionID, projectRoot, gitBranch, gitRemote, model, ts, block)
 				if reasoning != "" {
 					evt.PrecedingReasoning = truncate(a.scrubber.String(reasoning), 2048)
 				}
@@ -363,7 +364,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 				if body == "" {
 					continue
 				}
-				res.ToolEvents = append(res.ToolEvents, a.assistantTextEvent(path, toolID, sessionID, projectRoot, gitBranch, model, ts, i, blockIdx, body))
+				res.ToolEvents = append(res.ToolEvents, a.assistantTextEvent(path, toolID, sessionID, projectRoot, gitBranch, gitRemote, model, ts, i, blockIdx, body))
 			case "image":
 				// Multimodal attachment (Anthropic image content block:
 				// {type:"image", source:{type:"base64", media_type, data}}).
@@ -372,10 +373,11 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 				// user turns carry no <task> text, so extractUserPrompt
 				// skips them) — observability-only, no image bytes stored.
 				// The image's token cost lands on the per-message TokenEvent.
-				res.ToolEvents = append(res.ToolEvents, a.imageEvent(path, toolID, sessionID, projectRoot, gitBranch, model, ts, i, blockIdx))
+				res.ToolEvents = append(res.ToolEvents, a.imageEvent(path, toolID, sessionID, projectRoot, gitBranch, gitRemote, model, ts, i, blockIdx))
 			}
 		}
 	}
+	res.CacheObservations = buildCacheObservations(msgs, path, sessionID)
 	return res, nil
 }
 
@@ -389,7 +391,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 // RawToolName uses the resolved toolID (cline / roo-code), matching the
 // `<source>.assistant_text` convention.
 func (a *Adapter) assistantTextEvent(
-	sourceFile, toolID, sessionID, projectRoot, gitBranch, model string,
+	sourceFile, toolID, sessionID, projectRoot, gitBranch, gitRemote, model string,
 	ts time.Time,
 	msgIdx, blockIdx int,
 	body string,
@@ -403,6 +405,7 @@ func (a *Adapter) assistantTextEvent(
 		ProjectRoot:        projectRoot,
 		Timestamp:          ts,
 		GitBranch:          gitBranch,
+		GitRemote:          gitRemote,
 		Model:              model,
 		Tool:               toolID,
 		ActionType:         models.ActionAssistantMessage,
@@ -463,7 +466,7 @@ func appendReasoning(acc, next string) string {
 // the timeline. SourceEventID is derived from the message + block index
 // so the (source_file, source_event_id) upsert dedupes across re-parses.
 func (a *Adapter) imageEvent(
-	sourceFile, toolID, sessionID, projectRoot, gitBranch, model string,
+	sourceFile, toolID, sessionID, projectRoot, gitBranch, gitRemote, model string,
 	ts time.Time,
 	msgIdx, blockIdx int,
 ) models.ToolEvent {
@@ -475,6 +478,7 @@ func (a *Adapter) imageEvent(
 		ProjectRoot:   projectRoot,
 		Timestamp:     ts,
 		GitBranch:     gitBranch,
+		GitRemote:     gitRemote,
 		Model:         model,
 		Tool:          toolID,
 		ActionType:    models.ActionUserPrompt,
@@ -490,7 +494,7 @@ func (a *Adapter) imageEvent(
 // store-layer (source_file, source_event_id) upsert dedupes across the
 // adapter's full-file re-parses.
 func (a *Adapter) userPromptEvent(
-	sourceFile, toolID, sessionID, projectRoot, gitBranch, model string,
+	sourceFile, toolID, sessionID, projectRoot, gitBranch, gitRemote, model string,
 	ts time.Time,
 	msgIdx int,
 	prompt string,
@@ -504,6 +508,7 @@ func (a *Adapter) userPromptEvent(
 		ProjectRoot:        projectRoot,
 		Timestamp:          ts,
 		GitBranch:          gitBranch,
+		GitRemote:          gitRemote,
 		Model:              model,
 		Tool:               toolID,
 		ActionType:         models.ActionUserPrompt,
@@ -517,7 +522,7 @@ func (a *Adapter) userPromptEvent(
 }
 
 func (a *Adapter) toolUseEvent(
-	sourceFile, toolID, sessionID, projectRoot, gitBranch, model string,
+	sourceFile, toolID, sessionID, projectRoot, gitBranch, gitRemote, model string,
 	ts time.Time,
 	block rawContentBlock,
 ) models.ToolEvent {
@@ -534,6 +539,7 @@ func (a *Adapter) toolUseEvent(
 		ProjectRoot:   projectRoot,
 		Timestamp:     ts,
 		GitBranch:     gitBranch,
+		GitRemote:     gitRemote,
 		Model:         model,
 		Tool:          toolID,
 		ActionType:    actionType,
@@ -606,7 +612,7 @@ func (a *Adapter) extractTarget(toolName string, rawInput json.RawMessage, proje
 // first (the format every current install produces) and fall back
 // to ui_messages.json for sessions captured by older Cline versions.
 //
-// Returns ("", "") when neither file yields a cwd — the watcher still
+// Returns ("", "", "") when neither file yields a cwd — the watcher still
 // stores the action but the store layer's "drop empty ProjectRoot"
 // guard then silently discards every event for the session. This was
 // the V1 bug surfaced by the 2026-06-06 Windows validation.
@@ -620,14 +626,14 @@ func (a *Adapter) extractTarget(toolName string, rawInput json.RawMessage, proje
 // as relative, prepends observer's own CWD, and walks UP — landing
 // on observer's own .git in the worst case
 // (memory [[feedback_foreign_path_git_resolve]]).
-func (a *Adapter) inferProjectContext(path string) (projectRoot, branch string) {
+func (a *Adapter) inferProjectContext(path string) (projectRoot, branch, remote string) {
 	if cwd := scanAPIHistoryCwd(path); cwd != "" {
 		return resolveProjectFromCwd(cwd)
 	}
 	if cwd := scanUIMessagesCwd(filepath.Join(filepath.Dir(path), "ui_messages.json")); cwd != "" {
 		return resolveProjectFromCwd(cwd)
 	}
-	return "", ""
+	return "", "", ""
 }
 
 // scanAPIHistoryCwd reads the first cwdScanBytes of
@@ -677,16 +683,17 @@ func scanUIMessagesCwd(uiPath string) string {
 
 // resolveProjectFromCwd normalises a raw cwd hint and runs git.Resolve
 // over it. When git.Resolve finds a repo root the returned root +
-// branch are used; otherwise the normalised cwd itself becomes the
-// project root with an empty branch (still satisfies the store
-// layer's non-empty ProjectRoot requirement).
-func resolveProjectFromCwd(cwd string) (string, string) {
+// branch + normalized remote are used; otherwise the normalised cwd
+// itself becomes the project root with an empty branch and remote
+// (still satisfies the store layer's non-empty ProjectRoot
+// requirement).
+func resolveProjectFromCwd(cwd string) (string, string, string) {
 	cwd = pathnorm.Normalize(cwd)
 	info, err := git.Resolve(cwd)
 	if err == nil {
-		return info.Root, info.Branch
+		return info.Root, info.Branch, git.NormalizeRemote(info.Remote)
 	}
-	return cwd, ""
+	return cwd, "", ""
 }
 
 // decodeContent handles the array-of-blocks form. Some Cline messages store

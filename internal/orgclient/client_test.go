@@ -512,14 +512,19 @@ func TestStatusAndUnenroll(t *testing.T) {
 // --- runLoop timing (synctest) ----------------------------------------------
 
 // The loop waits one interval before the first cycle, backs off exponentially
-// (jittered) on retryable errors, resets the backoff after a success, and
-// stops cleanly (returns nil) on an auth failure.
-func TestRunLoop_BackoffResetAndAuthStop(t *testing.T) {
+// (jittered) on retryable errors, resets the backoff after a success, and —
+// crucially — RETRIES an auth failure on a separate track (initialBackoff-then-
+// climb) rather than stopping, so a re-enrol recovers without a restart.
+func TestRunLoop_BackoffResetAndAuthRetry(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		c := New(config.OrgClientConfig{}, nil, &memBearerStore{}, "v", http.DefaultClient, quietLogger())
 		const interval = 900 * time.Second
 
-		script := []error{errors.New("boom"), errors.New("boom"), nil, ErrAuthFailed}
+		ctx, cancel := context.WithCancel(context.Background())
+		// boom, boom (backoff climbs) → nil (reset) → three ErrAuthFailed (auth
+		// track: retry at 250ms then 500ms, proving it does NOT stop); cancel
+		// after the last scripted step ends the loop.
+		script := []error{errors.New("boom"), errors.New("boom"), nil, ErrAuthFailed, ErrAuthFailed, ErrAuthFailed}
 		var gaps []time.Duration
 		last := time.Now()
 		i := 0
@@ -529,27 +534,33 @@ func TestRunLoop_BackoffResetAndAuthStop(t *testing.T) {
 			last = now
 			err := script[i]
 			i++
+			if i == len(script) {
+				cancel()
+			}
 			return err
 		}
 
-		if err := c.runLoop(context.Background(), interval, action); err != nil {
-			t.Fatalf("runLoop returned %v, want nil (auth stop)", err)
+		if err := c.runLoop(ctx, interval, action); !errors.Is(err, context.Canceled) {
+			t.Fatalf("runLoop returned %v, want context.Canceled (auth is retryable, not terminal)", err)
 		}
-		if len(gaps) != 4 {
-			t.Fatalf("ran %d cycles, want 4", len(gaps))
+		if len(gaps) != 6 {
+			t.Fatalf("ran %d cycles, want 6 (auth failures retried, not stopped)", len(gaps))
 		}
 		// First cycle: exactly one interval.
 		if gaps[0] != interval {
 			t.Errorf("gap[0] = %v, want %v", gaps[0], interval)
 		}
-		// After boom #1: ~250ms ±25%.
+		// After boom #1/#2: 250ms then doubled to 500ms.
 		assertWithin(t, "gap[1]", gaps[1], 250*time.Millisecond)
-		// After boom #2: backoff doubled to ~500ms ±25%.
 		assertWithin(t, "gap[2]", gaps[2], 500*time.Millisecond)
 		// After the success: backoff reset → back to the full interval.
 		if gaps[3] != interval {
 			t.Errorf("gap[3] = %v, want %v (backoff reset after success)", gaps[3], interval)
 		}
+		// After ErrAuthFailed #1/#2: the auth track retries at 250ms then 500ms
+		// — proof the loop keeps going instead of terminating.
+		assertWithin(t, "gap[4]", gaps[4], 250*time.Millisecond)
+		assertWithin(t, "gap[5]", gaps[5], 500*time.Millisecond)
 	})
 }
 
@@ -560,7 +571,8 @@ func TestRunLoop_IdleKeepsIntervalCadence(t *testing.T) {
 		c := New(config.OrgClientConfig{}, nil, &memBearerStore{}, "v", http.DefaultClient, quietLogger())
 		const interval = 900 * time.Second
 
-		script := []error{errIdle, errIdle, ErrAuthFailed}
+		ctx, cancel := context.WithCancel(context.Background())
+		script := []error{errIdle, errIdle}
 		var gaps []time.Duration
 		last := time.Now()
 		i := 0
@@ -570,10 +582,13 @@ func TestRunLoop_IdleKeepsIntervalCadence(t *testing.T) {
 			last = now
 			err := script[i]
 			i++
+			if i == len(script) {
+				cancel()
+			}
 			return err
 		}
-		_ = c.runLoop(context.Background(), interval, action)
-		for j, g := range gaps[:2] {
+		_ = c.runLoop(ctx, interval, action)
+		for j, g := range gaps {
 			if g != interval {
 				t.Errorf("idle gap[%d] = %v, want %v", j, g, interval)
 			}

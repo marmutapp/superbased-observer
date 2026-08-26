@@ -309,6 +309,24 @@ func (r *ProcResolver) findPIDForInode(inode uint64) (int, error) {
 // and WSL's distro init at pid 2 are system space — a bridge entry there
 // is registration poison, never a real AI tool; see the D17 record) or
 // on the first /proc read failure.
+//
+// A Lookup hit is trusted only after validateProcess confirms the pid is
+// still alive and still matches the row's Tool: bridge rows survive
+// until the 6h prune after their process exits, and the OS is free to
+// recycle the pid onto an unrelated binary — trusting such a row stamped
+// a fresh shell's bash/tail processes with a dead session's id (observed
+// live 2026-08-21). A failed validation skips the row and continues the
+// climb, so a stale hit cannot mask a legitimate ancestor row. Every
+// false answer counts as invalid, including /proc read errors:
+// validateProcess cannot distinguish a dead pid from an unreadable one,
+// and a wrong attribution is worse than none (a miss beats a wrong
+// link). Where the platform cannot answer at all (non-Linux,
+// platformCanValidate=false) hits are trusted unchanged — otherwise
+// resolution there would degrade to a permanent miss. Validation runs
+// only during this uncached walk — at most two small /proc reads per
+// bridge hit, zero on the common miss path — and its verdict becomes
+// part of the per-remote-addr cacheEntry like the rest of the walk's
+// decision.
 func (r *ProcResolver) walkAncestors(ctx context.Context, pid int) (string, string, string, bool, error) {
 	seen := map[int]struct{}{}
 	cur := pid
@@ -321,9 +339,11 @@ func (r *ProcResolver) walkAncestors(ctx context.Context, pid int) (string, stri
 		if err != nil {
 			return "", "", "", false, err
 		}
-		if hit {
+		if hit && (!platformCanValidate || validateProcess(r.procDir, cur, e.Tool)) {
 			return e.SessionID, e.Tool, e.CWD, true, nil
 		}
+		// No row here — or a stale one whose pid is gone or was
+		// recycled onto a different binary. Either way climb past.
 		ppid, err := readPPid(filepath.Join(r.procDir, strconv.Itoa(cur), "status"))
 		if err != nil {
 			return "", "", "", false, nil

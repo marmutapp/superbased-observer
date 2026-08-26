@@ -75,6 +75,10 @@ type ObsOrgProviders struct {
 	// other content tiers (the content_hash always ships). nil when obs is
 	// compiled out (no_obs) or the provider isn't wired.
 	EvalItems func(ctx context.Context, cur orgcontract.ObsCursor, max int) (orgcontract.ObsEvalItemBatch, error) // T7
+	// Egress is the T8 egress-routing decision provider (W5.3): what the
+	// node's compiled routing policy decided for outbound model/provider
+	// calls. nil when obs is compiled out or the tier is off.
+	Egress func(ctx context.Context, cur orgcontract.ObsCursor, max int) (orgcontract.ObsEgressBatch, error) // T8
 }
 
 // PushCursor is the agent's per-table push position. Each field is the
@@ -103,6 +107,71 @@ type PushBatch struct {
 	// under ShareOptions.RoutingSummary. It rides along with row data
 	// and does not affect cursors (the server upsert is idempotent).
 	RoutingSummaries []orgcontract.RoutingSummaryRow
+	// CacheSummaries is the OPTIONAL Arc 4 P5c cache-detail aggregate,
+	// attached only under ShareOptions.CacheDetail and computed by
+	// store.SelectCacheSummaries (which owns the node-local cache_events
+	// read; this file names no cache_* table). Windowed-recompute +
+	// server-upsert-idempotent, so it does not affect the per-table cursors.
+	CacheSummaries []orgcontract.CacheSummaryRow
+	// CodeintelSummaries is the OPTIONAL Arc 4 P5f codeintel-detail aggregate,
+	// attached only under ShareOptions.CodeintelDetail and computed by
+	// store.SelectCodeintelSummaries (which owns the node-local codeintel_*
+	// read; this file names no codeintel_* table). Snapshot-recompute +
+	// server-upsert-idempotent, so it does not affect the per-table cursors.
+	CodeintelSummaries []orgcontract.CodeintelSummaryRow
+	// ProcessSummaries is the OPTIONAL Arc 4 P5g process-detail aggregate,
+	// attached only under ShareOptions.ProcessDetail and computed by
+	// store.SelectProcessSummaries (which owns the node-local process_runs
+	// read; this file names no process_* table). Windowed-recompute +
+	// server-upsert-idempotent, so it does not affect the per-table cursors.
+	ProcessSummaries []orgcontract.ProcessSummaryRow
+	// SessionVerbositySummaries / SessionCacheSummaries / SessionProcesses
+	// are the org-parity session-scoped enterprise wires (W3.1 / W2.1 /
+	// W2.2), attached only under share.shipsRawContent() (FullContent ||
+	// AdminManaged — deliberately NOT the teams-tier detail flags above;
+	// session-scoped telemetry is per-developer detail the enterprise
+	// posture treats as admin-visible-by-default). Computed by
+	// store.SelectSessionVerbositySummaries / SelectSessionCacheSummaries /
+	// SelectSessionProcessRows, which own the node-local reads — this file
+	// names none of those tables (the privacy sentinel forbids it).
+	// Windowed-recompute + server-upsert-idempotent; no cursor effect.
+	SessionVerbositySummaries []orgcontract.SessionVerbosityRow
+	SessionCacheSummaries     []orgcontract.SessionCacheRow
+	SessionProcesses          []orgcontract.SessionProcessRow
+	SessionNetworkEvents      []orgcontract.SessionNetworkEventRow
+	// Wave-3 per-developer enterprise wires — same shipsRawContent() gate
+	// and one-owner Select-file discipline as the session wires above.
+	AdvisorSuggestions []orgcontract.AdvisorSuggestionRow
+	ProjectPatterns    []orgcontract.ProjectPatternRow
+	BenchmarkRuns      []orgcontract.BenchmarkRunRow
+	BenchmarkAttempts  []orgcontract.BenchmarkAttemptRow
+	CompressionStats   []orgcontract.CompressionStatRow
+	RoutingDevRows     []orgcontract.RoutingDevRow
+	CodeintelDevRows   []orgcontract.CodeintelDevRow
+	TerminalRuns       []orgcontract.TerminalRunRow
+	TerminalCommands   []orgcontract.TerminalCommandRow
+	RemoteAudit        []orgcontract.RemoteAuditRow
+	GuardPins          []orgcontract.GuardPinRow
+	GuardApprovals     []orgcontract.GuardApprovalRow
+	// TerminalSummaries + RemoteAuditSummaries are the OPTIONAL Arc 4 P5h
+	// terminal-detail aggregates, attached only under ShareOptions.TerminalDetail
+	// and computed by store.SelectTerminalSummaries / SelectRemoteAuditSummaries
+	// (which own the node-local terminal_* / remote_audit reads; this file names
+	// none of those tables). Windowed-recompute + server-upsert-idempotent, so
+	// they do not affect the per-table cursors.
+	TerminalSummaries    []orgcontract.TerminalSummaryRow
+	RemoteAuditSummaries []orgcontract.RemoteAuditSummaryRow
+	// RoutingDetails is the OPTIONAL Arc 4 P5d routing-detail aggregate,
+	// attached only under ShareOptions.RoutingDetail and computed by
+	// store.SelectRoutingDetail (which owns the node-local router_decisions
+	// read; this file names no such table). Windowed-recompute +
+	// server-upsert-idempotent, so it does not affect the per-table cursors.
+	RoutingDetails []orgcontract.RoutingDetailRow
+	// LimitGauges is the OPTIONAL Arc 4 P5e predictions aggregate, attached
+	// only under ShareOptions.LimitGauge and computed by store.SelectLimitGauges
+	// (which owns the node-local limit_snapshots read; this file names no such
+	// table). Windowed-recompute + server-upsert-idempotent.
+	LimitGauges []orgcontract.LimitGaugeRow
 	// Obs* are the OPTIONAL org-tier observability rollups
 	// (obs-org-tier plan), each attached only under its own ShareOptions
 	// flag and composed via the obs provider seam (this file names no
@@ -137,7 +206,11 @@ type PushBatch struct {
 	// T2/T3 structure rows + T6 events); windowed-recompute + server-upsert
 	// idempotent, so it does not affect the per-table cursors.
 	ObsEvalItems []orgcontract.ObsEvalItemRow // T7 per-item eval scores
-	EstBytes     int64
+	// ObsEgressDecisions is the OPTIONAL T8 egress-routing decision feed
+	// (W5.3), attached only under ShareOptions.ObsEgress and composed via
+	// the obs provider seam (this file names no obs_* table).
+	ObsEgressDecisions []orgcontract.ObsEgressRow // T8 egress routing decisions
+	EstBytes           int64
 }
 
 // RowCount is the total number of rows across all row-bearing tables in the
@@ -147,7 +220,7 @@ func (b PushBatch) RowCount() int {
 	return len(b.Sessions) + len(b.Actions) + len(b.APITurns) + len(b.TokenUsage) +
 		len(b.GuardEvents) + len(b.OTelContent) +
 		len(b.ObsTraces) + len(b.ObsSpans) + len(b.ObsSpanEvents) + len(b.ObsContent) +
-		len(b.ObsAdmissionEvents) + len(b.ObsEvalItems)
+		len(b.ObsAdmissionEvents) + len(b.ObsEvalItems) + len(b.ObsEgressDecisions)
 }
 
 // hasAggregates reports whether the batch carries any windowed-recompute
@@ -158,7 +231,20 @@ func (b PushBatch) RowCount() int {
 // aggregates are consulted here rather than being silently dropped by the
 // PushOnce empty-batch early return.
 func (b PushBatch) hasAggregates() bool {
-	return len(b.RoutingSummaries) > 0 || len(b.ObsSummaries) > 0 ||
+	return len(b.RoutingSummaries) > 0 || len(b.CacheSummaries) > 0 ||
+		len(b.CodeintelSummaries) > 0 || len(b.ProcessSummaries) > 0 ||
+		len(b.SessionVerbositySummaries) > 0 || len(b.SessionCacheSummaries) > 0 ||
+		len(b.SessionProcesses) > 0 || len(b.SessionNetworkEvents) > 0 ||
+		len(b.AdvisorSuggestions) > 0 || len(b.ProjectPatterns) > 0 ||
+		len(b.BenchmarkRuns) > 0 || len(b.BenchmarkAttempts) > 0 ||
+		len(b.CompressionStats) > 0 ||
+		len(b.RoutingDevRows) > 0 || len(b.CodeintelDevRows) > 0 ||
+		len(b.TerminalRuns) > 0 || len(b.TerminalCommands) > 0 ||
+		len(b.RemoteAudit) > 0 ||
+		len(b.GuardPins) > 0 || len(b.GuardApprovals) > 0 ||
+		len(b.TerminalSummaries) > 0 || len(b.RemoteAuditSummaries) > 0 ||
+		len(b.RoutingDetails) > 0 || len(b.LimitGauges) > 0 ||
+		len(b.ObsSummaries) > 0 ||
 		len(b.ObsEvalRuns) > 0 || len(b.ObsEndUserSpend) > 0 ||
 		len(b.ObsAdmissionPolicies) > 0
 }
@@ -444,6 +530,73 @@ type ShareOptions struct {
 	// additionally require shipsRawContent() (score metadata + content_hash ship
 	// regardless).
 	ObsEvalItems bool // T7 per-item eval scores
+	// ObsEgress gates the T8 egress-routing decision feed (W5.3). Default
+	// false, node-side only, never server-forced. Tenant/User columns
+	// additionally require shipsRawContent().
+	ObsEgress bool // T8 egress routing decisions
+	// FullToolBodies ships the four `actions` body columns (raw_tool_input,
+	// raw_tool_output, preceding_reasoning, error_message) that the local
+	// dashboard renders inline and that this seam NEVER ships in any other
+	// mode. It is a DISTINCT tier from shipsRawContent() (which ships
+	// paths/targets, never these bodies), so extraction is granular per the
+	// enterprise-managed control model. Default false; on an individual node
+	// it is node-opt-in only, on a managed node the org may RAISE it
+	// (extract.managed) — the merge that can raise it lives at the ONE
+	// ShareOptions construction site (internal/orgclient), never here.
+	FullToolBodies bool
+	// CacheDetail ships the Arc 4 P5c cache-detail aggregate (day × model ×
+	// kind counts + tokens + cost delta) computed by store.SelectCacheSummaries
+	// — which owns the node-local cache_events read; this file never names the
+	// cache_* tables (the privacy sentinel forbids them here). Default false; on
+	// an individual node node-opt-in only, on a managed node org-raisable
+	// (extract.managed). The cache_* tables stay node-local except for this
+	// content-free aggregate under this explicit tier.
+	CacheDetail bool
+	// RoutingDetail ships the Arc 4 P5d routing-detail aggregate (day ×
+	// original_model × selected_model × turn_kind × mode counts + savings)
+	// computed by store.SelectRoutingDetail — which owns the node-local
+	// router_decisions read; this file never names that table. Distinct from
+	// RoutingSummary (model-id-free tier aggregate); this tier discloses the
+	// actual model ids. Default false; node-opt-in individual, org-raisable
+	// (extract.managed) managed.
+	RoutingDetail bool
+	// LimitGauge ships the Arc 4 P5e predictions aggregate (per day × provider
+	// rate-limit utilization) computed by store.SelectLimitGauges — which owns
+	// the node-local limit_snapshots read; this file never names that table.
+	// Content-free (utilization stats only). Default false; node-opt-in
+	// individual, org-raisable (extract.managed) managed.
+	LimitGauge bool
+	// CodeintelDetail ships the Arc 4 P5f codeintel-detail aggregate (per
+	// project-hash × language file/symbol/edge counts) computed by
+	// store.SelectCodeintelSummaries — which owns the node-local codeintel_*
+	// read; this file never names those tables (the privacy sentinel forbids
+	// them here). Content-free STRUCTURE counts only — no symbol name, fqn,
+	// signature, or raw path. Default false; on an individual node
+	// node-opt-in only, on a managed node org-raisable via the DISTINCT
+	// extract.codeintel authority (NOT the umbrella extract.managed — this is
+	// the highest-sensitivity tier and gets its own explicit consent).
+	CodeintelDetail bool
+	// ProcessDetail ships the Arc 4 P5g process-detail aggregate (per day ×
+	// tool run/exit/duration counts) computed by store.SelectProcessSummaries
+	// — which owns the node-local process_runs read; this file never names the
+	// process_* tables (the privacy sentinel forbids them here). Content-free
+	// counts only — no exe path, argv, cwd, network body, or hash. Default
+	// false; on an individual node node-opt-in only, on a managed node
+	// org-raisable via the DISTINCT extract.process authority (NOT the umbrella
+	// extract.managed — the process/eBPF trees are a highest-sensitivity tier).
+	ProcessDetail bool
+	// TerminalDetail ships the Arc 4 P5h terminal-detail aggregates (per
+	// day×tool×kind terminal run/command counts + per day×kind×decision×principal
+	// remote-audit event counts) computed by store.SelectTerminalSummaries /
+	// SelectRemoteAuditSummaries — which own the node-local terminal_* /
+	// remote_audit reads; this file never names those tables (the privacy
+	// sentinel forbids them here, and they carry dedicated never-ships tests).
+	// Content-free counts only — no command, hash, session id, peer address, or
+	// route. Default false; on an individual node node-opt-in only, on a managed
+	// node org-raisable via the DISTINCT extract.terminal authority. Shipping
+	// this aggregate is the deliberate, reviewed reversal of the raw tables'
+	// never-ships pin.
+	TerminalDetail bool
 }
 
 // shipsRawContent reports whether raw content-bearing columns ship under these
@@ -453,6 +606,15 @@ type ShareOptions struct {
 // can never diverge.
 func (o ShareOptions) shipsRawContent() bool {
 	return o.FullContent || o.AdminManaged
+}
+
+// shipsToolBodies reports whether the four `actions` body columns ship. It is
+// deliberately its OWN predicate, NOT folded into shipsRawContent(): the body
+// columns are the highest-sensitivity per-action content and were never shipped
+// under FullContent/AdminManaged, so they get an independent tier the privacy
+// sentinel pins separately.
+func (o ShareOptions) shipsToolBodies() bool {
+	return o.FullToolBodies
 }
 
 // targetAllowed reports whether the given action type may ship a raw
@@ -604,7 +766,10 @@ func (s *Store) SelectUnpushedSince(ctx context.Context, cur PushCursor, maxByte
 		             a.timestamp, a.tool, a.action_type,
 		             COALESCE(a.target,''),
 		             COALESCE(a.turn_index,0), COALESCE(a.success,1), COALESCE(a.duration_ms,0),
-		             COALESCE(a.is_sidechain,0)
+		             COALESCE(a.is_sidechain,0),
+		             COALESCE(a.raw_tool_input,''), COALESCE(a.raw_tool_output,''),
+		             COALESCE(a.preceding_reasoning,''), COALESCE(a.error_message,''),
+		             COALESCE(json_extract(a.metadata,'$.effort_level'),'')
 		        FROM actions a WHERE a.id > ?`
 		if scopeFilter != "" {
 			q += ` AND a.project_id IN (` + scopeFilter + `)`
@@ -622,7 +787,10 @@ func (s *Store) SelectUnpushedSince(ctx context.Context, cur PushCursor, maxByte
 				&r.SourceFile, &r.SourceEventID,
 				&r.Timestamp, &r.Tool, &r.ActionType,
 				&r.Target, &r.TurnIndex,
-				&success, &r.DurationMs, &sidechain); err != nil {
+				&success, &r.DurationMs, &sidechain,
+				&r.RawToolInput, &r.RawToolOutput,
+				&r.PrecedingReasoning, &r.ErrorMessage,
+				&r.EffortLevel); err != nil {
 				_ = rows.Close()
 				return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: scan action: %w", err)
 			}
@@ -633,11 +801,19 @@ func (s *Store) SelectUnpushedSince(ctx context.Context, cur PushCursor, maxByte
 			//   - Target is per-action: in full-content mode, always ship;
 			//     in metadata-only mode, ship only when the action type is
 			//     in the explicit TargetActionAllowlist (e.g. read_file).
+			//   - The four body columns ship ONLY under the distinct
+			//     shipsToolBodies() tier (never under shipsRawContent alone).
 			if !share.shipsRawContent() {
 				r.SourceFile = ""
 			}
 			if !share.targetAllowed(r.ActionType) {
 				r.Target = ""
+			}
+			if !share.shipsToolBodies() {
+				r.RawToolInput = ""
+				r.RawToolOutput = ""
+				r.PrecedingReasoning = ""
+				r.ErrorMessage = ""
 			}
 			r.OrgID, r.UserEmail = orgID, userEmail
 			sz := jsonSize(r)
@@ -905,6 +1081,291 @@ func (s *Store) SelectUnpushedSince(ctx context.Context, cur PushCursor, maxByte
 		batch.RoutingSummaries = sums
 	}
 
+	// Cache-detail aggregate (Arc 4 P5c) — attached only under the
+	// cache_detail tier. Computed by store.SelectCacheSummaries (which owns
+	// the node-local cache_events read; this file deliberately never names the
+	// cache_* tables — the privacy sentinel forbids it). Day × model × kind
+	// counts + tokens + cost delta only, no content.
+	if share.CacheDetail {
+		sums, err := s.SelectCacheSummaries(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: cache summaries: %w", err)
+		}
+		for i := range sums {
+			sums[i].OrgID, sums[i].UserEmail = orgID, userEmail
+			est += jsonSize(sums[i])
+		}
+		batch.CacheSummaries = sums
+	}
+
+	// Session-scoped enterprise wires (org-parity W3.1 verbosity / W2.1
+	// cache / W2.2 process) — attached only under shipsRawContent()
+	// (FullContent || AdminManaged), deliberately NOT the teams-tier detail
+	// flags: session-scoped telemetry is per-developer detail the enterprise
+	// posture treats as admin-visible-by-default. Each Select lives in its
+	// own file and owns its node-local table reads; this file deliberately
+	// never names those tables (the privacy sentinel forbids it).
+	if share.shipsRawContent() {
+		sv, err := s.SelectSessionVerbositySummaries(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: session verbosity: %w", err)
+		}
+		for i := range sv {
+			sv[i].OrgID, sv[i].UserEmail = orgID, userEmail
+			est += jsonSize(sv[i])
+		}
+		batch.SessionVerbositySummaries = sv
+
+		sc, err := s.SelectSessionCacheSummaries(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: session cache summaries: %w", err)
+		}
+		for i := range sc {
+			sc[i].OrgID, sc[i].UserEmail = orgID, userEmail
+			est += jsonSize(sc[i])
+		}
+		batch.SessionCacheSummaries = sc
+
+		sp, err := s.SelectSessionProcessRows(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: session processes: %w", err)
+		}
+		for i := range sp {
+			sp[i].OrgID, sp[i].UserEmail = orgID, userEmail
+			est += jsonSize(sp[i])
+		}
+		batch.SessionProcesses = sp
+
+		sne, err := s.SelectSessionNetworkEvents(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: session network events: %w", err)
+		}
+		for i := range sne {
+			sne[i].OrgID, sne[i].UserEmail = orgID, userEmail
+			est += jsonSize(sne[i])
+		}
+		batch.SessionNetworkEvents = sne
+
+		// Wave-3 per-developer enterprise wires (advisor / patterns /
+		// benchmarks / compression / routing-dev / codeintel-dev /
+		// terminals+remote / guard pins+approvals). Each Select lives in its
+		// own file and owns its node-local table reads; this file names none
+		// of them. All windowed/snapshot recomputes with idempotent server
+		// upserts — no cursor effect.
+		as, err := s.SelectAdvisorSuggestionRows(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: advisor suggestions: %w", err)
+		}
+		for i := range as {
+			as[i].OrgID, as[i].UserEmail = orgID, userEmail
+			est += jsonSize(as[i])
+		}
+		batch.AdvisorSuggestions = as
+
+		pp, err := s.SelectProjectPatternRows(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: project patterns: %w", err)
+		}
+		for i := range pp {
+			pp[i].OrgID, pp[i].UserEmail = orgID, userEmail
+			est += jsonSize(pp[i])
+		}
+		batch.ProjectPatterns = pp
+
+		bruns, batts, err := s.SelectBenchmarkOrgRows(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: benchmark rows: %w", err)
+		}
+		for i := range bruns {
+			bruns[i].OrgID, bruns[i].UserEmail = orgID, userEmail
+			est += jsonSize(bruns[i])
+		}
+		for i := range batts {
+			batts[i].OrgID, batts[i].UserEmail = orgID, userEmail
+			est += jsonSize(batts[i])
+		}
+		batch.BenchmarkRuns, batch.BenchmarkAttempts = bruns, batts
+
+		cs, err := s.SelectCompressionStatRows(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: compression stats: %w", err)
+		}
+		for i := range cs {
+			cs[i].OrgID, cs[i].UserEmail = orgID, userEmail
+			est += jsonSize(cs[i])
+		}
+		batch.CompressionStats = cs
+
+		rd, err := s.SelectRoutingDevRows(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: routing dev: %w", err)
+		}
+		for i := range rd {
+			rd[i].OrgID, rd[i].UserEmail = orgID, userEmail
+			est += jsonSize(rd[i])
+		}
+		batch.RoutingDevRows = rd
+
+		cd, err := s.SelectCodeintelDevRows(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: codeintel dev: %w", err)
+		}
+		for i := range cd {
+			cd[i].OrgID, cd[i].UserEmail = orgID, userEmail
+			est += jsonSize(cd[i])
+		}
+		batch.CodeintelDevRows = cd
+
+		tr, err := s.SelectTerminalRunRows(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: terminal runs: %w", err)
+		}
+		for i := range tr {
+			tr[i].OrgID, tr[i].UserEmail = orgID, userEmail
+			est += jsonSize(tr[i])
+		}
+		batch.TerminalRuns = tr
+
+		tc, err := s.SelectTerminalCommandRows(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: terminal commands: %w", err)
+		}
+		for i := range tc {
+			tc[i].OrgID, tc[i].UserEmail = orgID, userEmail
+			est += jsonSize(tc[i])
+		}
+		batch.TerminalCommands = tc
+
+		ra, err := s.SelectRemoteAuditRows(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: remote audit: %w", err)
+		}
+		for i := range ra {
+			ra[i].OrgID, ra[i].UserEmail = orgID, userEmail
+			est += jsonSize(ra[i])
+		}
+		batch.RemoteAudit = ra
+
+		gp, err := s.SelectGuardPinRows(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: guard pins: %w", err)
+		}
+		for i := range gp {
+			gp[i].OrgID, gp[i].UserEmail = orgID, userEmail
+			est += jsonSize(gp[i])
+		}
+		batch.GuardPins = gp
+
+		ga, err := s.SelectGuardApprovalRows(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: guard approvals: %w", err)
+		}
+		for i := range ga {
+			ga[i].OrgID, ga[i].UserEmail = orgID, userEmail
+			est += jsonSize(ga[i])
+		}
+		batch.GuardApprovals = ga
+	}
+
+	// Codeintel-detail aggregate (Arc 4 P5f) — attached only under the
+	// codeintel_detail tier. Computed by store.SelectCodeintelSummaries (which
+	// owns the node-local codeintel_* read; this file deliberately never names
+	// the codeintel_* tables — the privacy sentinel forbids it). Per
+	// project-hash × language file/symbol/edge STRUCTURE counts only — no
+	// symbol name, fqn, signature, or raw path.
+	if share.CodeintelDetail {
+		sums, err := s.SelectCodeintelSummaries(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: codeintel summaries: %w", err)
+		}
+		for i := range sums {
+			sums[i].OrgID, sums[i].UserEmail = orgID, userEmail
+			est += jsonSize(sums[i])
+		}
+		batch.CodeintelSummaries = sums
+	}
+
+	// Process-detail aggregate (Arc 4 P5g) — attached only under the
+	// process_detail tier. Computed by store.SelectProcessSummaries (which owns
+	// the node-local process_runs read; this file deliberately never names the
+	// process_* tables — the privacy sentinel forbids it). Per day × tool
+	// run/exit/duration counts only — no exe path, argv, cwd, network body, or
+	// hash.
+	if share.ProcessDetail {
+		sums, err := s.SelectProcessSummaries(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: process summaries: %w", err)
+		}
+		for i := range sums {
+			sums[i].OrgID, sums[i].UserEmail = orgID, userEmail
+			est += jsonSize(sums[i])
+		}
+		batch.ProcessSummaries = sums
+	}
+
+	// Terminal-detail aggregates (Arc 4 P5h) — attached only under the
+	// terminal_detail tier. Computed by store.SelectTerminalSummaries /
+	// SelectRemoteAuditSummaries (which own the node-local terminal_* /
+	// remote_audit reads; this file deliberately never names those tables — the
+	// privacy sentinel forbids them AND they carry dedicated never-ships tests).
+	// Content-free counts only. Shipping these is the deliberate, reviewed
+	// reversal of the raw tables' never-ships pin — the raw rows still never
+	// cross, only these aggregates under this explicit tier.
+	if share.TerminalDetail {
+		tsums, err := s.SelectTerminalSummaries(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: terminal summaries: %w", err)
+		}
+		for i := range tsums {
+			tsums[i].OrgID, tsums[i].UserEmail = orgID, userEmail
+			est += jsonSize(tsums[i])
+		}
+		batch.TerminalSummaries = tsums
+
+		rsums, err := s.SelectRemoteAuditSummaries(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: remote audit summaries: %w", err)
+		}
+		for i := range rsums {
+			rsums[i].OrgID, rsums[i].UserEmail = orgID, userEmail
+			est += jsonSize(rsums[i])
+		}
+		batch.RemoteAuditSummaries = rsums
+	}
+
+	// Routing-detail aggregate (Arc 4 P5d) — attached only under the
+	// routing_detail tier. Computed by store.SelectRoutingDetail (which owns
+	// the node-local router_decisions read; this file never names that table).
+	// Model-id-bearing per-decision aggregate, distinct from the model-id-free
+	// RoutingSummaries above.
+	if share.RoutingDetail {
+		dets, err := s.SelectRoutingDetail(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: routing details: %w", err)
+		}
+		for i := range dets {
+			dets[i].OrgID, dets[i].UserEmail = orgID, userEmail
+			est += jsonSize(dets[i])
+		}
+		batch.RoutingDetails = dets
+	}
+
+	// Predictions / limit-gauge aggregate (Arc 4 P5e) — attached only under the
+	// limit_gauge tier. Computed by store.SelectLimitGauges (which owns the
+	// node-local limit_snapshots read; this file never names that table).
+	// Per day × provider utilization stats only, no scope/session/headers.
+	if share.LimitGauge {
+		gauges, err := s.SelectLimitGauges(ctx)
+		if err != nil {
+			return PushBatch{}, fmt.Errorf("store.SelectUnpushedSince: limit gauges: %w", err)
+		}
+		for i := range gauges {
+			gauges[i].OrgID, gauges[i].UserEmail = orgID, userEmail
+			est += jsonSize(gauges[i])
+		}
+		batch.LimitGauges = gauges
+	}
+
 	// Org-tier observability rollups (obs-org-tier plan §2). Each tier is
 	// reached ONLY through the injected obs provider seam — this file names
 	// no obs_* table (the read lives in internal/obs/store, which owns the
@@ -1005,6 +1466,9 @@ func (s *Store) composeObsTiers(ctx context.Context, batch *PushBatch, est *int6
 	if err := s.composeObsEvalItems(ctx, batch, est, orgID, userEmail, share, since); err != nil {
 		return err
 	}
+	if err := s.composeObsEgress(ctx, batch, est, orgID, userEmail, share, since); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1094,6 +1558,30 @@ func (s *Store) composeObsEvalItems(ctx context.Context, batch *PushBatch, est *
 		*est += jsonSize(eb.Items[i])
 	}
 	batch.ObsEvalItems = eb.Items
+	return nil
+}
+
+// composeObsEgress attaches the T8 egress-routing decision feed (W5.3).
+// Gated on ObsEgress + the Egress provider. Tenant/User (the only
+// PII-shaped columns) are stripped under !shipsRawContent(); everything
+// else ships whenever the tier is on, mirroring composeObsAdmission.
+func (s *Store) composeObsEgress(ctx context.Context, batch *PushBatch, est *int64, orgID, userEmail string, share ShareOptions, since orgcontract.ObsCursor) error {
+	if !share.ObsEgress || s.obsOrg.Egress == nil {
+		return nil
+	}
+	eb, err := s.obsOrg.Egress(ctx, since, obsOrgRowCap)
+	if err != nil {
+		return fmt.Errorf("store.SelectUnpushedSince: obs egress: %w", err)
+	}
+	for i := range eb.Events {
+		eb.Events[i].OrgID, eb.Events[i].UserEmail = orgID, userEmail
+		if !share.shipsRawContent() {
+			eb.Events[i].Tenant = ""
+			eb.Events[i].User = ""
+		}
+		*est += jsonSize(eb.Events[i])
+	}
+	batch.ObsEgressDecisions = eb.Events
 	return nil
 }
 

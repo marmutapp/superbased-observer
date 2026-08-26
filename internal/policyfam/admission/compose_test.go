@@ -57,7 +57,7 @@ func TestComposeOrgSpec_ModeIsLocalOnly(t *testing.T) {
 			}
 
 			orgModeBefore := org.Mode
-			got := ComposeOrgSpec(local, org)
+			got := ComposeOrgSpec(local, org, false)
 			if got.Mode != tc.want {
 				t.Errorf("composed Mode = %v, want %v (org body mode %q must be ignored)", got.Mode, tc.want, tc.orgMode)
 			}
@@ -81,6 +81,56 @@ func TestComposeOrgSpec_ModeIsLocalOnly(t *testing.T) {
 			}
 			if local != nil && local.Mode != ParseMode(tc.localMode) {
 				t.Errorf("local spec mutated: %v", local.Mode)
+			}
+		})
+	}
+}
+
+// TestComposeOrgSpec_ManagedEnforceHonorsOrgMode is the Arc 4 P3 §R23 lift: with
+// orgEnforce=true (managed tenancy + enforce.admission) the org body's mode is
+// honored AS AUTHORED, regardless of the local layer — the org may turn
+// enforcement on (mode enforce), and observe/off stays a real opt-out. No
+// coercion: the composed mode equals the org body's mode exactly.
+func TestComposeOrgSpec_ManagedEnforceHonorsOrgMode(t *testing.T) {
+	orgIn := PolicyInput{
+		Criteria: []CriterionInput{{
+			ID: "org-1", Type: string(TypeDeniedTopics), Topics: []string{"org-topic"},
+			Decision: "deny", Severity: "high",
+		}},
+	}
+	cases := []struct {
+		orgMode   string
+		localMode string
+		hasLocal  bool
+		want      Mode
+	}{
+		{orgMode: "enforce", hasLocal: false, want: ModeEnforce},                      // org turns it on with no local layer
+		{orgMode: "enforce", localMode: "off", hasLocal: true, want: ModeEnforce},     // org overrides a locally-off node
+		{orgMode: "observe", localMode: "enforce", hasLocal: true, want: ModeObserve}, // org opt-out wins over local enforce
+		{orgMode: "off", localMode: "enforce", hasLocal: true, want: ModeOff},         // org off is honored (opt-out)
+	}
+	for _, tc := range cases {
+		t.Run(tc.orgMode+"/"+tc.localMode, func(t *testing.T) {
+			oi := orgIn
+			oi.Mode = tc.orgMode
+			org, err := Compile(oi)
+			if err != nil {
+				t.Fatalf("compile org: %v", err)
+			}
+			var local *PolicySpec
+			if tc.hasLocal {
+				ls, err := Compile(PolicyInput{Mode: tc.localMode})
+				if err != nil {
+					t.Fatalf("compile local: %v", err)
+				}
+				local = &ls
+			}
+			got := ComposeOrgSpec(local, org, true)
+			if got.Mode != tc.want {
+				t.Errorf("managed-enforce composed Mode = %v, want %v (org mode %q honored)", got.Mode, tc.want, tc.orgMode)
+			}
+			if got.Hash != org.Hash {
+				t.Errorf("composed Hash = %q, want the org body's %q", got.Hash, org.Hash)
 			}
 		})
 	}

@@ -12,6 +12,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/marmutapp/superbased-observer/internal/adapter"
+	"github.com/marmutapp/superbased-observer/internal/adapter/cacheobs"
 	"github.com/marmutapp/superbased-observer/internal/contentcap"
 	"github.com/marmutapp/superbased-observer/internal/models"
 	"github.com/marmutapp/superbased-observer/internal/platform/sqlitedsn"
@@ -208,11 +209,20 @@ func (a *Adapter) emitConversation(res *adapter.ParseResult, sourceFile, session
 	if cwd == "" && len(conv.History) > 0 {
 		cwd = conv.History[0].User.EnvContext.EnvState.CurrentWorkingDirectory
 	}
-	projectRoot, gitBranch := resolveProjectRoot(cwd)
+	projectRoot, gitBranch, gitRemote := resolveProjectRoot(cwd)
 
 	// Pre-index every tool_use result so a tool_use event can attach its
 	// output + success in one pass.
 	results := indexToolResults(conv)
+
+	// A conversations_v2 row is a WHOLE-ROW REWRITE (its `value` JSON
+	// carries the FULL history array, not a delta since the last poll —
+	// see parseStateDB's fromOffset comment), so a fresh per-conversation
+	// accumulator, rebuilt from history[0] every call, reproduces the same
+	// block chain each time: the R3 byte-stability invariant holds for
+	// free here, unlike an incrementally-parsed producer (junie, cline,
+	// cowork), which must track drain-state across calls.
+	cacheAcc := cacheobs.New(MaxBlocksPerSession)
 
 	for i, h := range conv.History {
 		model := h.Request.ModelID
@@ -225,6 +235,7 @@ func (a *Adapter) emitConversation(res *adapter.ParseResult, sourceFile, session
 				SessionID:     sessionID,
 				ProjectRoot:   projectRoot,
 				GitBranch:     gitBranch,
+				GitRemote:     gitRemote,
 				Timestamp:     ts,
 				TurnIndex:     i,
 				Model:         model,
@@ -247,6 +258,7 @@ func (a *Adapter) emitConversation(res *adapter.ParseResult, sourceFile, session
 					SessionID:     sessionID,
 					ProjectRoot:   projectRoot,
 					GitBranch:     gitBranch,
+					GitRemote:     gitRemote,
 					Timestamp:     ts,
 					TurnIndex:     i,
 					Model:         model,
@@ -275,6 +287,7 @@ func (a *Adapter) emitConversation(res *adapter.ParseResult, sourceFile, session
 				SessionID:     sessionID,
 				ProjectRoot:   projectRoot,
 				GitBranch:     gitBranch,
+				GitRemote:     gitRemote,
 				Timestamp:     ts,
 				TurnIndex:     i,
 				Model:         model,
@@ -291,15 +304,28 @@ func (a *Adapter) emitConversation(res *adapter.ParseResult, sourceFile, session
 		// SigV4 endpoints, no proxy tier). uncached_input_tokens is NET
 		// non-cached (the name is explicit), so no gross→net subtraction
 		// is needed.
-		if te, ok := a.tokenEvent(h, sourceFile, sessionID, projectRoot, gitBranch, ts); ok {
+		if te, ok := a.tokenEvent(h, sourceFile, sessionID, projectRoot, gitBranch, gitRemote, ts); ok {
 			res.TokenEvents = append(res.TokenEvents, te)
+		}
+
+		// Cache observation — this turn's user+assistant content joins
+		// the running accumulator first, then (like the token event
+		// above) only actually emits when request_metadata carries a
+		// non-null, non-zero cache/token field.
+		accumulateTurnCache(cacheAcc, h)
+		msgID := h.Request.MessageID
+		if msgID == "" {
+			msgID = h.Request.RequestID
+		}
+		if obs := emitCacheObservation(cacheAcc, sourceFile, sessionID, msgID+":tok", model, ts, h.Request); obs != nil {
+			res.CacheObservations = append(res.CacheObservations, *obs)
 		}
 	}
 }
 
 // tokenEvent builds a TokenEvent from request_metadata when any token
 // field is present. Returns ok=false when all are null.
-func (a *Adapter) tokenEvent(h sqliteHistory, sourceFile, sessionID, projectRoot, gitBranch string, ts time.Time) (models.TokenEvent, bool) {
+func (a *Adapter) tokenEvent(h sqliteHistory, sourceFile, sessionID, projectRoot, gitBranch, gitRemote string, ts time.Time) (models.TokenEvent, bool) {
 	m := h.Request
 	if m.TotalTokens == nil && m.UncachedInputTokens == nil && m.OutputTokens == nil &&
 		m.CacheReadInputTokens == nil && m.CacheWriteInputTokens == nil {
@@ -315,6 +341,7 @@ func (a *Adapter) tokenEvent(h sqliteHistory, sourceFile, sessionID, projectRoot
 		SessionID:           sessionID,
 		ProjectRoot:         projectRoot,
 		GitBranch:           gitBranch,
+		GitRemote:           gitRemote,
 		Timestamp:           ts,
 		Tool:                models.ToolKiroCLI,
 		Model:               m.ModelID,

@@ -100,7 +100,7 @@ func (a *Adapter) parseFlatBundle(ctx context.Context, trigger string, fromOffse
 	// the embedded session_id is NOT allowed to override it (§4.5a — a
 	// re-keyed id orphans rows). In practice they are always equal.
 	state, turnByMsg := readFlatState(jsonPath)
-	projectRoot, gitBranch := resolveProjectRoot(state.CWD)
+	projectRoot, gitBranch, gitRemote := resolveProjectRoot(state.CWD)
 	model := state.SessionState.RTSModelState.ModelInfo.ModelID
 
 	body, err := os.ReadFile(jsonlPath) //nolint:gosec // jsonlPath derives from a validated watch-root trigger
@@ -134,6 +134,7 @@ func (a *Adapter) parseFlatBundle(ctx context.Context, trigger string, fromOffse
 				SessionID:     sessionID,
 				ProjectRoot:   projectRoot,
 				GitBranch:     gitBranch,
+				GitRemote:     gitRemote,
 				Timestamp:     ts,
 				TurnIndex:     max0(turnIndex),
 				Model:         model,
@@ -156,6 +157,7 @@ func (a *Adapter) parseFlatBundle(ctx context.Context, trigger string, fromOffse
 				SessionID:     sessionID,
 				ProjectRoot:   projectRoot,
 				GitBranch:     gitBranch,
+				GitRemote:     gitRemote,
 				Timestamp:     ts,
 				TurnIndex:     max0(turnIndex),
 				Model:         model,
@@ -178,6 +180,7 @@ func (a *Adapter) parseFlatBundle(ctx context.Context, trigger string, fromOffse
 					SessionID:     sessionID,
 					ProjectRoot:   projectRoot,
 					GitBranch:     gitBranch,
+					GitRemote:     gitRemote,
 					Timestamp:     ts,
 					Tool:          models.ToolKiroCLI,
 					Model:         model,

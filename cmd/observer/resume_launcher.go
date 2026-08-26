@@ -136,6 +136,19 @@ var resumeTranslations = map[string]resumeTranslation{
 	// unambiguous (grounded off `prime-agent --help`). The id is our stored
 	// SessionID verbatim (the `<uuid>.jsonl` filename stem), so no transform.
 	"prime-agent": {flag: "--resume"},
+	// zcode: `zcode --resume <sessionId>` — a REQUIRED-value flag (grounded
+	// off `zcode --help`, zcode 0.16.3). The id is our stored SessionID
+	// verbatim (zcode's own `sess_<uuid>`), so no transform.
+	"zcode": {flag: "--resume"},
+	// vibe (mistral-code): `vibe --resume <8hex>` — a REQUIRED-value flag.
+	// The id is our stored SessionID verbatim (the session dir's 8-hex
+	// suffix), so no transform.
+	"vibe": {flag: "--resume"},
+	// freebuff: `freebuff --continue=<id>` — a commander.js OPTIONAL-value
+	// flag (`--continue [conversation-id]`), so joined `=` spelling is the
+	// unambiguous form (the cursor/droid shape). The id is our stored
+	// SessionID verbatim (the chat dir's RFC3339 name), so no transform.
+	"freebuff": {flag: "--continue", joined: true},
 }
 
 // injectNativeResume translates the uniform observer `--resume <id>` into the

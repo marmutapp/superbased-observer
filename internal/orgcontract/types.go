@@ -41,6 +41,40 @@ type EnrollResponse struct {
 	// signing key also omit it — the field is never required.
 	OrgPolicyPublicKey string `json:"org_policy_public_key,omitempty"`
 
+	// Tenancy is the enrolment CLASS this node enrolled under:
+	// TenancyIndividual (the default and only behaviour for a BYO node —
+	// "Never server-forced" holds absolutely) or TenancyManaged (an
+	// org-provisioned node that opts into comprehensive Enterprise-Managed
+	// admin control). omitempty on both sides of the compat invariant: a
+	// pre-managed server omits it and the node defaults to individual; a
+	// pre-managed agent ignores the unknown key. It rides at the same
+	// authenticated-TLS trust level as OrgID/OrgName; the managed
+	// AUTHORITIES it unlocks live in the SIGNED Grant.Authority, and the node
+	// honours them only when it recorded ConsentMode=managed from this field.
+	Tenancy string `json:"tenancy,omitempty"`
+
+	// ConsentMode / ConsentActor record HOW this enrolment was consented to
+	// when the server itself knows the answer, which today means exactly one
+	// case: an enrolment minted by the ACP-P6c IdP device-code rail
+	// (enrolment_tokens.minted_via = 'idp'). ConsentMode is then "idp" and
+	// ConsentActor is the VERIFIED address of the member who approved the
+	// pairing in a browser after an enterprise-IdP sign-in — the identity
+	// that replaces the spoofable local $USER the node would otherwise
+	// record. Every other rail leaves both empty and the node resolves the
+	// consent mode from tenancy exactly as before.
+	//
+	// omitempty on both sides of the compat invariant: a pre-P6c server never
+	// emits them (the node falls back to token-rail semantics), and a pre-P6c
+	// agent ignores the unknown keys.
+	//
+	// These ride at the ENVELOPE trust level (authenticated TLS, like OrgID
+	// and Tenancy). The same two facts are also bound into the SIGNED
+	// EnrolmentGrant for an idp mint, so a node holding a grant prefers the
+	// signed copy and treats these as the fallback (see
+	// orgclient.GrantOffer).
+	ConsentMode  string `json:"consent_mode,omitempty"`
+	ConsentActor string `json:"consent_actor,omitempty"`
+
 	// Grant is the OPTIONAL enrolment grant (admin-controlled Plane B,
 	// docs/plans/admin-controlled-plane-b-spec-2026-08-15.md §2.3/§2.4):
 	// the bounded authority this organization is OFFERING the enrolling
@@ -54,6 +88,117 @@ type EnrollResponse struct {
 	// TTY (or --accept-governance was passed). Any of those failing means
 	// the node enrols WITHOUT governance and says so loudly.
 	Grant *EnrolmentGrant `json:"grant,omitempty"`
+}
+
+// Tenancy classes carried on EnrollResponse.Tenancy and stored both server-
+// side (enrolment_tokens.tenancy) and node-side (org_enrolment.tenancy). The
+// empty string is treated as TenancyIndividual everywhere so a pre-managed
+// server or a pre-084 node behaves exactly as an individual node.
+const (
+	TenancyIndividual = "individual"
+	TenancyManaged    = "managed"
+)
+
+// ValidTenancy reports whether s is a recognised tenancy class. The empty
+// string is INVALID here (callers normalise it to TenancyIndividual first);
+// this is the mint-time check that refuses an unknown class.
+func ValidTenancy(s string) bool {
+	return s == TenancyIndividual || s == TenancyManaged
+}
+
+// ManagedBindRequest is the body of POST /api/agent/managed-bind, the SECOND
+// step of managed enrolment (Arc 4 P6a, plan §9). A node that enrolled under
+// TenancyManaged presents its org-salted machine fingerprint so the server can
+// bind one managed node to one machine and surface a collision to the admin.
+// An individual/BYO node NEVER calls this endpoint and never computes a
+// fingerprint — the individual plane sends no machine identity at all, which is
+// why this rides its own bearer-authenticated request rather than a field on
+// EnrollRequest.
+//
+// MachineIdentity is the opaque, one-way, org-salted hash from
+// internal/machineid.ForOrg — never the raw OS machine id. The agent skips the
+// call entirely (rather than sending "") on a host with no stable source, so a
+// non-empty value is expected here.
+type ManagedBindRequest struct {
+	MachineIdentity string `json:"machine_identity"`
+}
+
+// ManagedBindResponse is the 200 body of POST /api/agent/managed-bind. Status
+// is one of the ManagedBind* values. Collision is true only when the machine
+// was already bound to a DIFFERENT active developer: under the server's
+// "record" posture the bind still succeeds (evidence, not prevention) and
+// Status is ManagedBindCollision, while under "enforce" the server returns 409
+// instead of this body.
+type ManagedBindResponse struct {
+	Status    string `json:"status"`
+	Collision bool   `json:"collision"`
+}
+
+// ManagedBind* are the ManagedBindResponse.Status values.
+const (
+	ManagedBindBound      = "bound"      // first binding for this (org, machine)
+	ManagedBindRebound    = "rebound"    // same developer re-enrolling the same machine
+	ManagedBindReassigned = "reassigned" // prior binding's developer deprovisioned; machine reassigned
+	ManagedBindCollision  = "collision"  // machine already bound to a different ACTIVE developer (record posture)
+)
+
+// ManagedIntegrityReport is the body of POST /api/agent/managed-integrity, the
+// Arc 4 P6b managed-integrity probe (plan §9). A managed node periodically
+// reports tamper-EVIDENCE of circumvention on its host: a second/parallel
+// observer install (SiblingObservers) and AI-tool proxy routes that have
+// drifted away from the managed proxy (RouteDrift). Like ManagedBind it rides
+// its OWN bearer-authenticated request, NOT the push envelope: an individual/BYO
+// node never computes or sends this, so the individual plane is untouched by
+// construction.
+//
+// EVIDENCE, not prevention: the fingerprint, sibling DBs and route configs all
+// live on a host the developer controls and are spoofable. True prevention is
+// OS ownership/MDM (the §5 legal-ownership gate). The report gives the admin
+// visibility of evasion, never a lock.
+//
+// Content-floor: only counts and COARSE labels cross the wire. SiblingDetail is
+// origin/OS labels (e.g. "windows/wsl-mnt"); DriftedTools is adapter tool names
+// (e.g. "claude-code", "codex"). No filesystem paths, usernames, or config
+// values are ever included.
+type ManagedIntegrityReport struct {
+	MachineIdentity  string   `json:"machine_identity"`
+	SiblingObservers int      `json:"sibling_observers"`
+	SiblingDetail    []string `json:"sibling_detail,omitempty"`
+	RouteDrift       int      `json:"route_drift"`
+	DriftedTools     []string `json:"drifted_tools,omitempty"`
+}
+
+// ManagedIntegrityResponse is the 200 body of POST /api/agent/managed-integrity.
+// The signal is fire-and-forget; the ack only confirms the server recorded it.
+type ManagedIntegrityResponse struct {
+	Acknowledged bool `json:"acknowledged"`
+}
+
+// ManagedIntegrityState* are the derived health states surfaced on the admin
+// Control Center. They are computed from a ManagedIntegrityReport via State();
+// they are NOT sent on the wire (the node sends only the raw counts).
+const (
+	ManagedIntegrityOK         = "ok"               // no evidence of circumvention
+	ManagedIntegritySibling    = "sibling_observer" // a parallel/second observer install detected
+	ManagedIntegrityRouteDrift = "route_drift"      // AI-tool routes drifted off the managed proxy
+	ManagedIntegrityBoth       = "both"             // both signals present
+)
+
+// State derives the Control Center health state from the report's counts. The
+// ordering (both > either > ok) is what the admin badge renders.
+func (r ManagedIntegrityReport) State() string {
+	sibling := r.SiblingObservers > 0
+	drift := r.RouteDrift > 0
+	switch {
+	case sibling && drift:
+		return ManagedIntegrityBoth
+	case sibling:
+		return ManagedIntegritySibling
+	case drift:
+		return ManagedIntegrityRouteDrift
+	default:
+		return ManagedIntegrityOK
+	}
 }
 
 // BearerClaims is the JSON envelope signed with the server's Ed25519 key.
@@ -87,6 +232,122 @@ type PushEnvelope struct {
 	// Optional both directions: v1.8.x servers ignore the key,
 	// future servers tolerate its absence.
 	RoutingSummaries []RoutingSummaryRow `json:"routing_summaries,omitempty"`
+
+	// CacheSummaries is the OPTIONAL Arc 4 P5c cache-detail aggregate
+	// (day × model × kind counts + tokens + cost delta only), present
+	// only when the node ships the cache_detail tier (opt-in individual /
+	// admin-raised managed). Optional both directions like RoutingSummaries.
+	CacheSummaries []CacheSummaryRow `json:"cache_summaries,omitempty"`
+
+	// CodeintelSummaries is the OPTIONAL Arc 4 P5f codeintel-detail aggregate
+	// (per project-hash × language file/symbol/edge counts only), present only
+	// when the node ships the codeintel_detail tier (opt-in individual /
+	// admin-raised managed via the DISTINCT extract.codeintel authority). No
+	// symbol name, fqn, signature, or raw path ever crosses. Optional both
+	// directions like RoutingSummaries.
+	CodeintelSummaries []CodeintelSummaryRow `json:"codeintel_summaries,omitempty"`
+
+	// ProcessSummaries is the OPTIONAL Arc 4 P5g process-detail aggregate
+	// (per day × tool run/exit/duration counts only), present only when the
+	// node ships the process_detail tier (opt-in individual / admin-raised
+	// managed via the DISTINCT extract.process authority). No exe path, argv,
+	// cwd, network body, or hash ever crosses. Optional both directions like
+	// RoutingSummaries.
+	ProcessSummaries []ProcessSummaryRow `json:"process_summaries,omitempty"`
+
+	// SessionVerbositySummaries carries the W3.1 output-composition summary,
+	// one row per session (byte totals by category + language split, never
+	// content) — session-scoped enterprise wire, present only under
+	// shipsRawContent() (full_content / admin_managed). Optional both
+	// directions like RoutingSummaries. See internal/orgcontract/verbosity.go.
+	SessionVerbositySummaries []SessionVerbosityRow `json:"session_verbosity,omitempty"`
+
+	// SessionCacheSummaries carries the W2.1 session-scoped cache summary
+	// (per session × model × kind × cause counts + token sums, no content) —
+	// present only under shipsRawContent() (full_content / admin_managed);
+	// the fleet day-aggregate CacheSummaries above is the separate teams-tier
+	// surface. Optional both directions. See internal/orgcontract/cachesession.go.
+	SessionCacheSummaries []SessionCacheRow `json:"session_cache,omitempty"`
+
+	// SessionProcesses is the W2.2 session-scoped RAW process-run wire (one
+	// row per process run: exe/cwd/argv-preview/metrics, capped per session
+	// at push time) — present only under shipsRawContent() (full_content /
+	// admin_managed); the fleet ProcessSummaries above stays the content-free
+	// teams tier. Optional both directions. See
+	// internal/orgcontract/processsession.go.
+	SessionProcesses []SessionProcessRow `json:"session_processes,omitempty"`
+
+	// SessionNetworkEvents is the W2.2b session-scoped RAW network-egress wire
+	// (one row per process_events network row, joined to its optional
+	// process_network_bodies excerpt when a plaintext capture source produced
+	// one; capped per session at push time) — present only under
+	// shipsRawContent() (full_content / admin_managed). Every network event
+	// ships regardless of body availability — a non-proxied TLS connection is
+	// metadata-only BY CAPTURE, never an omission. See
+	// internal/orgcontract/networksession.go.
+	SessionNetworkEvents []SessionNetworkEventRow `json:"session_network_events,omitempty"`
+
+	// --- Org-parity Wave-3 per-developer enterprise wires. All ride
+	// shipsRawContent() (full_content / admin_managed) like the session-
+	// scoped wires above; each row type documents its own posture. All
+	// optional both directions (older servers ignore, older agents omit).
+	// See docs/plans/org-parity-full-depth-plan-2026-08-24.md §4. ---
+
+	// AdvisorSuggestions is the W3.2 Suggestions/Advisor wire: one row per
+	// active suggestion in the node's advisor digest, enterprise-raw
+	// (paths/commands/evidence verbatim). See advisor.go.
+	AdvisorSuggestions []AdvisorSuggestionRow `json:"advisor_suggestions,omitempty"`
+	// ProjectPatterns is the W3.3 Discovery/Patterns wire: one row per
+	// project × pattern kind × value, raw paths/commands. See patterns.go.
+	ProjectPatterns []ProjectPatternRow `json:"project_patterns,omitempty"`
+	// BenchmarkRuns / BenchmarkAttempts are the W3.4 wire: per-(run,config)
+	// aggregates + terminal attempts (task prompts / judge rationales /
+	// answer excerpts raw). See benchmark.go.
+	BenchmarkRuns     []BenchmarkRunRow     `json:"benchmark_runs,omitempty"`
+	BenchmarkAttempts []BenchmarkAttemptRow `json:"benchmark_attempts,omitempty"`
+	// CompressionStats is the W3.5 wire: day × mechanism honest byte deltas
+	// (saved vs evicted kept structurally separate). See compression.go.
+	CompressionStats []CompressionStatRow `json:"compression_stats,omitempty"`
+	// RoutingDevRows / CodeintelDevRows are the W2.3/W2.4 per-developer
+	// variants of the teams-tier fleet aggregates (which stay untouched).
+	// See routingdev.go / codeinteldev.go.
+	RoutingDevRows   []RoutingDevRow   `json:"routing_dev,omitempty"`
+	CodeintelDevRows []CodeintelDevRow `json:"codeintel_dev,omitempty"`
+	// TerminalRuns / TerminalCommands / RemoteAudit are the W2.6 per-dev
+	// terminal + remote-access visibility wires (command identity is
+	// hash-only BY CAPTURE — the node never stores raw command text; peer
+	// addresses raw). See terminaldev.go.
+	TerminalRuns     []TerminalRunRow     `json:"terminal_runs,omitempty"`
+	TerminalCommands []TerminalCommandRow `json:"terminal_commands,omitempty"`
+	RemoteAudit      []RemoteAuditRow     `json:"remote_audit,omitempty"`
+	// GuardPins / GuardApprovals are the W5.2 guard pin + exception-approval
+	// current-state snapshots. See guardpins.go.
+	GuardPins      []GuardPinRow      `json:"guard_pins,omitempty"`
+	GuardApprovals []GuardApprovalRow `json:"guard_approvals,omitempty"`
+
+	// TerminalSummaries + RemoteAuditSummaries are the OPTIONAL Arc 4 P5h
+	// terminal-detail aggregates (per day×tool×kind terminal run/command counts,
+	// and per day×kind×decision×principal remote-audit event counts), present
+	// only when the node ships the terminal_detail tier (opt-in individual /
+	// admin-raised managed via the DISTINCT extract.terminal authority). No
+	// command, hash, session id, peer address, or route ever crosses. The
+	// terminal_* / remote_audit raw tables stay pinned out of the wire; only
+	// these aggregates cross, under this explicit tier. Optional both directions
+	// like RoutingSummaries.
+	TerminalSummaries    []TerminalSummaryRow    `json:"terminal_summaries,omitempty"`
+	RemoteAuditSummaries []RemoteAuditSummaryRow `json:"remote_audit_summaries,omitempty"`
+
+	// RoutingDetails is the OPTIONAL Arc 4 P5d routing-detail aggregate
+	// (model-id-bearing per-decision rollup), present only when the node
+	// ships the routing_detail tier (opt-in individual / admin-raised
+	// managed). Optional both directions like RoutingSummaries.
+	RoutingDetails []RoutingDetailRow `json:"routing_details,omitempty"`
+
+	// LimitGauges is the OPTIONAL Arc 4 P5e predictions aggregate (per day ×
+	// provider rate-limit utilization), present only when the node ships the
+	// limit_gauge tier (opt-in individual / admin-raised managed). Optional
+	// both directions like RoutingSummaries.
+	LimitGauges []LimitGaugeRow `json:"limit_gauges,omitempty"`
 
 	// GuardEvents are guard-layer verdict rows (v1.8.3+, guard spec
 	// §14.3). omitempty keeps pre-guard envelopes byte-identical and
@@ -150,6 +411,10 @@ type PushEnvelope struct {
 	// excerpts (input/expected/output/rationale) are gated by shipsRawContent().
 	// Same additive-compat posture as the other optional slices.
 	ObsEvalItems []ObsEvalItemRow `json:"obs_eval_items,omitempty"`
+	// ObsEgressDecisions carries the T8 egress-routing decision feed (W5.3).
+	// Populated only when the node has opted in via
+	// [org_client.share.obs].egress (default false). Optional both directions.
+	ObsEgressDecisions []ObsEgressRow `json:"obs_egress_decisions,omitempty"`
 }
 
 // PushResponse is the 200 body of POST /api/agent/push.
@@ -339,10 +604,31 @@ type ActionRow struct {
 	Target     string `json:"target,omitempty"`
 	SourceFile string `json:"source_file,omitempty"`
 
-	TurnIndex   int    `json:"turn_index"`
-	Success     bool   `json:"success"`
-	DurationMs  int64  `json:"duration_ms"`
-	IsSidechain bool   `json:"is_sidechain"`
+	// Tool-call BODIES — the four actions columns the local dashboard renders
+	// inline. Present ONLY under the distinct full_tool_bodies tier
+	// (ShareOptions.shipsToolBodies), which on an individual node is node-opt-in
+	// and on a managed node the org may raise (extract.managed). They are NEVER
+	// present under full_content/admin_managed alone. Additive/omitempty: a
+	// pre-P2 server ignores them, a pre-P2 agent never sends them.
+	RawToolInput       string `json:"raw_tool_input,omitempty"`
+	RawToolOutput      string `json:"raw_tool_output,omitempty"`
+	PrecedingReasoning string `json:"preceding_reasoning,omitempty"`
+	ErrorMessage       string `json:"error_message,omitempty"`
+
+	TurnIndex   int   `json:"turn_index"`
+	Success     bool  `json:"success"`
+	DurationMs  int64 `json:"duration_ms"`
+	IsSidechain bool  `json:"is_sidechain"`
+	// EffortLevel is the reasoning-effort selection in force when the action
+	// ran (minimal | low | medium | high | xhigh | max — accepted verbatim,
+	// no enum check, matching the node's claudecode_effort sidecar posture).
+	// Content-free (a closed vocabulary, never prose), so it ships in every
+	// tier alongside the other action metadata. Extracted at push time from
+	// the node's actions.metadata JSON; empty when the node never captured an
+	// effort signal for this action (pre-feature rows, tools without an
+	// effort concept). Additive/omitempty both directions: an older server
+	// ignores it, an older agent never sends it.
+	EffortLevel string `json:"effort_level,omitempty"`
 	OrgID       string `json:"org_id"`
 	UserEmail   string `json:"user_email"`
 }
@@ -506,6 +792,188 @@ type RoutingSummaryRow struct {
 	// EstSavingsUSD / CacheForfeitUSD are decision-time estimate sums.
 	EstSavingsUSD   float64 `json:"est_savings_usd"`
 	CacheForfeitUSD float64 `json:"cache_forfeit_usd"`
+}
+
+// CacheSummaryRow is the Arc 4 P5c cache-detail aggregate — one row per
+// (day, model, kind) of the node-local cache_events log (cache_segments /
+// cache_entries / cache_events are otherwise NODE-LOCAL per spec §11 and
+// never leave the agent). It carries only content-free counts: no prompt
+// prefix, no raw scope (cache_scope is a hash), no path. It ships ONLY under
+// the cache_detail tier (node opt-in on an individual node, admin-raised on a
+// managed one) — the tier is what sanctions shipping per-turn cache-hit
+// patterns the privacy sentinel otherwise treats as private.
+type CacheSummaryRow struct {
+	// OrgID / UserEmail are the agent-stamped attribution (same stamping rule
+	// as every other wire row).
+	OrgID     string `json:"org_id,omitempty"`
+	UserEmail string `json:"user_email,omitempty"`
+	// Day is the UTC date (YYYY-MM-DD) of the cache events.
+	Day string `json:"day"`
+	// Model is the model the cache belief/event is for.
+	Model string `json:"model"`
+	// Kind is the cache-event class (hit | write | expiry_rewrite | ...).
+	Kind string `json:"kind"`
+	// Events is the row count for the (day, model, kind) bucket.
+	Events int64 `json:"events"`
+	// TokensRead / TokensWritten are the summed cache token movements.
+	TokensRead    int64 `json:"tokens_read"`
+	TokensWritten int64 `json:"tokens_written"`
+	// CostDeltaUSD is the summed write-vs-read cost delta estimate.
+	CostDeltaUSD float64 `json:"cost_delta_usd"`
+}
+
+// CodeintelSummaryRow is the Arc 4 P5f codeintel-detail aggregate — one row per
+// (project-hash, language) of the node-local code-intelligence index
+// (codeintel_files / codeintel_nodes / codeintel_edges are otherwise
+// NODE-LOCAL and never leave the agent). It carries only content-free STRUCTURE
+// counts: no symbol name, no fully-qualified name, no signature excerpt, and no
+// raw file or project path (the project path is one-way domain-separated-hashed
+// on the node). It ships ONLY under the codeintel_detail tier (node opt-in on an
+// individual node, admin-raised on a managed one via the DISTINCT
+// extract.codeintel authority) — the highest-sensitivity extraction tier, so it
+// gets its own explicit consent rather than riding the umbrella extract.managed.
+type CodeintelSummaryRow struct {
+	// OrgID / UserEmail are the agent-stamped attribution (same stamping rule
+	// as every other wire row).
+	OrgID     string `json:"org_id,omitempty"`
+	UserEmail string `json:"user_email,omitempty"`
+	// ProjectHash is the opaque one-way hash of the project's git-root path —
+	// a stable grouping key that never discloses the path itself.
+	ProjectHash string `json:"project_hash"`
+	// Lang is the resolved language of the files in this bucket (e.g. go,
+	// typescript). A public language label, never source.
+	Lang string `json:"lang"`
+	// Files / Symbols / Edges are the structure counts for the bucket:
+	// indexed files, extracted symbols (nodes), and call/import edges.
+	Files   int64 `json:"files"`
+	Symbols int64 `json:"symbols"`
+	Edges   int64 `json:"edges"`
+}
+
+// ProcessSummaryRow is the Arc 4 P5g process-detail aggregate — one row per
+// (day, tool) of the node-local process-observability log (process_runs /
+// process_events / process_network_bodies are otherwise NODE-LOCAL and never
+// leave the agent). It carries only content-free counts: no executable path,
+// no argv, no cwd, no network request/response body, and none of the
+// process/network domain-separated hashes. It ships ONLY under the
+// process_detail tier (node opt-in on an individual node, admin-raised on a
+// managed one via the DISTINCT extract.process authority — the process/eBPF
+// trees are a highest-sensitivity tier, so they get their own explicit
+// consent rather than riding the umbrella extract.managed).
+type ProcessSummaryRow struct {
+	// OrgID / UserEmail are the agent-stamped attribution (same stamping rule
+	// as every other wire row).
+	OrgID     string `json:"org_id,omitempty"`
+	UserEmail string `json:"user_email,omitempty"`
+	// Day is the UTC date (YYYY-MM-DD) the process runs started.
+	Day string `json:"day"`
+	// Tool is the attributed AI tool (e.g. claude-code) or '' when unattributed.
+	Tool string `json:"tool"`
+	// Runs is the number of process runs in the bucket; Exited how many have
+	// exited; NonzeroExits how many exited with a non-zero code.
+	Runs         int64 `json:"runs"`
+	Exited       int64 `json:"exited"`
+	NonzeroExits int64 `json:"nonzero_exits"`
+	// DurationMsSum is the summed wall-clock duration of the runs in the bucket.
+	DurationMsSum int64 `json:"duration_ms_sum"`
+}
+
+// TerminalSummaryRow is one half of the Arc 4 P5h terminal-detail aggregate —
+// one row per (day, tool, kind) of the node-local terminal_run log (joined to
+// terminal_commands for the command count). terminal_run / terminal_commands /
+// remote_audit are otherwise pinned ENTIRELY out of the push wire (dedicated
+// end-to-end never-ships tests); this content-free count aggregate under the
+// DISTINCT terminal_detail tier is the deliberate, reviewed reversal. It never
+// carries a command, a project_root_hash, a correlation_token_hash, a cmd_hash,
+// or a source_session_id.
+type TerminalSummaryRow struct {
+	// OrgID / UserEmail are the agent-stamped attribution.
+	OrgID     string `json:"org_id,omitempty"`
+	UserEmail string `json:"user_email,omitempty"`
+	// Day is the UTC date (YYYY-MM-DD) the terminal runs launched.
+	Day string `json:"day"`
+	// Tool is the target tool (e.g. claude-code); Kind is handoff | fresh.
+	Tool string `json:"tool"`
+	Kind string `json:"kind"`
+	// Runs / Ended / NonzeroExits are per-run counts; Commands is the number of
+	// command boundaries observed across those runs.
+	Runs         int64 `json:"runs"`
+	Ended        int64 `json:"ended"`
+	NonzeroExits int64 `json:"nonzero_exits"`
+	Commands     int64 `json:"commands"`
+}
+
+// RemoteAuditSummaryRow is the other half of the Arc 4 P5h terminal-detail
+// aggregate — one row per (day, kind, decision, principal) of the node-local
+// remote_audit log. Content-free: it carries only the public event taxonomy
+// (kind), the allow/deny/ok/fail decision, and the resolved capability class
+// (principal: public|view|execute|anonymous) — never a session id, a peer
+// address, a route, or a detail string.
+type RemoteAuditSummaryRow struct {
+	// OrgID / UserEmail are the agent-stamped attribution.
+	OrgID     string `json:"org_id,omitempty"`
+	UserEmail string `json:"user_email,omitempty"`
+	// Day is the UTC date (YYYY-MM-DD) of the audit events.
+	Day string `json:"day"`
+	// Kind is the event kind; Decision the allow/deny/ok/fail verdict;
+	// Principal the resolved capability class.
+	Kind      string `json:"kind"`
+	Decision  string `json:"decision"`
+	Principal string `json:"principal"`
+	// Events is the row count for the bucket.
+	Events int64 `json:"events"`
+}
+
+// RoutingDetailRow is the Arc 4 P5d routing-detail aggregate — the
+// MODEL-ID-BEARING per-decision rollup the tier-only RoutingSummaryRow omits:
+// one row per (day, original_model, selected_model, turn_kind, mode) of the
+// node-local router_decisions log. router_decisions / model_calibration are
+// otherwise NODE-LOCAL (spec §R9.1); this content-free aggregate ships ONLY
+// under the routing_detail tier (node opt-in / admin raise). Distinct from
+// RoutingSummaryRow, which is model-id-free and ships under routing_summary.
+type RoutingDetailRow struct {
+	// OrgID / UserEmail are the agent-stamped attribution.
+	OrgID     string `json:"org_id,omitempty"`
+	UserEmail string `json:"user_email,omitempty"`
+	// Day is the UTC date (YYYY-MM-DD).
+	Day string `json:"day"`
+	// OriginalModel / SelectedModel are the ACTUAL model ids the decision
+	// mapped between (unlike the tier-only summary).
+	OriginalModel string `json:"original_model"`
+	SelectedModel string `json:"selected_model"`
+	// TurnKind is the classifier's turn-kind bucket; Mode is advise | enforce.
+	TurnKind string `json:"turn_kind"`
+	Mode     string `json:"mode"`
+	// Decisions / Applied are row counts.
+	Decisions int64 `json:"decisions"`
+	Applied   int64 `json:"applied"`
+	// EstSavingsUSD / CacheForfeitUSD are decision-time estimate sums.
+	EstSavingsUSD   float64 `json:"est_savings_usd"`
+	CacheForfeitUSD float64 `json:"cache_forfeit_usd"`
+}
+
+// LimitGaugeRow is the Arc 4 P5e predictions tier — one row per (day, provider)
+// of the node-local limit_snapshots log (the 5h/weekly rate-limit gauge the
+// Next-Message Cost & Limit Predictor records). limit_snapshots is otherwise
+// NODE-LOCAL; this content-free aggregate — utilization stats only, no
+// scope_hash, no session id, no raw headers — ships ONLY under the limit_gauge
+// tier (node opt-in / admin raise).
+type LimitGaugeRow struct {
+	// OrgID / UserEmail are the agent-stamped attribution.
+	OrgID     string `json:"org_id,omitempty"`
+	UserEmail string `json:"user_email,omitempty"`
+	// Day is the UTC date (YYYY-MM-DD) of the observations.
+	Day string `json:"day"`
+	// Provider is anthropic | openai.
+	Provider string `json:"provider"`
+	// Snapshots is the observation count for the (day, provider) bucket.
+	Snapshots int64 `json:"snapshots"`
+	// Max/Avg utilization of the 5h and weekly windows (0..1). Zero when the
+	// provider never returned that window's header.
+	Max5hUtil float64 `json:"max_5h_util"`
+	Avg5hUtil float64 `json:"avg_5h_util"`
+	Max7dUtil float64 `json:"max_7d_util"`
+	Avg7dUtil float64 `json:"avg_7d_util"`
 }
 
 // --- Org-tier observability wire shapes (obs-org-tier plan §3) -------------
@@ -877,6 +1345,32 @@ type PolicyStateRow struct {
 	RestartRequired bool   `json:"restart_required"` // HasOrgRail && RunningVersion < CachedAcceptedVersion (independent of Status)
 	Mode            string `json:"mode"`             // off|observe|enforce — NORMALIZED (advise->observe)
 	LastSeen        string `json:"last_seen"`        // RFC3339 — point liveness at report time
+
+	// AcceptedAuthority, ExtractionEffective, and DroppedClasses are gen2
+	// fields (managed-tenancy authority visibility). They are ONLY
+	// meaningful on the family="node.governance" row (pointNodeDashboard) —
+	// a report carrying them on any other row is a 400 — and are omitted
+	// entirely (empty) by a gen1 agent or a gen2 agent on an individual /
+	// unbindable node.
+	//
+	// AcceptedAuthority is the closed set of authority tokens
+	// (govern.KnownAuthority) this node's grant resolver actually honors —
+	// what internal/govern/resolve.go granted, after any retirement/version
+	// gating, not merely what the server offered.
+	AcceptedAuthority []string `json:"accepted_authority,omitempty"`
+	// ExtractionEffective is the subset of AcceptedAuthority that are
+	// extraction tiers (govern.ExtractionAuthority) whose share raise is
+	// actually applying at the node's push seam right now — distinct from
+	// "accepted" because an accepted extraction authority can still be
+	// inert (e.g. share.full_content off locally).
+	ExtractionEffective []string `json:"extraction_effective,omitempty"`
+	// DroppedClasses maps a directive class name (the closed set returned
+	// by internal/govern/resolve.go's directiveClasses(): "sections",
+	// "pinned", "share", "features") to why that class's directive was NOT
+	// applied: one of ReasonNotPreauthorized, ReasonModeObserve,
+	// ReasonSidecarUnwritable, or ReasonFamilyNotAccepted. A class present
+	// and accepted is simply absent from this map.
+	DroppedClasses map[string]string `json:"dropped_classes,omitempty"`
 }
 
 // PolicyStateReport is the POST /api/agent/policy-ack body. AgentVersion is
@@ -889,6 +1383,17 @@ type PolicyStateReport struct {
 	AgentVersion string           `json:"agent_version"`
 	ReportSeq    int64            `json:"report_seq"` // persisted monotonic counter; strictly increasing per daemon, restart-safe (R4-B6); MUST be > 0
 	Rows         []PolicyStateRow `json:"rows"`
+
+	// MachineIdentity is the gen2 managed-node machine binding id (matches
+	// machineid.ForOrg's org-salted SHA-256 hex fingerprint) — report-level
+	// because one report describes one machine. Empty for a gen1 agent, an
+	// individual-tenancy node, or a managed node on a host with no stable
+	// machine identity (unbindable). Distinguishes two machines reporting
+	// for the SAME user: the server keys policy_state on
+	// (org_id, user_id, machine_identity, enforcement_point, family), so an
+	// empty value is its own valid key, not a collision with every other
+	// unbindable report from the same user.
+	MachineIdentity string `json:"machine_identity,omitempty"`
 }
 
 // Policy-state Status enum (§3.3) — the CLOSED set of effective-state statuses a
@@ -942,6 +1447,18 @@ const (
 	// rollout-targeting defect, and folding it into the capability bucket
 	// would corrupt auto-halt diagnostics.
 	ReasonSelectorMismatch = "selector_mismatch" // P0-10 Phase B — org/agent targeting disagreement
+	// ReasonFamilyNotAccepted is the gen2 P4-2 reason: the node declined the
+	// family entirely via its own [org_client.policy].accept_families
+	// allow-list, as opposed to receiving-but-rejecting it (capability
+	// mismatch / version skew). It pairs with delivered_unaccepted only.
+	ReasonFamilyNotAccepted = "family_not_accepted" // gen2 — node-side accept_families opt-out
+	// ReasonSidecarUnwritable is the gen2 P4-2 reason: the
+	// dashboard.visibility directive's sidecar file could not be written
+	// (§1.4.1), so the class was accepted by policy but never took effect
+	// locally. Previously this borrowed ReasonNotPreauthorized, which
+	// conflated a real preauthorization gap with a local I/O failure; it
+	// pairs with accepted_inert only.
+	ReasonSidecarUnwritable = "sidecar_unwritable" // gen2 — dashboard.visibility sidecar write failure
 )
 
 // RowIsOrgRailState classifies a (status, reason) pair as org-rail or local
@@ -980,7 +1497,24 @@ type RoutingPolicyDoc struct {
 	BodyHash string `json:"body_hash"`
 	// Signature is base64(Ed25519 signature over body bytes) made with
 	// the org server's policy signing key.
+	//
+	// This is the v1 rail and it is RELEASED, which is why it still
+	// covers the bare body — see SignatureV2 below and docs/security.md
+	// ledger row ROUTING-SIG-1.
 	Signature string `json:"signature"`
+	// SignatureV2 is base64(Ed25519 signature over
+	// RoutingPolicySigningMessageV2(Version, Body)) — the
+	// DOMAIN-SEPARATED, VERSION-BOUND signature that closes
+	// ROUTING-SIG-1's version-replay and cross-rail confusion.
+	//
+	// ADDITIVE and omitempty on purpose, in BOTH compat directions: a
+	// pre-v2 server's response is byte-identical (the field is simply
+	// absent, and the agent falls back to verifying Signature), and a
+	// pre-v2 agent ignores the extra key. An agent that RECEIVES a v2
+	// signature verifies THAT and never falls back — the fallback is
+	// for a document carrying no v2 at all, never for one whose v2
+	// failed.
+	SignatureV2 string `json:"signature_v2,omitempty"`
 	// PublicKey is base64(Ed25519 public key) — TOFU-pinned by the
 	// agent on first receipt (enrolment-channel trust, §R19.1).
 	PublicKey string `json:"public_key"`

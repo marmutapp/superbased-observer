@@ -189,7 +189,7 @@ func (a *Adapter) parseSession(ctx context.Context, db *sql.DB, sourceFile strin
 	if len(chain) == 0 {
 		return nil, nil, warns
 	}
-	projectRoot := a.resolveProjectRoot(s.WorkingDir)
+	projectRoot, gitRemote := a.resolveProjectRoot(s.WorkingDir)
 
 	// First pass: collect tool-role results keyed by tool_call_id.
 	results := map[string]toolResult{}
@@ -218,12 +218,12 @@ func (a *Adapter) parseSession(ctx context.Context, db *sql.DB, sourceFile strin
 		n := chain[i]
 		switch strings.ToLower(cm.Role) {
 		case "user":
-			if ev, ok := a.userPromptEvent(sourceFile, projectRoot, s, n, cm); ok {
+			if ev, ok := a.userPromptEvent(sourceFile, projectRoot, gitRemote, s, n, cm); ok {
 				tools = append(tools, ev)
 			}
 		case "assistant":
-			tools = append(tools, a.assistantEvents(sourceFile, projectRoot, s, n, cm, results)...)
-			if tok, ok := a.tokenEvent(sourceFile, projectRoot, s, n, cm); ok {
+			tools = append(tools, a.assistantEvents(sourceFile, projectRoot, gitRemote, s, n, cm, results)...)
+			if tok, ok := a.tokenEvent(sourceFile, projectRoot, gitRemote, s, n, cm); ok {
 				tokens = append(tokens, tok)
 			}
 		}
@@ -232,7 +232,7 @@ func (a *Adapter) parseSession(ctx context.Context, db *sql.DB, sourceFile strin
 	return tools, tokens, warns
 }
 
-func (a *Adapter) userPromptEvent(sourceFile, projectRoot string, s sessionRow, n node, cm *chatMessage) (models.ToolEvent, bool) {
+func (a *Adapter) userPromptEvent(sourceFile, projectRoot, gitRemote string, s sessionRow, n node, cm *chatMessage) (models.ToolEvent, bool) {
 	body := strings.TrimSpace(contentString(cm.Content))
 	if body == "" {
 		return models.ToolEvent{}, false
@@ -243,6 +243,7 @@ func (a *Adapter) userPromptEvent(sourceFile, projectRoot string, s sessionRow, 
 		SourceEventID: "prompt:" + eventKey(cm.MessageID, n.NodeID),
 		SessionID:     s.ID,
 		ProjectRoot:   projectRoot,
+		GitRemote:     gitRemote,
 		Timestamp:     secondsToTime(n.Created),
 		Tool:          models.ToolDevin,
 		ActionType:    models.ActionUserPrompt,
@@ -256,7 +257,7 @@ func (a *Adapter) userPromptEvent(sourceFile, projectRoot string, s sessionRow, 
 // assistantEvents emits the assistant narration (as an assistant_message)
 // plus one tool event per tool_call. The node's thinking is carried as
 // PrecedingReasoning on both the narration and every tool call.
-func (a *Adapter) assistantEvents(sourceFile, projectRoot string, s sessionRow, n node, cm *chatMessage, results map[string]toolResult) []models.ToolEvent {
+func (a *Adapter) assistantEvents(sourceFile, projectRoot, gitRemote string, s sessionRow, n node, cm *chatMessage, results map[string]toolResult) []models.ToolEvent {
 	when := secondsToTime(n.Created)
 	model := firstNonEmpty(metaModel(cm.Metadata), s.Model)
 	reasoning := a.scrub(truncate(thinkingText(cm.Thinking), 500))
@@ -272,6 +273,7 @@ func (a *Adapter) assistantEvents(sourceFile, projectRoot string, s sessionRow, 
 			SourceEventID:      "text:" + eventKey(cm.MessageID, n.NodeID),
 			SessionID:          s.ID,
 			ProjectRoot:        projectRoot,
+			GitRemote:          gitRemote,
 			Timestamp:          when,
 			Model:              model,
 			Tool:               models.ToolDevin,
@@ -286,12 +288,12 @@ func (a *Adapter) assistantEvents(sourceFile, projectRoot string, s sessionRow, 
 	}
 
 	for _, tc := range cm.ToolCalls {
-		out = append(out, a.toolCallEvent(sourceFile, projectRoot, s, when, model, reasoning, cm.MessageID, tc, results))
+		out = append(out, a.toolCallEvent(sourceFile, projectRoot, gitRemote, s, when, model, reasoning, cm.MessageID, tc, results))
 	}
 	return out
 }
 
-func (a *Adapter) toolCallEvent(sourceFile, projectRoot string, s sessionRow, when time.Time, model, reasoning, messageID string, tc toolCall, results map[string]toolResult) models.ToolEvent {
+func (a *Adapter) toolCallEvent(sourceFile, projectRoot, gitRemote string, s sessionRow, when time.Time, model, reasoning, messageID string, tc toolCall, results map[string]toolResult) models.ToolEvent {
 	actionType, target := mapTool(tc.Name, tc.Arguments)
 
 	success := true
@@ -313,6 +315,7 @@ func (a *Adapter) toolCallEvent(sourceFile, projectRoot string, s sessionRow, wh
 		SourceEventID:      sourceID,
 		SessionID:          s.ID,
 		ProjectRoot:        projectRoot,
+		GitRemote:          gitRemote,
 		Timestamp:          when,
 		Model:              model,
 		Tool:               models.ToolDevin,
@@ -334,7 +337,7 @@ func (a *Adapter) toolCallEvent(sourceFile, projectRoot string, s sessionRow, wh
 // source. cache_* fields were null in the capture (0 in practice);
 // reasoning/thinking is folded into output_tokens (no separate count),
 // so ReasoningTokens stays 0.
-func (a *Adapter) tokenEvent(sourceFile, projectRoot string, s sessionRow, n node, cm *chatMessage) (models.TokenEvent, bool) {
+func (a *Adapter) tokenEvent(sourceFile, projectRoot, gitRemote string, s sessionRow, n node, cm *chatMessage) (models.TokenEvent, bool) {
 	if cm.Metadata == nil || cm.Metadata.Metrics == nil {
 		return models.TokenEvent{}, false
 	}
@@ -351,6 +354,7 @@ func (a *Adapter) tokenEvent(sourceFile, projectRoot string, s sessionRow, n nod
 		SourceEventID:       "tokens:" + eventKey(cm.MessageID, n.NodeID),
 		SessionID:           s.ID,
 		ProjectRoot:         projectRoot,
+		GitRemote:           gitRemote,
 		Timestamp:           secondsToTime(n.Created),
 		Tool:                models.ToolDevin,
 		Model:               firstNonEmpty(metaModel(cm.Metadata), s.Model),
@@ -365,21 +369,22 @@ func (a *Adapter) tokenEvent(sourceFile, projectRoot string, s sessionRow, n nod
 }
 
 // resolveProjectRoot turns a session's raw working_directory into a stable
-// project root. Foreign-mount Windows paths (a raw C:\… string on a
-// Windows-side session) are translated to their /mnt/c equivalent BEFORE
-// git.Resolve so a Windows-side project doesn't misfile under the
-// observer's own repo. Empty/unresolvable cwds fall back to "[devin]".
-func (a *Adapter) resolveProjectRoot(workingDir string) string {
+// project root plus its normalized git remote. Foreign-mount Windows paths
+// (a raw C:\… string on a Windows-side session) are translated to their
+// /mnt/c equivalent BEFORE git.Resolve so a Windows-side project doesn't
+// misfile under the observer's own repo. Empty/unresolvable cwds fall back
+// to "[devin]" with no remote.
+func (a *Adapter) resolveProjectRoot(workingDir string) (root, remote string) {
 	wd := strings.TrimSpace(workingDir)
 	if wd == "" {
-		return "[devin]"
+		return "[devin]", ""
 	}
 	wd = crossmount.TranslateForeignPath(wd)
 	info, err := git.Resolve(wd)
 	if err != nil {
-		return wd
+		return wd, ""
 	}
-	return info.Root
+	return info.Root, git.NormalizeRemote(info.Remote)
 }
 
 // mapTool resolves a Devin built-in tool name onto the normalized action

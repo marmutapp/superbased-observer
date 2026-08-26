@@ -70,6 +70,16 @@ func TestProxyRouteKinds(t *testing.T) {
 		"kimi-code":   RouteConfigFile,   // ~/.kimi-code/config.toml [providers.openai].base_url, live-verified 2026-07-09 (api_turns 23075)
 		"crush":       RouteProviderJSON, // crush.json providers.openai.base_url, live-verified 2026-07-09 via the Windows crush.cmd → WSL :8820 (api_turns 23081)
 		"qwen-code":   RouteConfigFile,   // ~/.qwen/settings.json model.baseUrl + matching modelProviders entry, live-verified 2026-07-10 (api_turns 23728-23730)
+		// Promoted 2026-08-21: live turns landed through each launcher path
+		// (grok: successful /up/grok turn, 12155/24 tokens; aider +
+		// prime-agent: api_turns rows recorded through the route — keyed
+		// prime-agent turn captured real usage 4119/2; goose: rows landed
+		// once the operator shell's ambient OPENAI_HOST was unset — it had
+		// been silently overriding the injection).
+		"grok":        RouteLauncher, // GROK_CLI_CHAT_PROXY_BASE_URL at the /up/grok upstream, opt-in --proxy flag
+		"aider":       RouteLauncher, // OPENAI_API_BASE=<proxy>/v1 injected by observer aider
+		"prime-agent": RouteLauncher, // 'observer' provider in ~/.prime/agent/models.json, exec --provider observer
+		"goose":       RouteLauncher, // OPENAI_HOST=<proxy root>, opt-in --proxy flag; needs GOOSE_PROVIDER=openai + no ambient OPENAI_HOST
 	}
 	for tool, kind := range want {
 		c, ok := For(tool)

@@ -114,6 +114,7 @@ func TestSynthesizeTranscriptEventsEmitsBothSides(t *testing.T) {
 		pbPath,
 		"aaaa1111-2222-3333-4444-555555555555",
 		"/home/u/code/proj-a",
+		"",
 		"aaaa1111-2222-3333-4444-555555555555",
 		scrub.New(),
 		entries,
@@ -189,7 +190,7 @@ func TestSynthesizeTranscriptDedupesAgainstExisting(t *testing.T) {
 				{ActionType: tc.assistType, Target: "ok"},
 			}
 			out := synthesizeTranscriptEvents(
-				pbPath, "aaaa1111-2222-3333-4444-555555555555", "/p", "aaaa1111-2222-3333-4444-555555555555",
+				pbPath, "aaaa1111-2222-3333-4444-555555555555", "/p", "", "aaaa1111-2222-3333-4444-555555555555",
 				scrub.New(), entries, existing,
 				nil, nil,
 			)
@@ -222,7 +223,7 @@ func TestSynthesizeTranscriptDedupesAgainstMixedTypedHistory(t *testing.T) {
 		{ActionType: models.ActionAssistantMessage, Target: "Nice to meet you, Bash 2. How can I help you today?"},
 	}
 	out := synthesizeTranscriptEvents(
-		pbPath, "aaaa1111-2222-3333-4444-555555555555", "/p", "aaaa1111-2222-3333-4444-555555555555",
+		pbPath, "aaaa1111-2222-3333-4444-555555555555", "/p", "", "aaaa1111-2222-3333-4444-555555555555",
 		scrub.New(), entries, existing,
 		nil, nil,
 	)
@@ -251,8 +252,8 @@ func TestSourceEventIDsAreStablePerStep(t *testing.T) {
 	cliRoot, _ := cliRootsFor(pbPath)
 	entries := readCLITranscriptEntries(cliTranscriptPath(cliRoot, "aaaa1111-2222-3333-4444-555555555555"))
 
-	out1 := synthesizeTranscriptEvents(pbPath, "aaaa1111-2222-3333-4444-555555555555", "/p", "aaaa1111-2222-3333-4444-555555555555", scrub.New(), entries, nil, nil, nil)
-	out2 := synthesizeTranscriptEvents(pbPath, "aaaa1111-2222-3333-4444-555555555555", "/p", "aaaa1111-2222-3333-4444-555555555555", scrub.New(), entries, nil, nil, nil)
+	out1 := synthesizeTranscriptEvents(pbPath, "aaaa1111-2222-3333-4444-555555555555", "/p", "", "aaaa1111-2222-3333-4444-555555555555", scrub.New(), entries, nil, nil, nil)
+	out2 := synthesizeTranscriptEvents(pbPath, "aaaa1111-2222-3333-4444-555555555555", "/p", "", "aaaa1111-2222-3333-4444-555555555555", scrub.New(), entries, nil, nil, nil)
 	if len(out1) != len(out2) {
 		t.Fatalf("non-deterministic event count: %d vs %d", len(out1), len(out2))
 	}
@@ -287,7 +288,7 @@ func TestSynthesizeTranscriptDedupesAgainstExtraCoverage(t *testing.T) {
 	extraA := []string{"ok", "Nice to meet you, Bash 2. How can I help you today?"}
 
 	out := synthesizeTranscriptEvents(
-		pbPath, "aaaa1111-2222-3333-4444-555555555555", "/p", "aaaa1111-2222-3333-4444-555555555555",
+		pbPath, "aaaa1111-2222-3333-4444-555555555555", "/p", "", "aaaa1111-2222-3333-4444-555555555555",
 		scrub.New(), entries, nil,
 		extraU, extraA,
 	)
@@ -322,7 +323,7 @@ func TestAugmentResultPrefersTranscriptOverHistory(t *testing.T) {
 	}
 	a := NewWithOptions(nil, filepath.Dir(pbPath))
 	res := adapter.ParseResult{}
-	got := a.augmentResultFromHistory(pbPath, "aaaa1111-2222-3333-4444-555555555555", "/p", &res)
+	got := a.augmentResultFromHistory(pbPath, "aaaa1111-2222-3333-4444-555555555555", "/p", "", &res)
 	if got < 6 {
 		t.Errorf("expected at least 6 events from transcript, got %d", got)
 	}
@@ -397,7 +398,7 @@ func TestSynthesizeTranscriptEvents_ToolCallsAreNotPromoted(t *testing.T) {
 				t.Fatalf("no entries decoded from fixture")
 			}
 			out := synthesizeTranscriptEvents(
-				"/conv.pb", "conv", "/p", "conv",
+				"/conv.pb", "conv", "/p", "", "conv",
 				scrub.New(), entries, nil, nil, nil,
 			)
 			for _, ev := range out {

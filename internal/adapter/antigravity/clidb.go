@@ -33,10 +33,11 @@ func (a *Adapter) parseCLIDB(ctx context.Context, path string, size int64) (adap
 	if conversationID == "" {
 		return res, nil
 	}
-	projectRoot := "[antigravity]"
+	projectRoot, gitRemote := "[antigravity]", ""
 	if idx := a.lookupCLIIndexEntry(path, conversationID); idx != nil && idx.workspaceURI != "" {
-		if root := decodeFileURIToRoot(idx.workspaceURI); root != "" {
+		if root, remote := decodeFileURIToRoot(idx.workspaceURI); root != "" {
 			projectRoot = root
+			gitRemote = remote
 		}
 	}
 
@@ -56,8 +57,9 @@ func (a *Adapter) parseCLIDB(ctx context.Context, path string, size int64) (adap
 	// (the default-cli-project) resolves to "" here and is left for the
 	// transcript-metadata recovery in augmentResultFromHistory below.
 	if projectRoot == "[antigravity]" {
-		if root := projectRootFromTrajectoryMeta(ctx, db, path); root != "" {
+		if root, remote := projectRootFromTrajectoryMeta(ctx, db, path); root != "" {
 			projectRoot = root
+			gitRemote = remote
 		}
 	}
 
@@ -87,6 +89,7 @@ func (a *Adapter) parseCLIDB(ctx context.Context, path string, size int64) (adap
 			SourceEventID:       fmt.Sprintf("antigravity-cli-db:%s:gen:%d", conversationID, idx),
 			SessionID:           conversationID,
 			ProjectRoot:         projectRoot,
+			GitRemote:           gitRemote,
 			Tool:                models.ToolAntigravity,
 			Model:               gen.model,
 			InputTokens:         int64(gen.input),
@@ -111,7 +114,7 @@ func (a *Adapter) parseCLIDB(ctx context.Context, path string, size int64) (adap
 	// augmentResultFromHistory also patches the project root from the
 	// transcript's ADDITIONAL_METADATA when projectRoot is still the
 	// "[antigravity]" placeholder (workspace-stamped sessions).
-	a.augmentResultFromHistory(path, conversationID, projectRoot, &res)
+	a.augmentResultFromHistory(path, conversationID, projectRoot, gitRemote, &res)
 	return res, nil
 }
 
@@ -121,30 +124,30 @@ func (a *Adapter) parseCLIDB(ctx context.Context, path string, size int64) (adap
 // (projectResources.resources[].gitFolder.folderUri). Returns "" when the
 // blob/field/project-file is absent or the project has no workspace folder
 // (e.g. the default-cli-project), so the caller falls back.
-func projectRootFromTrajectoryMeta(ctx context.Context, db *sql.DB, sessionPath string) string {
+func projectRootFromTrajectoryMeta(ctx context.Context, db *sql.DB, sessionPath string) (root, remote string) {
 	var data []byte
 	row := db.QueryRowContext(ctx, "SELECT data FROM trajectory_metadata_blob LIMIT 1")
 	if err := row.Scan(&data); err != nil || len(data) == 0 {
-		return ""
+		return "", ""
 	}
 	projectID := projectIDFromTrajectoryBlob(data)
 	if projectID == "" {
-		return ""
+		return "", ""
 	}
 	_, geminiRoot := cliRootsFor(sessionPath)
 	if geminiRoot == "" {
-		return ""
+		return "", ""
 	}
 	proj, ok := readCLIProjectFile(filepath.Join(geminiRoot, "config", "projects", projectID+".json"))
 	if !ok {
-		return ""
+		return "", ""
 	}
 	if len(proj.ProjectResources.Resources) > 0 {
 		if uri := proj.ProjectResources.Resources[0].GitFolder.FolderURI; uri != "" {
 			return decodeFileURIToRoot(uri)
 		}
 	}
-	return ""
+	return "", ""
 }
 
 // projectIDFromTrajectoryBlob walks a trajectory_metadata_blob protobuf and

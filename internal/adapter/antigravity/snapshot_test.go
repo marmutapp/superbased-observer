@@ -83,7 +83,7 @@ func TestLoadSnapshotEnrichmentMissesGracefully(t *testing.T) {
 	// os.UserHomeDir reads USERPROFILE on Windows, not HOME.
 	t.Setenv("USERPROFILE", tmp)
 	a := New()
-	en, ok := a.loadSnapshotEnrichment("never-cached", "/p", "/p/x.pb")
+	en, ok := a.loadSnapshotEnrichment("never-cached", "/p", "", "/p/x.pb")
 	if ok {
 		t.Errorf("expected ok=false for missing snapshot, got enrichment %+v", en)
 	}
@@ -101,7 +101,7 @@ func TestReconcileWithSnapshotWritesFirstTime(t *testing.T) {
 	a := New()
 	raw := []byte{0x0a, 0x05, 'h', 'e', 'l', 'l', 'o'} // arbitrary proto-looking bytes
 	conv := "first-time-conv"
-	_ = a.reconcileWithSnapshot(conv, "/p", "/p/x.pb", raw)
+	_ = a.reconcileWithSnapshot(conv, "/p", "", "/p/x.pb", raw)
 	got, ok := readSnapshot(conv)
 	if !ok {
 		t.Fatal("expected snapshot to be written on first reconcile")

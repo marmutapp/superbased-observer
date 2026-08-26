@@ -486,6 +486,21 @@ export function LaunchTerminal({
           'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
         fontSize: 12,
         theme: { background: "#0b0b0f", foreground: "#e6e6e6" },
+        // A full-screen TUI (opencode, claude-code 2.1.220+, etc.) turns on
+        // DECSET mouse-tracking (?1000/1002/1003/1006h) so it can receive
+        // clicks/drags itself. xterm couples that 1:1 to its OWN selection
+        // engine: Terminal.ts disables SelectionService entirely for as long
+        // as ANY mouse-tracking mode is active, so a plain click-drag no
+        // longer produces a local text selection — the drag goes to the app
+        // instead. xterm's shipped escape hatch is a modifier-held drag
+        // forcing local selection regardless of mouse-tracking
+        // (SelectionService.shouldForceSelection): Shift on Windows/Linux,
+        // which is xterm's default and needs no config here — but on macOS
+        // it instead checks Option, gated behind this option, whose default
+        // is `false`. Without this, Mac users have no drag-to-select
+        // fallback at all while a TUI owns the mouse. This is a terminal-
+        // capability fix, not a per-tool one: every full-screen TUI trips it.
+        macOptionClickForcesSelection: true,
       });
       fit = new FitAddon();
       term.loadAddon(fit);

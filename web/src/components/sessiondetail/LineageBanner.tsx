@@ -1,6 +1,7 @@
 import { useState } from "react";
 import clsx from "clsx";
 import type { SessionDetail } from "@/lib/types";
+import { fmtCompact, fmtUSD } from "@/lib/format";
 
 // LineageBanner — codex fork / subagent lineage. Extracted VERBATIM from
 // SessionDetailPanel.tsx during the tab split. It renders ABOVE the tab strip
@@ -37,7 +38,11 @@ export function LineageBanner({
   const parentId = d.forked_from_id || d.parent_thread_id || "";
   const hasParent = parentId !== "";
   const children = d.children ?? [];
-  if (!hasParent && children.length === 0) return null;
+  // Inline sub-agent activity (claude-code same-session sidechain model):
+  // no separate child session rows exist, so the banner notes the volume
+  // and points at the System tab's per-sub-agent breakdown.
+  const sidechainCount = d.sidechain_action_count ?? 0;
+  if (!hasParent && children.length === 0 && sidechainCount === 0) return null;
 
   const canOpenParent = hasParent && d.parent_in_db && !!onOpenSession;
   const parentLabel = isSubagent
@@ -46,6 +51,14 @@ export function LineageBanner({
 
   return (
     <div className="mb-3 flex flex-col gap-2">
+      {sidechainCount > 0 && !hasParent && children.length === 0 && (
+        <div className="rounded-md border border-accent/30 bg-accent-soft px-3 py-2 text-[11px] text-fg-2">
+          Contains{" "}
+          <span className="font-semibold text-fg-1">{sidechainCount}</span>{" "}
+          sidechain action{sidechainCount === 1 ? "" : "s"} from inline
+          sub-agents — see the System tab for the per-sub-agent breakdown.
+        </div>
+      )}
       {hasParent && (
         <div>
           <button
@@ -130,6 +143,16 @@ export function LineageBanner({
                       <span className="font-mono text-fg-2">
                         {shortSid(c.id)}…
                       </span>
+                      {(c.input_tokens ?? 0) > 0 || (c.output_tokens ?? 0) > 0 ? (
+                        <span className="ml-auto shrink-0 font-mono text-[10px] text-fg-3">
+                          {fmtCompact((c.input_tokens ?? 0) + (c.output_tokens ?? 0))} tok
+                          {(c.cost_usd ?? 0) > 0 ? ` · ${fmtUSD(c.cost_usd)}` : ""}
+                        </span>
+                      ) : (c.action_count ?? 0) > 0 ? (
+                        <span className="ml-auto shrink-0 font-mono text-[10px] text-fg-3">
+                          {c.action_count} action{(c.action_count ?? 0) === 1 ? "" : "s"}
+                        </span>
+                      ) : null}
                     </button>
                   </li>
                 );

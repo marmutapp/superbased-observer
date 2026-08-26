@@ -481,6 +481,12 @@ func continueFromLauncher(tool string) string {
 		return "observer muse"
 	case "prime-agent":
 		return "observer prime-agent"
+	case "zcode":
+		return "observer zcode"
+	case "mistral-code":
+		return "observer vibe"
+	case "freebuff":
+		return "observer freebuff"
 	default:
 		return ""
 	}

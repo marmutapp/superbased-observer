@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -378,6 +380,20 @@ func newCodeIntelExplainCmd() *cobra.Command {
 // is best-effort and NEVER blocks/aborts the daemon: any error is logged
 // and swallowed (ADR-0002 — index time only, off the proxy hot path).
 // New projects over auto_index_limit are consent-gated (force=false).
+//
+// T2.4 (2026-08-26 disk/compute remediation plan, P2-H): the whole loop
+// is bounded by an aggregate wall-clock deadline
+// ([codeintel.index].on_start_timeout_minutes, default 10) so a huge
+// discovered project set (historically 384K files across a Windows home
+// directory's worth of roots) can't run unbounded on every boot — any
+// projects not reached by the deadline are simply left for next start or
+// an explicit `observer index`. This is orthogonal to (and doesn't
+// weaken) the existing per-project isAutoIndexBlocked home/drive-root
+// gate inside index.IndexProject, nor the per-project auto_index_limit
+// consent gate below.
+//
+// T2.3 (P1-F): guarded by the "codeintel-index" dblease so only one
+// observer process on this machine runs this pass per boot.
 func runCodeIntelOnStart(ctx context.Context, configPath string) {
 	cfg, database, cleanup, err := loadConfigAndDB(ctx, configPath)
 	if err != nil {
@@ -388,6 +404,19 @@ func runCodeIntelOnStart(ctx context.Context, configPath string) {
 		return
 	}
 	logger := newLogger(cfg.Observer.LogLevel)
+
+	release, proceed := acquireMaintenanceLease(cfg, "codeintel-index", logger)
+	defer release()
+	if !proceed {
+		return
+	}
+
+	if minutes := cfg.CodeIntel.Index.OnStartTimeoutMinutes; minutes > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(minutes)*time.Minute)
+		defer cancel()
+	}
+
 	st := store.New(database)
 
 	// Union of already-indexed projects and every project Observer knows
@@ -413,6 +442,10 @@ func runCodeIntelOnStart(ctx context.Context, configPath string) {
 	ix := index.New(codeIntelIndexOptions(cfg, st))
 	for _, project := range projects {
 		if err := ctx.Err(); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				logger.Info("codeintel: index-on-start aggregate deadline reached — remaining projects deferred to next start",
+					"timeout_minutes", cfg.CodeIntel.Index.OnStartTimeoutMinutes)
+			}
 			return
 		}
 		rep, err := ix.IndexProject(ctx, project, false)

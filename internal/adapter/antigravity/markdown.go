@@ -60,7 +60,7 @@ import (
 // Set to true when the caller has structured assistant_text rows
 // from 1.2.20.1 (Tier 3, enum=15 = PLANNER_RESPONSE). Same dedup
 // logic as skipUserInputs.
-func parseMarkdownConversation(path, conversationID, projectRoot string, ts time.Time, scrubber stringScrubber, markdown string, skipInlineTools, skipUserInputs, skipPlannerResponse bool) adapter.ParseResult {
+func parseMarkdownConversation(path, conversationID, projectRoot, gitRemote string, ts time.Time, scrubber stringScrubber, markdown string, skipInlineTools, skipUserInputs, skipPlannerResponse bool) adapter.ParseResult {
 	res := adapter.ParseResult{}
 	if conversationID == "" {
 		conversationID = "antigravity-unknown"
@@ -89,6 +89,7 @@ func parseMarkdownConversation(path, conversationID, projectRoot string, ts time
 				SourceEventID: stableMarkdownID("md-user", path, conversationID, turnIdx),
 				SessionID:     sessionID,
 				ProjectRoot:   projectRoot,
+				GitRemote:     gitRemote,
 				Timestamp:     bumpTimestamp(ts, turnIdx),
 				Tool:          models.ToolAntigravity,
 				ActionType:    models.ActionUserPrompt,
@@ -107,7 +108,7 @@ func parseMarkdownConversation(path, conversationID, projectRoot string, ts time
 			// When the caller has structured tool events (Tier 1
 			// dedup), strip the inline lines from the body but skip
 			// emitting them as their own ToolEvents.
-			toolEvents, remainingBody := extractInlineTools(path, conversationID, projectRoot, sessionID, ts, turnIdx, scrubber, body)
+			toolEvents, remainingBody := extractInlineTools(path, conversationID, projectRoot, gitRemote, sessionID, ts, turnIdx, scrubber, body)
 			if !skipInlineTools {
 				res.ToolEvents = append(res.ToolEvents, toolEvents...)
 			}
@@ -122,6 +123,7 @@ func parseMarkdownConversation(path, conversationID, projectRoot string, ts time
 				SourceEventID:      stableMarkdownID("md-assistant", path, conversationID, turnIdx),
 				SessionID:          sessionID,
 				ProjectRoot:        projectRoot,
+				GitRemote:          gitRemote,
 				Timestamp:          bumpTimestamp(ts, turnIdx),
 				Tool:               models.ToolAntigravity,
 				ActionType:         models.ActionTaskComplete,
@@ -176,7 +178,7 @@ var inlineToolPattern = regexp.MustCompile(`\*([^*]{2,200})\*`)
 // lines and emits ToolEvents for each recognized action. Returns
 // the events and the body with the inline lines removed (so the
 // task_complete row's text doesn't double-count them).
-func extractInlineTools(path, conversationID, projectRoot, sessionID string, ts time.Time, turnIdx int, scrubber stringScrubber, body string) ([]models.ToolEvent, string) {
+func extractInlineTools(path, conversationID, projectRoot, gitRemote, sessionID string, ts time.Time, turnIdx int, scrubber stringScrubber, body string) ([]models.ToolEvent, string) {
 	var events []models.ToolEvent
 	matches := inlineToolPattern.FindAllStringSubmatchIndex(body, -1)
 	if len(matches) == 0 {
@@ -195,6 +197,7 @@ func extractInlineTools(path, conversationID, projectRoot, sessionID string, ts 
 			SourceEventID: stableMarkdownID("md-tool", path, conversationID, turnIdx, idx),
 			SessionID:     sessionID,
 			ProjectRoot:   projectRoot,
+			GitRemote:     gitRemote,
 			Timestamp:     bumpTimestamp(ts, turnIdx),
 			Tool:          models.ToolAntigravity,
 			ActionType:    actionType,

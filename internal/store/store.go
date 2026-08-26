@@ -41,6 +41,7 @@ type Store struct {
 	cacheEngine *cachetrack.Engine
 	guard       *guard.Guard
 	obsOrg      ObsOrgProviders
+	advisorOrg  AdvisorOrgProvider
 }
 
 // SetObsOrgProviders wires the org-tier observability provider seam
@@ -962,8 +963,8 @@ func (s *Store) InsertTokenEvents(ctx context.Context, events []models.TokenEven
 		cache_creation_1h_tokens, reasoning_tokens, web_search_requests,
 		estimated_cost_usd, source, reliability,
 		source_file, source_file_hash, source_event_id, message_id, turn_id,
-		org_id, user_email, fast
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		org_id, user_email, fast, is_sidechain
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(source_file, source_event_id) DO UPDATE SET
 		model = COALESCE(NULLIF(excluded.model, ''), token_usage.model),
 		-- Heal a placeholder message_id. Modern Copilot CLI process logs
@@ -1017,6 +1018,15 @@ func (s *Store) InsertTokenEvents(ctx context.Context, events []models.TokenEven
 		-- existing non-NULL value if the new emit is empty so a stale
 		-- adapter can't clear it.
 		turn_id = COALESCE(NULLIF(excluded.turn_id, ''), token_usage.turn_id),
+		-- is_sidechain heals on re-parse (migration 087): the flag is a
+		-- deterministic function of the source line — the adapter reads it
+		-- straight off every transcript record — so the incoming value
+		-- always wins. That is exactly what lets "observer scan --force"
+		-- backfill the flag onto pre-087 rows with no dedicated surgical
+		-- pass. Contrast the MAX-guarded counters above: those defend
+		-- against a PARTIAL re-parse of an in-flight request; a boolean
+		-- read whole off the line has no partial state to protect.
+		is_sidechain = excluded.is_sidechain,
 		-- Cost: upgrade when the new emit carries a non-zero cost and
 		-- the existing one is zero (proxy-sourced rows are gold standard
 		-- per the v1.4.12 cost-provenance rule). Two non-zero values
@@ -1101,6 +1111,7 @@ func (s *Store) InsertTokenEvents(ctx context.Context, events []models.TokenEven
 			nullableString(e.OrgID),
 			nullableString(e.UserEmail),
 			boolToInt(e.Fast),
+			boolToInt(e.IsSidechain),
 		)
 		if err != nil {
 			return inserted, fmt.Errorf("store.InsertTokenEvents: exec: %w", err)
@@ -1523,7 +1534,7 @@ func (s *Store) Ingest(
 		pid, ok := projectIDs[e.ProjectRoot]
 		if !ok {
 			var err error
-			pid, err = s.UpsertProject(ctx, e.ProjectRoot, "")
+			pid, err = s.UpsertProject(ctx, e.ProjectRoot, e.GitRemote)
 			if err != nil {
 				return result, err
 			}
@@ -1688,7 +1699,7 @@ func (s *Store) Ingest(
 		pid, ok := projectIDs[tk.ProjectRoot]
 		if !ok {
 			var err error
-			pid, err = s.UpsertProject(ctx, tk.ProjectRoot, "")
+			pid, err = s.UpsertProject(ctx, tk.ProjectRoot, tk.GitRemote)
 			if err != nil {
 				return result, err
 			}

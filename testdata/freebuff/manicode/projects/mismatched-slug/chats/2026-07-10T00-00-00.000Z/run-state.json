@@ -1,0 +1,13 @@
+{
+  "sessionState": {
+    "fileContext": {
+      "projectRoot": "/home/dev/actual-project-name",
+      "cwd": "/home/dev/actual-project-name"
+    },
+    "mainAgentState": {
+      "contextTokenCount": 512,
+      "creditsUsed": 0,
+      "directCreditsUsed": 0
+    }
+  }
+}

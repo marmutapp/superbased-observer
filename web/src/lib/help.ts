@@ -1547,6 +1547,14 @@ export const HELP_REGISTRY: HelpEntry[] = [
     related: ["column.sessions.sidechain", "metric.stale_count", "column.discover.stale"],
   },
   {
+    id: "glossary.subagents_view",
+    category: "glossary",
+    title: "Sub-agents view (session detail)",
+    oneLiner: "Per-sub-agent breakdown of a session's inline sub-agent activity.",
+    detail: "Because sub-agents share the parent's session_id, the observer reconstructs per-sub-agent windows from the lifecycle brackets the capture paths record: spawn_subagent / subagent_start open a window, subagent_stop closes it, and every is_sidechain action inside the window is attributed to that sub-agent. Identity comes from structured metadata when available (the SubagentStart/SubagentStop hooks' agent_id, or transcript agent-name persona rows); otherwise windows fall back to ordinals. Sidechain activity outside any bracket lands in an explicit 'unattributed' bucket rather than being dropped. Codex child sessions are NOT here — they are separate sessions surfaced through lineage.",
+    related: ["glossary.sidechain"],
+  },
+  {
     id: "glossary.token_row",
     category: "glossary",
     title: "Token row",

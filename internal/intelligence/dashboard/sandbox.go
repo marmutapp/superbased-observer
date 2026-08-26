@@ -48,6 +48,9 @@ type SandboxAvailability struct {
 	// "readonly") so the dialog can show what a sandboxed launch will do to
 	// $HOME without a separate config read.
 	HomeMode string `json:"home_mode,omitempty"`
+	// DefaultOn mirrors [terminal.sandbox].default_on so the New Terminal
+	// dialog can honor the operator's persisted default after restart.
+	DefaultOn bool `json:"default_on"`
 	// Sources is the per-workspace-source availability list ("live",
 	// "clone-local", "clone-remote", "worktree") — the server's OWN
 	// membership list handleTerminalLaunch validates a client-supplied

@@ -44,13 +44,6 @@ const (
 	blockStatusFailed     = "FAILED"
 )
 
-// outerStateCompleted is the value SessionA2uxEvent.event.state takes once
-// the enclosing task has finished. Every block belonging to that task is
-// rebroadcast once, byte-identical, at this transition (see the package
-// doc). It carries no NEW information — the parser updates the existing
-// row in place rather than emitting a duplicate.
-const outerStateCompleted = "COMPLETED"
-
 // rawRecord is one JSONL line of a Junie events.jsonl.
 //
 // A single tolerant struct covers every top-level Kind: only the fields

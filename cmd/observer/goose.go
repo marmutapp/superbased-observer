@@ -6,6 +6,8 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+
+	"github.com/marmutapp/superbased-observer/internal/config"
 )
 
 // gooseContinueSubcommand is the subcommand the `--continue-from` launch
@@ -21,13 +23,15 @@ const gooseContinueSubcommand = "run"
 // handover from a source session and seed it via `goose run -t "<handover>"
 // -s` (the run subcommand's --text value, kept interactive by -s).
 //
-// NON-PROXIED on purpose. Goose's override surface is OPENAI_HOST (plus
+// NON-PROXIED BY DEFAULT. Goose's override surface is OPENAI_HOST (plus
 // per-provider host settings in config.yaml), NOT OPENAI_BASE_URL — and
-// overriding it would redirect whatever provider the operator already
-// configured (registry RouteStatusProbeRequired; same rationale as
-// `observer qwen`). Token capture happens via observer's local goose
-// adapter (session-level counts in sessions.db), not the proxy. The
-// launcher never touches API keys or ~/.config/goose/secrets.yaml.
+// goose may be pre-configured to a non-OpenAI provider (e.g. openrouter), so
+// setting OPENAI_HOST unconditionally would silently redirect that
+// provider's traffic. So routing stays opt-in: pass `--proxy` to inject
+// OPENAI_HOST at the observer proxy's OpenAI-compatible root (goose appends
+// /v1 itself). Without `--proxy`, token capture happens via observer's local
+// goose adapter (session-level counts in sessions.db). The launcher never
+// touches API keys or ~/.config/goose/secrets.yaml.
 func newGooseCmd() *cobra.Command {
 	var (
 		configPath   string
@@ -36,6 +40,7 @@ func newGooseCmd() *cobra.Command {
 		carry        string
 		fromMessage  int
 		fromTime     string
+		useProxy     bool
 		attach       *bool
 		noAttach     *bool
 		resume       *string
@@ -43,12 +48,17 @@ func newGooseCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "goose [-- goose-args...]",
 		Short: "Launch goose; with --continue-from, seed a handover via goose run -t … -s",
-		Long: "Wraps Block's goose agent (binary `goose`). This launcher is\n" +
-			"NON-PROXIED — goose's env override is OPENAI_HOST (not\n" +
-			"OPENAI_BASE_URL) and setting it would redirect an already-\n" +
-			"configured provider, so the proxy lane stays a registry probe\n" +
-			"item. Token capture happens via observer's local goose adapter\n" +
-			"(session-level counts in sessions.db).\n\n" +
+		Long: "Wraps Block's goose agent (binary `goose`). NON-PROXIED BY\n" +
+			"DEFAULT — token capture happens via observer's local goose\n" +
+			"adapter (session-level counts in sessions.db), not the proxy.\n\n" +
+			"Pass --proxy to opt in: this sets OPENAI_HOST at the observer\n" +
+			"proxy's root (goose appends /v1 itself). WARNING: goose may\n" +
+			"already be configured to a non-OpenAI provider (e.g. openrouter)\n" +
+			"in config.yaml — --proxy overrides OPENAI_HOST unconditionally\n" +
+			"(unless you've already exported it yourself), which redirects\n" +
+			"that provider's traffic to the proxy's OpenAI-compatible\n" +
+			"upstream. Only pass --proxy when you want goose on OpenAI\n" +
+			"through observer.\n\n" +
 			"With --continue-from <session-id> the launcher distills a handover\n" +
 			"from that session and seeds it via `goose run -t \"<handover>\" -s`\n" +
 			"(delivery=inject_prompt), so goose executes the mission prompt and\n" +
@@ -75,7 +85,7 @@ func newGooseCmd() *cobra.Command {
 				flagNoAttach: *noAttach,
 				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime) ||
 					argsLeadWithSubcommand(args, gooseAttachHeadlessSubcommands),
-				passthrough: append(gooseAttachPassthrough(binPath), resumeAttachPassthrough(*resume)...),
+				passthrough: append(gooseAttachPassthrough(binPath, useProxy), resumeAttachPassthrough(*resume)...),
 				toolArgs:    args,
 				stderr:      cmd.ErrOrStderr(),
 			})
@@ -151,7 +161,31 @@ func newGooseCmd() *cobra.Command {
 				continueDir = cwd
 			}
 
-			return runSeedOnlyLaunch("goose", bin, args, continueDir)
+			if !useProxy {
+				// Best-effort attribution config: a load failure just disables
+				// the launch seed (recordLaunchSeed treats "" as off).
+				dbPath := ""
+				if cfg, cErr := config.Load(config.LoadOptions{GlobalPath: configPath}); cErr == nil {
+					dbPath = cfg.Observer.DBPath
+				}
+				return runSeedOnlyLaunchSeeded(dbPath, "goose", "goose", bin, args, continueDir)
+			}
+			cfg, cErr := config.Load(config.LoadOptions{GlobalPath: configPath})
+			if cErr != nil {
+				return fmt.Errorf("load config: %w", cErr)
+			}
+			resolved := resolveProxyURL(cfg.Proxy.Port, "")
+			return runEnvLauncher(envLauncherSpec{
+				tool:     "goose",
+				bin:      bin,
+				args:     args,
+				dir:      continueDir,
+				proxyURL: resolved,
+				// Goose wants the HOST ROOT — it appends /v1 itself.
+				env:    map[string]string{"OPENAI_HOST": resolved},
+				dbPath: cfg.Observer.DBPath,
+				stderr: cmd.ErrOrStderr(),
+			})
 		},
 	}
 	cmd.Flags().StringVar(&configPath, "config", "", "Path to config.toml (defaults to ~/.observer/config.toml); used to resolve the source session for --continue-from")
@@ -160,6 +194,7 @@ func newGooseCmd() *cobra.Command {
 	cmd.Flags().StringVar(&carry, "carry", "", "Carry mode for --continue-from: metadata|distilled|distilled_tail|full|full_cache (default from [handoff] config)")
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
+	cmd.Flags().BoolVar(&useProxy, "proxy", false, "Opt in to routing goose's traffic through the observer proxy (sets OPENAI_HOST at the proxy's OpenAI-compatible root; goose appends /v1 itself). WARNING: goose may be pre-configured to a non-OpenAI provider (e.g. openrouter) — this overrides OPENAI_HOST unconditionally (unless already set in your env) and redirects that provider's traffic to the proxy. Default off.")
 	attach, noAttach = registerAttachFlags(cmd, "goose")
 	resume = registerResumeFlag(cmd, "goose")
 	return cmd
@@ -170,13 +205,19 @@ func newGooseCmd() *cobra.Command {
 // exits, so an attach notice + daemon-owned PTY would be spam).
 var gooseAttachHeadlessSubcommands = map[string]bool{"run": true}
 
-// gooseAttachPassthrough forwards the --goose-path wrapper flag to the
-// daemon-spawned inner `observer goose` launcher when set (nil otherwise).
-func gooseAttachPassthrough(goosePath string) []string {
+// gooseAttachPassthrough forwards the --goose-path wrapper flag (when set)
+// and the opt-in --proxy flag (when engaged) to the daemon-spawned inner
+// `observer goose` launcher, so an attached session honors the same routing
+// choice as the operator's original invocation.
+func gooseAttachPassthrough(goosePath string, useProxy bool) []string {
+	var out []string
 	if goosePath != "" {
-		return []string{"--goose-path", goosePath}
+		out = append(out, "--goose-path", goosePath)
 	}
-	return nil
+	if useProxy {
+		out = append(out, "--proxy")
+	}
+	return out
 }
 
 // gooseSubcommands are the goose argv tokens that are subcommands, not a

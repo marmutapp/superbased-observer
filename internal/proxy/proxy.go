@@ -1437,6 +1437,25 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// include-usage injection (aider capture gap, 2026-08-21): OpenAI Chat
+	// Completions streams carry NO usage unless the caller sets
+	// stream_options.include_usage — aider/LiteLLM counts tokens client-side
+	// instead, so proxied turns landed api_turns rows with 0/0 tokens even
+	// though the tool displayed real counts. Inject the option into
+	// streaming chat-completions bodies on the DEFAULT api.openai.com lane
+	// when absent (never on /up/<id> custom upstreams — third-party
+	// OpenAI-compatible servers may reject the field; never on the Responses
+	// API, which reports usage natively). Fail-open: any parse surprise
+	// forwards the original body.
+	if provider == models.ProviderOpenAI && explicitUpstream == nil && upstreamLaneID == "" &&
+		strings.Contains(r.URL.Path, "/chat/completions") {
+		if mutated, ok := injectOpenAIIncludeUsage(reqShapeBody); ok {
+			reqShapeBody = mutated
+			bodyMutated = true
+			p.logger.Debug("proxy: injected stream_options.include_usage for accurate token capture")
+		}
+	}
+
 	// Request shape, pre-forward. The single parseRequest pass also
 	// feeds cache-tracking enumeration and the post-response turn
 	// build; hoisting it here (it previously ran after the upstream
@@ -2427,10 +2446,14 @@ func (p *Proxy) resolveAPITurnSessionID(r *http.Request, provider string, reqBod
 	// from explicit sources (body metadata / X-Session-Id); absent those it
 	// stays "" (unattributed) — same discriminator as the gateway rail and
 	// admission gate (obsLaneCtxKey).
-	if sid == "" && p.sessions != nil && obsUpstreamLane(r) == "" {
+	if sid == "" && p.sessions != nil {
 		if resolved, ok, err := p.sessions.Resolve(r.Context(), r.RemoteAddr); err != nil {
 			p.logger.Debug("proxy: session resolve", "addr", r.RemoteAddr, "err", err)
-		} else if ok {
+		} else if ok && (obsUpstreamLane(r) == "" || strings.HasPrefix(resolved, models.ArenaSessionIDPrefix)) {
+			// Explicit /up lanes normally reject pid-derived Plane-B identity.
+			// The sole exception is an Arena runner's directly-bound synthetic
+			// candidate id: it cannot be a nearby interactive coding session and
+			// is required for named-provider harnesses such as Grok.
 			sid = resolved
 		}
 	}

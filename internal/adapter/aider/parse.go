@@ -62,6 +62,7 @@ type parser struct {
 	a           *Adapter
 	sourceFile  string
 	projectRoot string
+	gitRemote   string
 
 	sess *session
 	ord  int // session ordinal within the file (0-based)
@@ -76,8 +77,8 @@ type parser struct {
 // parseTranscript is the entry point: it walks the whole Markdown file and
 // returns the normalized events. ctx is honored for cancellation between
 // lines.
-func (a *Adapter) parseTranscript(ctx context.Context, data []byte, sourceFile, projectRoot string) ([]models.ToolEvent, []models.TokenEvent) {
-	p := &parser{a: a, sourceFile: sourceFile, projectRoot: projectRoot}
+func (a *Adapter) parseTranscript(ctx context.Context, data []byte, sourceFile, projectRoot, gitRemote string) ([]models.ToolEvent, []models.TokenEvent) {
+	p := &parser{a: a, sourceFile: sourceFile, projectRoot: projectRoot, gitRemote: gitRemote}
 
 	// Normalize CRLF; split into lines without a trailing-empty artifact.
 	text := strings.ReplaceAll(string(data), "\r\n", "\n")
@@ -194,6 +195,7 @@ func (p *parser) flushUser() {
 		SourceEventID: p.nextID("prompt"),
 		SessionID:     p.sess.key,
 		ProjectRoot:   p.projectRoot,
+		GitRemote:     p.gitRemote,
 		Timestamp:     p.sess.start,
 		Tool:          models.ToolAider,
 		Model:         p.sess.model,
@@ -222,6 +224,7 @@ func (p *parser) flushAssistant() {
 		SourceEventID: p.nextID("text"),
 		SessionID:     p.sess.key,
 		ProjectRoot:   p.projectRoot,
+		GitRemote:     p.gitRemote,
 		Timestamp:     p.sess.start,
 		Tool:          models.ToolAider,
 		Model:         p.sess.model,
@@ -248,6 +251,7 @@ func (p *parser) emitFileOp(actionType, rawName, target string) {
 		SourceEventID: p.nextID(actionType),
 		SessionID:     p.sess.key,
 		ProjectRoot:   p.projectRoot,
+		GitRemote:     p.gitRemote,
 		Timestamp:     p.sess.start,
 		Tool:          models.ToolAider,
 		Model:         p.sess.model,
@@ -287,6 +291,7 @@ func (p *parser) emitToken(m []string) {
 		SourceEventID:       p.nextID("tokens"),
 		SessionID:           p.sess.key,
 		ProjectRoot:         p.projectRoot,
+		GitRemote:           p.gitRemote,
 		Timestamp:           p.sess.start,
 		Tool:                models.ToolAider,
 		Model:               p.sess.model,

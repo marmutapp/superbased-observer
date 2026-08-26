@@ -1,0 +1,42 @@
+-- Composite index serving the W2.2b session-scoped network-events org-wire
+-- read (internal/store/networkorgrows.go::SelectSessionNetworkEvents).
+--
+-- That query runs on every org-push tick over a trailing 7-day window:
+--
+--   WHERE event_type = ? AND session_id IS NOT NULL AND session_id != ''
+--     AND timestamp >= ?
+--   ORDER BY session_id, timestamp DESC
+--
+-- Neither pre-existing index matched the ORDER BY:
+--   idx_process_events_session (session_id, timestamp)  -- no event_type lead
+--   idx_process_events_type    (event_type, timestamp)  -- wrong sort order
+-- so SQLite filtered via idx_process_events_type and then externally sorted
+-- the entire window to a temp file (a VdbeSorter spill) on every tick. That
+-- spill was the residual single-core CPU consumer named by the 2026-08-26
+-- compute/CPU audit (docs/plans/post-incident-task-queue-2026-08-26.md,
+-- Task 3) once the codeintel Cartesian fan-out was fixed.
+--
+-- The intent was: event_type as a leading equality + the (session_id,
+-- timestamp DESC) suffix = the required output order, letting SQLite stream
+-- rows in index order with no sort.
+--
+-- CORRECTION (2026-08-26, same-day re-verification with fixtures): the
+-- planner does NOT pick this index for the query it was written for. On
+-- idx_process_events_type both predicates are seek constraints
+-- (event_type=? AND timestamp>?), while here `timestamp` sits at column 3
+-- behind the near-useless `session_id>''` range, degrading the window
+-- filter to a post-filter over every network_connect row. With no ANALYZE
+-- stats in this schema, SQLite's default selectivity guesses prefer the
+-- range seek + a bounded sort of the in-window rows — and measurement
+-- agrees with it on deep-history nodes (forcing this index via INDEXED BY
+-- was ~5% SLOWER at 9% window density, faster only when nearly all history
+-- is in-window). This is a genuine either/or: session_id must precede
+-- timestamp for the ordering and follow it for the seek; one index cannot
+-- do both. The real, measured win of the accompanying query rewrite is the
+-- ROW_NUMBER() cap pushdown, which makes the process_network_bodies join
+-- fire only on post-cap survivors. The index is kept for now (dropping an
+-- applied migration's index needs its own migration + a check that nothing
+-- else uses it — tracked in the 2026-08-26 CPU remediation plan, Track
+-- R1-b), but do not add new queries expecting it to serve them.
+CREATE INDEX IF NOT EXISTS idx_process_events_type_session_ts
+    ON process_events(event_type, session_id, timestamp DESC);

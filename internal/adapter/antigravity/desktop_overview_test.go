@@ -227,7 +227,7 @@ func TestDesktopOverviewTxtParsesAsTranscript(t *testing.T) {
 
 	// Synthesis end-to-end must produce 2 ToolEvents (user + assistant).
 	events := synthesizeTranscriptEvents(
-		sessionPath, convID, "/test/project", convID,
+		sessionPath, convID, "/test/project", "", convID,
 		scrub.New(), entries, nil,
 		nil, nil,
 	)

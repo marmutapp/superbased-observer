@@ -208,11 +208,16 @@ var expectedClassification = map[string]string{
 	"/api/terminal/launch/preflight":      "L", // runs a $SHELL -lc login-shell PATH capture + reveals binary paths/home layout — owner-local only (reclassified V→L, 2026-07-23 review)
 	"/api/terminal/launch/models":         "V", // reads token_usage model history + registry Known list only — same posture as /api/models (B5 model picker)
 	"/api/terminal/sandbox":               "V", // B9 fail-soft sandbox probe — reads the daemon's cached bwrap probe result + [terminal.sandbox] config only, same posture as /api/terminal/launch/models
+	"/api/terminal/sandbox/config":        "L", // owner-local editor for [terminal.sandbox], including remote-clone / extra-rw-bind authority expansion
 	"/api/terminal/limits":                "L",
 	"/api/terminal/policy":                "L",
 	"/api/terminal/project/":              "V",
 	"/api/terminal/session/":              "V",
 	"/api/terminal/runs":                  "V",
+	"/api/arena/runs":                     "V", // agent arena: GET list; POST create auto-escalates to X + confirm token in-handler
+	"/api/arena/runs/{id}":                "V",
+	"/api/arena/runs/{id}/diff/{cid}":     "V",
+	"/api/arena/runs/{id}/action/{cid}":   "V", // keep/discard POST auto-escalates to X + confirm token in-handler
 	"/api/terminal/sessions":              "V",
 	"/api/terminal/workspace-layout":      "V",
 	"/api/terminal/workspace-layout/save": "L",

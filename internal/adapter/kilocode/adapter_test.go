@@ -323,8 +323,8 @@ func TestParseSessionFile_CLIProjectTableJoinForCwd(t *testing.T) {
 // CWD-prefixing observer's own .git.
 func TestResolveProjectRoot_TranslatesForeignCwd(t *testing.T) {
 	a := NewCLIWithOptions(nil, []string{t.TempDir()})
-	cache := map[string]string{}
-	got := a.resolveProjectRoot(`C:\programsx\kilo-test`, cache)
+	cache := map[string]kiloResolvedRoot{}
+	got, _ := a.resolveProjectRoot(`C:\programsx\kilo-test`, cache)
 	if !strings.HasPrefix(got, "/mnt/") && !strings.Contains(got, "kilo-test") {
 		// On hosts where the foreign translation doesn't kick in (no
 		// crossmount homes detected) the input is returned verbatim,
@@ -341,8 +341,8 @@ func TestResolveProjectRoot_TranslatesForeignCwd(t *testing.T) {
 // rollups coalesce until a real cwd is observed.
 func TestResolveProjectRoot_EmptyReturnsPlaceholder(t *testing.T) {
 	a := NewCLIWithOptions(nil, []string{t.TempDir()})
-	cache := map[string]string{}
-	if got := a.resolveProjectRoot("", cache); got != "[kilo-code-cli]" {
+	cache := map[string]kiloResolvedRoot{}
+	if got, _ := a.resolveProjectRoot("", cache); got != "[kilo-code-cli]" {
 		t.Errorf("empty cwd -> %q, want [kilo-code-cli]", got)
 	}
 }

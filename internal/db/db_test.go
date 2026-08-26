@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/marmutapp/superbased-observer/internal/db/migrations"
@@ -789,5 +790,120 @@ func TestConcurrentWritersSurviveContention(t *testing.T) {
 	want := writers * txPerWriter * rowsPerTx
 	if got := count(t, final, "contention"); got != want {
 		t.Errorf("row count: got %d want %d", got, want)
+	}
+}
+
+// TestOpenPinsTempStoreAndHeapLimitOnEveryPooledConnection is the T1.5
+// regression test for the P0-B disk-exhaustion defect (docs/plans/observer-
+// disk-compute-remediation-plan-2026-08-26.md Phase 1): temp_store and
+// synchronous used to be applied via a post-open `db.ExecContext`, which
+// only reaches the ONE pooled connection database/sql happens to hand it —
+// every OTHER connection the pool opens silently kept SQLite's file-backed
+// temp_store default and could spill temp files to disk. They (and the
+// hard_heap_limit backstop) must instead be DSN `_pragma=` terms, which
+// modernc.org/sqlite applies to EVERY physical connection at open time. This
+// test pins several concurrent connections and checks each one
+// individually, so a regression back to the post-open pattern would show up
+// as a per-connection mismatch rather than passing by luck on the one
+// connection a serial check happened to touch.
+//
+// Uses a file-backed DB, not ":memory:" — a ":memory:" DSN gives each
+// connection its own isolated empty database in this driver, so pinning N
+// connections against it would not exercise N connections against the SAME
+// store the way the real pooled-connection bug requires.
+func TestOpenPinsTempStoreAndHeapLimitOnEveryPooledConnection(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "pool-pragmas.db")
+
+	// Open with an EXPLICIT non-default TempStore ("memory" → 2). The
+	// default is now "file" (1), which is also SQLite's own compile-time
+	// default — so asserting the default value can't distinguish "the DSN
+	// pragma reached this connection" from "this connection is just on the
+	// SQLite default". Requesting the NON-default value makes the P0-B
+	// regression observable: a connection that never received the DSN
+	// pragma would read back 1 (file), not the requested 2 (memory).
+	database, err := Open(ctx, Options{Path: path, TempStore: "memory"})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer database.Close()
+
+	// Pin N distinct physical connections concurrently, before any is
+	// returned to the pool, so database/sql cannot satisfy later Conn calls
+	// by handing back one of the earlier connections.
+	const n = 4
+	conns := make([]*sql.Conn, n)
+	for i := range conns {
+		c, err := database.Conn(ctx)
+		if err != nil {
+			t.Fatalf("Conn %d: %v", i, err)
+		}
+		conns[i] = c
+	}
+	defer func() {
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	}()
+
+	for i, c := range conns {
+		var tempStore int
+		if err := c.QueryRowContext(ctx, "PRAGMA temp_store").Scan(&tempStore); err != nil {
+			t.Fatalf("conn %d: PRAGMA temp_store: %v", i, err)
+		}
+		if tempStore != sqliteTempStoreMemory {
+			t.Errorf("conn %d: PRAGMA temp_store = %d, want %d (memory) — this connection is still on SQLite's file-backed default (the P0-B regression)",
+				i, tempStore, sqliteTempStoreMemory)
+		}
+
+		var synchronous int
+		if err := c.QueryRowContext(ctx, "PRAGMA synchronous").Scan(&synchronous); err != nil {
+			t.Fatalf("conn %d: PRAGMA synchronous: %v", i, err)
+		}
+		if synchronous != sqliteSynchronousNormal {
+			t.Errorf("conn %d: PRAGMA synchronous = %d, want %d (NORMAL)", i, synchronous, sqliteSynchronousNormal)
+		}
+
+		// hard_heap_limit is process-global in SQLite (verified empirically
+		// for the remediation plan's T1.6), so this assertion alone would
+		// pass even if only one connection ever applied it — it's checked
+		// per-connection anyway for completeness, since the DSN term is
+		// issued identically on every connection's open regardless.
+		var heapLimit int64
+		if err := c.QueryRowContext(ctx, "PRAGMA hard_heap_limit").Scan(&heapLimit); err != nil {
+			t.Fatalf("conn %d: PRAGMA hard_heap_limit: %v", i, err)
+		}
+		if heapLimit != defaultHardHeapLimitBytes {
+			t.Errorf("conn %d: PRAGMA hard_heap_limit = %d, want %d (the default memory backstop for TempStore==\"memory\")",
+				i, heapLimit, defaultHardHeapLimitBytes)
+		}
+	}
+
+	// Informational: confirm this SQLite build reports a TEMP_STORE compile
+	// option at all. SQLite silently no-ops an unrecognized PRAGMA *name*
+	// (not a modernc bug — standard SQLite behavior), so the per-connection
+	// assertions above are only meaningful if temp_store is a pragma this
+	// build actually understands.
+	rows, err := database.QueryContext(ctx, "PRAGMA compile_options")
+	if err != nil {
+		t.Fatalf("PRAGMA compile_options: %v", err)
+	}
+	defer rows.Close()
+	foundTempStore := false
+	for rows.Next() {
+		var opt string
+		if err := rows.Scan(&opt); err != nil {
+			t.Fatalf("compile_options scan: %v", err)
+		}
+		if strings.HasPrefix(opt, "TEMP_STORE") {
+			foundTempStore = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("compile_options rows: %v", err)
+	}
+	if !foundTempStore {
+		t.Errorf("PRAGMA compile_options: no TEMP_STORE entry found — temp_store pragma support could not be confirmed for this build")
 	}
 }

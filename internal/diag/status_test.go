@@ -3,6 +3,7 @@ package diag
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,6 +13,55 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/models"
 	"github.com/marmutapp/superbased-observer/internal/store"
 )
+
+func TestStatusSnapshotMarshalJSONOmitsZeroTimes(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name        string
+		snap        StatusSnapshot
+		wantLast    bool
+		wantStarted bool
+	}{
+		{
+			name: "fresh database omits both zero timestamps",
+			snap: StatusSnapshot{DBPath: "/tmp/empty.db"},
+		},
+		{
+			name:     "captured activity emits last timestamp",
+			snap:     StatusSnapshot{DBPath: "/tmp/active.db", LastActionAt: now},
+			wantLast: true,
+		},
+		{
+			name:        "serving dashboard emits process start",
+			snap:        StatusSnapshot{DBPath: "/tmp/served.db", StartedAt: now},
+			wantStarted: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := json.Marshal(tc.snap)
+			if err != nil {
+				t.Fatalf("Marshal: %v", err)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(body, &fields); err != nil {
+				t.Fatalf("Unmarshal wire: %v", err)
+			}
+			if _, ok := fields["db_path"]; !ok {
+				t.Fatalf("ordinary embedded fields disappeared: %s", body)
+			}
+			_, gotLast := fields["last_action_at"]
+			if gotLast != tc.wantLast {
+				t.Errorf("last_action_at present = %v, want %v: %s", gotLast, tc.wantLast, body)
+			}
+			_, gotStarted := fields["started_at"]
+			if gotStarted != tc.wantStarted {
+				t.Errorf("started_at present = %v, want %v: %s", gotStarted, tc.wantStarted, body)
+			}
+		})
+	}
+}
 
 func TestSnapshot_EmptyDB(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "obs.db")

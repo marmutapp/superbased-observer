@@ -109,11 +109,27 @@ type Announcement struct {
 // reaches older installs is R2 (the npm-registry piggyback field in
 // npm/observer/package.json), and the rail that reaches a fleet in
 // minutes is R3 (org). See plan §0 for why no fourth rail can exist.
-// DRAFT — awaiting operator sign-off on the copy before any release.
-// Deliberately names NO version: the plugins tree it describes reached
+//
+// The plugin-coverage banner's copy was operator-signed-off 2026-08-26 for
+// the v1.32.0 release (it had shipped in npm metadata as a draft earlier).
+// It deliberately names NO version: the plugins tree it describes reached
 // users in the 1.28.0 refresh, but this text stays true whenever it
 // ships, so it cannot go stale against a retag or a slipped release.
+//
+// The disk-maintenance banner pairs with the 2026-08-26 disk/compute
+// remediation (CHANGELOG v1.32.0); its R2 copy in npm/observer/package.json
+// takes that rail's single slot because older installs — the audience that
+// still has the bug — are exactly who R2 reaches.
 var releaseAnnouncements = []Announcement{
+	{
+		ID:        "2026-08-26-disk-maintenance-fix",
+		Severity:  SeverityNotice,
+		Title:     "v1.32.0 fixes unbounded database maintenance that could fill the disk",
+		Body:      "Large databases could trigger automatic full-database VACUUM and integrity scans, silently consuming tens of GB of disk plus sustained CPU. v1.32.0 removes the unbounded paths, bounds SQLite memory and temp use, and adds a watchdog. Upgrade any machines on older versions.",
+		URL:       "https://github.com/superbasedapp/observer/releases",
+		ExpiresAt: "2026-11-01T00:00:00Z",
+		Source:    SourceRelease,
+	},
 	{
 		ID:        "2026-08-plugin-coverage",
 		Severity:  SeverityInfo,

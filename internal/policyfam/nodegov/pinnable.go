@@ -122,12 +122,24 @@ type ShareKey struct {
 	Label string
 }
 
-// ShareKeys is the v1b capture.pin allow-list. Every row is
-// DirLoweringOnly by construction — the direction is a property of the
-// whole block, not of a row, so it is not repeated per row.
+// ShareKeys is the capture.pin allow-list — the [org_client.share] keys the
+// org may DIRECT. The direction is tenancy-gated, not a per-row property: on
+// an INDIVIDUAL node every directive is lowering-only (§2.1, applied via
+// govern.LowerBool), and on a MANAGED node that granted extract.managed the
+// same directive may RAISE the tier (govern.RaiseBool — the sanctioned
+// enterprise lift). `admin_managed` remains structurally absent (it is the
+// provisioning default-flip, never remotely directable; pinned by
+// TestAdminManagedNotRemotelySettable).
 var ShareKeys = []ShareKey{
 	{Key: "full_content", Kind: "bool", Label: "Full file paths and command text"},
+	{Key: "full_tool_bodies", Kind: "bool", Label: "Tool inputs, outputs, reasoning, and errors"},
 	{Key: "routing_summary", Kind: "bool", Label: "Routing summary rollup"},
+	{Key: "cache_detail", Kind: "bool", Label: "Cache hit/write aggregate (day/model/kind)"},
+	{Key: "routing_detail", Kind: "bool", Label: "Routing per-decision aggregate (model ids)"},
+	{Key: "limit_gauge", Kind: "bool", Label: "Rate-limit gauge (5h/weekly utilization)"},
+	{Key: "codeintel_detail", Kind: "bool", Label: "Code-intelligence structure counts (project/language/symbols/edges)"},
+	{Key: "process_detail", Kind: "bool", Label: "Process run/exit counts (day/tool)"},
+	{Key: "terminal_detail", Kind: "bool", Label: "Terminal-run + remote-audit event counts"},
 	{Key: "policy_state", Kind: "bool", Label: "Effective-policy-state reports"},
 	{Key: "target_action_allowlist", Kind: "string_list", Label: "Action types allowed to ship a raw target"},
 	{Key: "obs.summary", Kind: "bool", Label: "Observability: aggregate rollup"},
@@ -192,9 +204,14 @@ var BootstrapEnvelopeKeys = []string{
 	"ingest.otel.http_addr",
 	// The privacy-posture flag that flips content sharing raw.
 	"org_client.share.admin_managed",
-	// Deferred to Phase 4 with the family.enforce:routing.optimization flip
-	// (parent §3.4 / §R23). Recorded here so nobody adds them "while they
-	// are in there".
+	// routing.enabled / routing.mode stay OUT of the nodegov settings-pin
+	// vocabulary BY DESIGN, even after the Arc 4 P3b §R23 managed-enforce lift
+	// landed: that lift is delivered through the ORG ROUTING POLICY body's mode
+	// + the enforce.routing authority on a managed node (cmd/observer
+	// routing_live.effectiveMode), NOT by letting a node.governance pin set the
+	// routing switch. Keeping them here means the two rails never collide — a
+	// settings pin can never turn routing enforcement on behind the authority
+	// gate's back. Recorded so nobody adds them "while they are in there".
 	"routing.enabled",
 	"routing.mode",
 }

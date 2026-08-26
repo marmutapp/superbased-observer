@@ -17,11 +17,13 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,6 +48,66 @@ func resolveProxyURL(cfgPort int, override string) string {
 		cfgPort = 8820
 	}
 	return "http://127.0.0.1:" + strconv.Itoa(cfgPort)
+}
+
+// agentRuntimeDir resolves the optional rename-safe runtime dir for launched
+// agents ([launch].agent_runtime_dir). The OBSERVER_AGENT_RUNTIME_DIR env var
+// wins over the config key so a container can set it without editing config;
+// the config fallback reads the DEFAULT config path only (a launcher run with
+// a custom --config should use the env var). Memoized: at most one config load
+// per process regardless of how many launchers fire. Empty = feature OFF.
+var agentRuntimeDir = sync.OnceValue(func() string {
+	if e := strings.TrimSpace(os.Getenv("OBSERVER_AGENT_RUNTIME_DIR")); e != "" {
+		return e
+	}
+	if cfg, err := config.Load(config.LoadOptions{}); err == nil {
+		return strings.TrimSpace(cfg.Launch.AgentRuntimeDir)
+	}
+	return ""
+})
+
+// agentRuntimeEnv returns the rename-safe runtime-dir env for coding agents
+// whose runtimes perform atomic-rename dependency installs (npm/bun). It
+// points the agent's XDG config/cache/state and the npm/bun package caches
+// under dir — a local, rename-capable filesystem — so a provider-dependency
+// install (e.g. OpenCode's openrouter provider module) doesn't fail on an
+// SMB/NFS HOME (the EACCES-on-rename footgun). It deliberately does NOT set
+// XDG_DATA_HOME: agents write their session storage there and the watcher
+// reads it under $HOME/.local/share, so relocating it would blind the
+// capture path. Adapter-agnostic — keyed on the runtime-dir capability, never
+// on a tool name. Empty dir → nil (feature off). Pure: no I/O.
+func agentRuntimeEnv(dir string) map[string]string {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return nil
+	}
+	return map[string]string{
+		"XDG_CONFIG_HOME":       filepath.Join(dir, "config"),
+		"XDG_CACHE_HOME":        filepath.Join(dir, "cache"),
+		"XDG_STATE_HOME":        filepath.Join(dir, "state"),
+		"npm_config_cache":      filepath.Join(dir, "npm"),
+		"BUN_INSTALL_CACHE_DIR": filepath.Join(dir, "bun"),
+	}
+}
+
+// applyAgentRuntimeEnv layers the rename-safe runtime-dir env into base (a
+// launcher's starting env) when the feature is on, creating the target dirs.
+// A user's own XDG_* value still wins (applyBaseURLEnv semantics), and the
+// runtime keys are layered QUIETLY — they are not reported in the launcher's
+// "routing via …" line, which stays focused on the base-URL keys. No-op
+// (returns base unchanged) when dir is empty. Shared by runEnvLauncher and
+// runOpencodeLauncher so every launcher gets it from one seam — a new
+// launcher inherits it for free.
+func applyAgentRuntimeEnv(base []string, dir string) []string {
+	rt := agentRuntimeEnv(dir)
+	if rt == nil {
+		return base
+	}
+	for _, v := range rt {
+		_ = os.MkdirAll(v, 0o755) //nolint:errcheck,gosec // best-effort; the child surfaces a real dir failure
+	}
+	out, _, _ := applyBaseURLEnv(base, rt)
+	return out
 }
 
 // resolveEnv returns the toolresolve.Env driving the registry resolution
@@ -205,8 +267,20 @@ type envLauncherSpec struct {
 	// cwd (the default). A `--continue-from` launch sets it to the source
 	// session's translated project root (via launchDir) so a cross-OS
 	// continuation lands in the real project folder, not the daemon's cwd.
-	dir    string
-	stderr io.Writer
+	dir string
+	// dbPath is the observer DB path (cfg.Observer.DBPath). When set, the
+	// launcher records a launch_seeds row for the spawned child so the
+	// daemon's correlation sweep can bind it to the ingested session
+	// directly (migration 086) instead of falling through to lazy cwd
+	// correlation. Best-effort; empty disables seeding.
+	dbPath string
+	// seedTool overrides the tool name recorded in the launch seed. Empty
+	// records spec.tool. Set it when the stderr label differs from the
+	// canonical adapter name the watcher stores in sessions.tool (e.g. the
+	// gemini launcher labels "gemini" but stores "gemini-cli") — the sweep's
+	// matcher requires exact equality with sessions.tool.
+	seedTool string
+	stderr   io.Writer
 }
 
 // runEnvLauncher injects the spec's base-URL env vars (user values win),
@@ -214,7 +288,10 @@ type envLauncherSpec struct {
 // forwards its exit code (same shape as `observer run`). Pure exec — it does
 // not consult or set any secret.
 func runEnvLauncher(spec envLauncherSpec) error {
-	childEnv, applied, presets := applyBaseURLEnv(os.Environ(), spec.env)
+	// Layer the rename-safe agent runtime-dir env under the base-URL env, so
+	// an SMB/NFS HOME can't break the agent's provider-dependency install
+	// (adapter-agnostic; no-op unless [launch].agent_runtime_dir is set).
+	childEnv, applied, presets := applyBaseURLEnv(applyAgentRuntimeEnv(os.Environ(), agentRuntimeDir()), spec.env)
 
 	for _, k := range presets {
 		fmt.Fprintf(spec.stderr,
@@ -240,7 +317,32 @@ func runEnvLauncher(spec envLauncherSpec) error {
 	child.Stdin = os.Stdin
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
-	if err := child.Run(); err != nil {
+	if err := child.Start(); err != nil {
+		return fmt.Errorf("exec %s: %w", spec.tool, err)
+	}
+	// Direct process attribution (migration 086): record the child pid now
+	// that Start has made it knowable; retract the seed when the child is
+	// reaped. Best-effort both ways — a seeding failure never affects the
+	// launch (see cmd/observer/launchseed.go).
+	seedTool := spec.tool
+	if spec.seedTool != "" {
+		seedTool = spec.seedTool
+	}
+	recordLaunchSeed(spec.dbPath, seedTool, spec.dir, child.Process.Pid, spec.stderr)
+	// Best-effort generic post-launch session discovery (WS-DISCOVERY): a
+	// no-op unless the trusted OOB channel is active AND seedTool resolves to
+	// an adapter that declares session-file watch roots. seedTool (not
+	// spec.tool) is used deliberately — it is the exact adapter-registry key
+	// the launch seed itself already resolved to (e.g. gemini's launcher
+	// label "gemini" vs its registered/stored tool name "gemini-cli").
+	// Cancel the instant the child exits so a window cut short by exit never
+	// announces a candidate that only looked unique because the scan stopped
+	// early.
+	discoverCancel := maybeStartGenericDiscovery(context.Background(), seedTool, spec.dir)
+	if discoverCancel != nil {
+		defer discoverCancel()
+	}
+	if err := child.Wait(); err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
 			return exitErr(ee.ExitCode())

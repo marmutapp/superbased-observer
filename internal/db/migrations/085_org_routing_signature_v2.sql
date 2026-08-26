@@ -1,0 +1,25 @@
+-- 085_org_routing_signature_v2.sql — Arc 5 R-5b, node-side half of the
+-- ROUTING-SIG-1 close-out (docs/security.md open ledger). Paired with org-server
+-- migration 078_routing_signature_v2.sql.
+--
+-- Adds the DOMAIN-SEPARATED, VERSION-BOUND signature to the single-row cache of
+-- the org-distributed routing policy (the table created by 043). The cache
+-- already stores body / body_hash / signature / server_pubkey precisely so the
+-- node can RE-VERIFY the document it is about to compose without a live server;
+-- without this column that offline re-verification would silently fall back to
+-- the v1 body-only signature, which is the shape the ledger row exists about.
+--
+-- NODE-LOCAL, exactly like every other column of this table: org_routing_policies
+-- never enters the org push (pinned in tests/invariant/privacy_test.go). It is
+-- RECEIVED state.
+--
+-- Empty means "the server that served this document did not offer a v2
+-- signature" — either a pre-078 org server, or a row cached by a pre-085 agent.
+-- Both are legitimate and both keep verifying on the v1 rail; the empty string
+-- is never treated as a v2 signature that failed (orgcontract.VerifyRoutingPolicyV2
+-- refuses an empty SignatureV2 outright rather than answering for it).
+--
+-- Enforcement posture is UNCHANGED (§R23 as amended by Arc-4 P3b): this column
+-- changes only WHICH BYTES a cached document is authenticated against. It grants
+-- nothing, enables nothing, and is not consulted by the composer.
+ALTER TABLE org_routing_policies ADD COLUMN signature_v2 TEXT NOT NULL DEFAULT '';

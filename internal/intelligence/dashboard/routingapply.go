@@ -181,6 +181,16 @@ func (s *Server) applyRoutingChange(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no currently-planned change matches this path + target — the preview is stale (or the change already applied); re-run the preview", http.StatusConflict)
 		return
 	}
+	// W5.1 org-governed feature gate: node.features.routing_apply. Fail-open
+	// (nil FeatureGate, or no accepted policy) — checked as late as
+	// possible, right before the write, so a denied request never even
+	// leaves a stale-preview error path unexplained.
+	if s.opts.FeatureGate != nil {
+		if allowed, reason := s.opts.FeatureGate(nodeFeatureRoutingApply); !allowed {
+			http.Error(w, reason, http.StatusForbidden)
+			return
+		}
+	}
 	c := changes[idx]
 	stamp := routingapply.Stamp(time.Now())
 	if err := routingapply.Write(c, stamp); err != nil {

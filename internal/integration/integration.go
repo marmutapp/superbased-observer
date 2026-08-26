@@ -223,6 +223,12 @@ type Capability struct {
 	// v1 grounds only claude-code; every other launchable tool carries the
 	// Note fallback (plan amendment A3, ledger G21).
 	Sandbox SandboxSpec
+	// Headless, when non-nil, declares a live-verified headless one-shot
+	// contract (prompt on argv → parseable final answer) that the Agent
+	// Arena drives. Nil = no grounded one-shot form — the honest floor;
+	// populated only after a real drive proves the argv, pinned to the
+	// exact grounded set by registry coverage tests.
+	Headless *HeadlessSpec
 }
 
 // registry is the capability table, keyed by the adapter's canonical tool
@@ -299,6 +305,15 @@ var registry = map[string]Capability{
 			StateRW: []string{".claude", ".claude.json", ".claude.json.backup"},
 			StateRO: []string{".local/share/claude"},
 		},
+		// Headless one-shot, grounded by the live benchmark drives
+		// (cmd/observer/benchmark_driver.go claudeCodeDriver): `claude -p
+		// <prompt> --output-format json` prints a result JSON envelope on
+		// stdout. Arena arena runner reuses the same argv shape.
+		Headless: &HeadlessSpec{
+			PromptFlag: "-p",
+			OutputArgs: []string{"--output-format", "json"},
+			Result:     HeadlessResultStdoutJSON,
+		},
 	},
 	"codex": {
 		Tool:        "codex",
@@ -354,6 +369,16 @@ var registry = map[string]Capability{
 		// list; every other launchable tool carries the honest zero note
 		// until a per-tool probe grounds its StateRW/StateRO paths.
 		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
+		// Headless one-shot, grounded by the live benchmark drives
+		// (cmd/observer/benchmark_driver.go codexDriver): `codex exec
+		// <prompt> --json -o <file>` writes the final message to the -o
+		// file and thread ids to stdout JSON.
+		Headless: &HeadlessSpec{
+			Lead:       []string{"exec"},
+			OutputArgs: []string{"--json"},
+			Result:     HeadlessResultOutputFile,
+			ResultFlag: "-o",
+		},
 	},
 
 	// Proxy-routable CLI (OpenAI-compatible base URL via launcher).
@@ -413,6 +438,23 @@ var registry = map[string]Capability{
 		// launcherArgsOrDone (B6), so a forwarded `--model <value>` reaches
 		// the opencode binary unmodified.
 		Model: ModelSpec{Kind: ModelArg, Flag: "--model"},
+		// Headless one-shot, LIVE-GROUNDED 2026-08-22 (arena headless-drive
+		// arc): `opencode run <prompt> --format json` streams NDJSON events
+		// (step_start/text/step_finish), each carrying sessionID; the last
+		// text part is the answer. A real drive created oc.txt and replied
+		// DONE. Default formatted output also works but carries no ids. The
+		// routed Arena lane pins the provider to openrouter/* because the
+		// process-local OPENCODE_CONFIG_CONTENT override points that provider
+		// at Observer's named OpenRouter upstream. stealth/ox-alpha was
+		// confirmed at zero prompt/completion price in OpenRouter's live
+		// catalog on 2026-08-24.
+		Headless: &HeadlessSpec{
+			Lead:              []string{"run"},
+			OutputArgs:        []string{"--format", "json"},
+			Result:            HeadlessResultOpenCodeEvents,
+			ProxyModelPrefix:  "openrouter/",
+			ProxyDefaultModel: "openrouter/stealth/ox-alpha",
+		},
 		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
 		// amendment A3) — only claude-code has a verified state-dir bind
 		// list; every other launchable tool carries the honest zero note
@@ -439,7 +481,18 @@ var registry = map[string]Capability{
 		// (providerOptions.cursor.modelName) at hook time — see
 		// cursor.ResolveModelFromStore. Tokens still depend on the stop hook
 		// firing (the transcript carries no usage).
-		TokenTier: TokenTier{Best: "sqlite", Gap: "tokens require the stop hook (transcript has none)"},
+		//
+		// C1 CLOSED AS UPSTREAM-REGRESSION (2026-08-22 live audit): cursor
+		// 3.15.19 stop payloads carry NO usage fields at all (verified via
+		// ~/.observer/cursor-stop-debug.jsonl `no_usage_fields` rows — hooks
+		// fire, session_id present, payload keys are conversation/model/
+		// status/transcript_path only), and no local surface carries
+		// per-generation tokens anymore: agent-transcripts JSONLs have none,
+		// chats/<ws>/<conv>/store.db blobs are message content only, and
+		// ai-tracking/ai-code-tracking.db tracks code hashes, not spend.
+		// The ff8ebc12 guard fix stands ready if usage returns; until a
+		// surface reappears this is an upstream capture ceiling.
+		TokenTier: TokenTier{Best: "sqlite", Gap: "3.15.x dropped usage from stop payloads entirely; no local token surface remains (upstream regression, watch cursor-stop-debug.jsonl)"},
 		// P0.1 FULL (CLI): ~/.cursor/projects/<slug>/agent-transcripts/
 		// <sid>/<sid>.jsonl, Anthropic-shaped; NOT referenced by DB
 		// source_file (sentinel) — derive by session id. IDE state.vscdb
@@ -806,15 +859,14 @@ var registry = map[string]Capability{
 		//
 		// UPDATE — Phase C shipped + LIVE-VERIFIED 2026-06-27: the /up/<id>
 		// seam + [proxy.upstreams] openrouter route hermes' OpenRouter traffic;
-		// proxyroute.RegisterHermes rewrites model.base_url →
+		// the since-deleted proxyroute.RegisterHermes (superseded by Approach
+		// B below) rewrote model.base_url →
 		// http://127.0.0.1:<port>/up/openrouter/api/v1. A live `hermes -z` turn
 		// routed to OpenRouter (confirmed via OpenRouter-specific responses)
 		// and landed an api_turns row as provider=openai with the OpenRouter
 		// model name (tokens were 0 only because the free tier was rate-limited
 		// — error responses carry no usage; the parse path is covered by the
-		// proxy e2e test). Proxy stays nil because init does not auto-write it
-		// (the RegisterHermes writer + a node [proxy.upstreams] entry apply it),
-		// but the surface is verified-routable.
+		// proxy e2e test).
 		// ROUTING MECHANISM VERIFIED LIVE 2026-06-27. hermes' NAMED providers
 		// (openrouter, nous) hardcode their endpoint via `base_url = base_url or
 		// CONST` and IGNORE model.base_url — so `-z`/`chat` under provider:
@@ -924,7 +976,7 @@ var registry = map[string]Capability{
 		Hook:        HookSpec{Mechanism: HookNone},
 		MCP:         nil,
 		Native:      NativeRails{},
-		TokenTier:   TokenTier{Best: "transcript"}, // un-audited depth.
+		TokenTier:   TokenTier{Best: "transcript", Gap: "capture depth un-audited"},
 		// P0.1 FULL: audit.jsonl user/assistant records (Windows
 		// cross-mount; reader = P2 tranche).
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile}},
@@ -1115,7 +1167,7 @@ var registry = map[string]Capability{
 		Hook:        HookSpec{Mechanism: HookNone},
 		MCP:         nil,
 		Native:      NativeRails{},
-		TokenTier:   TokenTier{Best: "transcript"}, // un-audited depth.
+		TokenTier:   TokenTier{Best: "transcript", Gap: "capture depth un-audited"},
 		// P0.1 FULL: sessions/<slug>/<ts>_<id>.jsonl message records
 		// (reader = P2 tranche).
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile, InjectPrompt}, Launch: &LaunchSpec{Subcommand: "pi"}},
@@ -1418,11 +1470,20 @@ var registry = map[string]Capability{
 		// row (id 23025, provider=openai, model grok-4.5, 11394/29 tokens,
 		// HTTP 200). The per-model base_url is https://cli-chat-proxy.grok.com/v1
 		// (api_backend:"responses") — so the /v1 belongs in the override.
-		// Routable now, but observer drives no route today — the `observer grok`
-		// launcher is non-proxied and init writes no route — so Proxy stays nil
-		// while the writer is pending (the cline/aider/goose "routable_now,
-		// writer-pending" pattern).
-		Proxy:       nil,
+		// Routable now, and `observer grok` (2026-08-21) gained an opt-in
+		// `--proxy` flag that injects GROK_CLI_CHAT_PROXY_BASE_URL at this
+		// exact /up/grok/v1 upstream. The launcher stays non-proxied by
+		// DEFAULT (routing is opt-in, not automatic). PROMOTED 2026-08-21:
+		// a live `observer grok --proxy -p` turn landed api_turns through
+		// the flag (provider=openai, model grok-4.6-build, 12155/24 tokens,
+		// HTTP 200) — the checklist §10.1f bar.
+		Proxy: &ProxyRoute{
+			Kind:     RouteLauncher,
+			EnvVar:   "GROK_CLI_CHAT_PROXY_BASE_URL",
+			Suffix:   "/up/grok/v1",
+			Launcher: "observer grok --proxy",
+			Note:     "Opt-in via the --proxy launcher flag; routes at the [proxy.upstreams] grok upstream (cli-chat-proxy.grok.com), not the default lane.",
+		},
 		Routability: RouteStatusRoutableNow,
 		// updates.jsonl shows hook_execution records (ACP pre_tool_use fired
 		// live) — a real upstream hook system, but no observer receiver is
@@ -1480,6 +1541,17 @@ var registry = map[string]Capability{
 		// is DisableFlagParsing + launcherArgsOrDone (B6), so a forwarded
 		// `--model <value>` reaches the grok binary unmodified.
 		Model: ModelSpec{Kind: ModelArg, Flag: "--model"},
+		// Headless one-shot, LIVE-GROUNDED 2026-08-22 (arena headless-drive
+		// arc): `grok -p <prompt> --output-format json --always-approve`
+		// prints a single JSON envelope keyed text/sessionId/usage/
+		// total_cost_usd (claude-shaped but different keys). A real drive
+		// created answer.txt and replied DONE; a second drive returned
+		// sessionId + full usage without any proxy lane.
+		Headless: &HeadlessSpec{
+			PromptFlag: "-p",
+			OutputArgs: []string{"--output-format", "json", "--always-approve"},
+			Result:     HeadlessResultGrokJSON,
+		},
 		// Sandbox filesystem-isolation row (B9). Not grounded in v1 (plan
 		// amendment A3) — only claude-code has a verified state-dir bind
 		// list; every other launchable tool carries the honest zero note
@@ -1791,13 +1863,16 @@ var registry = map[string]Capability{
 		// surface, LIVE-GROUNDED 2026-07-09: a probe with
 		// OPENAI_API_BASE=http://127.0.0.1:8820/v1 (aider --message …
 		// --model gpt-4o-mini) landed an api_turns row (provider openai,
-		// model gpt-4o-mini-2024-07-18). The knob is proven routable, but
-		// observer drives no route today — there is no `observer aider`
-		// launcher and no init writer (aider takes the base URL from the
-		// operator's own env / .aider.conf.yml) — so Proxy stays nil while
-		// the writer is pending (the cline/kilo VS-Code "routable_now,
-		// writer-pending" pattern).
-		Proxy:       nil,
+		// model gpt-4o-mini-2024-07-18). The knob is proven routable, and a
+		// minimal `observer aider` launcher injects OPENAI_API_BASE.
+		// PROMOTED 2026-08-21: a live `observer aider` turn landed an
+		// api_turns row through the launcher path itself (id 166805,
+		// provider openai, model gpt-4o-mini-2024-07-18) with a valid key —
+		// checklist §10.1f met. (An earlier 401 row, 166747, proved the
+		// wire; the keyed run's usage fields read 0/0 in api_turns while
+		// aider itself reported 665/1 — a capture-parse gap on this shape
+		// worth a follow-up, not a routing doubt.)
+		Proxy:       &ProxyRoute{Kind: RouteLauncher, EnvVar: "OPENAI_API_BASE", Suffix: "/v1", Launcher: "observer aider"},
 		Routability: RouteStatusRoutableNow,
 		// No pre/post-tool hook surface exists.
 		Hook: HookSpec{Mechanism: HookNone},
@@ -1811,11 +1886,45 @@ var registry = map[string]Capability{
 		TokenTier: TokenTier{Best: "transcript", Gap: "prose-only rounded counts (unreliable precision); no reasoning split; no per-turn timestamps"},
 		// The per-repo .aider.chat.history.md is fully re-readable, but
 		// there is NO seed lane: --message runs one turn and exits, the
-		// REPL takes no preload flag — file-lane carry only, no launcher.
+		// REPL takes no preload flag — file-lane carry only. `observer aider`
+		// (2026-08-21) is a minimal exec+env-inject launcher only — no
+		// --continue-from/--attach/--resume wiring, so no Launch/Attach/
+		// Resume block below.
 		Handoff: HandoffCapability{
 			Transcript: TranscriptFull,
 			Inject:     []InjectKind{InjectFile},
 			Note:       "no interactive-seed lane (--message exits after the turn)",
+		},
+		// Headless one-shot, LIVE-GROUNDED 2026-08-22 (arena headless-drive
+		// arc): `aider --yes --no-auto-commits --message <prompt>` runs the
+		// turn non-interactively and prints the reply + "Tokens: N sent, M
+		// received. Cost: $X" prose to stdout. A real drive created ai.txt
+		// (kiwi) end-to-end. CAVEAT (live arena run headless-20260823-02):
+		// aider only edits files explicitly added to its chat — a prompt
+		// that names the file is NOT enough; it wrote a .gitignore instead.
+		// Arena supplies explicitly selected project-relative files as
+		// positional argv; naming a path only in prompt prose is insufficient.
+		// NOTE: aider needs OPENAI_API_KEY WITHOUT the literal quotes .env
+		// carries (operator-shell gotcha); with a bare key it drives clean.
+		// No session-id surface exists. A live Arena run must prove process
+		// attribution binds the routed api_turn to the candidate; if it does
+		// not, the candidate rollup stays honestly zero.
+		Headless: &HeadlessSpec{
+			PromptFlag:  "--message",
+			OutputArgs:  []string{"--yes", "--no-auto-commits"},
+			Result:      HeadlessResultStdoutText,
+			ContextMode: HeadlessContextPositional,
+		},
+		// Binary resolution + grounded install. Unix launcher resolves
+		// "aider"; official install is the aider.chat uv-based script
+		// (installs Python 3.12 if needed). No Windows-native install path
+		// grounded here.
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{Unix: []string{"aider"}},
+			Installs: []InstallHint{
+				{OS: "linux", Channel: "script", Argv: []string{"sh", "-lc", "curl https://aider.chat/install.sh | sh"}, Display: "curl https://aider.chat/install.sh | sh"},
+				{OS: "darwin", Channel: "script", Argv: []string{"sh", "-lc", "curl https://aider.chat/install.sh | sh"}, Display: "curl https://aider.chat/install.sh | sh"},
+			},
 		},
 	},
 	"deepseek": {
@@ -1848,7 +1957,7 @@ var registry = map[string]Capability{
 		// see the package doc's "Known gaps" section.
 		TokenTier: TokenTier{
 			Best: "events_jsonl",
-			Gap:  "no cache-write field; sub-agent token rollup ungrounded",
+			Gap:  "no cache-write field; sub-agent token rollup ungrounded; no cost field in the on-disk store (rows always $0)",
 		},
 		// session.jsonl.zstd is fully re-readable (whole-file rewrite on
 		// every flush, re-decoded in full by ParseSessionFile), but there
@@ -1869,14 +1978,23 @@ var registry = map[string]Capability{
 		// openai provider (--provider openai + OPENAI_HOST=http://127.0.0.1:8820,
 		// --model gpt-4o-mini, keyring disabled so the env key is used)
 		// landed api_turns rows (provider openai, model gpt-4o-mini-2024-07-18,
-		// real usage). The knob is proven routable, but the `observer goose`
-		// launcher is deliberately NON-PROXIED — setting OPENAI_HOST would
-		// redirect an operator's already-configured provider (the live config
-		// here defaulted to openrouter) — and init writes no route, so
-		// observer drives no route today. Proxy stays nil while the writer is
-		// pending (the cline/kilo VS-Code "routable_now, writer-pending"
-		// pattern).
-		Proxy:       nil,
+		// real usage). The knob is proven routable; `observer goose`
+		// (2026-08-21) gained an opt-in `--proxy` flag that injects
+		// OPENAI_HOST, but stays NON-PROXIED by DEFAULT — unconditionally
+		// setting OPENAI_HOST would redirect an operator's already-configured
+		// provider (the live config here defaulted to openrouter). Proxy
+		// stays nil until a live turn lands an api_turns row through the flag
+		// itself (the cline/kilo VS-Code "routable_now, writer-pending"
+		// pattern). PROMOTED 2026-08-21 (second attempt): the first re-probe
+		// failed because the operator shell exports
+		// OPENAI_HOST=https://api.openai.com globally, and the launcher's
+		// user-values-win rule let it override the injection — with
+		// OPENAI_HOST unset, a live `observer goose --proxy run` turn landed
+		// api_turns rows through the route (ids 167714-5, provider openai,
+		// model gpt-4o-mini; 401 upstream on a throwaway key = wire proven).
+		// OPERATOR NOTE: unset your ambient OPENAI_HOST (shell profile) when
+		// using `observer goose --proxy`, or accept that yours wins.
+		Proxy:       &ProxyRoute{Kind: RouteLauncher, EnvVar: "OPENAI_HOST", Suffix: "", Launcher: "observer goose --proxy", Note: "Opt-in --proxy flag injects OPENAI_HOST at the proxy ROOT (goose appends /v1). Requires GOOSE_PROVIDER=openai (or another OPENAI_HOST-honoring provider); an ambient OPENAI_HOST in the operator env wins over the injection by design."},
 		Routability: RouteStatusRoutableNow,
 		// No pre/post-tool hook surface exists (extensions are MCP servers,
 		// not hooks).
@@ -2471,13 +2589,12 @@ var registry = map[string]Capability{
 		// drives for pi — unsurprising, since prime-agent is a hard fork of
 		// the same pi-mono upstream and inherited the file schema.
 		//
-		// `cmd/observer/prime-agent.go` (added 2026-08-06, modelled 1:1 on
-		// pi.go) now writes that provider and execs
-		// `prime-agent --provider observer`. Proxy still stays nil: no
-		// live turn has landed an api_turns row through it yet, and
-		// checklist §10.1f forbids flipping the PROXY cell before that —
-		// this row is the grounded structural half, not the verified half.
-		Proxy:       nil,
+		// `prime-agent --provider observer`. PROMOTED 2026-08-21: a live
+		// `observer prime-agent --provider observer --model gpt-4o-mini -p`
+		// turn landed api_turns rows through the proxy with REAL usage
+		// captured (id 166806, provider openai, gpt-4o-mini, 4119/2 tokens,
+		// valid key) — checklist §10.1f fully met.
+		Proxy:       &ProxyRoute{Kind: RouteLauncher, EnvVar: "", Suffix: "/v1", Launcher: "observer prime-agent", Note: "Routes via the 'observer' provider entry the launcher writes into ~/.prime/agent/models.json (baseUrl = proxy /v1); exec with --provider observer."},
 		Routability: RouteStatusRoutableNow,
 		// Prime Agent's extension points are TypeScript EXTENSIONS
 		// (-e/--extension, pi.registerTool / lifecycle callbacks), not a
@@ -2606,6 +2723,191 @@ var registry = map[string]Capability{
 		// no "junie" case.
 		Handoff: HandoffCapability{Transcript: TranscriptFull, Inject: []InjectKind{InjectFile}},
 	},
+	// zcode (Z.AI's OpenCode fork, docs/zcode-adapter.md). Phase-0 grounded
+	// 2026-08-18: a structural transposition of the opencode adapter with
+	// one difference — per-call tokens come from zcode's own `model_usage`
+	// SQLite table (OpenCode's message.data.tokens bundle is zeroed).
+	"zcode": {
+		Tool: "zcode",
+		// 10 native tool names grounded off mapTool (internal/adapter/zcode/
+		// adapter.go:1105-1156), OpenCode-derived short-name aliases, plus
+		// the step_finish harness marker (WP-T4 family). The default case's
+		// `strings.Contains(part.Tool, "mcp")` heuristic stays adapter-
+		// private per the globalGlobRows precedent (a guess, not an
+		// identity).
+		Vocabulary: Vocabulary{InTaxonomy: true},
+		// zcode authenticates model access via Z.AI OAuth (`zcode login`)
+		// and exposes no OpenAI-style base-URL env knob (`zcode --help`,
+		// zcode 0.16.3) — routing it through the proxy would be a guess.
+		Proxy:       nil,
+		Routability: RouteStatusProbeRequired,
+		Hook:        HookSpec{Mechanism: HookNone},
+		// config.json carries an `mcp` object, but its shape is zcode's own
+		// and no writer emits it.
+		MCP:    nil,
+		Native: NativeRails{},
+		// Per-call model/cache/token counts come off the model_usage table
+		// (one row per call; netInput = input_tokens - cache_read, the
+		// codebase-wide GROSS-input convention) — the same full per-call
+		// tier opencode's own sqlite capture carries.
+		TokenTier: TokenTier{Best: "sqlite"},
+		// db.sqlite reconstructs the full turn (messages + parts), the same
+		// tier opencode carries. Launcher `observer zcode`: --continue-from
+		// seeds a distilled handover via zcode's `--prompt` flag
+		// (LaunchSeeded).
+		Handoff: HandoffCapability{
+			Transcript: TranscriptFull,
+			Inject:     []InjectKind{InjectFile, InjectPrompt},
+			Launch:     &LaunchSpec{Subcommand: "zcode"},
+		},
+		// Attach grounded 2026-08-24 (attach-all-launchers); PTY handoff
+		// only — no prompt seeding, token capture path unchanged.
+		Attach: &AttachSpec{Subcommand: "zcode"},
+		// Native resume GROUNDED off `zcode --help` (0.16.3): `--resume
+		// <sessionId>` is a REQUIRED-value flag taking zcode's own
+		// `sess_<uuid>` verbatim (the id this adapter already keys on), so
+		// no transform.
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "zcode", IDMechanism: "flag:--resume"},
+		// Binary: install grounded 2026-08-18 (npmjs.com/package/
+		// zcode-app-cli; github.com/kingsword09/zcode-cli).
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{Unix: []string{"zcode"}, Windows: []string{"zcode.exe"}},
+			Installs: []InstallHint{
+				{OS: "linux", Channel: "npm", Argv: []string{"npm", "install", "-g", "zcode-app-cli@latest"}, Display: "npm install -g zcode-app-cli@latest"},
+				{OS: "darwin", Channel: "npm", Argv: []string{"npm", "install", "-g", "zcode-app-cli@latest"}, Display: "npm install -g zcode-app-cli@latest"},
+				{OS: "windows", Channel: "npm", Argv: []string{"npm", "install", "-g", "zcode-app-cli@latest"}, Display: "npm install -g zcode-app-cli@latest"},
+			},
+		},
+		// `zcode --help` (0.16.3) exposes no top-level --model flag, so no
+		// ModelArg is claimed.
+		Model: ModelSpec{Kind: ModelNone},
+		// Sandbox filesystem-isolation row (B9). Not grounded — only
+		// claude-code has a verified state-dir bind list.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
+	},
+	// Mistral Code (`vibe`, docs/mistral-code-adapter.md). Phase-0 grounded
+	// 2026-08-18.
+	"mistral-code": {
+		Tool: "mistral-code",
+		// 11 native tool names grounded off mapVibeTool (internal/adapter/
+		// mistralcode/adapter.go:350-378), vibe's own snake_case OpenAI-
+		// function-name vocabulary (grounded live off meta.json
+		// tools_available).
+		Vocabulary: Vocabulary{InTaxonomy: true},
+		// vibe authenticates to the Mistral API via an API key; its
+		// vibe_base_url/provider api_base override has never been driven
+		// live through the proxy, so routing it there would be a guess.
+		Proxy:       nil,
+		Routability: RouteStatusProbeRequired,
+		Hook:        HookSpec{Mechanism: HookNone},
+		// config.mcp_servers exists but no writer emits vibe's shape.
+		MCP:    nil,
+		Native: NativeRails{},
+		// Tokens are SESSION-LEVEL from meta.json/stats (session_prompt_
+		// tokens GROSS incl. cached, session_completion_tokens,
+		// session_cached_tokens, session_cost) — no per-message usage
+		// field. The adapter emits one session-level token event per
+		// session (netInput = session_prompt_tokens - session_cached_
+		// tokens), MAX-upgraded as the session grows.
+		TokenTier: TokenTier{Best: "session_meta", Gap: "no per-message usage field; one session-level token row, MAX-upgraded as the session grows"},
+		// messages.jsonl reconstructs the full turn (prompt, tool calls +
+		// results). Launcher `observer vibe`: --continue-from seeds a
+		// distilled handover as vibe's bare positional [PROMPT]
+		// (LaunchSeeded).
+		Handoff: HandoffCapability{
+			Transcript: TranscriptFull,
+			Inject:     []InjectKind{InjectFile, InjectPrompt},
+			Launch:     &LaunchSpec{Subcommand: "vibe"},
+		},
+		// Attach grounded 2026-08-24 (attach-all-launchers); PTY handoff
+		// only — no prompt seeding, token capture path unchanged.
+		Attach: &AttachSpec{Subcommand: "vibe"},
+		// Native resume operator-verified (WSL + Windows, space form):
+		// `--resume <8hex>` is a REQUIRED-value flag taking the session
+		// dir's 8-hex suffix verbatim (the id this adapter already keys
+		// on), so no transform.
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "vibe", IDMechanism: "flag:--resume"},
+		// Binary: install grounded 2026-08-18 (docs.mistral.ai;
+		// github.com/mistralai/mistral-vibe). uv-tool console script; on
+		// Windows it lands at %USERPROFILE%\.local\bin\vibe.exe.
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{Unix: []string{"vibe"}, Windows: []string{"vibe.exe"}},
+			Installs: []InstallHint{
+				{OS: "linux", Channel: "uv", Argv: []string{"uv", "tool", "install", "mistral-vibe"}, Display: "uv tool install mistral-vibe"},
+				{OS: "darwin", Channel: "uv", Argv: []string{"uv", "tool", "install", "mistral-vibe"}, Display: "uv tool install mistral-vibe"},
+				{OS: "windows", Channel: "uv", Argv: []string{"uv", "tool", "install", "mistral-vibe"}, Display: "uv tool install mistral-vibe"},
+			},
+		},
+		// `vibe --help` exposes no --model flag (model comes from
+		// config.models/--agent), so no ModelArg is claimed.
+		Model: ModelSpec{Kind: ModelNone},
+		// Sandbox filesystem-isolation row (B9). Not grounded — only
+		// claude-code has a verified state-dir bind list.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
+	},
+	// Freebuff (CodebuffAI; the Manicode -> Codebuff -> Freebuff lineage,
+	// docs/freebuff-adapter.md). Phase-0 grounded 2026-08-18. The first
+	// launchable adapter with NO token tier at all — an honest upstream
+	// ceiling, not a gap in the adapter.
+	"freebuff": {
+		Tool: "freebuff",
+		// 9 native tool names grounded off mapFreebuffTool (internal/
+		// adapter/freebuff/adapter.go, mapFreebuffTool), freebuff's own snake_case
+		// vocabulary with several Claude-Code-style aliases. The
+		// structural block-type discriminator "agent" (alongside "text"/
+		// "tool") is NOT a tool name and is deliberately excluded — same
+		// honest-zero reasoning as junie's typed block kinds.
+		Vocabulary: Vocabulary{InTaxonomy: true},
+		// freebuff authenticates to the CodebuffAI backend (`freebuff
+		// login`) with no grounded base-URL override — routing it through
+		// the proxy would be a guess.
+		Proxy:       nil,
+		Routability: RouteStatusProbeRequired,
+		Hook:        HookSpec{Mechanism: HookNone},
+		MCP:         nil,
+		Native:      NativeRails{},
+		// Freebuff records NO billable token accounting at all.
+		// run-state.json carries a running contextTokenCount, but that is a
+		// context-window size, not usage — the adapter emits sessions +
+		// actions only, zero TokenEvents. The first launchable adapter with
+		// a "none" tier: a genuine upstream gap, surfaced honestly.
+		TokenTier: TokenTier{Best: "none", Gap: "no billable usage field anywhere in the on-disk store; run-state.json's contextTokenCount is a context-window size, not usage"},
+		// chat-messages.json reconstructs the full turn (prompt, reasoning,
+		// tool calls + results). NO --continue-from seed lane: freebuff
+		// exposes no positional prompt or one-shot flag to seed
+		// (Handoff.Inject is InjectFile only; Launch.Mode=LaunchDocAssisted
+		// is the hermes/kimi precedent — the launcher writes the handover
+		// doc and opens the TUI, seeding no prompt).
+		Handoff: HandoffCapability{
+			Transcript: TranscriptFull,
+			Inject:     []InjectKind{InjectFile},
+			Launch:     &LaunchSpec{Subcommand: "freebuff", Mode: LaunchDocAssisted},
+		},
+		// Attach grounded 2026-08-24 (attach-all-launchers); PTY handoff
+		// only.
+		Attach: &AttachSpec{Subcommand: "freebuff"},
+		// Native resume grounded off `freebuff --help` (2026-08-18):
+		// `--continue [conversation-id]` is a commander.js OPTIONAL-value
+		// flag, so the joined `=` spelling is the unambiguous form (the
+		// cursor/droid shape). The id is the chat dir's RFC3339 name
+		// verbatim (the id this adapter already keys on), so no transform.
+		Resume: ResumeSpec{Kind: ResumeNative, Subcommand: "freebuff", IDMechanism: "flag:--continue"},
+		// Binary: install grounded 2026-08-18 (npm `freebuff`, every OS).
+		Binary: &BinaryResolveSpec{
+			Names: BinaryNames{Unix: []string{"freebuff"}, Windows: []string{"freebuff.exe"}},
+			Installs: []InstallHint{
+				{OS: "linux", Channel: "npm", Argv: []string{"npm", "install", "-g", "freebuff"}, Display: "npm install -g freebuff"},
+				{OS: "darwin", Channel: "npm", Argv: []string{"npm", "install", "-g", "freebuff"}, Display: "npm install -g freebuff"},
+				{OS: "windows", Channel: "npm", Argv: []string{"npm", "install", "-g", "freebuff"}, Display: "npm install -g freebuff"},
+			},
+		},
+		// `freebuff --help` (2026-08-18) exposes only `login` and
+		// `--continue` — no --model flag, so no ModelArg is claimed.
+		Model: ModelSpec{Kind: ModelNone},
+		// Sandbox filesystem-isolation row (B9). Not grounded — only
+		// claude-code has a verified state-dir bind list.
+		Sandbox: SandboxSpec{Note: "state dirs not yet grounded — not sandbox-launchable"},
+	},
 }
 
 // RegistryVersion is the version of the adapter capability registry's
@@ -2614,7 +2916,13 @@ var registry = map[string]Capability{
 // vocabulary on a wire — e.g. the G25 aggregate rail — can stamp which
 // vocabulary it was built against (design §3.2, finding #24). It versions
 // the tool NAME set only, not the content of every capability cell.
-const RegistryVersion = 1
+// Kept honest by TestRegistryVersionMovesWithVocabulary
+// (registry_version_test.go): the test pins (RegistryVersion, len(Tools()))
+// as a golden pair, so adding/removing a tool without bumping this constant
+// fails loudly. Bumped 1 → 2 on 2026-08-25 (adapter-parity audit): the
+// constant had sat at 1 through ~24 tool additions, leaving the G25
+// ConsentRegistryChanged gate inert.
+const RegistryVersion = 2
 
 // Tools returns every registered tool name, sorted. It is the canonical,
 // closed tool vocabulary (NOT config.EnabledAdapters, which is a

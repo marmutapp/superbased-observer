@@ -574,7 +574,8 @@ func (a *Adapter) parseSessionFile(ctx context.Context, path string, fromOffset 
 				// skips the merge).
 				conversationID := uuidFromFilename(path)
 				projectRoot := projectRootFromResult(&recRes, conversationID)
-				a.augmentResultFromHistory(path, conversationID, projectRoot, &recRes)
+				gitRemote := gitRemoteFromResult(&recRes, conversationID)
+				a.augmentResultFromHistory(path, conversationID, projectRoot, gitRemote, &recRes)
 				return recRes, nil
 			} else {
 				// Recovery failed too. Before falling back to the
@@ -651,7 +652,8 @@ func (a *Adapter) parseSessionFile(ctx context.Context, path string, fromOffset 
 	// logic at every event-producing exit so future flow refactors
 	// don't silently lose it.
 	projectRoot := projectRootFromResult(&res, conversationID)
-	a.augmentResultFromHistory(path, conversationID, projectRoot, &res)
+	gitRemote := gitRemoteFromResult(&res, conversationID)
+	a.augmentResultFromHistory(path, conversationID, projectRoot, gitRemote, &res)
 	return res, nil
 }
 
@@ -668,9 +670,9 @@ func (a *Adapter) parseSessionFile(ctx context.Context, path string, fromOffset 
 func (a *Adapter) recoverViaLocalGRPC(ctx context.Context, path string, fi os.FileInfo) (adapter.ParseResult, string, error) {
 	conversationID := uuidFromFilename(path)
 	idxEntry := a.lookupIndexEntry(path, conversationID)
-	projectRoot := "[antigravity]"
+	projectRoot, gitRemote := "[antigravity]", ""
 	if idxEntry != nil && idxEntry.workspaceURI != "" {
-		projectRoot = decodeFileURIToRoot(idxEntry.workspaceURI)
+		projectRoot, gitRemote = decodeFileURIToRoot(idxEntry.workspaceURI)
 	}
 	ts := time.Now().UTC()
 	if idxEntry != nil && !idxEntry.created.IsZero() {
@@ -726,7 +728,7 @@ func (a *Adapter) recoverViaLocalGRPC(ctx context.Context, path string, fi os.Fi
 				}
 				tracef("linux-native pid=%d %s OK (%d bytes, ws=%q match=%v)",
 					ls.PID, useEndpoint, len(md), ls.WorkspaceID, wsMatch)
-				enrichment := a.fetchStructuredEnrichmentNativeAt(ctx, ls, useEndpoint, conversationID, projectRoot, path)
+				enrichment := a.fetchStructuredEnrichmentNativeAt(ctx, ls, useEndpoint, conversationID, projectRoot, gitRemote, path)
 				if !enrichment.StartedAt.IsZero() {
 					ts = enrichment.StartedAt
 				}
@@ -744,7 +746,7 @@ func (a *Adapter) recoverViaLocalGRPC(ctx context.Context, path string, fi os.Fi
 					tracef("linux-native pid=%d returned wrong-workspace stub (no structured payload); trying next server", ls.PID)
 					continue
 				}
-				res := parseMarkdownConversation(path, conversationID, projectRoot, ts, a.scrubber, md, skipInline, skipUserInputs, skipPlanner)
+				res := parseMarkdownConversation(path, conversationID, projectRoot, gitRemote, ts, a.scrubber, md, skipInline, skipUserInputs, skipPlanner)
 				applyStructuredEnrichment(&res, enrichment)
 				// Project-root recovery: when idxEntry was nil
 				// (live in-progress conversation not yet in
@@ -798,7 +800,7 @@ func (a *Adapter) recoverViaLocalGRPC(ctx context.Context, path string, fi os.Fi
 		// fetch via the same bridge, ~250ms. On failure we keep the
 		// markdown result unchanged — observer still records actions,
 		// just without model attribution or token rows.
-		enrichment := a.fetchStructuredEnrichmentWSL(ctx, conversationID, projectRoot, path)
+		enrichment := a.fetchStructuredEnrichmentWSL(ctx, conversationID, projectRoot, gitRemote, path)
 		if !enrichment.StartedAt.IsZero() {
 			tracef("structured ts override: %s -> %s", ts.Format(time.RFC3339), enrichment.StartedAt.Format(time.RFC3339))
 			ts = enrichment.StartedAt
@@ -818,7 +820,7 @@ func (a *Adapter) recoverViaLocalGRPC(ctx context.Context, path string, fi os.Fi
 		skipInline := len(enrichment.ToolEvents) > 0
 		skipUserInputs := hasStructuredUserPrompts(enrichment.ToolEvents)
 		skipPlanner := structuredAssistantTextCoverage(enrichment) >= AssistantTextCoverageThreshold
-		res := parseMarkdownConversation(path, conversationID, projectRoot, ts, a.scrubber, md, skipInline, skipUserInputs, skipPlanner)
+		res := parseMarkdownConversation(path, conversationID, projectRoot, gitRemote, ts, a.scrubber, md, skipInline, skipUserInputs, skipPlanner)
 		applyStructuredEnrichment(&res, enrichment)
 		return res, "", nil
 	}
@@ -851,7 +853,7 @@ func (a *Adapter) recoverViaLocalGRPC(ctx context.Context, path string, fi os.Fi
 			continue
 		}
 		tracef("grpc pid=%d %s OK (%d bytes, ws=%q match=%v)", ls.PID, useEndpoint, len(md), ls.WorkspaceID, wsMatch)
-		enrichment := a.fetchStructuredEnrichmentNativeAt(ctx, ls, useEndpoint, conversationID, projectRoot, path)
+		enrichment := a.fetchStructuredEnrichmentNativeAt(ctx, ls, useEndpoint, conversationID, projectRoot, gitRemote, path)
 		if !enrichment.StartedAt.IsZero() {
 			ts = enrichment.StartedAt
 		}
@@ -864,7 +866,7 @@ func (a *Adapter) recoverViaLocalGRPC(ctx context.Context, path string, fi os.Fi
 		skipInline := len(enrichment.ToolEvents) > 0
 		skipUserInputs := hasStructuredUserPrompts(enrichment.ToolEvents)
 		skipPlanner := structuredAssistantTextCoverage(enrichment) >= AssistantTextCoverageThreshold
-		res := parseMarkdownConversation(path, conversationID, projectRoot, ts, a.scrubber, md, skipInline, skipUserInputs, skipPlanner)
+		res := parseMarkdownConversation(path, conversationID, projectRoot, gitRemote, ts, a.scrubber, md, skipInline, skipUserInputs, skipPlanner)
 		applyStructuredEnrichment(&res, enrichment)
 		if projectRoot == "[antigravity]" && ls.WorkspaceID != "" {
 			if resolved := a.resolveWorkspaceIDToPathCached(ls.WorkspaceID); resolved != "" {
@@ -1276,17 +1278,17 @@ func applyResolvedProjectRoot(res *adapter.ParseResult, resolved string) {
 // failure (originating agy.exe terminated, no live instance has
 // this conv) we fall back to the snapshot when one exists so token
 // rows that were ever captured stay visible across the gap.
-func (a *Adapter) fetchStructuredEnrichmentWSL(ctx context.Context, conversationID, projectRoot, path string) StructuredEnrichment {
+func (a *Adapter) fetchStructuredEnrichmentWSL(ctx context.Context, conversationID, projectRoot, gitRemote, path string) StructuredEnrichment {
 	raw, err := a.callBridgeStructuredCached(ctx, conversationID, path, 30*time.Second)
 	if err != nil {
 		tracef("structured bridge err: %v", err)
-		if cached, ok := a.loadSnapshotEnrichment(conversationID, projectRoot, path); ok {
+		if cached, ok := a.loadSnapshotEnrichment(conversationID, projectRoot, gitRemote, path); ok {
 			return cached
 		}
 		return StructuredEnrichment{}
 	}
 	tracef("structured bridge OK (%d bytes)", len(raw))
-	return a.reconcileWithSnapshot(conversationID, projectRoot, path, raw)
+	return a.reconcileWithSnapshot(conversationID, projectRoot, gitRemote, path, raw)
 }
 
 // fetchStructuredEnrichmentNativeAt is the endpoint-explicit variant
@@ -1295,7 +1297,7 @@ func (a *Adapter) fetchStructuredEnrichmentWSL(ctx context.Context, conversation
 // structured-trajectory call lands on the same endpoint that just
 // succeeded for ConvertTrajectoryToMarkdown — avoids re-iterating
 // failing protocols.
-func (a *Adapter) fetchStructuredEnrichmentNativeAt(ctx context.Context, ls LanguageServer, endpoint, conversationID, projectRoot, path string) StructuredEnrichment {
+func (a *Adapter) fetchStructuredEnrichmentNativeAt(ctx context.Context, ls LanguageServer, endpoint, conversationID, projectRoot, gitRemote, path string) StructuredEnrichment {
 	if endpoint == "" {
 		return StructuredEnrichment{}
 	}
@@ -1307,12 +1309,12 @@ func (a *Adapter) fetchStructuredEnrichmentNativeAt(ctx context.Context, ls Lang
 		// — typically because the originating language_server has
 		// terminated — surface the last successfully captured
 		// trajectory so token rows persist across the gap.
-		if cached, ok := a.loadSnapshotEnrichment(conversationID, projectRoot, path); ok {
+		if cached, ok := a.loadSnapshotEnrichment(conversationID, projectRoot, gitRemote, path); ok {
 			return cached
 		}
 		return StructuredEnrichment{}
 	}
-	en := a.reconcileWithSnapshot(conversationID, projectRoot, path, raw)
+	en := a.reconcileWithSnapshot(conversationID, projectRoot, gitRemote, path, raw)
 	tracef("structured grpc pid=%d %s OK (%d bytes, %d tools, %d tokens, model=%q)",
 		ls.PID, endpoint, len(raw), len(en.ToolEvents), len(en.TokenEvents), en.Model)
 	// Wire-shape mismatch warning (Issue #5). When the gRPC response

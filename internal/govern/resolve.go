@@ -104,8 +104,14 @@ func resolveTable() []resolveRule {
 func Resolve(spec Delivered, grant *Grant, live LiveIdentity, now time.Time) Effective {
 	in := resolveInput{spec: spec, grant: grant, live: live, now: now}
 	if grant != nil {
-		in.authority = make(map[string]bool, len(grant.Authority))
-		for _, a := range grant.Authority {
+		// Build the APPLIED authority set from HonoredAuthority, not the raw
+		// grant tokens: managed-only authorities (enforce.*/extract.managed)
+		// are stripped unless the node enrolled managed. Every directive
+		// class keyed on a managed authority is therefore tenancy-gated here,
+		// once — the individual plane can never act on one.
+		honored := HonoredAuthority(grant)
+		in.authority = make(map[string]bool, len(honored))
+		for _, a := range honored {
 			in.authority[a] = true
 		}
 	}
@@ -147,7 +153,7 @@ func applyIntersection(in resolveInput) Effective {
 			// the reason travels through unchanged rather than being
 			// relabelled.
 			e.Dropped = append(e.Dropped, Dropped{Directive: class.name, Reason: in.spec.InertReason})
-		case in.authority[class.authority]:
+		case class.authorizedBy(in):
 			class.apply(&e, in.spec.Spec)
 		default:
 			// The org asked for something this node never granted. Drop the
@@ -184,6 +190,21 @@ type directiveClass struct {
 	// not_preauthorized. Only `share` uses it today, for the retired
 	// capture.raise token.
 	dropReason func(resolveInput) string
+	// authorized, when non-nil, REPLACES the default single-token check for
+	// this class. It exists for the one class whose authority is a SET rather
+	// than a token (`share`); every other row leaves it nil and keeps the
+	// exact Phase-1a/1b semantics. Additive by construction (CLAUDE.md #6).
+	authorized func(resolveInput) bool
+}
+
+// authorizedBy answers "does this grant authorize this directive class". The
+// default is the single-token check the table has always used; a class may
+// override it with its own predicate.
+func (c directiveClass) authorizedBy(in resolveInput) bool {
+	if c.authorized != nil {
+		return c.authorized(in)
+	}
+	return in.authority[c.authority]
 }
 
 func directiveClasses() []directiveClass {
@@ -215,7 +236,42 @@ func directiveClasses() []directiveClass {
 			dropReason: notPreauthorized,
 		},
 		{
+			// The `share` class has TWO authorities, because the share block
+			// is the delivery vehicle for both DIRECTIONS of the share
+			// algebra:
+			//
+			//   capture.pin  — LOWER or pin a tier (LowerBool/LowerList),
+			//                  the individual-plane direction.
+			//   extract.*    — RAISE a tier on a MANAGED node (RaiseBool),
+			//                  the Enterprise-Managed Tenancy lift; either the
+			//                  umbrella extract.managed or any per-tier token.
+			//
+			// Either one populates e.Share. Authorizing on capture.pin ALONE
+			// (the pre-fix behaviour) dropped the whole block for a managed
+			// grant carrying only extraction authority, so RaiseBool found an
+			// empty map and managed extraction silently never applied —
+			// reported as accepted_inert while raising nothing.
+			//
+			// Widening the GATE does not widen the SEMANTICS: raise stays
+			// managed-only and per-tier because RaiseBool re-checks
+			// e.Managed, and every caller gates its own tier on the matching
+			// Effective.GrantsXxxExtraction predicate (managed AND the right
+			// token). A grant with only capture.pin therefore still lowers
+			// and raises nothing, and an individual grant never sees an
+			// extract.* token at all — HonoredAuthority strips managed-only
+			// tokens before the resolve input is built.
 			name: "share", authority: AuthorityCapturePin,
+			authorized: func(in resolveInput) bool {
+				if in.authority[AuthorityCapturePin] {
+					return true
+				}
+				for tok := range in.authority {
+					if ExtractionAuthority(tok) {
+						return true
+					}
+				}
+				return false
+			},
 			present: func(s nodegov.PolicySpec) bool { return len(s.Share) > 0 },
 			apply: func(e *Effective, s nodegov.PolicySpec) {
 				e.Share = mergeAny(e.Share, s.Share)
@@ -291,8 +347,34 @@ func (e *Effective) normalize(grant *Grant) {
 		known, unknown := splitAuthority(grant.Authority)
 		e.Authority = known
 		e.UnknownAuthority = unknown
+		e.Managed = ManagedConsent(grant.ConsentMode)
 	}
 	e.Hash = e.contentHash()
+}
+
+// HonoredAuthority returns the subset of a grant's authority tokens the node
+// will actually act on. It strips the managed-only tokens (ManagedAuthority)
+// unless the grant was recorded under managed-class consent (ManagedConsent).
+// This is THE single gate that keeps the individual plane inert against
+// enforce.*/extract.managed even if a grant somehow carries them (an older or
+// mis-configured server): every directive class keyed on a managed authority
+// is gated here, once, never re-checking tenancy per class.
+//
+// A nil grant honours nothing. Input order is preserved; callers that display
+// the set sort it themselves (splitAuthority).
+func HonoredAuthority(grant *Grant) []string {
+	if grant == nil {
+		return nil
+	}
+	managed := ManagedConsent(grant.ConsentMode)
+	out := make([]string, 0, len(grant.Authority))
+	for _, a := range grant.Authority {
+		if ManagedAuthority(a) && !managed {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
 }
 
 // splitAuthority partitions a grant's tokens into the ones this build

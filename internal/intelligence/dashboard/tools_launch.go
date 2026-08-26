@@ -35,6 +35,16 @@ func (s *Server) handleToolsLaunch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "decode body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	// W5.1 org-governed feature gate: node.features.terminals — this path
+	// spawns an embedded terminal with no sandbox lane, so it presents
+	// requestedSandbox=false (an org sandbox_required policy therefore
+	// denies it). Fail-open on nil gate / no accepted policy.
+	if s.opts.TerminalFeatureGate != nil {
+		if allowed, reason := s.opts.TerminalFeatureGate(false); !allowed {
+			http.Error(w, reason, http.StatusForbidden)
+			return
+		}
+	}
 
 	// Routed tools get a plain launch (the tool's own config reaches
 	// the proxy; native OAuth refresh stays in charge — D13); unrouted

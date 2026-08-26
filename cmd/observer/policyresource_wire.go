@@ -17,6 +17,7 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/orgcontract"
 	"github.com/marmutapp/superbased-observer/internal/policyfam"
 	"github.com/marmutapp/superbased-observer/internal/policyfam/admission"
+	"github.com/marmutapp/superbased-observer/internal/policyfam/nodefeatures"
 	"github.com/marmutapp/superbased-observer/internal/policyfam/providers"
 	"github.com/marmutapp/superbased-observer/internal/store"
 )
@@ -314,6 +315,163 @@ func applyGatewayProviders(gw *gatewayProvidersHandle, res orgclient.PolicyResou
 	gw.recordApplied(res.Version, res.BodyHash)
 }
 
+// nodeFeaturesHandle is the org-parity W5.1 install seam for the
+// node.features family (docs/plans/org-parity-full-depth-plan-2026-08-24.md
+// §4). Unlike gatewayProvidersHandle/nodeGovernanceHandle, it applies
+// nothing onto a live subsystem — the compiled spec is only ever READ, at
+// the moment of a local action, by the four dashboard enforcement seams
+// (dashboard.Options.FeatureGate / TerminalFeatureGate). So this handle is
+// simpler than its siblings: no apply/clear closures, just a mutex-guarded
+// pointer to the latest accepted spec plus enough identity to answer the
+// P0-6 policy_state effective-state row.
+//
+// A nil *nodeFeaturesHandle, or a handle holding no accepted (or an INERT)
+// spec, means every seam fail-opens — Allowed/TerminalAllowed both defer to
+// internal/policyfam/nodefeatures' own nil-spec fail-open semantics.
+type nodeFeaturesHandle struct {
+	mu    sync.Mutex
+	state nodeFeaturesState
+}
+
+// nodeFeaturesState is the org-rail half of the node.features
+// effective-state truth, mirroring gatewayProvidersState's shape.
+type nodeFeaturesState struct {
+	// hasOrgRail is true once an org-published node.features body is
+	// accepted (applied or accepted-inert); false after a clear.
+	hasOrgRail bool
+	// version / bodyHash are the accepted org resource's identity. bodyHash
+	// is the SIGNED BodyHash, never the compiled Spec.Hash — same org-rail
+	// wire rule as every other family here.
+	version  int64
+	bodyHash string
+	// inertReason is the §6.4 preauthorization inert reason on an
+	// accepted-but-not-applied body. Empty when the body is in effect.
+	inertReason string
+	// spec is the compiled decision spec, nil unless the body is actually
+	// in effect (hasOrgRail && inertReason == ""). A nil spec is exactly
+	// nodefeatures.FeatureDecision/TerminalDecision's own fail-open input,
+	// so an inert body degrades to "every seam fail-open" for free.
+	spec *nodefeatures.PolicySpec
+}
+
+// newNodeFeaturesHandle builds the daemon-lifetime install seam.
+func newNodeFeaturesHandle() *nodeFeaturesHandle {
+	return &nodeFeaturesHandle{}
+}
+
+// Allowed implements the dashboard.Options.FeatureGate closure shape:
+// (bool allowed, string reason). Nil-safe.
+func (h *nodeFeaturesHandle) Allowed(feature string) (bool, string) {
+	if h == nil {
+		return true, ""
+	}
+	h.mu.Lock()
+	spec := h.state.spec
+	h.mu.Unlock()
+	d := nodefeatures.FeatureDecision(spec, feature)
+	return d.Allowed, d.Reason
+}
+
+// TerminalAllowed implements the dashboard.Options.TerminalFeatureGate
+// closure shape: (bool allowed, string reason). Nil-safe.
+func (h *nodeFeaturesHandle) TerminalAllowed(requestedSandbox bool) (bool, string) {
+	if h == nil {
+		return true, ""
+	}
+	h.mu.Lock()
+	spec := h.state.spec
+	h.mu.Unlock()
+	d := nodefeatures.TerminalDecision(spec, requestedSandbox)
+	return d.Allowed, d.Reason
+}
+
+// Clear reverts to no accepted body — every seam fail-opens. Nil-safe.
+func (h *nodeFeaturesHandle) Clear() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.state = nodeFeaturesState{}
+	h.mu.Unlock()
+}
+
+// recordApplied stamps a body that is actually in effect.
+func (h *nodeFeaturesHandle) recordApplied(version int64, bodyHash string, spec nodefeatures.PolicySpec) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.state = nodeFeaturesState{hasOrgRail: true, version: version, bodyHash: bodyHash, spec: &spec}
+}
+
+// recordInert stamps a body that was ACCEPTED but not applied (the §6.4
+// preauthorize_enforce gate) — spec stays nil, so every seam keeps
+// fail-opening exactly as if no policy existed.
+func (h *nodeFeaturesHandle) recordInert(version int64, bodyHash, reason string) {
+	if h == nil {
+		return
+	}
+	if reason == "" {
+		reason = "not_preauthorized"
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.state = nodeFeaturesState{hasOrgRail: true, version: version, bodyHash: bodyHash, inertReason: reason}
+}
+
+// nodeFeaturesFacts is the plain snapshot the P0-6 node.features point
+// reader consumes.
+type nodeFeaturesFacts struct {
+	HasOrgRail  bool
+	Version     int64
+	BodyHash    string
+	InertReason string
+	// InEffect is true only when the body is actually in effect (not
+	// inert) — i.e. at least one seam could deny a request right now.
+	InEffect bool
+}
+
+// Facts snapshots the handle for the P0-6 reader. Nil-safe.
+func (h *nodeFeaturesHandle) Facts() nodeFeaturesFacts {
+	if h == nil {
+		return nodeFeaturesFacts{}
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return nodeFeaturesFacts{
+		HasOrgRail:  h.state.hasOrgRail,
+		Version:     h.state.version,
+		BodyHash:    h.state.bodyHash,
+		InertReason: h.state.inertReason,
+		InEffect:    h.state.spec != nil,
+	}
+}
+
+// applyNodeFeatures downcasts a compiled node.features spec and records it
+// through nf, honouring the plan §6.4 preauthorization verdict exactly like
+// applyGatewayProviders: an inert body is recorded (for the effective-state
+// row) but never actually applied, so an unpreauthorized org body cannot
+// silently start denying a dev's terminal/remote/routing-apply/
+// patterns-write requests.
+func applyNodeFeatures(nf *nodeFeaturesHandle, res orgclient.PolicyResourceResult, logger *slog.Logger) {
+	spec, ok := res.Spec.(nodefeatures.PolicySpec)
+	if !ok {
+		return
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if !res.EnforceAllowed {
+		nf.recordInert(res.Version, res.BodyHash, res.InertReason)
+		logger.Info("policy resource: node.features accepted but INERT — every gated seam stays fail-open",
+			"version", res.Version, "reason", res.InertReason)
+		return
+	}
+	nf.recordApplied(res.Version, res.BodyHash, spec)
+	logger.Info("policy resource: node.features applied", "version", res.Version)
+}
+
 // publishPolicyResourceResult dispatches one family's fetch/LKG outcome
 // onto its install seam — the ONE place both the LKG loader and the poller
 // call, so the two callers can never diverge on how a PolicyResourceResult
@@ -321,7 +479,7 @@ func applyGatewayProviders(gw *gatewayProvidersHandle, res orgclient.PolicyResou
 // egress.routing_guardrail install through *obsAdmissionHandle (nil-safe);
 // gateway.providers installs through the separate *gatewayProvidersHandle
 // (also nil-safe) since it has no obs/admission counterpart at all.
-func publishPolicyResourceResult(handle *obsAdmissionHandle, gw *gatewayProvidersHandle, ngov *nodeGovernanceHandle, family string, res orgclient.PolicyResourceResult, logger *slog.Logger) {
+func publishPolicyResourceResult(handle *obsAdmissionHandle, gw *gatewayProvidersHandle, ngov *nodeGovernanceHandle, nf *nodeFeaturesHandle, family string, res orgclient.PolicyResourceResult, logger *slog.Logger) {
 	switch res.Status {
 	case orgclient.PRApplied, orgclient.PRAppliedInert:
 		// Plan §6.10 / GWF-SF1: re-check live enrolment identity immediately
@@ -336,9 +494,9 @@ func publishPolicyResourceResult(handle *obsAdmissionHandle, gw *gatewayProvider
 		}
 		switch family {
 		case policyfam.FamilyAdmissionInput:
-			handle.PublishOrgAdmission(res.OrgKey, res.Generation, res.Version, res.BodyHash, res.InertReason, res.EnforceAllowed, res.Spec)
+			handle.PublishOrgAdmission(res.OrgKey, res.Generation, res.Version, res.BodyHash, res.InertReason, res.EnforceAllowed, managedEnforceFor(ngov, family), res.Spec)
 		case policyfam.FamilyEgressGuardrail:
-			handle.PublishOrgEgress(res.OrgKey, res.Generation, res.Version, res.BodyHash, res.InertReason, res.EnforceAllowed, res.Spec)
+			handle.PublishOrgEgress(res.OrgKey, res.Generation, res.Version, res.BodyHash, res.InertReason, res.EnforceAllowed, managedEnforceFor(ngov, family), res.Spec)
 		case policyfam.FamilyGatewayProviders:
 			applyGatewayProviders(gw, res, logger)
 		case policyfam.FamilyNodeGovernance:
@@ -347,15 +505,17 @@ func publishPolicyResourceResult(handle *obsAdmissionHandle, gw *gatewayProvider
 			// the GRANT — not this call — decides whether anything actually
 			// takes effect.
 			ngov.Apply(res)
+		case policyfam.FamilyNodeFeatures:
+			applyNodeFeatures(nf, res, logger)
 		}
 	case orgclient.PRNone:
 		// Withdrawn (404): clear any previously-installed Org layer.
-		clearOrgLayer(handle, gw, ngov, family)
+		clearOrgLayer(handle, gw, ngov, nf, family)
 	case orgclient.PRRejected:
 		// Plan §4.4: gate rejection keeps prior LKG — EXCEPT an identity
 		// change (unenrol/re-enrol), which must ClearOrg (§6.9).
 		if res.RejectCode == orgclient.PRRejectIdentityChanged {
-			clearOrgLayer(handle, gw, ngov, family)
+			clearOrgLayer(handle, gw, ngov, nf, family)
 		}
 		// PRUnchanged / PRDeliveredUnaccepted: no Org-layer mutation.
 	}
@@ -366,7 +526,7 @@ func publishPolicyResourceResult(handle *obsAdmissionHandle, gw *gatewayProvider
 // handle.ClearOrgAdmission/ClearOrgEgress and gw.Clear are all nil-safe, so
 // this never needs its own top-level nil guard: a family whose seam isn't
 // wired on this node simply no-ops.
-func clearOrgLayer(handle *obsAdmissionHandle, gw *gatewayProvidersHandle, ngov *nodeGovernanceHandle, family string) {
+func clearOrgLayer(handle *obsAdmissionHandle, gw *gatewayProvidersHandle, ngov *nodeGovernanceHandle, nf *nodeFeaturesHandle, family string) {
 	switch family {
 	case policyfam.FamilyAdmissionInput:
 		handle.ClearOrgAdmission()
@@ -376,6 +536,8 @@ func clearOrgLayer(handle *obsAdmissionHandle, gw *gatewayProvidersHandle, ngov 
 		gw.Clear()
 	case policyfam.FamilyNodeGovernance:
 		ngov.Clear()
+	case policyfam.FamilyNodeFeatures:
+		nf.Clear()
 	}
 }
 
@@ -397,8 +559,8 @@ type policyResourceOutcomeSink func(family string, o orgclient.PolicyResourceFet
 // dashboard. gw may be nil (gateway.providers not appliable on this node,
 // e.g. the no_obs build or a node with no proxy wired) — every downstream
 // call is nil-safe.
-func runPolicyResourcePoller(ctx context.Context, cfg config.Config, oc *orgclient.Client, handle *obsAdmissionHandle, gw *gatewayProvidersHandle, ngov *nodeGovernanceHandle, sink policyResourceOutcomeSink, logger *slog.Logger) {
-	if oc == nil || (handle == nil && gw == nil && ngov == nil) {
+func runPolicyResourcePoller(ctx context.Context, cfg config.Config, oc *orgclient.Client, handle *obsAdmissionHandle, gw *gatewayProvidersHandle, ngov *nodeGovernanceHandle, nf *nodeFeaturesHandle, sink policyResourceOutcomeSink, logger *slog.Logger) {
+	if oc == nil || (handle == nil && gw == nil && ngov == nil && nf == nil) {
 		return
 	}
 	if logger == nil {
@@ -411,7 +573,7 @@ func runPolicyResourcePoller(ctx context.Context, cfg config.Config, oc *orgclie
 		case errors.Is(pr.Err, orgclient.ErrNotEnrolled):
 			// Plan §6.9 + Codex SF4: clear Org layer AND let Classify emit
 			// Cleared so the outcome sink wipes stale reject/unreachable slots.
-			clearOrgLayer(handle, gw, ngov, pr.Family)
+			clearOrgLayer(handle, gw, ngov, nf, pr.Family)
 		case pr.Err != nil:
 			// Transport/auth/indeterminate failure: leave whatever is
 			// currently installed alone — a transient unreachability
@@ -421,7 +583,7 @@ func runPolicyResourcePoller(ctx context.Context, cfg config.Config, oc *orgclie
 			// on a decisive fetch outcome. PolicyResourcePollLoop already
 			// logs the failure.
 		default:
-			publishPolicyResourceResult(handle, gw, ngov, pr.Family, pr.Result, logger)
+			publishPolicyResourceResult(handle, gw, ngov, nf, pr.Family, pr.Result, logger)
 		}
 		// Apply-then-poke: classify AFTER the Org-layer mutation so the
 		// reporter's next snapshot observes the post-apply state.
@@ -546,6 +708,30 @@ func policyResourceEnforceGate(family string, spec any, preauthorizeEnforce []st
 	return true, ""
 }
 
+// managedEnforceFor resolves the Arc 4 P3 §R23 lift for one family: true only
+// when the node enrolled under Enterprise-Managed Tenancy AND the live grant
+// carries that family's enforce.* authority. This is the ONE place the govern
+// enforcement predicates meet the admission/egress publish path; the resolved
+// bool travels onto OrgLayerMeta.ManagedEnforce so obs never imports govern.
+// A nil handle (no governance) or the individual plane both yield false, so an
+// unmanaged node's enforcement stays entirely node-owned ("never
+// server-forced"). Only admission.input and egress.routing_guardrail have a
+// managed-enforce lift here; routing is lifted separately (routing_live), and
+// gateway.providers/node.governance are not §R23-gated.
+func managedEnforceFor(ngov *nodeGovernanceHandle, family string) bool {
+	if ngov == nil {
+		return false
+	}
+	eff := ngov.Effective(context.Background())
+	switch family {
+	case policyfam.FamilyAdmissionInput:
+		return eff.GrantsAdmissionEnforcement()
+	case policyfam.FamilyEgressGuardrail:
+		return eff.GrantsEgressEnforcement()
+	}
+	return false
+}
+
 func containsString(s string, set []string) bool {
 	for _, v := range set {
 		if v == s {
@@ -577,7 +763,7 @@ func capabilitiesSubsetLKG(required, live []string) bool {
 // (matrix rows 3/4) as the family's Org layer, after re-applying the same
 // accept_families / runtime-capability gates live accept uses (plan §4.4 /
 // §6.6 — LKG must not resurrect a withdrawn or unrealizable envelope).
-func installPolicyResourceLKG(family, orgKey string, generation int64, opts orgclient.PolicyResourceOptions, cached verifiedCachedResource, handle *obsAdmissionHandle, gw *gatewayProvidersHandle, ngov *nodeGovernanceHandle, logger *slog.Logger) {
+func installPolicyResourceLKG(family, orgKey string, generation int64, opts orgclient.PolicyResourceOptions, cached verifiedCachedResource, handle *obsAdmissionHandle, gw *gatewayProvidersHandle, ngov *nodeGovernanceHandle, nf *nodeFeaturesHandle, logger *slog.Logger) {
 	if !containsString(family, opts.AcceptFamilies) {
 		logger.Info("policy resource LKG: family not in accept_families — leaving uninstalled", "family", family)
 		return
@@ -598,7 +784,7 @@ func installPolicyResourceLKG(family, orgKey string, generation int64, opts orgc
 	if !enforceAllowed {
 		status = orgclient.PRAppliedInert
 	}
-	publishPolicyResourceResult(handle, gw, ngov, family, orgclient.PolicyResourceResult{
+	publishPolicyResourceResult(handle, gw, ngov, nf, family, orgclient.PolicyResourceResult{
 		Status: status, Version: cached.resource.Version, EnforceAllowed: enforceAllowed,
 		InertReason: inertReason, Family: family, OrgKey: orgKey, Generation: generation,
 		BodyHash: cached.resource.BodyHash, Spec: cached.spec,
@@ -615,7 +801,7 @@ func installPolicyResourceLKG(family, orgKey string, generation int64, opts orgc
 // envelope's own version/hash/digest, then installed. Re-validates identity
 // and the floor INSIDE the fence (a concurrent writer may have already
 // caught up), matching store.WithPolicyResourceFence's own contract.
-func repairAndInstallPolicyResourceLKG(ctx context.Context, st *store.Store, orgKey string, generation int64, family string, opts orgclient.PolicyResourceOptions, cached verifiedCachedResource, handle *obsAdmissionHandle, gw *gatewayProvidersHandle, ngov *nodeGovernanceHandle, logger *slog.Logger) {
+func repairAndInstallPolicyResourceLKG(ctx context.Context, st *store.Store, orgKey string, generation int64, family string, opts orgclient.PolicyResourceOptions, cached verifiedCachedResource, handle *obsAdmissionHandle, gw *gatewayProvidersHandle, ngov *nodeGovernanceHandle, nf *nodeFeaturesHandle, logger *slog.Logger) {
 	commit := store.PolicyResourceCommit{
 		Generation: generation, FloorVersion: cached.resource.Version, LastVersion: cached.resource.Version,
 		BodyHash: cached.resource.BodyHash, MsgDigest: cached.digest,
@@ -641,7 +827,7 @@ func repairAndInstallPolicyResourceLKG(ctx context.Context, st *store.Store, org
 		logger.Info("policy resource LKG: repair aborted (identity/floor raced) — leaving family uninstalled", "family", family)
 		return
 	}
-	installPolicyResourceLKG(family, orgKey, generation, opts, cached, handle, gw, ngov, logger)
+	installPolicyResourceLKG(family, orgKey, generation, opts, cached, handle, gw, ngov, nf, logger)
 }
 
 // refetchPolicyResourceLKG runs matrix rows 1/2: the on-disk cache is
@@ -652,17 +838,17 @@ func repairAndInstallPolicyResourceLKG(ctx context.Context, st *store.Store, org
 // must be re-verified from scratch). A refetch failure leaves the family
 // with no Org layer (Local/nil), reporting none/no_policy — never
 // pending_restart.
-func refetchPolicyResourceLKG(ctx context.Context, oc *orgclient.Client, st *store.Store, opts orgclient.PolicyResourceOptions, orgKey string, generation int64, family string, handle *obsAdmissionHandle, gw *gatewayProvidersHandle, ngov *nodeGovernanceHandle, logger *slog.Logger) {
+func refetchPolicyResourceLKG(ctx context.Context, oc *orgclient.Client, st *store.Store, opts orgclient.PolicyResourceOptions, orgKey string, generation int64, family string, handle *obsAdmissionHandle, gw *gatewayProvidersHandle, ngov *nodeGovernanceHandle, nf *nodeFeaturesHandle, logger *slog.Logger) {
 	if err := st.SavePolicyResourceETag(ctx, orgKey, generation, family, ""); err != nil {
 		logger.Warn("policy resource LKG: etag clear failed (refetch may still hit a stale 304)", "family", family, "err", err)
 	}
 	res, err := oc.FetchAndAcceptPolicyResource(ctx, family, opts)
 	if err != nil {
 		logger.Warn("policy resource LKG: refetch failed — booting with no Org layer for this family", "family", family, "err", err)
-		clearOrgLayer(handle, gw, ngov, family)
+		clearOrgLayer(handle, gw, ngov, nf, family)
 		return
 	}
-	publishPolicyResourceResult(handle, gw, ngov, family, res, logger)
+	publishPolicyResourceResult(handle, gw, ngov, nf, family, res, logger)
 	logger.Info("policy resource LKG: refetch outcome", "family", family, "status", res.Status)
 }
 
@@ -671,7 +857,7 @@ func refetchPolicyResourceLKG(ctx context.Context, oc *orgclient.Client, st *sto
 // (floor_version, msg_digest) state row, and either install it as-is,
 // repair the DB and install, or force a refetch — never installing a
 // cryptographically valid cache that sits below the durable replay floor.
-func loadPolicyResourceLKGFamily(ctx context.Context, oc *orgclient.Client, st *store.Store, opts orgclient.PolicyResourceOptions, orgURL, orgKey string, generation int64, family string, handle *obsAdmissionHandle, gw *gatewayProvidersHandle, ngov *nodeGovernanceHandle, logger *slog.Logger) {
+func loadPolicyResourceLKGFamily(ctx context.Context, oc *orgclient.Client, st *store.Store, opts orgclient.PolicyResourceOptions, orgURL, orgKey string, generation int64, family string, handle *obsAdmissionHandle, gw *gatewayProvidersHandle, ngov *nodeGovernanceHandle, nf *nodeFeaturesHandle, logger *slog.Logger) {
 	cachePath := filepath.Join(opts.CacheDir, orgKey, strconv.FormatInt(generation, 10), family+".json")
 	cached, cacheErr := verifyCachedPolicyResource(ctx, st, orgURL, family, cachePath, opts.NodeAttrs)
 
@@ -684,17 +870,17 @@ func loadPolicyResourceLKGFamily(ctx context.Context, oc *orgclient.Client, st *
 	switch {
 	case cacheErr != nil:
 		// Row 1: no verified cache — force a refetch.
-		refetchPolicyResourceLKG(ctx, oc, st, opts, orgKey, generation, family, handle, gw, ngov, logger)
+		refetchPolicyResourceLKG(ctx, oc, st, opts, orgKey, generation, family, handle, gw, ngov, nf, logger)
 	case !hasState:
 		// No durable floor at all (implicitly 0): a verified cache with
 		// version > 0 is ahead of it — same repair-then-install path as
 		// row 4 below.
-		repairAndInstallPolicyResourceLKG(ctx, st, orgKey, generation, family, opts, cached, handle, gw, ngov, logger)
+		repairAndInstallPolicyResourceLKG(ctx, st, orgKey, generation, family, opts, cached, handle, gw, ngov, nf, logger)
 	case cached.resource.Version < stateRow.FloorVersion,
 		cached.resource.Version == stateRow.FloorVersion && cached.digest != stateRow.MsgDigest:
 		// Row 2: cache behind the durable floor, or an equal-version
 		// digest mismatch (replay/corruption) — never install; refetch.
-		refetchPolicyResourceLKG(ctx, oc, st, opts, orgKey, generation, family, handle, gw, ngov, logger)
+		refetchPolicyResourceLKG(ctx, oc, st, opts, orgKey, generation, family, handle, gw, ngov, nf, logger)
 	case cached.resource.Version == stateRow.FloorVersion:
 		// Row 3: cache matches the durable floor exactly — install as-is,
 		// but only when the state row's generation still matches the live
@@ -705,10 +891,10 @@ func loadPolicyResourceLKGFamily(ctx context.Context, oc *orgclient.Client, st *
 				"state_gen", stateRow.Generation, "live_gen", generation)
 			return
 		}
-		installPolicyResourceLKG(family, orgKey, generation, opts, cached, handle, gw, ngov, logger)
+		installPolicyResourceLKG(family, orgKey, generation, opts, cached, handle, gw, ngov, nf, logger)
 	default: // cached.resource.Version > stateRow.FloorVersion
 		// Row 4: cache ahead of the durable floor — repair, then install.
-		repairAndInstallPolicyResourceLKG(ctx, st, orgKey, generation, family, opts, cached, handle, gw, ngov, logger)
+		repairAndInstallPolicyResourceLKG(ctx, st, orgKey, generation, family, opts, cached, handle, gw, ngov, nf, logger)
 	}
 }
 
@@ -723,8 +909,8 @@ func loadPolicyResourceLKGFamily(ctx context.Context, oc *orgclient.Client, st *
 // appliable on this node) — the loop still runs for admission/egress in
 // that case, and vice versa: a nil handle with a non-nil gw still lets
 // gateway.providers load.
-func loadPolicyResourceLKG(ctx context.Context, cfg config.Config, oc *orgclient.Client, st *store.Store, handle *obsAdmissionHandle, gw *gatewayProvidersHandle, ngov *nodeGovernanceHandle, logger *slog.Logger) {
-	if oc == nil || (handle == nil && gw == nil && ngov == nil) {
+func loadPolicyResourceLKG(ctx context.Context, cfg config.Config, oc *orgclient.Client, st *store.Store, handle *obsAdmissionHandle, gw *gatewayProvidersHandle, ngov *nodeGovernanceHandle, nf *nodeFeaturesHandle, logger *slog.Logger) {
+	if oc == nil || (handle == nil && gw == nil && ngov == nil && nf == nil) {
 		return
 	}
 	if logger == nil {
@@ -741,6 +927,6 @@ func loadPolicyResourceLKG(ctx context.Context, cfg config.Config, oc *orgclient
 	}
 	opts := policyResourceOptionsFor(cfg)
 	for _, family := range policyfam.SupportedFamilies {
-		loadPolicyResourceLKGFamily(ctx, oc, st, opts, enr.OrgServerURL, orgKey, genRow.Generation, family, handle, gw, ngov, logger)
+		loadPolicyResourceLKGFamily(ctx, oc, st, opts, enr.OrgServerURL, orgKey, genRow.Generation, family, handle, gw, ngov, nf, logger)
 	}
 }

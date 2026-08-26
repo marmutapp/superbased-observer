@@ -66,6 +66,27 @@ type WhoAmI = { authenticated?: boolean; csrf?: string };
 // lost session would fight the pairing gate for the screen (or recurse).
 const AUTH_PATHS = ["/api/remote/pair", "/api/remote/whoami"];
 
+// The owner-local management routes use one readable double-submit cookie for
+// every privileged panel. Several panels can mount together (Terminals loads
+// launch policy + sandbox settings in parallel), and an older daemon may rotate
+// that cookie on each GET. A token copied from a sibling response can therefore
+// be stale by the time its Save button is clicked. The cookie is deliberately
+// readable so the SPA can echo it; always prefer its CURRENT value at mutation
+// time. Newer daemons also reuse a valid cookie, making both sides convergent.
+const LOCAL_CONFIRM_COOKIE = "sb_remote_confirm";
+
+function currentLocalConfirmToken(fallback: string): string {
+  if (typeof document === "undefined") return fallback;
+  const prefix = `${LOCAL_CONFIRM_COOKIE}=`;
+  for (const part of document.cookie.split(";")) {
+    const item = part.trim();
+    if (!item.startsWith(prefix)) continue;
+    const value = item.slice(prefix.length).trim();
+    return value || fallback;
+  }
+  return fallback;
+}
+
 function isAuthEndpoint(path: string): boolean {
   return AUTH_PATHS.some((p) => path === p || path.startsWith(`${p}?`));
 }
@@ -131,6 +152,14 @@ export async function fetchJSON<T>(
   const buildInit = (csrfValue: string): RequestInit => {
     const headers = new Headers(init?.headers);
     headers.set("Accept", "application/json");
+    // Replace a response-captured owner-local confirm token with the latest
+    // cookie value immediately before fetch. This closes cross-panel rotation
+    // races without weakening the server's constant-time double-submit check.
+    const suppliedConfirm = headers.get("X-Observer-Confirm");
+    if (suppliedConfirm !== null) {
+      const currentConfirm = currentLocalConfirmToken(suppliedConfirm);
+      if (currentConfirm) headers.set("X-Observer-Confirm", currentConfirm);
+    }
     if (needsRemoteCSRF && csrfValue) headers.set("X-Remote-CSRF", csrfValue);
     return { ...init, headers };
   };

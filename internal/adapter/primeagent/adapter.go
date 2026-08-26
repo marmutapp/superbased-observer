@@ -207,6 +207,10 @@ type parseState struct {
 	// header's git block, refined by git.Resolve when it disagrees.
 	cwd    string
 	branch string
+	// remote is the normalized git remote, resolved alongside the project
+	// root (see projectRoot). Unlike branch, this comes ONLY from
+	// git.Resolve, not the header's own git block.
+	remote string
 	// rootCache memoizes cwd → resolved project root (git.Resolve walks
 	// the filesystem and one transcript shares one cwd throughout).
 	rootCache map[string]string
@@ -303,6 +307,7 @@ func (st *parseState) emitSessionStart(rec *rawLine, res *adapter.ParseResult) {
 		ProjectRoot:   st.projectRoot(),
 		Timestamp:     parseTimestamp(rec.Timestamp),
 		GitBranch:     st.branch,
+		GitRemote:     st.remote,
 		Tool:          models.ToolPrimeAgent,
 		ActionType:    models.ActionSessionStart,
 		Target:        "startup",
@@ -350,6 +355,7 @@ func (st *parseState) emitUserPrompt(rec *rawLine, msg *agentMessage, lineNum in
 		ProjectRoot:   st.projectRoot(),
 		Timestamp:     ts,
 		GitBranch:     st.branch,
+		GitRemote:     st.remote,
 		Model:         st.modelString(msg),
 		Tool:          models.ToolPrimeAgent,
 		ActionType:    models.ActionUserPrompt,
@@ -389,6 +395,7 @@ func (st *parseState) emitAssistant(rec *rawLine, msg *agentMessage, lineNum int
 			ProjectRoot:        root,
 			Timestamp:          ts,
 			GitBranch:          st.branch,
+			GitRemote:          st.remote,
 			Model:              model,
 			Tool:               models.ToolPrimeAgent,
 			ActionType:         mapToolName(call.Name),
@@ -420,6 +427,7 @@ func (st *parseState) emitAssistant(rec *rawLine, msg *agentMessage, lineNum int
 			ProjectRoot:        root,
 			Timestamp:          ts,
 			GitBranch:          st.branch,
+			GitRemote:          st.remote,
 			Model:              model,
 			Tool:               models.ToolPrimeAgent,
 			ActionType:         models.ActionAssistantMessage,
@@ -458,6 +466,7 @@ func (st *parseState) emitTerminal(rec *rawLine, msg *agentMessage, lineNum int,
 		ProjectRoot:        root,
 		Timestamp:          ts,
 		GitBranch:          st.branch,
+		GitRemote:          st.remote,
 		Model:              model,
 		Tool:               models.ToolPrimeAgent,
 		ActionType:         action,
@@ -482,6 +491,7 @@ func (st *parseState) emitUsage(rec *rawLine, msg *agentMessage, lineNum int, ts
 		SessionID:     st.sessionID,
 		ProjectRoot:   root,
 		GitBranch:     st.branch,
+		GitRemote:     st.remote,
 		Timestamp:     ts,
 		Tool:          models.ToolPrimeAgent,
 		Model:         model,
@@ -527,6 +537,7 @@ func (st *parseState) emitChildUsage(rec *rawLine, res *adapter.ParseResult) {
 		SessionID:           st.sessionID,
 		ProjectRoot:         st.projectRoot(),
 		GitBranch:           st.branch,
+		GitRemote:           st.remote,
 		Timestamp:           mark.ts,
 		Tool:                models.ToolPrimeAgent,
 		Model:               mark.model,
@@ -585,6 +596,7 @@ func (st *parseState) emitBashExecution(rec *rawLine, msg *agentMessage, lineNum
 		ProjectRoot:   st.projectRoot(),
 		Timestamp:     ts,
 		GitBranch:     st.branch,
+		GitRemote:     st.remote,
 		Model:         st.modelString(msg),
 		Tool:          models.ToolPrimeAgent,
 		ActionType:    models.ActionRunCommand,
@@ -609,6 +621,7 @@ func (st *parseState) emitCompaction(rec *rawLine, lineNum int, res *adapter.Par
 		ProjectRoot:   st.projectRoot(),
 		Timestamp:     parseTimestamp(rec.Timestamp),
 		GitBranch:     st.branch,
+		GitRemote:     st.remote,
 		Model:         st.modelString(nil),
 		Tool:          models.ToolPrimeAgent,
 		ActionType:    models.ActionContextCompacted,
@@ -631,6 +644,7 @@ func (st *parseState) emitCompactionSummaryMessage(rec *rawLine, msg *agentMessa
 		ProjectRoot:   st.projectRoot(),
 		Timestamp:     ts,
 		GitBranch:     st.branch,
+		GitRemote:     st.remote,
 		Model:         st.modelString(msg),
 		Tool:          models.ToolPrimeAgent,
 		ActionType:    models.ActionContextCompacted,
@@ -666,6 +680,7 @@ func (st *parseState) projectRoot() string {
 	if info.Branch != "" {
 		st.branch = info.Branch
 	}
+	st.remote = git.NormalizeRemote(info.Remote)
 	return info.Root
 }
 

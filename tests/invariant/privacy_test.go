@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"database/sql"
 	"encoding/json"
 	"go/ast"
 	"go/parser"
@@ -534,6 +535,751 @@ func TestPushPayloadCarriesContentWhenOptedIn(t *testing.T) {
 	}
 }
 
+// TestPushPayloadCarriesToolBodiesWhenOptedIn is the Arc 4 P2 extraction tier:
+// under the DISTINCT full_tool_bodies opt-in, the four actions body columns
+// (raw_tool_input, raw_tool_output, preceding_reasoning, error_message) — which
+// TestPushPayloadCarriesContentWhenOptedIn proves NEVER ship under
+// full_content/admin_managed alone — DO ship. And because the tier is
+// orthogonal to shipsRawContent(), the path/target columns must STILL be
+// stripped (full_tool_bodies grants bodies, not paths). Together with the two
+// tests above this pins the granularity: bodies ⟺ full_tool_bodies, paths ⟺
+// full_content, and neither leaks the other.
+//
+// The managed remote-RAISE of this tier is exercised at the govern layer
+// (RaiseBool gated on Effective.Managed) + cmd/observer (lowerShareOptions);
+// here we pin the wire seam given the resolved ShareOptions, which is where the
+// individual-plane guarantee ultimately lands.
+func TestPushPayloadCarriesToolBodiesWhenOptedIn(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "agent.db")})
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	st := store.New(database)
+	seed(ctx, t, st)
+
+	if _, err := database.ExecContext(ctx,
+		`UPDATE actions SET raw_tool_input = ?, raw_tool_output = ?, preceding_reasoning = ?, error_message = ?, target = ?, source_file = ?`,
+		secRawInput, secRawOutput, secReasoning, secErrMsg, secTarget, secSourceFile); err != nil {
+		t.Fatalf("stuff actions: %v", err)
+	}
+
+	batch, err := st.SelectUnpushedSince(ctx, store.PushCursor{}, 1<<20, "org-1", "dev@acme.example",
+		store.ShareOptions{FullToolBodies: true}, store.ScopeOptions{})
+	if err != nil {
+		t.Fatalf("SelectUnpushedSince: %v", err)
+	}
+	raw, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatalf("marshal batch: %v", err)
+	}
+
+	// The four body columns MUST ship under this tier.
+	for _, s := range []string{secRawInput, secRawOutput, secReasoning, secErrMsg} {
+		if !bytes.Contains(raw, []byte(s)) {
+			t.Errorf("body column %q did NOT ship under full_tool_bodies — the tier failed to flip the seam", s)
+		}
+	}
+	// Paths/targets are a DIFFERENT tier (shipsRawContent) — full_tool_bodies
+	// must not leak them.
+	for _, s := range []string{secTarget, secSourceFile} {
+		if bytes.Contains(raw, []byte(s)) {
+			t.Errorf("path/target %q leaked under full_tool_bodies — the tier is orthogonal to full_content and must not ship paths", s)
+		}
+	}
+}
+
+// seedCacheEvents inserts one cache_events row with a sentinel model, so a
+// SelectUnpushedSince batch can be searched for whether the P5c cache aggregate
+// shipped. cache_segments/entries/events stay NODE-LOCAL; only the content-free
+// (day, model, kind) aggregate crosses the wire, and only under cache_detail.
+func seedCacheEvents(ctx context.Context, t *testing.T, database *sql.DB, model string) {
+	t.Helper()
+	ts := time.Now().UTC().Format(time.RFC3339)
+	if _, err := database.ExecContext(ctx,
+		`INSERT INTO cache_events (session_id, tier, timestamp, model, kind, tokens_read, tokens_written, cost_delta_usd)
+		 VALUES ('sess-cc-1', 'proxy', ?, ?, 'hit', 4000, 0, -0.012)`, ts, model); err != nil {
+		t.Fatalf("seed cache_events: %v", err)
+	}
+}
+
+// TestPushPayloadCarriesCacheWhenOptedIn is the Arc 4 P5c extraction tier: under
+// the DISTINCT cache_detail opt-in, the node-local cache_events log ships as a
+// content-free (day × model × kind) aggregate. The cache_* table NAMES still
+// never appear in orgpush.go (SelectCacheSummaries owns the read in a separate
+// file — TestSelectUnpushedSinceExcludesCacheTables guards that); this proves
+// the aggregate itself flips onto the wire under the tier.
+func TestPushPayloadCarriesCacheWhenOptedIn(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "agent.db")})
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	st := store.New(database)
+	seed(ctx, t, st)
+	const secCacheModel = "SENTINEL_CACHE_MODEL_pangram_zz"
+	seedCacheEvents(ctx, t, database, secCacheModel)
+
+	batch, err := st.SelectUnpushedSince(ctx, store.PushCursor{}, 1<<20, "org-1", "dev@acme.example",
+		store.ShareOptions{CacheDetail: true}, store.ScopeOptions{})
+	if err != nil {
+		t.Fatalf("SelectUnpushedSince: %v", err)
+	}
+	if len(batch.CacheSummaries) == 0 {
+		t.Fatal("cache_detail opt-in shipped no CacheSummaries — the tier failed to flip the seam")
+	}
+	raw, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatalf("marshal batch: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(secCacheModel)) {
+		t.Error("cache aggregate did NOT ship under cache_detail — the tier failed to flip the seam")
+	}
+}
+
+// TestPushPayloadStripsCacheWhenNotOptedIn is the other side of the tier: with
+// cache_detail OFF, the fleet cache aggregate must NOT ship — not even under
+// full_content (maximum path/content disclosure). cache_detail is a DISTINCT
+// tier, orthogonal to shipsRawContent().
+//
+// Org-parity W2.1 nuance (plan §0/§3.1, 2026-08-24): the SESSION-scoped cache
+// summary (SessionCacheSummaries) is a separate wire that deliberately rides
+// shipsRawContent() — full_content / admin_managed nodes DO ship per-session
+// cache buckets (model included). So under full_content-only the batch-wide
+// byte-scan for the sentinel model is scoped to exclude that legitimate wire;
+// the zero-value (metadata-only, TEAMS default) case still byte-scans the
+// ENTIRE batch — nothing cache-shaped may cross there, which is the guard
+// that actually protects the teams tier.
+func TestPushPayloadStripsCacheWhenNotOptedIn(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "agent.db")})
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	st := store.New(database)
+	seed(ctx, t, st)
+	const secCacheModel = "SENTINEL_CACHE_MODEL_pangram_zz"
+	seedCacheEvents(ctx, t, database, secCacheModel)
+
+	for _, tc := range []struct {
+		name  string
+		share store.ShareOptions
+	}{
+		{"zero-value", store.ShareOptions{}},
+		{"full_content-only", store.ShareOptions{FullContent: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			batch, err := st.SelectUnpushedSince(ctx, store.PushCursor{}, 1<<20, "org-1", "dev@acme.example", tc.share, store.ScopeOptions{})
+			if err != nil {
+				t.Fatalf("SelectUnpushedSince: %v", err)
+			}
+			if len(batch.CacheSummaries) != 0 {
+				t.Errorf("cache aggregate shipped under %s (cache_detail OFF) — the cache tier must be orthogonal and opt-in", tc.name)
+			}
+			if tc.share.FullContent {
+				// full_content legitimately ships the W2.1 session-scoped
+				// cache wire (model included) — scope the leak scan to the
+				// batch WITHOUT that wire so the fleet cache_detail tier
+				// stays pinned orthogonal.
+				if len(batch.SessionCacheSummaries) == 0 {
+					t.Error("full_content shipped no session cache wire — the W2.1 enterprise wire failed to flip")
+				}
+				batch.SessionCacheSummaries = nil
+			} else if len(batch.SessionCacheSummaries) != 0 {
+				t.Errorf("session cache wire shipped under %s (metadata-only) — it must ride shipsRawContent only", tc.name)
+			}
+			raw, err := json.Marshal(batch)
+			if err != nil {
+				t.Fatalf("marshal batch: %v", err)
+			}
+			if bytes.Contains(raw, []byte(secCacheModel)) {
+				t.Errorf("cache model leaked under %s without cache_detail", tc.name)
+			}
+		})
+	}
+}
+
+// seedCodeintel inserts one codeintel file + symbol + edge whose project path
+// and symbol name are sentinels, so a SelectUnpushedSince batch can be searched
+// both for whether the P5f codeintel-detail aggregate shipped AND for whether
+// any raw source identity leaked. codeintel_* stays NODE-LOCAL; only the
+// content-free per (project-HASH × lang) file/symbol/edge count aggregate
+// crosses, and only under codeintel_detail — the project path is hashed and the
+// symbol name is never shipped.
+func seedCodeintel(ctx context.Context, t *testing.T, database *sql.DB, project, symbol string) {
+	t.Helper()
+	res, err := database.ExecContext(ctx,
+		`INSERT INTO codeintel_files (project, path, lang, status) VALUES (?, ?, 'go', 'indexed')`,
+		project, project+"/main.go")
+	if err != nil {
+		t.Fatalf("seed codeintel_files: %v", err)
+	}
+	fileID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("codeintel_files last id: %v", err)
+	}
+	if _, err := database.ExecContext(ctx,
+		`INSERT INTO codeintel_nodes (project, file_id, kind, name, fqn, lang) VALUES (?, ?, 'function', ?, ?, 'go')`,
+		project, fileID, symbol, symbol); err != nil {
+		t.Fatalf("seed codeintel_nodes: %v", err)
+	}
+	if _, err := database.ExecContext(ctx,
+		`INSERT INTO codeintel_edges (project, file_id, src_id, dst_id, kind) VALUES (?, ?, 0, 0, 'CALLS')`,
+		project, fileID); err != nil {
+		t.Fatalf("seed codeintel_edges: %v", err)
+	}
+}
+
+// TestPushPayloadCarriesCodeintelWhenOptedIn is the Arc 4 P5f extraction tier:
+// under the DISTINCT codeintel_detail opt-in, the node-local codeintel index
+// ships as a content-free per (project-HASH × language) file/symbol/edge count
+// aggregate. Two properties are proven together: (1) the tier FLIPS the seam
+// (CodeintelSummaries is non-empty and the ProjectHash is a hash, not the raw
+// path); and (2) even when it ships, NO raw source identity crosses — neither
+// the project path nor the symbol name appears in the marshalled batch. The
+// codeintel_* table NAMES still never appear in orgpush.go (SelectCodeintelSummaries
+// owns the read in a separate file — TestSelectUnpushedSinceExcludesCacheTables
+// guards that).
+func TestPushPayloadCarriesCodeintelWhenOptedIn(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "agent.db")})
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	st := store.New(database)
+	seed(ctx, t, st)
+	const (
+		secProject = "SENTINEL_CODEINTEL_PROJECT_pangram_zz"
+		secSymbol  = "SENTINEL_CODEINTEL_SYMBOL_pangram_zz"
+	)
+	seedCodeintel(ctx, t, database, secProject, secSymbol)
+
+	batch, err := st.SelectUnpushedSince(ctx, store.PushCursor{}, 1<<20, "org-1", "dev@acme.example",
+		store.ShareOptions{CodeintelDetail: true}, store.ScopeOptions{})
+	if err != nil {
+		t.Fatalf("SelectUnpushedSince: %v", err)
+	}
+	if len(batch.CodeintelSummaries) == 0 {
+		t.Fatal("codeintel_detail opt-in shipped no CodeintelSummaries — the tier failed to flip the seam")
+	}
+	// The project path must be HASHED, never raw.
+	for _, r := range batch.CodeintelSummaries {
+		if r.ProjectHash == "" {
+			t.Error("CodeintelSummaryRow.ProjectHash is empty — the project must ship as a hash")
+		}
+		if r.ProjectHash == secProject {
+			t.Error("CodeintelSummaryRow.ProjectHash is the RAW project path — it must be hashed")
+		}
+	}
+	raw, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatalf("marshal batch: %v", err)
+	}
+	// Content-free even when shipped: no raw path, no symbol name.
+	if bytes.Contains(raw, []byte(secProject)) {
+		t.Error("raw project path leaked into the codeintel aggregate — it must ship only as a hash")
+	}
+	if bytes.Contains(raw, []byte(secSymbol)) {
+		t.Error("symbol name leaked into the codeintel aggregate — only structure counts may ship")
+	}
+}
+
+// TestPushPayloadStripsCodeintelWhenNotOptedIn is the other side of the tier:
+// with codeintel_detail OFF, the aggregate must NOT ship — not even under
+// full_content (maximum path/content disclosure). codeintel_detail is a DISTINCT
+// tier, orthogonal to shipsRawContent(), and raised only by the DISTINCT
+// extract.codeintel authority on a managed node.
+func TestPushPayloadStripsCodeintelWhenNotOptedIn(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "agent.db")})
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	st := store.New(database)
+	seed(ctx, t, st)
+	const (
+		secProject = "SENTINEL_CODEINTEL_PROJECT_pangram_zz"
+		secSymbol  = "SENTINEL_CODEINTEL_SYMBOL_pangram_zz"
+	)
+	seedCodeintel(ctx, t, database, secProject, secSymbol)
+
+	for _, tc := range []struct {
+		name  string
+		share store.ShareOptions
+	}{
+		{"zero-value", store.ShareOptions{}},
+		{"full_content-only", store.ShareOptions{FullContent: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			batch, err := st.SelectUnpushedSince(ctx, store.PushCursor{}, 1<<20, "org-1", "dev@acme.example", tc.share, store.ScopeOptions{})
+			if err != nil {
+				t.Fatalf("SelectUnpushedSince: %v", err)
+			}
+			if len(batch.CodeintelSummaries) != 0 {
+				t.Errorf("codeintel aggregate shipped under %s (codeintel_detail OFF) — the tier must be orthogonal and opt-in", tc.name)
+			}
+			if tc.share.FullContent {
+				// Enterprise (org-parity W2.4): full_content legitimately
+				// ships the per-dev codeintel wire, which carries the RAW
+				// project root (operator ruling 2026-08-24) — scope the
+				// leak scan past it. Symbol names still NEVER cross on any
+				// wire, so secSymbol stays in the unscoped scan below.
+				if len(batch.CodeintelDevRows) == 0 {
+					t.Error("full_content shipped no codeintel dev rows — the W2.4 enterprise wire failed to flip")
+				}
+				batch.CodeintelDevRows = nil
+			} else if len(batch.CodeintelDevRows) != 0 {
+				t.Errorf("codeintel dev rows shipped under %s (metadata-only) — must ride shipsRawContent only", tc.name)
+			}
+			raw, err := json.Marshal(batch)
+			if err != nil {
+				t.Fatalf("marshal batch: %v", err)
+			}
+			if bytes.Contains(raw, []byte(secProject)) || bytes.Contains(raw, []byte(secSymbol)) {
+				t.Errorf("codeintel identity leaked under %s without codeintel_detail", tc.name)
+			}
+		})
+	}
+}
+
+// seedProcessRun inserts one process_runs row whose exe_path and argv are
+// sentinels, so a SelectUnpushedSince batch can be searched both for whether the
+// P5g process-detail aggregate shipped AND for whether any raw process identity
+// leaked. process_* stays NODE-LOCAL; only the content-free per (day × tool)
+// run/exit count aggregate crosses, and only under process_detail — the exe
+// path and argv are never shipped.
+func seedProcessRun(ctx context.Context, t *testing.T, database *sql.DB, tool, exePath, argv string) {
+	t.Helper()
+	ts := time.Now().UTC().Format(time.RFC3339)
+	if _, err := database.ExecContext(ctx,
+		`INSERT INTO process_runs
+		   (process_key, pid, attribution_source, attribution_confidence, tool,
+		    exe_path, argv_preview, started_at, last_seen_at, exited_at, exit_code, duration_ms)
+		 VALUES (?, 4242, 'pidbridge', 'high', ?, ?, ?, ?, ?, ?, 0, 1500)`,
+		"pk-"+exePath, tool, exePath, argv, ts, ts, ts); err != nil {
+		t.Fatalf("seed process_runs: %v", err)
+	}
+}
+
+// TestPushPayloadCarriesProcessWhenOptedIn is the Arc 4 P5g extraction tier:
+// under the DISTINCT process_detail opt-in, the node-local process_runs log
+// ships as a content-free per (day × tool) run/exit count aggregate. Two
+// properties are proven together: (1) the tier FLIPS the seam (ProcessSummaries
+// is non-empty); and (2) even when it ships, NO raw process identity crosses —
+// neither the exe path nor the argv appears in the marshalled batch. The
+// process_* table NAMES still never appear in orgpush.go (SelectProcessSummaries
+// owns the read in a separate file — TestSelectUnpushedSinceExcludesCacheTables
+// guards that).
+func TestPushPayloadCarriesProcessWhenOptedIn(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "agent.db")})
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	st := store.New(database)
+	seed(ctx, t, st)
+	const (
+		secExe  = "SENTINEL_PROCESS_EXE_pangram_zz"
+		secArgv = "SENTINEL_PROCESS_ARGV_pangram_zz"
+	)
+	seedProcessRun(ctx, t, database, "claude-code", secExe, secArgv)
+
+	batch, err := st.SelectUnpushedSince(ctx, store.PushCursor{}, 1<<20, "org-1", "dev@acme.example",
+		store.ShareOptions{ProcessDetail: true}, store.ScopeOptions{})
+	if err != nil {
+		t.Fatalf("SelectUnpushedSince: %v", err)
+	}
+	if len(batch.ProcessSummaries) == 0 {
+		t.Fatal("process_detail opt-in shipped no ProcessSummaries — the tier failed to flip the seam")
+	}
+	raw, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatalf("marshal batch: %v", err)
+	}
+	// Content-free even when shipped: no exe path, no argv.
+	if bytes.Contains(raw, []byte(secExe)) {
+		t.Error("exe path leaked into the process aggregate — only run/exit counts may ship")
+	}
+	if bytes.Contains(raw, []byte(secArgv)) {
+		t.Error("argv leaked into the process aggregate — only run/exit counts may ship")
+	}
+}
+
+// TestPushPayloadStripsProcessWhenNotOptedIn is the other side of the tier: with
+// process_detail OFF, the aggregate must NOT ship — not even under full_content
+// (maximum disclosure). process_detail is a DISTINCT tier, orthogonal to
+// shipsRawContent(), and raised only by the DISTINCT extract.process authority
+// on a managed node.
+func TestPushPayloadStripsProcessWhenNotOptedIn(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "agent.db")})
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	st := store.New(database)
+	seed(ctx, t, st)
+	const (
+		secExe  = "SENTINEL_PROCESS_EXE_pangram_zz"
+		secArgv = "SENTINEL_PROCESS_ARGV_pangram_zz"
+	)
+	seedProcessRun(ctx, t, database, "claude-code", secExe, secArgv)
+
+	for _, tc := range []struct {
+		name  string
+		share store.ShareOptions
+	}{
+		{"zero-value", store.ShareOptions{}},
+		{"full_content-only", store.ShareOptions{FullContent: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			batch, err := st.SelectUnpushedSince(ctx, store.PushCursor{}, 1<<20, "org-1", "dev@acme.example", tc.share, store.ScopeOptions{})
+			if err != nil {
+				t.Fatalf("SelectUnpushedSince: %v", err)
+			}
+			if len(batch.ProcessSummaries) != 0 {
+				t.Errorf("process aggregate shipped under %s (process_detail OFF) — the tier must be orthogonal and opt-in", tc.name)
+			}
+			raw, err := json.Marshal(batch)
+			if err != nil {
+				t.Fatalf("marshal batch: %v", err)
+			}
+			if bytes.Contains(raw, []byte(secExe)) || bytes.Contains(raw, []byte(secArgv)) {
+				t.Errorf("process identity leaked under %s without process_detail", tc.name)
+			}
+		})
+	}
+}
+
+// seedTerminalActivity inserts one terminal_run (+ command) and one remote_audit
+// row whose SENSITIVE columns are sentinels but whose public enums (tool, kind,
+// decision, principal) are benign, so a SelectUnpushedSince batch can be
+// searched both for whether the P5h terminal-detail aggregate shipped AND for
+// whether any raw terminal/remote identity leaked. terminal_* / remote_audit
+// stay pinned ENTIRELY out of the wire otherwise (the dedicated
+// TestTerminalRunTablesPinnedOutOfPush / TestRemoteAuditTablePinnedOutOfPush);
+// only the content-free count aggregate crosses, and only under terminal_detail.
+func seedTerminalActivity(ctx context.Context, t *testing.T, st *store.Store, sentinel string) {
+	t.Helper()
+	if err := st.InsertTerminalRun(ctx, store.TerminalRun{
+		RunID: "run-" + sentinel, Tool: "claude-code", Kind: "handoff",
+		SourceSessionID: sentinel, ProjectRootHash: sentinel, CorrelationTokenHash: sentinel,
+	}); err != nil {
+		t.Fatalf("InsertTerminalRun: %v", err)
+	}
+	if err := st.InsertTerminalCommand(ctx, store.TerminalCommand{
+		RunID: "run-" + sentinel, TurnSeq: 1, Trust: "hint", CmdHash: sentinel,
+	}); err != nil {
+		t.Fatalf("InsertTerminalCommand: %v", err)
+	}
+	if err := st.InsertRemoteAudit(ctx, store.RemoteAuditEvent{
+		Kind: "session_paired", SessionID: sentinel, Principal: "view",
+		RemoteAddr: sentinel, Route: sentinel, Decision: "ok", Detail: sentinel,
+	}); err != nil {
+		t.Fatalf("InsertRemoteAudit: %v", err)
+	}
+}
+
+// TestPushPayloadCarriesTerminalWhenOptedIn is the Arc 4 P5h extraction tier:
+// under the DISTINCT terminal_detail opt-in, the node-local terminal_run +
+// remote_audit logs ship as content-free count aggregates. Two properties are
+// proven together: (1) the tier FLIPS the seam (both TerminalSummaries and
+// RemoteAuditSummaries are non-empty); and (2) even when it ships, NO raw
+// terminal/remote identity crosses — no project/correlation/command hash, no
+// source session id, no remote session id, no peer address, no route, no detail.
+// The raw table NAMES still never appear in orgpush.go (SelectTerminalSummaries
+// / SelectRemoteAuditSummaries own the reads in a separate file), and the
+// pre-existing never-ships tests (which assert absence under full_content) stay
+// true because this aggregate is orthogonal to full_content.
+func TestPushPayloadCarriesTerminalWhenOptedIn(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "agent.db")})
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	st := store.New(database)
+	seed(ctx, t, st)
+	const secTerm = "SENTINEL_TERMINAL_grandiloquent_zz"
+	seedTerminalActivity(ctx, t, st, secTerm)
+
+	batch, err := st.SelectUnpushedSince(ctx, store.PushCursor{}, 1<<20, "org-1", "dev@acme.example",
+		store.ShareOptions{TerminalDetail: true}, store.ScopeOptions{})
+	if err != nil {
+		t.Fatalf("SelectUnpushedSince: %v", err)
+	}
+	if len(batch.TerminalSummaries) == 0 {
+		t.Fatal("terminal_detail opt-in shipped no TerminalSummaries — the tier failed to flip the seam")
+	}
+	if len(batch.RemoteAuditSummaries) == 0 {
+		t.Fatal("terminal_detail opt-in shipped no RemoteAuditSummaries — the tier failed to flip the seam")
+	}
+	raw, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatalf("marshal batch: %v", err)
+	}
+	// Content-free even when shipped: none of the sensitive columns cross.
+	if bytes.Contains(raw, []byte(secTerm)) {
+		t.Error("terminal/remote identity leaked into the aggregate — only counts + public enums may ship")
+	}
+}
+
+// TestPushPayloadStripsTerminalWhenNotOptedIn is the other side of the tier:
+// with terminal_detail OFF, neither aggregate ships — not even under
+// full_content (maximum disclosure). terminal_detail is a DISTINCT tier,
+// orthogonal to shipsRawContent(), raised only by the DISTINCT extract.terminal
+// authority on a managed node. This is what keeps the raw-table never-ships
+// pins intact: the ONLY way terminal/remote data crosses at all is this
+// content-free aggregate under this explicit tier.
+func TestPushPayloadStripsTerminalWhenNotOptedIn(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "agent.db")})
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	st := store.New(database)
+	seed(ctx, t, st)
+	const secTerm = "SENTINEL_TERMINAL_grandiloquent_zz"
+	seedTerminalActivity(ctx, t, st, secTerm)
+
+	for _, tc := range []struct {
+		name  string
+		share store.ShareOptions
+	}{
+		{"zero-value", store.ShareOptions{}},
+		{"full_content-only", store.ShareOptions{FullContent: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			batch, err := st.SelectUnpushedSince(ctx, store.PushCursor{}, 1<<20, "org-1", "dev@acme.example", tc.share, store.ScopeOptions{})
+			if err != nil {
+				t.Fatalf("SelectUnpushedSince: %v", err)
+			}
+			if len(batch.TerminalSummaries) != 0 || len(batch.RemoteAuditSummaries) != 0 {
+				t.Errorf("terminal aggregate shipped under %s (terminal_detail OFF) — the tier must be orthogonal and opt-in", tc.name)
+			}
+			if tc.share.FullContent {
+				// Enterprise (org-parity W2.6): full_content legitimately
+				// ships the per-dev terminal/remote visibility wires —
+				// scope the leak scan past them; the teams-tier aggregates
+				// above stay flag-gated.
+				if len(batch.TerminalRuns) == 0 {
+					t.Error("full_content shipped no terminal runs — the W2.6 enterprise wire failed to flip")
+				}
+				batch.TerminalRuns, batch.TerminalCommands, batch.RemoteAudit = nil, nil, nil
+			} else if len(batch.TerminalRuns) != 0 || len(batch.TerminalCommands) != 0 || len(batch.RemoteAudit) != 0 {
+				t.Errorf("terminal/remote dev wires shipped under %s (metadata-only) — must ride shipsRawContent only", tc.name)
+			}
+			raw, err := json.Marshal(batch)
+			if err != nil {
+				t.Fatalf("marshal batch: %v", err)
+			}
+			if bytes.Contains(raw, []byte(secTerm)) {
+				t.Errorf("terminal/remote identity leaked under %s without terminal_detail", tc.name)
+			}
+		})
+	}
+}
+
+// seedRouterDecision inserts one router_decisions row with a sentinel model, so
+// a SelectUnpushedSince batch can be searched for whether the P5d routing-detail
+// aggregate shipped. router_decisions stays NODE-LOCAL; only the content-free
+// (day, model→model, turn_kind, mode) aggregate crosses, and only under
+// routing_detail.
+func seedRouterDecision(ctx context.Context, t *testing.T, database *sql.DB, selectedModel string) {
+	t.Helper()
+	ts := time.Now().UTC().Format(time.RFC3339)
+	if _, err := database.ExecContext(ctx,
+		`INSERT INTO router_decisions (session_id, ts, mode, channel, original_model, selected_model, turn_kind, policy_hash, applied, est_savings_usd)
+		 VALUES ('sess-cc-1', ?, 'enforce', 'proxy', 'claude-opus-4-8', ?, 'edit', 'ph', 1, 0.03)`, ts, selectedModel); err != nil {
+		t.Fatalf("seed router_decisions: %v", err)
+	}
+}
+
+// TestPushPayloadCarriesRoutingDetailWhenOptedIn is the Arc 4 P5d extraction
+// tier: under the DISTINCT routing_detail opt-in, the node-local
+// router_decisions log ships as a content-free but MODEL-ID-BEARING aggregate.
+// The router_decisions table NAME still never appears in orgpush.go
+// (SelectRoutingDetail owns the read in a separate file); this proves the
+// aggregate itself flips onto the wire under the tier.
+func TestPushPayloadCarriesRoutingDetailWhenOptedIn(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "agent.db")})
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	st := store.New(database)
+	seed(ctx, t, st)
+	const secRouteModel = "SENTINEL_ROUTE_MODEL_pangram_zz"
+	seedRouterDecision(ctx, t, database, secRouteModel)
+
+	batch, err := st.SelectUnpushedSince(ctx, store.PushCursor{}, 1<<20, "org-1", "dev@acme.example",
+		store.ShareOptions{RoutingDetail: true}, store.ScopeOptions{})
+	if err != nil {
+		t.Fatalf("SelectUnpushedSince: %v", err)
+	}
+	if len(batch.RoutingDetails) == 0 {
+		t.Fatal("routing_detail opt-in shipped no RoutingDetails — the tier failed to flip the seam")
+	}
+	raw, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatalf("marshal batch: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(secRouteModel)) {
+		t.Error("routing detail did NOT ship the selected model under routing_detail — the tier failed to flip the seam")
+	}
+}
+
+// TestPushPayloadStripsRoutingDetailWhenNotOptedIn is the other side of the
+// tier: with routing_detail OFF, the routing detail must NOT ship — not even
+// under full_content, and not under the model-id-FREE routing_summary tier
+// (which ships a DIFFERENT aggregate). routing_detail is a DISTINCT tier.
+func TestPushPayloadStripsRoutingDetailWhenNotOptedIn(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "agent.db")})
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	st := store.New(database)
+	seed(ctx, t, st)
+	const secRouteModel = "SENTINEL_ROUTE_MODEL_pangram_zz"
+	seedRouterDecision(ctx, t, database, secRouteModel)
+
+	for _, tc := range []struct {
+		name  string
+		share store.ShareOptions
+	}{
+		{"zero-value", store.ShareOptions{}},
+		{"full_content-only", store.ShareOptions{FullContent: true}},
+		{"routing_summary-only", store.ShareOptions{RoutingSummary: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			batch, err := st.SelectUnpushedSince(ctx, store.PushCursor{}, 1<<20, "org-1", "dev@acme.example", tc.share, store.ScopeOptions{})
+			if err != nil {
+				t.Fatalf("SelectUnpushedSince: %v", err)
+			}
+			if len(batch.RoutingDetails) != 0 {
+				t.Errorf("routing detail shipped under %s (routing_detail OFF) — the tier must be distinct and opt-in", tc.name)
+			}
+			if tc.share.FullContent {
+				// Enterprise (org-parity W2.3): full_content legitimately
+				// ships the per-dev routing wire, which MAY carry the
+				// model (plan §0.1) — scope the leak scan past it. The
+				// routing_summary-only and zero-value cases stay fully
+				// clean (the teams posture).
+				if len(batch.RoutingDevRows) == 0 {
+					t.Error("full_content shipped no routing dev rows — the W2.3 enterprise wire failed to flip")
+				}
+				batch.RoutingDevRows = nil
+			} else if len(batch.RoutingDevRows) != 0 {
+				t.Errorf("routing dev rows shipped under %s (no raw-content tier) — must ride shipsRawContent only", tc.name)
+			}
+			raw, err := json.Marshal(batch)
+			if err != nil {
+				t.Fatalf("marshal batch: %v", err)
+			}
+			if bytes.Contains(raw, []byte(secRouteModel)) {
+				t.Errorf("selected model leaked under %s without routing_detail", tc.name)
+			}
+		})
+	}
+}
+
+// seedLimitSnapshot inserts one limit_snapshots row with a sentinel scope_hash,
+// so a SelectUnpushedSince batch can be searched to prove the P5e aggregate
+// ships utilization stats but NEVER the raw scope hash. limit_snapshots stays
+// NODE-LOCAL; only the content-free (day, provider) utilization aggregate
+// crosses, and only under limit_gauge.
+func seedLimitSnapshot(ctx context.Context, t *testing.T, database *sql.DB, scopeHash string) {
+	t.Helper()
+	if _, err := database.ExecContext(ctx,
+		`INSERT INTO limit_snapshots (scope_hash, provider, observed_at, window_5h_util, window_7d_util)
+		 VALUES (?, 'anthropic', ?, 0.73, 0.41)`, scopeHash, time.Now().UTC().Unix()); err != nil {
+		t.Fatalf("seed limit_snapshots: %v", err)
+	}
+}
+
+// TestPushPayloadCarriesLimitGaugeWhenOptedIn is the Arc 4 P5e extraction tier:
+// under the DISTINCT limit_gauge opt-in, the node-local limit_snapshots log
+// ships as a content-free per (day, provider) utilization aggregate — and the
+// raw scope_hash (auth identity) is NEVER on the wire. The limit_snapshots table
+// NAME still never appears in orgpush.go (SelectLimitGauges owns the read in a
+// separate file).
+func TestPushPayloadCarriesLimitGaugeWhenOptedIn(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "agent.db")})
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	st := store.New(database)
+	seed(ctx, t, st)
+	const secScopeHash = "SENTINEL_LIMIT_SCOPE_pangram_zz"
+	seedLimitSnapshot(ctx, t, database, secScopeHash)
+
+	batch, err := st.SelectUnpushedSince(ctx, store.PushCursor{}, 1<<20, "org-1", "dev@acme.example",
+		store.ShareOptions{LimitGauge: true}, store.ScopeOptions{})
+	if err != nil {
+		t.Fatalf("SelectUnpushedSince: %v", err)
+	}
+	if len(batch.LimitGauges) == 0 {
+		t.Fatal("limit_gauge opt-in shipped no LimitGauges — the tier failed to flip the seam")
+	}
+	raw, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatalf("marshal batch: %v", err)
+	}
+	// The aggregate rides, but the raw auth-scope hash must NOT.
+	if bytes.Contains(raw, []byte(secScopeHash)) {
+		t.Error("limit gauge leaked the raw scope_hash — only the (day, provider) utilization aggregate may ship")
+	}
+	if batch.LimitGauges[0].Provider != "anthropic" || batch.LimitGauges[0].Max5hUtil <= 0 {
+		t.Errorf("limit gauge = %+v, want anthropic with a positive 5h util", batch.LimitGauges[0])
+	}
+}
+
+// TestPushPayloadStripsLimitGaugeWhenNotOptedIn is the other side of the tier:
+// with limit_gauge OFF, the aggregate must NOT ship — not even under
+// full_content. It is a DISTINCT tier.
+func TestPushPayloadStripsLimitGaugeWhenNotOptedIn(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.Open(ctx, db.Options{Path: filepath.Join(t.TempDir(), "agent.db")})
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	st := store.New(database)
+	seed(ctx, t, st)
+	const secScopeHash = "SENTINEL_LIMIT_SCOPE_pangram_zz"
+	seedLimitSnapshot(ctx, t, database, secScopeHash)
+
+	for _, tc := range []struct {
+		name  string
+		share store.ShareOptions
+	}{
+		{"zero-value", store.ShareOptions{}},
+		{"full_content-only", store.ShareOptions{FullContent: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			batch, err := st.SelectUnpushedSince(ctx, store.PushCursor{}, 1<<20, "org-1", "dev@acme.example", tc.share, store.ScopeOptions{})
+			if err != nil {
+				t.Fatalf("SelectUnpushedSince: %v", err)
+			}
+			if len(batch.LimitGauges) != 0 {
+				t.Errorf("limit gauge shipped under %s (limit_gauge OFF) — the tier must be distinct and opt-in", tc.name)
+			}
+		})
+	}
+}
+
 // forbiddenCacheTables names the three node-local cachetrack tables
 // that MUST NEVER appear in the org-push wire path. Spec §11:
 // cachetrack data (segments, entries, events) is local, passive,
@@ -573,6 +1319,14 @@ var forbiddenCacheTables = []string{
 	// into the push via a function call precisely so this sentinel
 	// can keep forbidding the underlying table names here.
 	"org_routing_policies",
+	// project_patterns (W3.3 Discovery/Patterns) is NODE-LOCAL by table
+	// name: orgpush.go must never reference it directly. A derived,
+	// capped, enterprise-raw wire row (ProjectPatternRow) DOES ship under
+	// shipsRawContent(), computed in store/patternsorgrows.go and
+	// composed into the push via a function call — precisely so this
+	// sentinel can keep forbidding the underlying table name here, same
+	// pattern as org_routing_policies/router_decisions above.
+	"project_patterns",
 	// Guard-layer tables (migration 040, guard spec §10.2): pins,
 	// policy state and approvals are NODE-LOCAL until the G13/G14
 	// teams arc deliberately adds their wire surfaces (pins ship
@@ -750,14 +1504,19 @@ var forbiddenCacheTables = []string{
 	// separate opt-in AGGREGATE wire shape, never this raw table.
 	"remote_audit",
 
-	// obs Plane-A egress-routing audit (migration 0007, G22 design §7): the
-	// egress decision log is NODE-LOCAL like the rest of obs_* — v1 ships NO
-	// egress org tier (design §8), so there is no push path at all. The raw
-	// request is NEVER stored (only message_hash); user/tenant are node-local
-	// PII. This literal sentinel keeps the table name out of orgpush.go; the
-	// structural absence of any Egress provider on store.ObsOrgProviders
-	// (TestObsEgressHasNoOrgProviderSeam) proves it can never be composed onto
-	// the wire either.
+	// obs Plane-A egress-routing audit (migration 0007, G22 design §7). The
+	// raw request is NEVER stored (only message_hash). Since 2026-08-24
+	// (org-parity W5.3) an egress org tier DOES exist — exactly the "future
+	// opt-in wire shape + share key + sentinel update" the original G22 §8
+	// deferral prescribed: composed as orgcontract.ObsEgressRow via the
+	// store.ObsOrgProviders.Egress FUNC SEAM, gated on the node-side
+	// [org_client.share.obs].egress opt-in (ShareOptions.ObsEgress, default
+	// false), with the Tenant/User content columns additionally stripped
+	// under !shipsRawContent(). This literal sentinel therefore still holds:
+	// the table NAME never appears in orgpush.go (module-boundary
+	// discipline, same as every obs_* table); the tier contract itself is
+	// pinned by TestObsEgressTierContract + the compose gating test in
+	// internal/store/orgpush_obs_test.go.
 	"obs_egress_decisions",
 
 	// Terminal-run identity + correlation (migration 064, terminal-product-
@@ -868,6 +1627,23 @@ var forbiddenOrgControlPlaneTables = []string{
 	"org_llm_provider",
 	"org_secret",
 	"insight_run_step",
+	// Enterprise-Managed Tenancy machine-identity binding (server migration
+	// 074, Arc 4 P6a): server-only, and the fingerprint rides the managed-bind
+	// REQUEST, never the push wire. Pinned as a fixed expected member by
+	// TestForbiddenOrgControlPlaneTablesExpectedSet.
+	"managed_node",
+	// The managed-integrity probe posture store (server migration 075, Arc 4
+	// P6b): server-only, and the integrity signal rides the managed-integrity
+	// REQUEST, never the push wire. Same posture as managed_node. Pinned as a
+	// fixed expected member by TestForbiddenOrgControlPlaneTablesExpectedSet.
+	"managed_integrity",
+	// The ACP-P6c IdP device-code enrolment pairing store (server migration
+	// 076): server-only, holding the device-code digest and the human-typed
+	// user code of an in-flight browser pairing. Both live ONLY on the two
+	// agent-facing idp-enrol endpoints, never on the node->server push wire.
+	// Same posture as managed_node / managed_integrity. Pinned as a fixed
+	// expected member by TestForbiddenOrgControlPlaneTablesExpectedSet.
+	"idp_enrol_requests",
 	// The fleet remote-config mutation trail (server migration 046). It
 	// records WHICH ADMIN changed a collector's remote config, in which org —
 	// server-side attribution for a control-plane mutation the node never
@@ -952,6 +1728,60 @@ var forbiddenOrgControlPlaneTables = []string{
 	"org_policy_evolution_proposal",
 	"org_policy_evolution_decision",
 	"org_policy_evolution_applied",
+	// Team Project Identity Mapping Wave B (server migration 083;
+	// docs/plans/team-project-identity-mapping-plan-2026-08-21.md §1 L2/L4).
+	// org_projects is the admin-authored team-level project identity (name +
+	// client_label); org_project_members maps many project_root_hash-derived
+	// ids onto one org_projects row. Both are org-side grouping/naming data
+	// layered on top of the hash the node already ships — naming either on
+	// the node->server push wire would be both nonsensical and a boundary
+	// violation, the same posture as org_project_labels (048) above.
+	"org_projects",
+	"org_project_members",
+	// Org Dashboard RBAC Wave A (server migration 084;
+	// docs/plans/org-dashboard-rbac-plan-2026-08-21.md §1, §5 Wave A).
+	// org_roles/org_role_permissions/org_member_roles are the role/
+	// permission model (who may see which slice of the org's already-pushed
+	// data), and org_role_bootstrap_applied is the bootstrap-marker gating
+	// the one-time builtin-permission seed and the config-email member-role
+	// backfill. All four are pure org-server authorization state with no
+	// agent counterpart — the node never builds, grants, or reads roles or
+	// permissions; naming any of them on the node->server push wire would be
+	// both nonsensical and a boundary violation, the same posture as
+	// org_project_labels (048) / org_projects (083) above.
+	"org_roles",
+	"org_role_permissions",
+	"org_member_roles",
+	"org_role_bootstrap_applied",
+	// Pre-045-convention control-plane tables (C1 fix wave, slice A). These
+	// predate the migration-file-comment convention the entries above follow,
+	// but are the same posture: server-only state the node never possesses.
+	// budgets/budget_alert_events (server migrations 002 base +
+	// 080_budgets_multilevel widen) are the org-authored spend caps and the
+	// evaluator's threshold-crossing audit trail — the node has no budget
+	// concept and never fires an alert itself. issued_bearers/revoked_bearers
+	// (server migration 001/002) are the bearer-token mint/revoke ledger — a
+	// credential store, never shipped. enrolment_tokens (server migration
+	// 001) and invite_attempts (server migration 024) are the enrolment/
+	// invite rails' own state (who was offered a token, who attempted an
+	// invite) — org control-plane bookkeeping about the node, not data from
+	// it.
+	"budgets",
+	"budget_alert_events",
+	"issued_bearers",
+	"revoked_bearers",
+	"enrolment_tokens",
+	"invite_attempts",
+	// Evals plane versioning/scheduling (server migrations 082_org_eval_run +
+	// 085_org_eval_versioning_scheduling). org_eval_run/org_eval_score are the
+	// eval-run ledger and its per-item scores; org_eval_run_item/
+	// org_eval_schedule (085) added per-run item detail and the recurring-
+	// schedule config. All four are org control-plane eval state with no
+	// agent counterpart — the node never runs, schedules, or scores an eval.
+	"org_eval_run",
+	"org_eval_score",
+	"org_eval_run_item",
+	"org_eval_schedule",
 }
 
 // TestForbiddenOrgControlPlaneTablesExpectedSet is the NON-GAMEABLE membership
@@ -1026,6 +1856,43 @@ func TestForbiddenOrgControlPlaneTablesExpectedSet(t *testing.T) {
 		// that named them.
 		"org_policy_evolution_proposal",
 		"org_policy_evolution_decision",
+		// Enterprise-Managed Tenancy machine-identity binding (server
+		// migration 074, Arc 4 P6a). managed_node binds one managed node to
+		// one machine; the fingerprint rides the bearer-authed managed-bind
+		// REQUEST, never the node->server push wire, so naming it in
+		// orgpush.go would be both nonsensical and a boundary violation.
+		"managed_node",
+		// The managed-integrity probe posture store (server migration 075,
+		// Arc 4 P6b). managed_integrity records per-(org, machine)
+		// tamper-evidence; the signal rides the bearer-authed
+		// managed-integrity REQUEST, never the node->server push wire. Same
+		// boundary as managed_node.
+		"managed_integrity",
+		// The IdP device-code enrolment pairing store (server migration 076,
+		// ACP-P6c). idp_enrol_requests holds the device-code digest and the
+		// user code of an in-flight pairing — enrolment-credential-adjacent
+		// material that rides the two agent-facing idp-enrol REQUESTS, never
+		// the node->server push wire. Dropping it from the sentinel would stop
+		// the orgpush.go guard from noticing a seam that named it.
+		"idp_enrol_requests",
+		// Team Project Identity Mapping Wave B (server migration 083): the
+		// admin-authored project-grouping pair. org_projects names a team-
+		// level project identity (with an optional client_label);
+		// org_project_members maps hash-derived ids onto it. Dropping either
+		// from the sentinel would stop the orgpush.go guard from noticing a
+		// seam that tried to carry project grouping/naming on the agent wire.
+		"org_projects",
+		"org_project_members",
+		// Org Dashboard RBAC Wave A (server migration 084): the role/
+		// permission model (org_roles, org_role_permissions,
+		// org_member_roles) plus its bootstrap-marker
+		// (org_role_bootstrap_applied). Dropping any of these from the
+		// sentinel would stop the orgpush.go guard from noticing a seam that
+		// tried to carry role/permission grant state on the agent wire.
+		"org_roles",
+		"org_role_permissions",
+		"org_member_roles",
+		"org_role_bootstrap_applied",
 	}
 	have := make(map[string]struct{}, len(forbiddenOrgControlPlaneTables))
 	for _, n := range forbiddenOrgControlPlaneTables {
@@ -1144,18 +2011,40 @@ func TestRemoteAuditTablePinnedOutOfPush(t *testing.T) {
 		}
 	}
 
-	// Full-content = maximum surface; the audit table must STILL be absent.
+	// TEAMS posture (zero-value, metadata-only): remote_audit ships nothing.
+	teams, err := st.SelectUnpushedSince(ctx, store.PushCursor{}, 1<<20, "org-1", "dev@x",
+		store.ShareOptions{}, store.ScopeOptions{})
+	if err != nil {
+		t.Fatalf("SelectUnpushedSince (teams): %v", err)
+	}
+	rawTeams, err := json.Marshal(teams)
+	if err != nil {
+		t.Fatalf("marshal teams batch: %v", err)
+	}
+	if bytes.Contains(rawTeams, []byte(secRemoteAudit)) {
+		t.Error("remote_audit content leaked under metadata-only — the teams tier must never push it")
+	}
+
+	// ENTERPRISE posture (org-parity W2.6, plan §0 — deliberate reversal of
+	// the pre-2026-08-24 "never pushed" pin): under full_content /
+	// admin_managed the remote-access audit DOES ship, via the composed
+	// SelectRemoteAuditRows seam (orgpush.go still never names the table).
+	// The sentinel's remaining job: it ships ONLY in that slice.
 	batch, err := st.SelectUnpushedSince(ctx, store.PushCursor{}, 1<<20, "org-1", "dev@x",
 		store.ShareOptions{FullContent: true}, store.ScopeOptions{})
 	if err != nil {
 		t.Fatalf("SelectUnpushedSince: %v", err)
 	}
+	if len(batch.RemoteAudit) == 0 {
+		t.Error("full_content shipped no remote-audit rows — the W2.6 enterprise wire failed to flip")
+	}
+	batch.RemoteAudit = nil
 	raw, err := json.Marshal(batch)
 	if err != nil {
 		t.Fatalf("marshal batch: %v", err)
 	}
 	if bytes.Contains(raw, []byte(secRemoteAudit)) {
-		t.Error("remote_audit content leaked into the push payload — the table must never be pushed")
+		t.Error("remote_audit content leaked OUTSIDE the RemoteAudit slice — only the composed wire may carry it")
 	}
 }
 
@@ -1211,18 +2100,41 @@ func TestTerminalRunTablesPinnedOutOfPush(t *testing.T) {
 		t.Fatalf("InsertTerminalCommand: %v", err)
 	}
 
-	// Full-content = maximum surface; the identity tables must STILL be absent.
+	// TEAMS posture (zero-value, metadata-only): nothing terminal-shaped ships.
+	teams, err := st.SelectUnpushedSince(ctx, store.PushCursor{}, 1<<20, "org-1", "dev@x",
+		store.ShareOptions{}, store.ScopeOptions{})
+	if err != nil {
+		t.Fatalf("SelectUnpushedSince (teams): %v", err)
+	}
+	rawTeams, err := json.Marshal(teams)
+	if err != nil {
+		t.Fatalf("marshal teams batch: %v", err)
+	}
+	if bytes.Contains(rawTeams, []byte(secTermRun)) {
+		t.Error("terminal_run content leaked under metadata-only — the teams tier must never push it")
+	}
+
+	// ENTERPRISE posture (org-parity W2.6, plan §0 — deliberate reversal of
+	// the pre-2026-08-24 "never pushed" pin): under full_content /
+	// admin_managed the per-dev terminal visibility wire DOES ship, via the
+	// composed SelectTerminalRunRows/SelectTerminalCommandRows seam
+	// (orgpush.go still never names the tables — part (1) above stays the
+	// source-level guard). Remaining job: it ships ONLY in those slices.
 	batch, err := st.SelectUnpushedSince(ctx, store.PushCursor{}, 1<<20, "org-1", "dev@x",
 		store.ShareOptions{FullContent: true}, store.ScopeOptions{})
 	if err != nil {
 		t.Fatalf("SelectUnpushedSince: %v", err)
 	}
+	if len(batch.TerminalRuns) == 0 {
+		t.Error("full_content shipped no terminal runs — the W2.6 enterprise wire failed to flip")
+	}
+	batch.TerminalRuns, batch.TerminalCommands = nil, nil
 	raw, err := json.Marshal(batch)
 	if err != nil {
 		t.Fatalf("marshal batch: %v", err)
 	}
 	if bytes.Contains(raw, []byte(secTermRun)) {
-		t.Error("terminal_run content leaked into the push payload — the tables must never be pushed")
+		t.Error("terminal_run content leaked OUTSIDE the terminal wire slices — only the composed wire may carry it")
 	}
 }
 
@@ -1386,20 +2298,34 @@ func TestPolicyResourceTablesPinnedOutOfPush(t *testing.T) {
 	}
 }
 
-// TestObsEgressHasNoOrgProviderSeam pins the G22 privacy posture structurally
-// (design §7/§8): v1 ships NO egress org tier, so store.ObsOrgProviders must
-// carry no Egress provider — obs_egress_decisions can never be composed onto
-// the push wire. If a future opt-in egress_summary aggregate is ever added
-// (design §8 deferred), it lands as its own AGGREGATE wire shape + share key +
-// sentinel update, never the raw decisions table — and this test is the
-// forcing function that makes that a conscious change.
-func TestObsEgressHasNoOrgProviderSeam(t *testing.T) {
+// TestObsEgressTierContract pins the T8 egress org tier's shape (org-parity
+// W5.3, 2026-08-24 — the conscious change the retired
+// TestObsEgressHasNoOrgProviderSeam sentinel demanded: G22 design §8 deferred
+// an egress org tier to "its own wire shape + share key + sentinel update",
+// which is exactly what shipped). Structurally: the tier is reachable ONLY
+// through the store.ObsOrgProviders.Egress func seam (never SQL against
+// obs_egress_decisions inside orgpush.go — the literal table-name sentinel
+// above still enforces that), and it is gated by its OWN node-side share key
+// ShareOptions.ObsEgress (default false; zero value ships nothing). The
+// behavioral gating — absent without the opt-in, Tenant/User stripped under
+// !shipsRawContent() — is pinned by TestObsEgressComposeGating in
+// internal/store/orgpush_obs_test.go.
+func TestObsEgressTierContract(t *testing.T) {
 	t.Parallel()
-	typ := reflect.TypeOf(store.ObsOrgProviders{})
-	for i := 0; i < typ.NumField(); i++ {
-		if strings.Contains(strings.ToLower(typ.Field(i).Name), "egress") {
-			t.Errorf("store.ObsOrgProviders gained an egress provider field %q — v1 ships no egress org tier; obs_egress_decisions must have NO push seam (design §8)", typ.Field(i).Name)
-		}
+	pt := reflect.TypeOf(store.ObsOrgProviders{})
+	if _, ok := pt.FieldByName("Egress"); !ok {
+		t.Errorf("store.ObsOrgProviders lost its Egress provider func — the T8 egress tier must be composed through the func seam, never inline SQL in orgpush.go")
+	}
+	st := reflect.TypeOf(store.ShareOptions{})
+	f, ok := st.FieldByName("ObsEgress")
+	if !ok {
+		t.Fatalf("store.ShareOptions lost ObsEgress — the T8 egress tier must be gated by its own node-side share key ([org_client.share.obs].egress), default false")
+	}
+	if f.Type.Kind() != reflect.Bool {
+		t.Errorf("ShareOptions.ObsEgress is %s, want bool (a node-side opt-in flag, never a server-driven value)", f.Type)
+	}
+	if (store.ShareOptions{}).ObsEgress {
+		t.Errorf("ShareOptions zero value has ObsEgress=true — the egress tier must default OFF")
 	}
 }
 
@@ -1510,10 +2436,16 @@ func TestRoutingSummaryWireShapeIsAggregateOnly(t *testing.T) {
 
 // TestPolicyStateRowWireShapeIsHashOnly pins the P0-6 effective-state row
 // (docs/plans/plane-a-p0-6-effective-policy-state-plan.md §2.1/§5.1): the
-// PolicyStateRow that rides POST /api/agent/policy-ack may carry ONLY the 12
+// PolicyStateRow that rides POST /api/agent/policy-ack may carry ONLY the 15
 // allow-listed hash/version/enum/timestamp fields — no Body/TOML/Path/Detail/
 // Message/Excerpt/Tenant/EndUser/Prompt or any free-text field, forever. A new
 // field fails loudly. Modeled on TestRoutingSummaryWireShapeIsAggregateOnly.
+//
+// gen2 (P4-2) widened the allow-list by exactly three CLOSED-VOCABULARY
+// fields — AcceptedAuthority/ExtractionEffective are govern.KnownAuthority /
+// govern.ExtractionAuthority token slices, and DroppedClasses is a closed
+// directive-class-name -> closed drop-reason map — still enum shape, never
+// free text.
 func TestPolicyStateRowWireShapeIsHashOnly(t *testing.T) {
 	t.Parallel()
 	allowed := map[string]bool{
@@ -1523,11 +2455,14 @@ func TestPolicyStateRowWireShapeIsHashOnly(t *testing.T) {
 		"EffectiveHash": true,                 // per-point hex digest
 		"Status":        true, "Reason": true, // closed enums (Reason a typed code, never Detail)
 		"RestartRequired": true, "Mode": true, // bool + closed enum
-		"LastSeen": true, // RFC3339 liveness
+		"LastSeen":            true, // RFC3339 liveness
+		"AcceptedAuthority":   true, // gen2 — closed authority-token slice
+		"ExtractionEffective": true, // gen2 — closed authority-token slice
+		"DroppedClasses":      true, // gen2 — closed class-name -> closed reason map
 	}
 	typ := reflect.TypeOf(orgcontract.PolicyStateRow{})
 	if typ.NumField() != len(allowed) {
-		t.Errorf("PolicyStateRow has %d fields, want exactly %d (§2.1 12-field allow-list, R4-NIT)", typ.NumField(), len(allowed))
+		t.Errorf("PolicyStateRow has %d fields, want exactly %d (§2.1 allow-list + gen2 P4-2 widening)", typ.NumField(), len(allowed))
 	}
 	for i := 0; i < typ.NumField(); i++ {
 		name := typ.Field(i).Name

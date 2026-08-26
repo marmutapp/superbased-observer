@@ -218,8 +218,8 @@ func TestAPIGuardConformance(t *testing.T) {
 	if blockers != 4 {
 		t.Errorf("block-capable channels = %d, want 4 (claude-code PreToolUse + cursor before×3)", blockers)
 	}
-	if watchers != 34 {
-		t.Errorf("watcher rows = %d, want 34 (every enabled non-browser adapter: 39 EnabledAdapters minus the 5 *-web browser-extension rows; deepseek + junie joined 2026-08-17)", watchers)
+	if watchers != 37 {
+		t.Errorf("watcher rows = %d, want 37 (every enabled non-browser adapter: 42 EnabledAdapters minus the 5 *-web browser-extension rows; deepseek + junie joined 2026-08-17)", watchers)
 	}
 }
 

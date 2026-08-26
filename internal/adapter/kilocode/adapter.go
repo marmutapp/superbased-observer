@@ -95,7 +95,7 @@ func (a *CLIAdapter) ParseSessionFile(ctx context.Context, path string, fromOffs
 	}
 	defer database.Close()
 
-	rootCache := map[string]string{}
+	rootCache := map[string]kiloResolvedRoot{}
 	// Resolve reasoning -> successor assignment BEFORE any emitter runs,
 	// so the threading can't depend on loader order (see
 	// loadReasoningIndex). Reasoning parts are never rows of their own.
@@ -365,7 +365,7 @@ func (a *CLIAdapter) loadSessionDirectories(ctx context.Context, db *sql.DB) (ma
 	return out, rows.Err()
 }
 
-func (a *CLIAdapter) loadUserPromptEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string) ([]models.ToolEvent, error) {
+func (a *CLIAdapter) loadUserPromptEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]kiloResolvedRoot) ([]models.ToolEvent, error) {
 	sessDirs, err := a.loadSessionDirectories(ctx, db)
 	if err != nil {
 		return nil, err
@@ -399,7 +399,7 @@ func (a *CLIAdapter) loadUserPromptEvents(ctx context.Context, db *sql.DB, sourc
 	return out, rows.Err()
 }
 
-func (a *CLIAdapter) userPromptEvent(ctx context.Context, db *sql.DB, sourceFile string, row messageRow, sessDirs map[string]kiloSessionDirectory, rootCache map[string]string) (models.ToolEvent, bool, error) {
+func (a *CLIAdapter) userPromptEvent(ctx context.Context, db *sql.DB, sourceFile string, row messageRow, sessDirs map[string]kiloSessionDirectory, rootCache map[string]kiloResolvedRoot) (models.ToolEvent, bool, error) {
 	var msg messageData
 	if err := json.Unmarshal([]byte(row.Data), &msg); err != nil {
 		return models.ToolEvent{}, false, nil
@@ -441,13 +441,14 @@ func (a *CLIAdapter) userPromptEvent(ctx context.Context, db *sql.DB, sourceFile
 	if when.IsZero() {
 		when = millisToTime(row.TimeCreate)
 	}
-	project := a.resolveProjectRoot(a.cwdFor(msg, sessDirs[row.SessionID]), rootCache)
+	project, remote := a.resolveProjectRoot(a.cwdFor(msg, sessDirs[row.SessionID]), rootCache)
 	model := firstNonEmpty(msg.Model.ModelID, msg.ModelID)
 	return models.ToolEvent{
 		SourceFile:         sourceFile,
 		SourceEventID:      "message:" + row.ID,
 		SessionID:          row.SessionID,
 		ProjectRoot:        project,
+		GitRemote:          remote,
 		Timestamp:          chooseTime(when, time.Time{}, 0),
 		Model:              model,
 		Tool:               models.ToolKiloCodeCLI,
@@ -528,7 +529,7 @@ func (a *CLIAdapter) loadReasoningIndex(ctx context.Context, db *sql.DB, fromOff
 // none was.
 func (r reasoningIndex) threaded(partID string) string { return r[partID] }
 
-func (a *CLIAdapter) loadToolEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string, reasoning reasoningIndex) ([]models.ToolEvent, error) {
+func (a *CLIAdapter) loadToolEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]kiloResolvedRoot, reasoning reasoningIndex) ([]models.ToolEvent, error) {
 	sessDirs, err := a.loadSessionDirectories(ctx, db)
 	if err != nil {
 		return nil, err
@@ -560,7 +561,7 @@ func (a *CLIAdapter) loadToolEvents(ctx context.Context, db *sql.DB, sourceFile 
 	return out, rows.Err()
 }
 
-func (a *CLIAdapter) toolEvent(sourceFile string, row partRow, sessDirs map[string]kiloSessionDirectory, rootCache map[string]string, reasoning reasoningIndex) (models.ToolEvent, bool) {
+func (a *CLIAdapter) toolEvent(sourceFile string, row partRow, sessDirs map[string]kiloSessionDirectory, rootCache map[string]kiloResolvedRoot, reasoning reasoningIndex) (models.ToolEvent, bool) {
 	var msg messageData
 	if err := json.Unmarshal([]byte(row.Message), &msg); err != nil {
 		return models.ToolEvent{}, false
@@ -578,7 +579,7 @@ func (a *CLIAdapter) toolEvent(sourceFile string, row partRow, sessDirs map[stri
 	if when.IsZero() {
 		when = millisToTime(row.TimeCreate)
 	}
-	project := a.resolveProjectRoot(a.cwdFor(msg, sessDirs[row.SessionID]), rootCache)
+	project, remote := a.resolveProjectRoot(a.cwdFor(msg, sessDirs[row.SessionID]), rootCache)
 	model := firstNonEmpty(msg.ModelID, msg.Model.ModelID)
 
 	rawInput := string(part.State.Input)
@@ -618,6 +619,7 @@ func (a *CLIAdapter) toolEvent(sourceFile string, row partRow, sessDirs map[stri
 		SourceEventID:      "part:" + row.ID,
 		SessionID:          row.SessionID,
 		ProjectRoot:        project,
+		GitRemote:          remote,
 		Timestamp:          chooseTime(when, time.Time{}, 0),
 		Model:              model,
 		Tool:               models.ToolKiloCodeCLI,
@@ -634,7 +636,7 @@ func (a *CLIAdapter) toolEvent(sourceFile string, row partRow, sessDirs map[stri
 	}, true
 }
 
-func (a *CLIAdapter) loadCompletionEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string) ([]models.ToolEvent, error) {
+func (a *CLIAdapter) loadCompletionEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]kiloResolvedRoot) ([]models.ToolEvent, error) {
 	sessDirs, err := a.loadSessionDirectories(ctx, db)
 	if err != nil {
 		return nil, err
@@ -666,12 +668,12 @@ func (a *CLIAdapter) loadCompletionEvents(ctx context.Context, db *sql.DB, sourc
 	return out, rows.Err()
 }
 
-func (a *CLIAdapter) completionEvent(sourceFile string, row messageRow, sessDirs map[string]kiloSessionDirectory, rootCache map[string]string) (models.ToolEvent, bool) {
+func (a *CLIAdapter) completionEvent(sourceFile string, row messageRow, sessDirs map[string]kiloSessionDirectory, rootCache map[string]kiloResolvedRoot) (models.ToolEvent, bool) {
 	var msg messageData
 	if err := json.Unmarshal([]byte(row.Data), &msg); err != nil {
 		return models.ToolEvent{}, false
 	}
-	project := a.resolveProjectRoot(a.cwdFor(msg, sessDirs[row.SessionID]), rootCache)
+	project, remote := a.resolveProjectRoot(a.cwdFor(msg, sessDirs[row.SessionID]), rootCache)
 	model := firstNonEmpty(msg.ModelID, msg.Model.ModelID)
 	when := millisToTime(msg.Time.Completed)
 	if when.IsZero() {
@@ -682,6 +684,7 @@ func (a *CLIAdapter) completionEvent(sourceFile string, row messageRow, sessDirs
 		SourceEventID: "complete:" + row.ID,
 		SessionID:     row.SessionID,
 		ProjectRoot:   project,
+		GitRemote:     remote,
 		Timestamp:     chooseTime(when, time.Time{}, 0),
 		Model:         model,
 		Tool:          models.ToolKiloCodeCLI,
@@ -708,7 +711,7 @@ func withStopReason(reason string) *models.ActionMetadata {
 	return &models.ActionMetadata{StopReason: reason}
 }
 
-func (a *CLIAdapter) loadAssistantTextEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string, reasoning reasoningIndex) ([]models.ToolEvent, error) {
+func (a *CLIAdapter) loadAssistantTextEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]kiloResolvedRoot, reasoning reasoningIndex) ([]models.ToolEvent, error) {
 	sessDirs, err := a.loadSessionDirectories(ctx, db)
 	if err != nil {
 		return nil, err
@@ -741,7 +744,7 @@ func (a *CLIAdapter) loadAssistantTextEvents(ctx context.Context, db *sql.DB, so
 	return out, rows.Err()
 }
 
-func (a *CLIAdapter) assistantTextEvent(sourceFile string, row partRow, sessDirs map[string]kiloSessionDirectory, rootCache map[string]string, reasoning reasoningIndex) (models.ToolEvent, bool) {
+func (a *CLIAdapter) assistantTextEvent(sourceFile string, row partRow, sessDirs map[string]kiloSessionDirectory, rootCache map[string]kiloResolvedRoot, reasoning reasoningIndex) (models.ToolEvent, bool) {
 	var msg messageData
 	if err := json.Unmarshal([]byte(row.Message), &msg); err != nil {
 		return models.ToolEvent{}, false
@@ -754,7 +757,7 @@ func (a *CLIAdapter) assistantTextEvent(sourceFile string, row partRow, sessDirs
 	if body == "" {
 		return models.ToolEvent{}, false
 	}
-	project := a.resolveProjectRoot(a.cwdFor(msg, sessDirs[row.SessionID]), rootCache)
+	project, remote := a.resolveProjectRoot(a.cwdFor(msg, sessDirs[row.SessionID]), rootCache)
 	model := firstNonEmpty(msg.ModelID, msg.Model.ModelID)
 	when := millisToTime(row.TimeCreate)
 	preview := truncate(body, 200)
@@ -778,6 +781,7 @@ func (a *CLIAdapter) assistantTextEvent(sourceFile string, row partRow, sessDirs
 		SourceEventID: "asst:" + row.ID,
 		SessionID:     row.SessionID,
 		ProjectRoot:   project,
+		GitRemote:     remote,
 		Timestamp:     chooseTime(when, time.Time{}, 0),
 		Model:         model,
 		Tool:          models.ToolKiloCodeCLI,
@@ -800,7 +804,7 @@ func (a *CLIAdapter) assistantTextEvent(sourceFile string, row partRow, sessDirs
 // emitting both double-counts). Skips step-start parts entirely (no
 // signal, no tokens, no cost — would 12× the per-turn row count on a
 // long turn without adding any analytical value).
-func (a *CLIAdapter) loadStepFinishEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string) ([]models.ToolEvent, error) {
+func (a *CLIAdapter) loadStepFinishEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]kiloResolvedRoot) ([]models.ToolEvent, error) {
 	sessDirs, err := a.loadSessionDirectories(ctx, db)
 	if err != nil {
 		return nil, err
@@ -832,7 +836,7 @@ func (a *CLIAdapter) loadStepFinishEvents(ctx context.Context, db *sql.DB, sourc
 	return out, rows.Err()
 }
 
-func (a *CLIAdapter) stepFinishEvent(sourceFile string, row partRow, sessDirs map[string]kiloSessionDirectory, rootCache map[string]string) (models.ToolEvent, bool) {
+func (a *CLIAdapter) stepFinishEvent(sourceFile string, row partRow, sessDirs map[string]kiloSessionDirectory, rootCache map[string]kiloResolvedRoot) (models.ToolEvent, bool) {
 	var msg messageData
 	if err := json.Unmarshal([]byte(row.Message), &msg); err != nil {
 		return models.ToolEvent{}, false
@@ -844,7 +848,7 @@ func (a *CLIAdapter) stepFinishEvent(sourceFile string, row partRow, sessDirs ma
 	if part.Type != "step-finish" {
 		return models.ToolEvent{}, false
 	}
-	project := a.resolveProjectRoot(a.cwdFor(msg, sessDirs[row.SessionID]), rootCache)
+	project, remote := a.resolveProjectRoot(a.cwdFor(msg, sessDirs[row.SessionID]), rootCache)
 	model := firstNonEmpty(msg.ModelID, msg.Model.ModelID)
 	when := millisToTime(row.TimeCreate)
 	return models.ToolEvent{
@@ -852,6 +856,7 @@ func (a *CLIAdapter) stepFinishEvent(sourceFile string, row partRow, sessDirs ma
 		SourceEventID: "step:" + row.ID,
 		SessionID:     row.SessionID,
 		ProjectRoot:   project,
+		GitRemote:     remote,
 		Timestamp:     chooseTime(when, time.Time{}, 0),
 		Model:         model,
 		Tool:          models.ToolKiloCodeCLI,
@@ -874,7 +879,7 @@ func (a *CLIAdapter) stepFinishEvent(sourceFile string, row partRow, sessDirs ma
 // the cost engine doesn't use it (we send input/output/reasoning/
 // cache.read/cache.write individually). Skips rows where the bundle
 // is all-zero (in-progress turns).
-func (a *CLIAdapter) loadTokenEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string) ([]models.TokenEvent, error) {
+func (a *CLIAdapter) loadTokenEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]kiloResolvedRoot) ([]models.TokenEvent, error) {
 	sessDirs, err := a.loadSessionDirectories(ctx, db)
 	if err != nil {
 		return nil, err
@@ -905,7 +910,7 @@ func (a *CLIAdapter) loadTokenEvents(ctx context.Context, db *sql.DB, sourceFile
 	return out, rows.Err()
 }
 
-func (a *CLIAdapter) tokenEvent(sourceFile string, row messageRow, sessDirs map[string]kiloSessionDirectory, rootCache map[string]string) (models.TokenEvent, bool) {
+func (a *CLIAdapter) tokenEvent(sourceFile string, row messageRow, sessDirs map[string]kiloSessionDirectory, rootCache map[string]kiloResolvedRoot) (models.TokenEvent, bool) {
 	var msg messageData
 	if err := json.Unmarshal([]byte(row.Data), &msg); err != nil {
 		return models.TokenEvent{}, false
@@ -915,7 +920,7 @@ func (a *CLIAdapter) tokenEvent(sourceFile string, row messageRow, sessDirs map[
 		msg.Tokens.Reasoning == 0 {
 		return models.TokenEvent{}, false
 	}
-	project := a.resolveProjectRoot(a.cwdFor(msg, sessDirs[row.SessionID]), rootCache)
+	project, remote := a.resolveProjectRoot(a.cwdFor(msg, sessDirs[row.SessionID]), rootCache)
 	model := firstNonEmpty(msg.ModelID, msg.Model.ModelID)
 	when := millisToTime(msg.Time.Completed)
 	if when.IsZero() {
@@ -926,6 +931,7 @@ func (a *CLIAdapter) tokenEvent(sourceFile string, row messageRow, sessDirs map[
 		SourceEventID:       "tokens:" + row.ID,
 		SessionID:           row.SessionID,
 		ProjectRoot:         project,
+		GitRemote:           remote,
 		Timestamp:           when,
 		Tool:                models.ToolKiloCodeCLI,
 		Model:               model,
@@ -946,7 +952,7 @@ func (a *CLIAdapter) tokenEvent(sourceFile string, row messageRow, sessDirs map[
 // the live capture (the v1 session didn't spawn a subagent) but the
 // part type exists in Kilo's source and we surface it for forward
 // compatibility.
-func (a *CLIAdapter) loadSubtaskEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string) ([]models.ToolEvent, error) {
+func (a *CLIAdapter) loadSubtaskEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]kiloResolvedRoot) ([]models.ToolEvent, error) {
 	sessDirs, err := a.loadSessionDirectories(ctx, db)
 	if err != nil {
 		return nil, err
@@ -980,7 +986,7 @@ func (a *CLIAdapter) loadSubtaskEvents(ctx context.Context, db *sql.DB, sourceFi
 		if sub.Type != "subtask" {
 			continue
 		}
-		project := a.resolveProjectRoot(a.cwdFor(msg, sessDirs[row.SessionID]), rootCache)
+		project, remote := a.resolveProjectRoot(a.cwdFor(msg, sessDirs[row.SessionID]), rootCache)
 		model := firstNonEmpty(sub.Model.ModelID, msg.ModelID, msg.Model.ModelID)
 		target := firstNonEmpty(sub.Agent, "subagent")
 		when := millisToTime(sub.Time.Created)
@@ -992,6 +998,7 @@ func (a *CLIAdapter) loadSubtaskEvents(ctx context.Context, db *sql.DB, sourceFi
 			SourceEventID: "subtask:" + row.ID,
 			SessionID:     row.SessionID,
 			ProjectRoot:   project,
+			GitRemote:     remote,
 			Timestamp:     when,
 			Model:         model,
 			Tool:          models.ToolKiloCodeCLI,
@@ -1010,7 +1017,7 @@ func (a *CLIAdapter) loadSubtaskEvents(ctx context.Context, db *sql.DB, sourceFi
 // agent's structured task list. Tolerant of older Kilo schemas that
 // might lack the table (every capture so far has it but the
 // __drizzle_migrations stack is still growing).
-func (a *CLIAdapter) loadTodoEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string) ([]models.ToolEvent, error) {
+func (a *CLIAdapter) loadTodoEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]kiloResolvedRoot) ([]models.ToolEvent, error) {
 	if !tableExists(ctx, db, "todo") {
 		return nil, nil
 	}
@@ -1041,11 +1048,13 @@ func (a *CLIAdapter) loadTodoEvents(ctx context.Context, db *sql.DB, sourceFile 
 			when = millisToTime(tCreated)
 		}
 		eventID := fmt.Sprintf("todo:%s:%d:%d", sessionID, position, tUpdated)
+		todoRoot, todoRemote := a.resolveProjectRoot(sessDirs[sessionID].Fallback(), rootCache)
 		out = append(out, models.ToolEvent{
 			SourceFile:    sourceFile,
 			SourceEventID: eventID,
 			SessionID:     sessionID,
-			ProjectRoot:   a.resolveProjectRoot(sessDirs[sessionID].Fallback(), rootCache),
+			ProjectRoot:   todoRoot,
+			GitRemote:     todoRemote,
 			Timestamp:     when,
 			Tool:          models.ToolKiloCodeCLI,
 			ActionType:    models.ActionTodoUpdate,
@@ -1086,21 +1095,32 @@ func (a *CLIAdapter) cwdFor(msg messageData, dir kiloSessionDirectory) string {
 // "D:\programsx\..." resolves to /mnt/d/programsx/... instead of
 // CWD-prefixing the observer's own .git
 // (memory feedback_foreign_path_git_resolve).
-func (a *CLIAdapter) resolveProjectRoot(cwd string, cache map[string]string) string {
+func (a *CLIAdapter) resolveProjectRoot(cwd string, cache map[string]kiloResolvedRoot) (root, remote string) {
 	if cwd == "" {
-		return "[kilo-code-cli]"
+		return "[kilo-code-cli]", ""
 	}
 	cwd = crossmount.TranslateForeignPath(cwd)
-	if root, ok := cache[cwd]; ok {
-		return root
+	if resolved, ok := cache[cwd]; ok {
+		return resolved.root, resolved.remote
 	}
 	info, err := git.Resolve(cwd)
 	if err != nil {
-		cache[cwd] = cwd
-		return cwd
+		cache[cwd] = kiloResolvedRoot{root: cwd}
+		return cwd, ""
 	}
-	cache[cwd] = info.Root
-	return info.Root
+	remote = git.NormalizeRemote(info.Remote)
+	cache[cwd] = kiloResolvedRoot{root: info.Root, remote: remote}
+	return info.Root, remote
+}
+
+// kiloResolvedRoot is the resolveProjectRoot cache entry: the git
+// working-tree root (or the bare cwd when it isn't inside one) plus
+// the normalized git remote, cached together per-cwd so repeated
+// lookups for the same directory across event types share one
+// git.Resolve call.
+type kiloResolvedRoot struct {
+	root   string
+	remote string
 }
 
 func latestWatermark(ctx context.Context, path string) (int64, error) {

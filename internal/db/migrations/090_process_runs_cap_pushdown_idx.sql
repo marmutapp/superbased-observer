@@ -1,0 +1,72 @@
+-- Two indexes serving the W2.2 session-scoped process-rows org-wire read
+-- (internal/store/processorgrows.go::SelectSessionProcessRows), the sibling
+-- of the network read migration 089 fixed. That query runs on every org-push
+-- tick and was measured at 11.9% of daemon CPU by the 2026-08-26 compute/CPU
+-- audit (docs/plans/post-incident-task-queue-2026-08-26.md) — the largest
+-- remaining single consumer after 089 closed the network-read spill.
+--
+-- It had two independent sinks, one per index below.
+--
+-- ---------------------------------------------------------------------------
+-- Sink 1: the per-run event count aggregated the WHOLE process_events table.
+--
+--   LEFT JOIN (SELECT process_run_id, COUNT(*) FROM process_events
+--              WHERE process_run_id IS NOT NULL GROUP BY process_run_id)
+--
+-- No index led with process_run_id — idx_process_events_session is
+-- (session_id, timestamp), idx_process_events_type is (event_type, timestamp),
+-- and 089's idx_process_events_type_session_ts is (event_type, session_id,
+-- timestamp DESC). So SQLite materialized the aggregate by full-scanning
+-- process_events and grouping through a temp b-tree, EVERY tick, regardless
+-- of how few runs the 7-day window actually held:
+--
+--   MATERIALIZE pe / SCAN process_events / USE TEMP B-TREE FOR GROUP BY
+--
+-- With a process_run_id-leading index the rewritten query instead resolves
+-- the count as a covering-index seek per surviving run:
+--
+--   SEARCH pe USING COVERING INDEX idx_process_events_run (process_run_id=?)
+--
+-- Deliberately NOT a partial index (WHERE process_run_id IS NOT NULL), even
+-- though the column is nullable: measured against a populated fixture both
+-- forms produce the byte-identical plan above, and the partial form is only
+-- usable while SQLite can prove the query implies its WHERE clause. That
+-- proof holds for today's `pe.process_run_id = r.id` equality but is silent
+-- and brittle — any future rewrite that stops implying NOT NULL loses the
+-- index with no error and no test signal. The full index also serves other
+-- equality lookups on the column. Equal plan, strictly more robust.
+--
+-- ---------------------------------------------------------------------------
+-- Sink 2: the per-session ordering externally sorted the whole window.
+--
+-- The read needs (session_id ASC, started_at DESC) — both for the new
+-- ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY started_at DESC) cap
+-- pushdown and for the outer ORDER BY. The pre-existing
+-- idx_process_runs_session is (session_id, started_at) — ASC on BOTH columns
+-- (migration 044). SQLite cannot serve a MIXED-direction order from it: a
+-- reverse scan yields (session_id DESC, started_at DESC), the wrong leading
+-- direction. Verified empirically rather than assumed — with only the ASC
+-- index the plan carries
+--
+--   SEARCH pr USING INDEX idx_process_runs_session (session_id>?)
+--   USE TEMP B-TREE FOR LAST TERM OF ORDER BY   <-- over the FULL window
+--
+-- and that temp b-tree sorts every run in the window, before the cap can
+-- discard ~half of them. With the DESC index that line disappears entirely
+-- and the window function streams in index order. (A residual temp b-tree
+-- remains on the OUTER ORDER BY, but it sorts only the POST-cap survivors —
+-- SQLite cannot carry sort order out of a co-routine CTE. The sibling's
+-- shipped query has the same residual; it is bounded by the cap, not by the
+-- window.)
+--
+-- Both indexes are on NODE-LOCAL tables (process_runs / process_events are
+-- pinned in tests/invariant/privacy_test.go and MUST NOT appear in
+-- internal/store/orgpush.go), so there is no paired
+-- internal/orgserver/db/migrations/ migration. Pure read-path optimization:
+-- no column, no wire shape, and no row content changes.
+
+CREATE INDEX IF NOT EXISTS idx_process_events_run
+    ON process_events(process_run_id);
+
+CREATE INDEX IF NOT EXISTS idx_process_runs_session_started_desc
+    ON process_runs(session_id, started_at DESC);

@@ -212,6 +212,30 @@ func TestValidateRejectsBadLogLevel(t *testing.T) {
 	}
 }
 
+// TestValidateAdmissionOnJudgeError pins the Arc-3 posture enum: an unknown
+// on_judge_error value is a load-time error, the two valid values + empty pass,
+// and a negative judge_retries is rejected.
+func TestValidateAdmissionOnJudgeError(t *testing.T) {
+	t.Parallel()
+	for _, v := range []string{"", "fail_open", "fail_closed"} {
+		c := Default()
+		c.Observability.Admission.OnJudgeError = v
+		if err := Validate(c); err != nil {
+			t.Fatalf("on_judge_error=%q should validate, got %v", v, err)
+		}
+	}
+	c := Default()
+	c.Observability.Admission.OnJudgeError = "queue_retry"
+	if err := Validate(c); err == nil {
+		t.Fatal("expected error for on_judge_error=queue_retry (not offered)")
+	}
+	c = Default()
+	c.Observability.Admission.JudgeRetries = -1
+	if err := Validate(c); err == nil {
+		t.Fatal("expected error for negative judge_retries")
+	}
+}
+
 // TestValidateProxyUpstreamsRejectsReservedAutoID pins the gateway config
 // plane spec Phase 2 rule: "auto" is a reserved virtual lane id — a
 // [proxy.upstreams] entry literally keyed "auto" is a config validation

@@ -154,6 +154,62 @@ func AnnouncementSigningMessage(version int64, body string) []byte {
 	return h.Sum(nil)
 }
 
+// Routing-policy signing, VERSION 2 (docs/security.md ledger
+// ROUTING-SIG-1, closed 2026-08-20). The v1 signature on this rail
+// covers the BODY BYTES ALONE ([VerifySignedBody]) — not the version,
+// not the rail — which let a party able to serve
+// GET /api/agent/routing-policy replay a genuinely signed OLD body under
+// an INFLATED version and freeze a node's cache against every later
+// genuine publish (the agent's monotonic `cached.Version >= doc.Version`
+// short-circuit does the rest).
+//
+// The rail is RELEASED, so v1 could not be changed in place: a new agent
+// would reject every old server's policy and vice versa. v2 is therefore
+// CARRIED ALONGSIDE — the server mints both, the agent prefers v2 when
+// the document offers one — exactly the versioned migration the ledger
+// row prescribed.
+//
+// The message shape mirrors [AnnouncementSigningMessage] byte-for-byte
+// in composition style, with a DIFFERENT domain tag, so a signature
+// minted on either rail can never verify on the other even though ONE
+// org key (orgserver/routingpolicy.SigningKey) signs both.
+
+// routingPolicySigningV2Domain domain-separates v2 routing-policy
+// signatures from every other Ed25519 use in the protocol — including
+// this rail's own v1 (bare body bytes) and the announcement rail
+// ([announcementSigningDomain]).
+const routingPolicySigningV2Domain = "sbo-routing-policy-v2"
+
+// RoutingPolicySigningMessageV2 returns the canonical bytes signed over a
+// routing-policy document on the v2 rail: SHA-256 over
+//
+//	domain || 0x00 || decimal(version) || 0x00 || body
+//
+// The NUL separators make the encoding unambiguous (the version is
+// decimal digits, so no body can shift the boundary), and binding the
+// VERSION is the whole point: a signature minted for version N cannot be
+// presented at version N+1, which is precisely the cache-freezing replay
+// ROUTING-SIG-1 recorded.
+func RoutingPolicySigningMessageV2(version int64, body string) []byte {
+	h := sha256.New()
+	h.Write([]byte(routingPolicySigningV2Domain))
+	h.Write([]byte{0})
+	h.Write([]byte(strconv.FormatInt(version, 10)))
+	h.Write([]byte{0})
+	h.Write([]byte(body))
+	return h.Sum(nil)
+}
+
+// SignRoutingPolicyV2 signs the canonical v2 message and returns the
+// base64 (std encoding, matching this rail's v1 field) signature the
+// RoutingPolicyDoc.SignatureV2 field carries. The org server's publish
+// path is the only caller.
+func SignRoutingPolicyV2(priv ed25519.PrivateKey, version int64, body string) string {
+	return base64.StdEncoding.EncodeToString(
+		ed25519.Sign(priv, RoutingPolicySigningMessageV2(version, body)),
+	)
+}
+
 // DecodeCapped decodes exactly ONE JSON value from r into v under a hard
 // byte cap, refusing both anything past that value and a document that
 // reaches the cap.

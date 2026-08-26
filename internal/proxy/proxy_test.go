@@ -2272,16 +2272,13 @@ func TestProxy_SessionResolverMissLeavesNull(t *testing.T) {
 	}
 }
 
-// TestProxy_SessionResolverSkippedOnHostedLane is the PLANE BOUNDARY
+// TestProxy_OrdinaryResolvedSessionRejectedOnHostedLane is the PLANE BOUNDARY
 // regression pin (operator-reported class, 2026-08-13): a request that
-// arrives on an explicit /up/<id> hosted lane (Plane A) must NEVER consult
-// the process-based SessionResolver, which maps a connection to a local
-// coding-agent session (Plane B). Absent an explicit session id the hosted
-// turn stays unattributed (SessionID ""), never borrowing a codex/claude-code
-// session — that borrowing polluted the Plane-B cost rollups. Against the
-// pre-fix code (resolver called on every lane) this fails: the resolver is
-// invoked and the turn lands with "sess-from-bridge".
-func TestProxy_SessionResolverSkippedOnHostedLane(t *testing.T) {
+// arrives on an explicit /up/<id> hosted lane (Plane A) must never ACCEPT an
+// ordinary process-resolved coding-agent session (Plane B). The Arena runner
+// now has a narrowly prefixed synthetic exception, so the resolver is
+// consulted but this ordinary result must still leave the turn unattributed.
+func TestProxy_OrdinaryResolvedSessionRejectedOnHostedLane(t *testing.T) {
 	const requestBody = `{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}`
 	const responseBody = `{"id":"msg_abc","model":"claude-sonnet-4","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
 
@@ -2309,7 +2306,7 @@ func TestProxy_SessionResolverSkippedOnHostedLane(t *testing.T) {
 	ts := httptest.NewServer(p.Handler())
 	defer ts.Close()
 
-	// Hosted lane, NO X-Session-Id: the resolver must be skipped entirely.
+	// Hosted lane, NO X-Session-Id: an ordinary bridge result is rejected.
 	req, _ := http.NewRequest("POST", ts.URL+"/up/hosted/v1/messages", strings.NewReader(requestBody))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
@@ -2325,8 +2322,19 @@ func TestProxy_SessionResolverSkippedOnHostedLane(t *testing.T) {
 	if turns[0].SessionID != "" {
 		t.Errorf("hosted-lane turn borrowed a coding-agent session_id: got %q want empty", turns[0].SessionID)
 	}
-	if resolver.callCount() != 0 {
-		t.Errorf("SessionResolver must not run on a /up hosted lane (called %d times)", resolver.callCount())
+	if resolver.callCount() != 1 {
+		t.Errorf("SessionResolver calls = %d, want 1 prefix check", resolver.callCount())
+	}
+}
+
+func TestProxy_ArenaSyntheticSessionAcceptedOnHostedLane(t *testing.T) {
+	resolver := &fakeResolver{sessionID: models.ArenaSessionIDPrefix + "run-grok", ok: true}
+	p := &Proxy{sessions: resolver, logger: slog.Default()}
+	req := httptest.NewRequest(http.MethodPost, "/up/grok/v1/chat/completions", strings.NewReader(`{"model":"grok"}`))
+	req = req.WithContext(context.WithValue(req.Context(), obsLaneCtxKey{}, "grok"))
+	got := p.resolveAPITurnSessionID(req, models.ProviderOpenAI, []byte(`{"model":"grok"}`))
+	if got != models.ArenaSessionIDPrefix+"run-grok" {
+		t.Fatalf("synthetic Arena session = %q", got)
 	}
 }
 

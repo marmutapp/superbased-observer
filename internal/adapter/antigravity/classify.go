@@ -72,9 +72,9 @@ func (a *Adapter) classify(path, conversationID string, plaintext []byte, idx *i
 		startTime = idx.created
 	}
 
-	projectRoot := "[antigravity]"
+	projectRoot, gitRemote := "[antigravity]", ""
 	if idx != nil && idx.workspaceURI != "" {
-		projectRoot = decodeFileURIToRoot(idx.workspaceURI)
+		projectRoot, gitRemote = decodeFileURIToRoot(idx.workspaceURI)
 	}
 
 	sessionID := conversationID
@@ -98,6 +98,7 @@ func (a *Adapter) classify(path, conversationID string, plaintext []byte, idx *i
 				SourceEventID: eventID,
 				SessionID:     sessionID,
 				ProjectRoot:   projectRoot,
+				GitRemote:     gitRemote,
 				Timestamp:     ts,
 				Model:         coalesce(model, idxModel(idx)),
 				Tool:          models.ToolAntigravity,
@@ -138,6 +139,7 @@ func (a *Adapter) classify(path, conversationID string, plaintext []byte, idx *i
 			SourceEventID: eventID,
 			SessionID:     sessionID,
 			ProjectRoot:   projectRoot,
+			GitRemote:     gitRemote,
 			Timestamp:     ts,
 			Model:         coalesce(model, idxModel(idx)),
 			Tool:          models.ToolAntigravity,
@@ -173,6 +175,7 @@ func (a *Adapter) classify(path, conversationID string, plaintext []byte, idx *i
 			SourceEventID:   eventID,
 			SessionID:       sessionID,
 			ProjectRoot:     projectRoot,
+			GitRemote:       gitRemote,
 			Timestamp:       ts,
 			Tool:            models.ToolAntigravity,
 			Model:           coalesce(model, idxModel(idx)),
@@ -564,10 +567,10 @@ func stableSourceID(seen map[string]bool, kind, path, sessionID, key string, ext
 // (Antigravity sometimes records a recently-edited file as the
 // workspace URI rather than the workspace folder itself) and
 // git.Resolve walks happen as before.
-func decodeFileURIToRoot(uri string) string {
-	root := strings.TrimSpace(uri)
+func decodeFileURIToRoot(uri string) (root, remote string) {
+	root = strings.TrimSpace(uri)
 	if root == "" {
-		return "[antigravity]"
+		return "[antigravity]", ""
 	}
 	// vscode-remote:// is antigravity-specific; pathnorm doesn't
 	// model it, so strip the scheme + percent-decode here and let
@@ -590,7 +593,7 @@ func decodeFileURIToRoot(uri string) string {
 	// pass through the remaining layers.
 	root = pathnorm.Normalize(root)
 	if root == "" {
-		return "[antigravity]"
+		return "[antigravity]", ""
 	}
 	if ext := filepath.Ext(root); ext != "" {
 		if dir := filepath.Dir(root); dir != "" && dir != "." && dir != "/" {
@@ -598,7 +601,7 @@ func decodeFileURIToRoot(uri string) string {
 		}
 	}
 	if info, err := git.Resolve(root); err == nil {
-		return info.Root
+		return info.Root, git.NormalizeRemote(info.Remote)
 	}
-	return root
+	return root, ""
 }

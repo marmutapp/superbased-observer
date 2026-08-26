@@ -1,0 +1,172 @@
+[
+  {
+    "id": "divider-1786432136772",
+    "variant": "ai",
+    "content": "",
+    "blocks": [
+      { "type": "mode-divider", "mode": "LITE" }
+    ],
+    "timestamp": "12:38 PM"
+  },
+  {
+    "id": "user-1786432136772",
+    "variant": "user",
+    "content": "Add a needle finder to the haystack package, then run it.",
+    "timestamp": "12:38 PM"
+  },
+  {
+    "id": "ai-1786432140001",
+    "variant": "ai",
+    "content": "",
+    "timestamp": "12:38 PM",
+    "metadata": {},
+    "blocks": [
+      {
+        "type": "text",
+        "textType": "reasoning",
+        "content": "The user wants a finder function; read the package first.",
+        "thinkingCollapseState": "collapsed",
+        "thinkingId": "think-1",
+        "thinkingOpen": false
+      },
+      {
+        "type": "text",
+        "textType": "text",
+        "content": "I'll start by reviewing the package and adding the finder."
+      },
+      {
+        "type": "tool",
+        "toolCallId": "call_a",
+        "toolName": "read_files",
+        "input": { "paths": ["haystack/finder.go"] },
+        "agentId": "main-agent",
+        "includeToolCall": true,
+        "output": "package haystack\n",
+        "isCollapsed": false
+      },
+      {
+        "type": "tool",
+        "toolCallId": "call_b",
+        "toolName": "write_file",
+        "input": { "path": "haystack/finder.go", "instructions": "Add a Find function", "content": "func Find() {}\n" },
+        "agentId": "main-agent",
+        "includeToolCall": true,
+        "output": "Created file successfully.",
+        "isCollapsed": false
+      },
+      {
+        "type": "tool",
+        "toolCallId": "call_c",
+        "toolName": "run_terminal_command",
+        "input": { "command": "go build ./haystack/", "process_type": "SYNC", "timeout_seconds": 30 },
+        "agentId": "main-agent",
+        "includeToolCall": true,
+        "output": "",
+        "isCollapsed": false
+      },
+      {
+        "type": "agent",
+        "agentId": "agent-1",
+        "agentName": "basher",
+        "agentType": "basher",
+        "content": "",
+        "status": "complete",
+        "initialPrompt": "",
+        "params": { "command": "go test ./haystack/" },
+        "spawnToolCallId": "call_d",
+        "spawnIndex": 0,
+        "isCollapsed": false,
+        "blocks": [
+          {
+            "type": "tool",
+            "toolCallId": "call_e",
+            "toolName": "run_terminal_command",
+            "input": { "command": "go test ./haystack/", "process_type": "SYNC", "timeout_seconds": 30 },
+            "agentId": "agent-1",
+            "includeToolCall": true,
+            "output": "PASS\nok  \thaystack\t0.004s\n",
+            "isCollapsed": false
+          },
+          {
+            "type": "tool",
+            "toolCallId": "call_f",
+            "toolName": "set_output",
+            "input": { "output": "tests pass" },
+            "agentId": "agent-1",
+            "includeToolCall": true,
+            "output": "",
+            "isCollapsed": false
+          }
+        ]
+      },
+      {
+        "type": "tool",
+        "toolCallId": "call_g",
+        "toolName": "glob",
+        "input": { "pattern": "haystack/**/*.go" },
+        "agentId": "main-agent",
+        "includeToolCall": true,
+        "output": "haystack/finder.go\nhaystack/finder_test.go\n",
+        "isCollapsed": false
+      },
+      {
+        "type": "tool",
+        "toolCallId": "call_h",
+        "toolName": "write_todos",
+        "input": { "todos": [{ "id": "1", "text": "Add Find() to haystack", "status": "completed" }] },
+        "agentId": "main-agent",
+        "includeToolCall": true,
+        "output": "",
+        "isCollapsed": false
+      },
+      {
+        "type": "tool",
+        "toolCallId": "call_i",
+        "toolName": "ask_user",
+        "input": { "question": "Should Find() return an index or a bool?" },
+        "agentId": "main-agent",
+        "includeToolCall": true,
+        "output": "index",
+        "isCollapsed": false
+      }
+    ]
+  },
+  {
+    "id": "divider-1786436785439",
+    "variant": "ai",
+    "content": "",
+    "blocks": [
+      { "type": "mode-divider", "mode": "LITE" }
+    ],
+    "timestamp": "01:56 PM"
+  },
+  {
+    "id": "user-1786436785438",
+    "variant": "user",
+    "content": "Thanks",
+    "timestamp": "01:56 PM"
+  },
+  {
+    "id": "ai-1786436786000",
+    "variant": "ai",
+    "content": "",
+    "timestamp": "01:56 PM",
+    "metadata": {},
+    "blocks": [
+      {
+        "type": "text",
+        "textType": "text",
+        "content": "You're welcome."
+      },
+      {
+        "type": "tool",
+        "toolCallId": "call_j",
+        "toolName": "suggest_followups",
+        "input": { "followups": [{ "prompt": "Add a benchmark for Find()", "label": "Benchmark Find" }] },
+        "agentId": "main-agent",
+        "includeToolCall": true,
+        "output": ""
+      }
+    ]
+  }
+]

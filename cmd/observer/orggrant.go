@@ -15,6 +15,7 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/govern"
 	"github.com/marmutapp/superbased-observer/internal/govern/sidecar"
 	"github.com/marmutapp/superbased-observer/internal/orgclient"
+	"github.com/marmutapp/superbased-observer/internal/orgcontract"
 	"github.com/marmutapp/superbased-observer/internal/store"
 )
 
@@ -45,42 +46,210 @@ func authorityPlainEnglish(tok string) string {
 		return "RETIRED - this token grants nothing. Re-run `observer enroll` if your organisation needs to manage sharing"
 	case govern.AuthorityFeatureLock:
 		return "force some features on or off"
+	case govern.AuthorityEnforceRouting:
+		return "FORCE model-routing enforcement on this machine (managed tenancy only)"
+	case govern.AuthorityEnforceAdmission:
+		return "FORCE input-admission guardrail enforcement on this machine (managed tenancy only)"
+	case govern.AuthorityEnforceEgress:
+		return "FORCE egress-policy enforcement on this machine (managed tenancy only)"
+	case govern.AuthorityExtractManaged:
+		return "let the organisation RAISE what this machine shares, including tool inputs/outputs and other local data (managed tenancy only)"
+	case govern.AuthorityExtractCodeintel:
+		return "let the organisation RAISE extraction of this machine's code-intelligence index as a content-free per-project language/symbol/edge count aggregate - never symbol names, signatures, or file paths (managed tenancy only)"
+	case govern.AuthorityExtractProcess:
+		return "let the organisation RAISE extraction of this machine's process-observability data as a content-free per-day/tool run/exit/duration count aggregate - never executable paths, command arguments, or network bodies (managed tenancy only)"
+	case govern.AuthorityExtractTerminal:
+		return "let the organisation RAISE extraction of this machine's terminal-run and remote-access-audit activity as content-free count aggregates - never command text, session ids, peer addresses, or routes (managed tenancy only)"
+	case govern.AuthorityExtractToolBodies:
+		return "let the organisation RAISE extraction of this machine's tool-call inputs, outputs, reasoning, and error text (managed tenancy only)"
+	case govern.AuthorityExtractFolders:
+		return "let the organisation RAISE extraction of this machine's raw project folder names, git remotes, and branches (managed tenancy only)"
+	case govern.AuthorityExtractTraces:
+		return "let the organisation RAISE extraction of this machine's full hosted-app traces, including span content and eval/admission detail (managed tenancy only)"
+	case govern.AuthorityExtractCache:
+		return "let the organisation RAISE extraction of this machine's prompt-cache activity as a content-free per-day model/kind aggregate (managed tenancy only)"
+	case govern.AuthorityExtractRouting:
+		return "let the organisation RAISE extraction of this machine's model-routing decisions as a per-day model/turn-kind aggregate (managed tenancy only)"
+	case govern.AuthorityExtractPredictions:
+		return "let the organisation RAISE extraction of this machine's cost/limit predictor snapshots as a content-free per-day provider utilization aggregate (managed tenancy only)"
 	default:
 		return "UNKNOWN to this version of Observer - it will be recorded but never acted on"
+	}
+}
+
+// consentModeForTenancy maps the enrolment tenancy onto the govern consent
+// mode recorded on the grant. Managed tenancy is the signal the resolver
+// branches on to honour the managed-only authorities; individual enrolments
+// stay interactive so those authorities are inert.
+//
+// This is the LOCAL answer: what the node concludes when the organisation
+// said nothing about how consent was obtained. grantConsent prefers the
+// organisation's own statement when there is one.
+func consentModeForTenancy(tenancy string) string {
+	if tenancy == orgcontract.TenancyManaged {
+		return govern.ConsentManaged
+	}
+	return govern.ConsentInteractive
+}
+
+// grantConsent is the resolved answer to "who consented to this grant, how,
+// and does this command still need to ask".
+type grantConsent struct {
+	Mode  string
+	Actor string
+	// AlreadyGiven is true when the consent act happened OUTSIDE this
+	// process and re-prompting would be theatre, not diligence. Today that
+	// means exactly one thing: an ACP-P6c browser approval after an
+	// enterprise-IdP sign-in.
+	AlreadyGiven bool
+	// Summary is the one line printed in place of the prompt, naming who
+	// consented and where.
+	Summary string
+}
+
+// unnamedConsentActor is recorded when the organisation declares a consent
+// mode but no actor. It is deliberately NOT the local username: the whole
+// value of an IdP-declared mode is that the actor is server-verified, and
+// substituting $USER would dress an unverified local name up as one.
+const unnamedConsentActor = "unknown"
+
+// resolveGrantConsent decides what to record, preferring the ORGANISATION's
+// declared consent mode over the node's tenancy-derived guess.
+//
+// Preference, and why: on the IdP rail the developer already proved who they
+// are to the organisation's identity provider and approved this enrolment in a
+// browser. That is a strictly stronger consent record than a y/N on a terminal
+// attributed to a spoofable $USER, so it wins — and the actor recorded is the
+// verified address rather than the local username.
+//
+// It returns a non-empty `problem` for a declaration this node refuses. The
+// caller then enrols UNGOVERNED, which is what every other grant refusal in
+// this codebase does: the failure mode being defended against is recording
+// managed-class consent that nobody managed-class ever gave.
+//
+// Two refusals, both narrow:
+//   - "idp" on a NON-managed enrolment. ConsentIdP is managed-class
+//     (govern.ManagedConsent), so accepting it on an individual enrolment
+//     would hand managed-only authority to a node whose tenancy never
+//     unlocked it. That combination cannot come from a correct server.
+//   - a mode this build does not recognise, which is refused rather than
+//     silently downgraded, so an operator finds out that their server is
+//     asserting something this Observer cannot honour.
+func resolveGrantConsent(offer *orgclient.GrantOffer) (grantConsent, string) {
+	switch offer.ConsentMode {
+	case "":
+		// The token rail: no organisation statement, so the node decides from
+		// tenancy exactly as it did before ACP-P6c.
+		return grantConsent{
+			Mode:  consentModeForTenancy(offer.Tenancy),
+			Actor: localConsentActor(),
+		}, ""
+	case govern.ConsentIdP:
+		if offer.Tenancy != orgcontract.TenancyManaged {
+			return grantConsent{}, "the organisation says this enrolment was consented to by an identity-provider sign-in, " +
+				"but it did not enrol this machine as organisation-managed. Those two cannot both be true"
+		}
+		actor := strings.TrimSpace(offer.ConsentActor)
+		if actor == "" {
+			actor = unnamedConsentActor
+		}
+		return grantConsent{
+			Mode:         govern.ConsentIdP,
+			Actor:        actor,
+			AlreadyGiven: true,
+			Summary: fmt.Sprintf("Consent recorded from the organisation sign-in approved by %s.\n"+
+				"  That browser approval was the consent, so this command does not ask again.", actor),
+		}, ""
+	case govern.ConsentManaged:
+		// A server restating what tenancy already implies. Accepted on a
+		// managed enrolment because it grants nothing the tenancy did not
+		// already grant - and crucially it does NOT skip the prompt: no
+		// consent act happened anywhere else, so this command still has to
+		// ask. Refusing a term this build's own vocabulary defines would be
+		// an odd asymmetry.
+		if offer.Tenancy != orgcontract.TenancyManaged {
+			return grantConsent{}, "the organisation declared managed consent for an enrolment it did not mark as organisation-managed"
+		}
+		actor := strings.TrimSpace(offer.ConsentActor)
+		if actor == "" {
+			actor = localConsentActor()
+		}
+		return grantConsent{Mode: govern.ConsentManaged, Actor: actor}, ""
+	default:
+		return grantConsent{}, fmt.Sprintf("the organisation declared a consent mode this version of Observer does not understand (%q)", offer.ConsentMode)
 	}
 }
 
 // confirmAndStoreGrant prints the offered grant, obtains consent, and stores
 // it. The rules, in the order they matter:
 //
+//   - an organisation that itself carried out the consent act (the ACP-P6c
+//     IdP browser approval) is not asked again: the developer already proved
+//     who they are and approved this enrolment, and a second y/N would be
+//     theatre. The full authority summary is STILL printed - the developer
+//     must be able to read what was granted on the machine it applies to;
 //   - a TTY gets an explicit y/N prompt naming every authority token;
 //   - no TTY and no --accept-governance means ENROL WITHOUT THE GRANT, with
 //     a loud warning naming the flag. Silently accepting governance because
 //     nobody was watching would make the consent claim false, and the admin
 //     sees an ungoverned node in fleet state, which is the honest signal;
 //   - declining is not an error: the node is enrolled and ungoverned.
-func confirmAndStoreGrant(cmd *cobra.Command, st *store.Store, offer *orgclient.GrantOffer, accept bool) error {
+//
+// grantOutcome is what confirmAndStoreGrant decided, for callers that need
+// to act on an ACCEPTED grant (W-5: managed enrolment auto-writes the
+// node-side [org_client.policy] consent for the families the accepted
+// grant's authority governs). Every early-return path (refused, declined,
+// no-TTY-no-flag) leaves Accepted false, which is the caller's single signal
+// that nothing should be written.
+type grantOutcome struct {
+	// Accepted is true only when a human actually agreed to the grant, or
+	// the organisation itself already carried out the consent act
+	// (ACP-P6c IdP browser approval).
+	Accepted bool
+	// Managed reports whether the enrolment that produced this grant is
+	// organisation-managed, as opposed to individual/BYO. Mirrors
+	// offer.Tenancy == orgcontract.TenancyManaged — the same signal
+	// govern.HonoredAuthority uses to decide whether managed-only
+	// authorities are honoured at all.
+	Managed bool
+	// Authority is the raw token list from the accepted grant, unfiltered
+	// (including tokens this build does not recognise).
+	Authority []string
+}
+
+func confirmAndStoreGrant(cmd *cobra.Command, st *store.Store, offer *orgclient.GrantOffer, accept bool) (grantOutcome, error) {
 	out := cmd.OutOrStdout()
 	printGrantOffer(out, offer)
 
+	consent, problem := resolveGrantConsent(offer)
+	if problem != "" {
+		fmt.Fprintf(out, "\nGrant REFUSED: %s.\n", problem)
+		fmt.Fprintln(out, "  This machine is enrolled and reporting, but NOT governed. Nothing was recorded.")
+		fmt.Fprintln(out, "  Tell your administrator what this said - it means the server and this machine")
+		fmt.Fprintln(out, "  disagree about how this enrolment was authorised.")
+		return grantOutcome{}, nil
+	}
+
 	switch {
+	case consent.AlreadyGiven:
+		fmt.Fprintln(out, "\n"+consent.Summary)
 	case accept:
 		fmt.Fprintln(out, "\nAccepted via --accept-governance.")
 	case isInteractiveTerminal(cmd):
 		ok, err := promptYesNo(cmd, "Accept these settings from this organisation? [y/N]: ")
 		if err != nil {
-			return err
+			return grantOutcome{}, err
 		}
 		if !ok {
 			fmt.Fprintln(out, "\nDeclined. This machine is enrolled and reporting, but NOT governed:")
 			fmt.Fprintln(out, "  nothing about this dashboard will be changed by the organisation.")
-			return nil
+			return grantOutcome{}, nil
 		}
 	default:
 		fmt.Fprintln(out, "\nNot accepted: this is not an interactive terminal and --accept-governance was not passed.")
 		fmt.Fprintln(out, "  This machine is enrolled and reporting, but NOT governed. Re-run `observer enroll`")
 		fmt.Fprintln(out, "  interactively, or pass --accept-governance, to accept the settings above.")
-		return nil
+		return grantOutcome{}, nil
 	}
 
 	row := store.EnrolmentGrant{
@@ -91,8 +260,16 @@ func confirmAndStoreGrant(cmd *cobra.Command, st *store.Store, offer *orgclient.
 		OrgServerURL: offer.Grant.OrgServerURL,
 		KeyPinSHA256: offer.KeyPinSHA256,
 		Authority:    offer.Grant.Authority,
-		ConsentMode:  govern.ConsentInteractive,
-		ConsentActor: localConsentActor(),
+		// Managed-class consent (govern.ManagedConsent: managed tenancy, or
+		// an IdP-verified browser approval) is the signal
+		// govern.HonoredAuthority / the resolver branch on to honour the
+		// managed-only authorities (enforce.*/extract.managed) this grant
+		// carries. An individual enrolment stays ConsentInteractive, so those
+		// authorities remain inert even if the grant lists them. The actor is
+		// the organisation-verified identity when there is one, and the local
+		// username only when the consent act happened here.
+		ConsentMode:  consent.Mode,
+		ConsentActor: consent.Actor,
 		GrantedAt:    parseRFC3339OrNow(offer.Grant.GrantedAt),
 		ExpiresAt:    parseRFC3339OrZero(offer.Grant.ExpiresAt),
 		// The SIGNED window, set at the one moment it is by definition
@@ -105,11 +282,15 @@ func confirmAndStoreGrant(cmd *cobra.Command, st *store.Store, offer *orgclient.
 		ReceiptHash:     offer.ReceiptHash,
 	}
 	if err := st.WriteEnrolmentGrant(cmd.Context(), row); err != nil {
-		return fmt.Errorf("observer enroll: could not record the governance grant: %w", err)
+		return grantOutcome{}, fmt.Errorf("observer enroll: could not record the governance grant: %w", err)
 	}
 	fmt.Fprintln(out, "Recorded. Run `observer org grant show` at any time to see exactly what this machine granted,")
 	fmt.Fprintln(out, "and `observer unenroll` to revoke it.")
-	return nil
+	return grantOutcome{
+		Accepted:  true,
+		Managed:   offer.Tenancy == orgcontract.TenancyManaged,
+		Authority: offer.Grant.Authority,
+	}, nil
 }
 
 // printGrantOffer renders the offer. Plain hyphens, no em-dashes (the
@@ -126,11 +307,59 @@ func printGrantOffer(out io.Writer, offer *orgclient.GrantOffer) {
 	for _, tok := range offer.Grant.Authority {
 		fmt.Fprintf(out, "  - %s\n     (%s)\n", authorityPlainEnglish(tok), tok)
 	}
+	// W-5 disclosure (operator ruling): managed sign-in IS the consent, so
+	// accepting on a managed enrolment also writes the node-side
+	// [org_client.policy] keys those authorities need before extraction or
+	// enforcement can flow at all — see ensureManagedPolicyBlock. Said here,
+	// before the prompt, so the write is never a surprise.
+	if offer.Tenancy == orgcontract.TenancyManaged {
+		if families := govern.GovernedFamilies(offer.Grant.Authority); len(families) > 0 {
+			fmt.Fprintln(out, "\nAccepting will also write to this machine's config.toml:")
+			fmt.Fprintf(out, "  [org_client.policy] accept_families = %s\n", quotedTomlStringList(families))
+			fmt.Fprintf(out, "  [org_client.policy] preauthorize_enforce = %s\n", quotedTomlStringList(families))
+			fmt.Fprintln(out, "  (the families the authority above governs). You can edit or remove this at any")
+			fmt.Fprintln(out, "  time - the organisation cannot rewrite it remotely.")
+		}
+	}
 	fmt.Fprintln(out, "\nIt may NOT:")
-	fmt.Fprintln(out, "  - read your code, your files, or your command output")
+	if offerHonoursExtraction(offer) {
+		// The usual "it cannot read your code or your command output" bullet
+		// is FALSE under an extraction grant on a managed machine:
+		// extract.tool_bodies (and the umbrella extract.managed) raise the
+		// tool-call input, output, reasoning and error columns, and a tool
+		// call IS your command text. Printing it anyway would make this
+		// screen consent theatre, so it is replaced by a line pointing at the
+		// extraction authorities above - each already names what it reaches.
+		fmt.Fprintln(out, "  - read anything beyond the lines above. This machine is organisation-managed,")
+		fmt.Fprintln(out, "     so the extraction lines DO apply: some of them raise your tool inputs,")
+		fmt.Fprintln(out, "     outputs, and command text. The Privacy page always shows what is shared.")
+	} else {
+		fmt.Fprintln(out, "  - read your code, your files, or your command output")
+	}
 	fmt.Fprintln(out, "  - hide the Privacy page or the enrolment settings, so you can always see")
 	fmt.Fprintln(out, "     what is shared and who manages this machine")
 	fmt.Fprintln(out, "  - stop you leaving: `observer unenroll` removes this at any time")
+}
+
+// offerHonoursExtraction reports whether this offer's authority will actually
+// be able to RAISE what the machine shares - i.e. it carries an extraction
+// token AND the enrolment is organisation-managed, the only tenancy under
+// which govern.HonoredAuthority keeps those tokens.
+//
+// Both halves matter for honest copy. An individual enrolment handed an
+// extract.* token honours nothing (each is rendered "managed tenancy only"
+// above), so the plain "it cannot read your code" promise still holds there
+// and must not be weakened.
+func offerHonoursExtraction(offer *orgclient.GrantOffer) bool {
+	if offer.Tenancy != orgcontract.TenancyManaged {
+		return false
+	}
+	for _, tok := range offer.Grant.Authority {
+		if govern.ExtractionAuthority(tok) {
+			return true
+		}
+	}
+	return false
 }
 
 // grantOrgName prefers the enrolment's own org name for display; the grant
@@ -238,6 +467,7 @@ func newOrgGrantShowCmd() *cobra.Command {
 			for _, tok := range grant.Authority {
 				fmt.Fprintf(out, "  - %-24s %s\n", tok, authorityPlainEnglish(tok))
 			}
+			printGovernedFamilies(out, grant.Authority, b.cfg.OrgClient.Policy)
 
 			// The one honest verification line: is the key this grant was
 			// bound to still the key this node pins?
@@ -297,6 +527,48 @@ func expiryLine(grant *govern.Grant, row store.EnrolmentGrant) string {
 	}
 	return fmt.Sprintf("%s (renewed %s; originally signed to expire %s)",
 		line, row.LastRenewedAt.Format("2006-01-02"), row.SignedExpiresAt.Format("2006-01-02"))
+}
+
+// printGovernedFamilies is the W-7 share-directive surface on `observer org
+// grant show`: for each [org_client.policy] family this grant's authority
+// governs (govern.GovernedFamilies), it shows whether THIS machine's
+// config.toml currently accepts it, and preauthorizes enforcement for it, so
+// a developer can see exactly why extraction or enforcement for a granted
+// authority is or is not flowing locally.
+//
+// Deliberately read-only and CONFIG-SIDE ONLY: it renders what this node's
+// own [org_client.policy] currently holds, not the org-published
+// node.governance share directives themselves or their live resolution
+// state. Rendering that would need the same LKG/store plumbing
+// printPinnedSettings uses for the PINNED directive class, which this
+// command does not thread through for the share-directive class — so this
+// section stays honestly scoped to what it can show without new plumbing.
+func printGovernedFamilies(out io.Writer, authority []string, policy config.OrgClientPolicyConfig) {
+	families := govern.GovernedFamilies(authority)
+	fmt.Fprintln(out, "\nPolicy families this authority governs:")
+	if len(families) == 0 {
+		fmt.Fprintln(out, "  (none - nothing in this grant's authority maps to an [org_client.policy] family)")
+		return
+	}
+	accepted := make(map[string]bool, len(policy.AcceptFamilies))
+	for _, f := range policy.AcceptFamilies {
+		accepted[f] = true
+	}
+	preauth := make(map[string]bool, len(policy.PreauthorizeEnforce))
+	for _, f := range policy.PreauthorizeEnforce {
+		preauth[f] = true
+	}
+	for _, f := range families {
+		switch {
+		case !accepted[f]:
+			fmt.Fprintf(out, "  - %-24s accept_families: MISSING (extraction/enforcement for this family will not flow)\n", f)
+		case !preauth[f]:
+			fmt.Fprintf(out, "  - %-24s accept_families: present; preauthorize_enforce: MISSING (enforce mode installs inert)\n", f)
+		default:
+			fmt.Fprintf(out, "  - %-24s accept_families: present; preauthorize_enforce: present\n", f)
+		}
+	}
+	fmt.Fprintln(out, "  Edit [org_client.policy] in config.toml to change this at any time.")
 }
 
 // printPinnedSettings is the §1.7 disclosure block. It is NON-NEGOTIABLE

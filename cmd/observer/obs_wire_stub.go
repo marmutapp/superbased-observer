@@ -62,13 +62,14 @@ func (h *obsAdmissionHandle) PolicyStateFacts(_ context.Context) obsPolicyStateF
 // are no-ops in the no_obs build (Phase W poller/LKG signature parity) —
 // admission (and all of internal/obs) is compiled out here, so there is no
 // Org layer to publish into or clear.
-func (h *obsAdmissionHandle) PublishOrgAdmission(_ string, _, _ int64, _, _ string, _ bool, _ any) {}
+func (h *obsAdmissionHandle) PublishOrgAdmission(_ string, _, _ int64, _, _ string, _, _ bool, _ any) {
+}
 
 func (h *obsAdmissionHandle) ClearOrgAdmission() {}
 
 func (h *obsAdmissionHandle) OrgIdentityMatches(_ string, _ int64) bool { return false }
 
-func (h *obsAdmissionHandle) PublishOrgEgress(_ string, _, _ int64, _, _ string, _ bool, _ any) {}
+func (h *obsAdmissionHandle) PublishOrgEgress(_ string, _, _ int64, _, _ string, _, _ bool, _ any) {}
 
 func (h *obsAdmissionHandle) ClearOrgEgress() {}
 

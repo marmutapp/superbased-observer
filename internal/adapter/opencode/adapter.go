@@ -85,7 +85,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 	}
 	defer database.Close()
 
-	rootCache := map[string]string{}
+	rootCache := map[string]projectGitInfo{}
 	// Resolve reasoning → successor assignment BEFORE any emitter runs,
 	// so the threading can't depend on loader order (see
 	// loadReasoningIndex). Reasoning parts are never rows of their own.
@@ -125,6 +125,10 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 	if err != nil {
 		return adapter.ParseResult{}, fmt.Errorf("opencode.ParseSessionFile: tokens: %w", err)
 	}
+	lineages, err := a.loadSessionLineages(ctx, database)
+	if err != nil {
+		return adapter.ParseResult{}, fmt.Errorf("opencode.ParseSessionFile: session lineages: %w", err)
+	}
 	// §14.3 Tier-2 cache observation. Volatile-element exclusion
 	// (wall-clock fields inside tool/reasoning/subtask part bodies)
 	// is documented in docs/audits/cachetrack-opencode-tier2-audit-
@@ -143,6 +147,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 	res.ToolEvents = append(res.ToolEvents, todos...)
 	res.TokenEvents = append(res.TokenEvents, tokens...)
 	res.CacheObservations = append(res.CacheObservations, cacheObservations...)
+	res.SessionLineages = append(res.SessionLineages, lineages...)
 	return res, nil
 }
 
@@ -246,8 +251,7 @@ type toolPartData struct {
 // the parent's message when it invokes a subagent — the prompt,
 // description, agent name, and optional model for the spawned
 // subagent. The actual sub-agent runs in a child session linked
-// via session.parent_id (which we'll wire into our sessions table
-// in v1.5.0).
+// via session.parent_id (captured by loadSessionLineages).
 type subtaskPartData struct {
 	Type        string `json:"type"`
 	Prompt      string `json:"prompt"`
@@ -268,7 +272,7 @@ type toolInput struct {
 	FilePath string `json:"filePath"`
 }
 
-func (a *Adapter) loadUserPromptEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string) ([]models.ToolEvent, error) {
+func (a *Adapter) loadUserPromptEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]projectGitInfo) ([]models.ToolEvent, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT m.id, m.session_id, COALESCE(s.directory, ''), m.time_created, m.time_updated, m.data
 		  FROM message m
@@ -298,7 +302,7 @@ func (a *Adapter) loadUserPromptEvents(ctx context.Context, db *sql.DB, sourceFi
 	return out, rows.Err()
 }
 
-func (a *Adapter) userPromptEvent(ctx context.Context, db *sql.DB, sourceFile string, row messageRow, rootCache map[string]string) (models.ToolEvent, bool, error) {
+func (a *Adapter) userPromptEvent(ctx context.Context, db *sql.DB, sourceFile string, row messageRow, rootCache map[string]projectGitInfo) (models.ToolEvent, bool, error) {
 	var msg messageData
 	if err := json.Unmarshal([]byte(row.Data), &msg); err != nil {
 		return models.ToolEvent{}, false, nil
@@ -340,13 +344,16 @@ func (a *Adapter) userPromptEvent(ctx context.Context, db *sql.DB, sourceFile st
 	if when.IsZero() {
 		when = millisToTime(row.TimeCreate)
 	}
-	project := a.resolveProjectRoot(firstNonEmpty(msg.Path.Cwd, row.Directory), rootCache)
+	cwd := firstNonEmpty(msg.Path.Cwd, row.Directory)
+	project := a.resolveProjectRoot(cwd, rootCache)
+	remote := a.resolveProjectRemote(cwd, rootCache)
 	model := firstNonEmpty(msg.Model.ModelID, msg.ModelID, msg.Agent)
 	return models.ToolEvent{
 		SourceFile:         sourceFile,
 		SourceEventID:      "message:" + row.ID,
 		SessionID:          row.SessionID,
 		ProjectRoot:        project,
+		GitRemote:          remote,
 		Timestamp:          chooseTime(when, time.Time{}, 0),
 		Model:              model,
 		Tool:               models.ToolOpenCode,
@@ -433,7 +440,7 @@ func (a *Adapter) loadReasoningIndex(ctx context.Context, db *sql.DB, fromOffset
 // none was.
 func (r reasoningIndex) threaded(partID string) string { return r[partID] }
 
-func (a *Adapter) loadToolEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string, reasoning reasoningIndex) ([]models.ToolEvent, error) {
+func (a *Adapter) loadToolEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]projectGitInfo, reasoning reasoningIndex) ([]models.ToolEvent, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT p.id, p.message_id, p.session_id, COALESCE(s.directory, ''), p.time_created, p.time_updated, p.data, m.data
 		  FROM part p
@@ -461,7 +468,7 @@ func (a *Adapter) loadToolEvents(ctx context.Context, db *sql.DB, sourceFile str
 	return out, rows.Err()
 }
 
-func (a *Adapter) toolEvent(sourceFile string, row partRow, rootCache map[string]string, reasoning reasoningIndex) (models.ToolEvent, bool) {
+func (a *Adapter) toolEvent(sourceFile string, row partRow, rootCache map[string]projectGitInfo, reasoning reasoningIndex) (models.ToolEvent, bool) {
 	var msg messageData
 	if err := json.Unmarshal([]byte(row.Message), &msg); err != nil {
 		return models.ToolEvent{}, false
@@ -479,7 +486,9 @@ func (a *Adapter) toolEvent(sourceFile string, row partRow, rootCache map[string
 	if when.IsZero() {
 		when = millisToTime(row.TimeCreate)
 	}
-	project := a.resolveProjectRoot(firstNonEmpty(msg.Path.Cwd, row.Directory), rootCache)
+	cwd := firstNonEmpty(msg.Path.Cwd, row.Directory)
+	project := a.resolveProjectRoot(cwd, rootCache)
+	remote := a.resolveProjectRemote(cwd, rootCache)
 	// Drop msg.Agent as a model fallback — `agent` is the OpenCode
 	// agent identity (build / plan / explore / build-subagent / etc.),
 	// NOT a model name. Letting it leak into the model column polluted
@@ -522,6 +531,7 @@ func (a *Adapter) toolEvent(sourceFile string, row partRow, rootCache map[string
 		SourceEventID:      "part:" + row.ID,
 		SessionID:          row.SessionID,
 		ProjectRoot:        project,
+		GitRemote:          remote,
 		Timestamp:          chooseTime(when, time.Time{}, 0),
 		Model:              model,
 		Tool:               models.ToolOpenCode,
@@ -539,7 +549,7 @@ func (a *Adapter) toolEvent(sourceFile string, row partRow, rootCache map[string
 	}, true
 }
 
-func (a *Adapter) loadCompletionEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string) ([]models.ToolEvent, error) {
+func (a *Adapter) loadCompletionEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]projectGitInfo) ([]models.ToolEvent, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT m.id, m.session_id, COALESCE(s.directory, ''), m.time_created, m.time_updated, m.data
 		  FROM message m
@@ -567,12 +577,14 @@ func (a *Adapter) loadCompletionEvents(ctx context.Context, db *sql.DB, sourceFi
 	return out, rows.Err()
 }
 
-func (a *Adapter) completionEvent(sourceFile string, row messageRow, rootCache map[string]string) (models.ToolEvent, bool) {
+func (a *Adapter) completionEvent(sourceFile string, row messageRow, rootCache map[string]projectGitInfo) (models.ToolEvent, bool) {
 	var msg messageData
 	if err := json.Unmarshal([]byte(row.Data), &msg); err != nil {
 		return models.ToolEvent{}, false
 	}
-	project := a.resolveProjectRoot(firstNonEmpty(msg.Path.Cwd, row.Directory), rootCache)
+	cwd := firstNonEmpty(msg.Path.Cwd, row.Directory)
+	project := a.resolveProjectRoot(cwd, rootCache)
+	remote := a.resolveProjectRemote(cwd, rootCache)
 	// Drop msg.Agent as a model fallback — `agent` is the OpenCode
 	// agent identity (build / plan / explore / build-subagent / etc.),
 	// NOT a model name. Letting it leak into the model column polluted
@@ -587,6 +599,7 @@ func (a *Adapter) completionEvent(sourceFile string, row messageRow, rootCache m
 		SourceEventID: "complete:" + row.ID,
 		SessionID:     row.SessionID,
 		ProjectRoot:   project,
+		GitRemote:     remote,
 		Timestamp:     chooseTime(when, time.Time{}, 0),
 		Model:         model,
 		Tool:          models.ToolOpenCode,
@@ -629,7 +642,7 @@ func withStopReason(meta *models.ActionMetadata, reason string) *models.ActionMe
 // carries no body. This loader complements it by surfacing the
 // actual text content. No token/cost fields are set; token usage
 // flows through loadTokenEvents.
-func (a *Adapter) loadAssistantTextEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string, reasoning reasoningIndex) ([]models.ToolEvent, error) {
+func (a *Adapter) loadAssistantTextEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]projectGitInfo, reasoning reasoningIndex) ([]models.ToolEvent, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT p.id, p.message_id, p.session_id, COALESCE(s.directory, ''), p.time_created, p.time_updated, p.data, m.data
 		  FROM part p
@@ -658,7 +671,7 @@ func (a *Adapter) loadAssistantTextEvents(ctx context.Context, db *sql.DB, sourc
 	return out, rows.Err()
 }
 
-func (a *Adapter) assistantTextEvent(sourceFile string, row partRow, rootCache map[string]string, reasoning reasoningIndex) (models.ToolEvent, bool) {
+func (a *Adapter) assistantTextEvent(sourceFile string, row partRow, rootCache map[string]projectGitInfo, reasoning reasoningIndex) (models.ToolEvent, bool) {
 	var msg messageData
 	if err := json.Unmarshal([]byte(row.Message), &msg); err != nil {
 		return models.ToolEvent{}, false
@@ -671,7 +684,9 @@ func (a *Adapter) assistantTextEvent(sourceFile string, row partRow, rootCache m
 	if body == "" {
 		return models.ToolEvent{}, false
 	}
-	project := a.resolveProjectRoot(firstNonEmpty(msg.Path.Cwd, row.Directory), rootCache)
+	cwd := firstNonEmpty(msg.Path.Cwd, row.Directory)
+	project := a.resolveProjectRoot(cwd, rootCache)
+	remote := a.resolveProjectRemote(cwd, rootCache)
 	model := firstNonEmpty(msg.ModelID, msg.Model.ModelID)
 	when := millisToTime(row.TimeCreate)
 	preview := truncate(body, 200)
@@ -695,6 +710,7 @@ func (a *Adapter) assistantTextEvent(sourceFile string, row partRow, rootCache m
 		SourceEventID:      "asst:" + row.ID,
 		SessionID:          row.SessionID,
 		ProjectRoot:        project,
+		GitRemote:          remote,
 		Timestamp:          chooseTime(when, time.Time{}, 0),
 		Model:              model,
 		Tool:               models.ToolOpenCode,
@@ -762,7 +778,7 @@ type stepFinishPartData struct {
 // RawToolInput carries the verbatim step-finish JSON (tokens +
 // cost) so the dashboard can render per-step cost histograms once
 // the UI lands.
-func (a *Adapter) loadStepFinishEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string) ([]models.ToolEvent, error) {
+func (a *Adapter) loadStepFinishEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]projectGitInfo) ([]models.ToolEvent, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT p.id, p.message_id, p.session_id, COALESCE(s.directory, ''), p.time_created, p.time_updated, p.data, m.data
 		  FROM part p
@@ -790,7 +806,7 @@ func (a *Adapter) loadStepFinishEvents(ctx context.Context, db *sql.DB, sourceFi
 	return out, rows.Err()
 }
 
-func (a *Adapter) stepFinishEvent(sourceFile string, row partRow, rootCache map[string]string) (models.ToolEvent, bool) {
+func (a *Adapter) stepFinishEvent(sourceFile string, row partRow, rootCache map[string]projectGitInfo) (models.ToolEvent, bool) {
 	var msg messageData
 	if err := json.Unmarshal([]byte(row.Message), &msg); err != nil {
 		return models.ToolEvent{}, false
@@ -802,7 +818,9 @@ func (a *Adapter) stepFinishEvent(sourceFile string, row partRow, rootCache map[
 	if part.Type != "step-finish" {
 		return models.ToolEvent{}, false
 	}
-	project := a.resolveProjectRoot(firstNonEmpty(msg.Path.Cwd, row.Directory), rootCache)
+	cwd := firstNonEmpty(msg.Path.Cwd, row.Directory)
+	project := a.resolveProjectRoot(cwd, rootCache)
+	remote := a.resolveProjectRemote(cwd, rootCache)
 	model := firstNonEmpty(msg.ModelID, msg.Model.ModelID)
 	when := millisToTime(row.TimeCreate)
 	return models.ToolEvent{
@@ -810,6 +828,7 @@ func (a *Adapter) stepFinishEvent(sourceFile string, row partRow, rootCache map[
 		SourceEventID: "step:" + row.ID,
 		SessionID:     row.SessionID,
 		ProjectRoot:   project,
+		GitRemote:     remote,
 		Timestamp:     chooseTime(when, time.Time{}, 0),
 		Model:         model,
 		Tool:          models.ToolOpenCode,
@@ -839,7 +858,7 @@ func (a *Adapter) stepFinishEvent(sourceFile string, row partRow, rootCache map[
 // Skips rows where assistant hasn't finished (finish != 'stop') or
 // no tokens are present (zero across the bundle) — those are still
 // in-progress turns.
-func (a *Adapter) loadTokenEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string) ([]models.TokenEvent, error) {
+func (a *Adapter) loadTokenEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]projectGitInfo) ([]models.TokenEvent, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT m.id, m.session_id, COALESCE(s.directory, ''), m.time_created, m.time_updated, m.data
 		  FROM message m
@@ -870,7 +889,7 @@ func (a *Adapter) loadTokenEvents(ctx context.Context, db *sql.DB, sourceFile st
 // Returns ok=false when the row carries no token data — early
 // in-progress turns, or non-assistant rows that slipped past the
 // SQL filter.
-func (a *Adapter) tokenEvent(sourceFile string, row messageRow, rootCache map[string]string) (models.TokenEvent, bool) {
+func (a *Adapter) tokenEvent(sourceFile string, row messageRow, rootCache map[string]projectGitInfo) (models.TokenEvent, bool) {
 	var msg messageData
 	if err := json.Unmarshal([]byte(row.Data), &msg); err != nil {
 		return models.TokenEvent{}, false
@@ -881,7 +900,9 @@ func (a *Adapter) tokenEvent(sourceFile string, row messageRow, rootCache map[st
 		msg.Tokens.Reasoning == 0 {
 		return models.TokenEvent{}, false
 	}
-	project := a.resolveProjectRoot(firstNonEmpty(msg.Path.Cwd, row.Directory), rootCache)
+	cwd := firstNonEmpty(msg.Path.Cwd, row.Directory)
+	project := a.resolveProjectRoot(cwd, rootCache)
+	remote := a.resolveProjectRemote(cwd, rootCache)
 	// Drop msg.Agent as a model fallback — `agent` is the OpenCode
 	// agent identity (build / plan / explore / build-subagent / etc.),
 	// NOT a model name. Letting it leak into the model column polluted
@@ -896,6 +917,7 @@ func (a *Adapter) tokenEvent(sourceFile string, row messageRow, rootCache map[st
 		SourceEventID:       "tokens:" + row.ID,
 		SessionID:           row.SessionID,
 		ProjectRoot:         project,
+		GitRemote:           remote,
 		Timestamp:           when,
 		Tool:                models.ToolOpenCode,
 		Model:               model,
@@ -919,10 +941,10 @@ func (a *Adapter) tokenEvent(sourceFile string, row messageRow, rootCache map[st
 // loadSubtaskEvents reads OpenCode's `subtask` parts and emits one
 // ActionSpawnSubagent per — the parent message invoked a sub-agent.
 // The actual sub-agent runs in a child session linked via
-// session.parent_id; that linkage is captured in v1.5.0. For now,
-// surfacing the parent-side spawn lets the dashboard count fan-out
+// session.parent_id; that linkage is captured by loadSessionLineages.
+// Surfacing the parent-side spawn lets the dashboard count fan-out
 // the same way Claude Code's Agent tool does.
-func (a *Adapter) loadSubtaskEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string) ([]models.ToolEvent, error) {
+func (a *Adapter) loadSubtaskEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]projectGitInfo) ([]models.ToolEvent, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT p.id, p.message_id, p.session_id, COALESCE(s.directory, ''),
 		       p.time_created, p.time_updated, p.data, m.data
@@ -956,7 +978,9 @@ func (a *Adapter) loadSubtaskEvents(ctx context.Context, db *sql.DB, sourceFile 
 		// Target is the spawned agent name (Build/Plan/Explore/custom).
 		// RawToolName captures the description so the Actions table
 		// shows what the parent asked the subagent to do.
-		project := a.resolveProjectRoot(firstNonEmpty(msg.Path.Cwd, row.Directory), rootCache)
+		cwd := firstNonEmpty(msg.Path.Cwd, row.Directory)
+		project := a.resolveProjectRoot(cwd, rootCache)
+		remote := a.resolveProjectRemote(cwd, rootCache)
 		// Prefer the spawned subagent's model when set; falls back to
 		// the parent message's model.
 		model := firstNonEmpty(sub.Model.ModelID, msg.ModelID, msg.Model.ModelID)
@@ -970,6 +994,7 @@ func (a *Adapter) loadSubtaskEvents(ctx context.Context, db *sql.DB, sourceFile 
 			SourceEventID: "subtask:" + row.ID,
 			SessionID:     row.SessionID,
 			ProjectRoot:   project,
+			GitRemote:     remote,
 			Timestamp:     when,
 			Model:         model,
 			Tool:          models.ToolOpenCode,
@@ -980,6 +1005,59 @@ func (a *Adapter) loadSubtaskEvents(ctx context.Context, db *sql.DB, sourceFile 
 			RawToolInput:  contentcap.Cap(firstNonEmpty(sub.Description, sub.Prompt), contentcap.DefaultMaxBytes),
 			MessageID:     row.MessageID,
 			Metadata:      effortMetadata(msg.Variant),
+		})
+	}
+	return out, rows.Err()
+}
+
+// loadSessionLineages reads OpenCode's session.parent_id links — the
+// upstream sub-agent child-session pointer (the v2 Session.subagent
+// surface spawns a child with parentID set; root list queries filter
+// IS NULL(parent_id), so children never pollute top-level lists) — and
+// emits one models.SessionLineage per linked child so the observer's
+// generic migration-069 lineage columns (forked_from_id /
+// parent_thread_id / thread_source) carry the parent→child link for
+// opencode too, not just codex. The read model is already tool-agnostic:
+// LoadSessionLineage feeds the session-detail payload and LineageBanner
+// regardless of sessions.tool.
+//
+// Emitted on EVERY parse that opens the DB (the pair set is small — one
+// indexed query over session — and SetSessionLineage is an idempotent,
+// COALESCE-preserving upsert that no-ops on unchanged values), so both
+// incremental polls and full re-parses (`observer scan --force`) converge
+// without dedicated watermark state. A child whose sessions row does not
+// exist yet is a silent store-side no-op; the next parse that ingests its
+// events stamps it. ThreadSource is "subagent": opencode uses parent_id
+// exclusively for spawned sub-agent children.
+func (a *Adapter) loadSessionLineages(ctx context.Context, db *sql.DB) ([]models.SessionLineage, error) {
+	// Older opencode schemas predate parent_id entirely; treat them as
+	// "no linkage available" rather than failing the whole parse.
+	var parentCol int
+	if err := db.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM pragma_table_info('session') WHERE name = 'parent_id'`,
+	).Scan(&parentCol); err != nil {
+		return nil, err
+	}
+	if parentCol == 0 {
+		return nil, nil
+	}
+	rows, err := db.QueryContext(ctx,
+		`SELECT id, parent_id FROM session WHERE parent_id IS NOT NULL AND parent_id != ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []models.SessionLineage
+	for rows.Next() {
+		var id, parent string
+		if err := rows.Scan(&id, &parent); err != nil {
+			return nil, err
+		}
+		out = append(out, models.SessionLineage{
+			SessionID:      id,
+			ParentThreadID: parent,
+			ThreadSource:   "subagent",
 		})
 	}
 	return out, rows.Err()
@@ -998,7 +1076,7 @@ func (a *Adapter) loadSubtaskEvents(ctx context.Context, db *sql.DB, sourceFile 
 // Tolerant of older OpenCode schemas that lack the todo table —
 // the SQL error gets swallowed and the function returns an empty
 // slice rather than failing the whole parse pass.
-func (a *Adapter) loadTodoEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]string) ([]models.ToolEvent, error) {
+func (a *Adapter) loadTodoEvents(ctx context.Context, db *sql.DB, sourceFile string, fromOffset int64, rootCache map[string]projectGitInfo) ([]models.ToolEvent, error) {
 	if !tableExists(ctx, db, "todo") {
 		return nil, nil
 	}
@@ -1031,6 +1109,7 @@ func (a *Adapter) loadTodoEvents(ctx context.Context, db *sql.DB, sourceFile str
 			SourceEventID: eventID,
 			SessionID:     sessionID,
 			ProjectRoot:   a.resolveProjectRoot(dir, rootCache),
+			GitRemote:     a.resolveProjectRemote(dir, rootCache),
 			Timestamp:     when,
 			Tool:          models.ToolOpenCode,
 			ActionType:    models.ActionTodoUpdate,
@@ -1113,7 +1192,17 @@ func mapTool(part toolPartData) (actionType, target string, success bool, errMsg
 //   - real cwd outside any git tree → the cwd itself (post-symlink).
 //
 // The cache lives for one ParseSessionFile call; same cwd resolves once.
-func (a *Adapter) resolveProjectRoot(cwd string, cache map[string]string) string {
+// projectGitInfo is the per-cwd cache entry for resolveProjectRoot /
+// resolveProjectRemote: the resolved project root and its normalized
+// "origin" remote, captured together from a single git.Resolve call so
+// the two never drift and the filesystem walk never happens twice for
+// the same cwd.
+type projectGitInfo struct {
+	Root   string
+	Remote string
+}
+
+func (a *Adapter) resolveProjectRoot(cwd string, cache map[string]projectGitInfo) string {
 	if cwd == "" {
 		return "[opencode]"
 	}
@@ -1129,16 +1218,31 @@ func (a *Adapter) resolveProjectRoot(cwd string, cache map[string]string) string
 	// claudecode adapter.go:1055 and codex adapter.go:2494
 	// ([[feedback-foreign-path-git-resolve]]).
 	cwd = crossmount.TranslateForeignPath(cwd)
-	if root, ok := cache[cwd]; ok {
-		return root
+	if info, ok := cache[cwd]; ok {
+		return info.Root
 	}
 	info, err := git.Resolve(cwd)
 	if err != nil {
-		cache[cwd] = cwd
+		cache[cwd] = projectGitInfo{Root: cwd}
 		return cwd
 	}
-	cache[cwd] = info.Root
+	cache[cwd] = projectGitInfo{Root: info.Root, Remote: git.NormalizeRemote(info.Remote)}
 	return info.Root
+}
+
+// resolveProjectRemote returns the normalized git remote for cwd, cached
+// alongside the project root by resolveProjectRoot. OpenCode never
+// carries a remote (or a branch) in its own SQLite rows, so this is
+// the adapter's only remote source. Callers must invoke
+// resolveProjectRoot for the same cwd first so the cache entry exists
+// — this never triggers its own git.Resolve call, to avoid resolving
+// the same cwd twice.
+func (a *Adapter) resolveProjectRemote(cwd string, cache map[string]projectGitInfo) string {
+	if cwd == "" {
+		return ""
+	}
+	cwd = crossmount.TranslateForeignPath(cwd)
+	return cache[cwd].Remote
 }
 
 func latestWatermark(ctx context.Context, path string) (int64, error) {

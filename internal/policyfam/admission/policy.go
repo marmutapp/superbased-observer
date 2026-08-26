@@ -221,7 +221,14 @@ type PolicySpec struct {
 	// 0 = the engine default (DefaultJudgeChunkOverlapBytes); it is clamped
 	// below JudgeChunkBytes so chunking always makes forward progress.
 	JudgeChunkOverlapBytes int
-	Hash                   string
+	// JudgeRetries is how many EXTRA bounded in-process attempts judgeOne makes
+	// on a judge transport error before applying the fail-mode (Strict → Deny;
+	// else Allow). 0 = one attempt, no retry (today's behavior). A cheap
+	// reliability lever for a flaky/cold-starting judge that does NOT change the
+	// synchronous single-Result contract — distinct from a request-queueing
+	// posture, which would need a new proxy AdmitResult shape.
+	JudgeRetries int
+	Hash         string
 }
 
 // PolicyInput is the plain, pre-compile policy translated from config AT THE
@@ -239,6 +246,9 @@ type PolicyInput struct {
 	// chunking; 0 for either = the engine default. See PolicySpec.
 	JudgeChunkBytes        int
 	JudgeChunkOverlapBytes int
+	// JudgeRetries is the bounded in-process retry count on judge transport
+	// error before the fail-mode fires. 0 = no retry. See PolicySpec.
+	JudgeRetries int
 }
 
 // CriterionInput is one uncompiled criterion.
@@ -275,6 +285,7 @@ func Compile(in PolicyInput) (PolicySpec, error) {
 		SecretRemoteJudge:      secretDec,
 		JudgeChunkBytes:        in.JudgeChunkBytes,
 		JudgeChunkOverlapBytes: in.JudgeChunkOverlapBytes,
+		JudgeRetries:           in.JudgeRetries,
 	}
 
 	pf, err := compilePatterns("prefilter.allow", in.Prefilter.Allow)
@@ -391,6 +402,9 @@ func hashPolicy(in PolicyInput) string {
 	}
 	if in.JudgeChunkOverlapBytes > 0 {
 		writeField("judge_chunk_overlap", fmt.Sprintf("%d", in.JudgeChunkOverlapBytes))
+	}
+	if in.JudgeRetries > 0 {
+		writeField("judge_retries", fmt.Sprintf("%d", in.JudgeRetries))
 	}
 	for _, a := range in.Prefilter.Allow {
 		writeField("pf_allow", a)

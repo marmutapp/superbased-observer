@@ -248,11 +248,12 @@ type rawJSONL struct {
 }
 
 type sessionState struct {
-	SessionID   string
-	ProjectHash string
-	ProjectRoot string
-	Model       string
-	StartTime   time.Time
+	SessionID     string
+	ProjectHash   string
+	ProjectRoot   string
+	ProjectRemote string
+	Model         string
+	StartTime     time.Time
 }
 
 // parseLegacy handles a single-object JSON session file. Re-reads the
@@ -293,12 +294,12 @@ func (a *Adapter) parseLegacy(ctx context.Context, path string, fi os.FileInfo, 
 	// downstream emission uses a stable project root.
 	for _, m := range legacy.Messages {
 		if strings.TrimSpace(m.Cwd) != "" {
-			state.ProjectRoot = resolveProjectRoot(path, m.Cwd)
+			state.ProjectRoot, state.ProjectRemote = resolveProjectRoot(path, m.Cwd)
 			break
 		}
 	}
 	if state.ProjectRoot == "" {
-		state.ProjectRoot = resolveProjectRoot(path, "")
+		state.ProjectRoot, state.ProjectRemote = resolveProjectRoot(path, "")
 	}
 
 	for i, msg := range legacy.Messages {
@@ -465,7 +466,7 @@ func (a *Adapter) parseJSONL(ctx context.Context, path string, fi os.FileInfo, f
 				state.StartTime = parseTimestamp(line.StartTime)
 			}
 			if state.ProjectRoot == "" {
-				state.ProjectRoot = resolveProjectRoot(path, line.Cwd)
+				state.ProjectRoot, state.ProjectRemote = resolveProjectRoot(path, line.Cwd)
 			}
 		case "user", "gemini", "model", "tool":
 			// Convert event record → legacy-message shape and reuse emitMessage.
@@ -482,7 +483,7 @@ func (a *Adapter) parseJSONL(ctx context.Context, path string, fi os.FileInfo, f
 				Thoughts:  line.Thoughts,
 			}
 			if state.ProjectRoot == "" {
-				state.ProjectRoot = resolveProjectRoot(path, msg.Cwd)
+				state.ProjectRoot, state.ProjectRemote = resolveProjectRoot(path, msg.Cwd)
 			}
 			a.emitMessage(path, lineNum, msg, &state, &res)
 		case "message_update":
@@ -516,7 +517,7 @@ func (a *Adapter) parseJSONL(ctx context.Context, path string, fi os.FileInfo, f
 		// Backfill: if no metadata line landed, give every event a root
 		// derived from the path. emitMessage already handled per-line
 		// resolution but a fully empty file would leave it blank.
-		state.ProjectRoot = resolveProjectRoot(path, "")
+		state.ProjectRoot, state.ProjectRemote = resolveProjectRoot(path, "")
 	}
 	return res, nil
 }
@@ -552,7 +553,7 @@ func applyUntypedHeaderLine(path string, line rawJSONL, state *sessionState) (ha
 			state.StartTime = parseTimestamp(line.StartTime)
 		}
 		if state.ProjectRoot == "" {
-			state.ProjectRoot = resolveProjectRoot(path, line.Cwd)
+			state.ProjectRoot, state.ProjectRemote = resolveProjectRoot(path, line.Cwd)
 		}
 	}
 	return true
@@ -562,7 +563,7 @@ func applyUntypedHeaderLine(path string, line rawJSONL, state *sessionState) (ha
 // TokenEvent records to res. Shared between legacy + JSONL paths.
 func (a *Adapter) emitMessage(path string, idx int, msg rawLegacyMsg, state *sessionState, res *adapter.ParseResult) {
 	if msg.Cwd != "" && state.ProjectRoot == "" {
-		state.ProjectRoot = resolveProjectRoot(path, msg.Cwd)
+		state.ProjectRoot, state.ProjectRemote = resolveProjectRoot(path, msg.Cwd)
 	}
 	if msg.Model != "" {
 		state.Model = msg.Model
@@ -603,6 +604,7 @@ func (a *Adapter) emitMessage(path string, idx int, msg rawLegacyMsg, state *ses
 			SourceEventID: firstNonEmpty(msg.ID, fmt.Sprintf("user:%s:%d", state.SessionID, idx)),
 			SessionID:     state.SessionID,
 			ProjectRoot:   state.ProjectRoot,
+			GitRemote:     state.ProjectRemote,
 			Timestamp:     ts,
 			Model:         state.Model,
 			Tool:          models.ToolGeminiCLI,
@@ -707,6 +709,7 @@ func (a *Adapter) assistantTextEvent(path string, msg rawLegacyMsg, partIdx, msg
 		SourceEventID:      fmt.Sprintf("asst:%s:%s:%d", state.SessionID, messageKey(msg, msgIdx), partIdx),
 		SessionID:          state.SessionID,
 		ProjectRoot:        state.ProjectRoot,
+		GitRemote:          state.ProjectRemote,
 		Timestamp:          ts,
 		Model:              state.Model,
 		Tool:               models.ToolGeminiCLI,
@@ -941,6 +944,7 @@ func (a *Adapter) toolCallEvent(path string, msg rawLegacyMsg, partIdx int, ts t
 		SourceEventID:      firstNonEmpty(call.ID, fmt.Sprintf("tool:%s:%s:%d:%d", state.SessionID, msg.ID, partIdx, len(rawInput))),
 		SessionID:          state.SessionID,
 		ProjectRoot:        state.ProjectRoot,
+		GitRemote:          state.ProjectRemote,
 		Timestamp:          ts,
 		Model:              state.Model,
 		Tool:               models.ToolGeminiCLI,
@@ -993,6 +997,7 @@ func tokenEventFor(path, msgID string, ts time.Time, modelHint string, state *se
 		SourceEventID:   "usage:" + msgID,
 		SessionID:       state.SessionID,
 		ProjectRoot:     state.ProjectRoot,
+		GitRemote:       state.ProjectRemote,
 		Timestamp:       ts,
 		Tool:            models.ToolGeminiCLI,
 		Model:           firstNonEmpty(modelHint, state.Model),

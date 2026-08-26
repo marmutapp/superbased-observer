@@ -180,8 +180,11 @@ func projectHashFromPath(path string) string {
 // synthetic key — unjoinable to a real repo (WP-T6 finding G1,
 // secondary).
 //
-// Returns the chosen root; never empty.
-func resolveProjectRoot(sessionPath, cwdHint string) string {
+// Returns the chosen root; never empty. remote is the normalized git
+// "origin" remote when the winning tier ran git.Resolve (tiers 1-3);
+// tiers 4-5 never touch git.Resolve so remote is "" for those — an
+// honest gap rather than a fabricated value.
+func resolveProjectRoot(sessionPath, cwdHint string) (root, remote string) {
 	// Normalize before resolving so a Windows-side Gemini CLI session
 	// (whose cwd is captured as `C:\…` or `file:///D:/…`) doesn't get
 	// fed to git.Resolve as a relative path. Without this, the
@@ -191,31 +194,31 @@ func resolveProjectRoot(sessionPath, cwdHint string) string {
 	cwdHint = pathnorm.Normalize(cwdHint)
 	if cwdHint != "" {
 		if info, err := git.Resolve(cwdHint); err == nil {
-			return info.Root
+			return info.Root, git.NormalizeRemote(info.Remote)
 		}
-		return cwdHint
+		return cwdHint, ""
 	}
 	hash := projectHashFromPath(sessionPath)
 	if hash != "" {
-		if root := readRecordedProjectRoot(sessionPath, hash); root != "" {
-			return root
+		if root, remote := readRecordedProjectRoot(sessionPath, hash); root != "" {
+			return root, remote
 		}
 		if root := readShadowGitWorktree(sessionPath, hash); root != "" {
-			return root
+			return root, ""
 		}
-		return "[gemini-cli:" + hash + "]"
+		return "[gemini-cli:" + hash + "]", ""
 	}
-	return "[gemini-cli]"
+	return "[gemini-cli]", ""
 }
 
 // readRecordedProjectRoot reads the project root the Gemini CLI itself
 // recorded for this project key, trying the `.project_root` sidecars
-// first and the projects.json reverse map second. Returns "" when
+// first and the projects.json reverse map second. Returns ("", "") when
 // neither is present/usable.
-func readRecordedProjectRoot(sessionPath, key string) string {
+func readRecordedProjectRoot(sessionPath, key string) (root, remote string) {
 	home := geminiHomeFromSessionPath(sessionPath)
 	if home == "" || key == "" {
-		return ""
+		return "", ""
 	}
 	for _, sidecar := range []string{
 		filepath.Join(home, "tmp", key, ".project_root"),
@@ -225,8 +228,8 @@ func readRecordedProjectRoot(sessionPath, key string) string {
 		if err != nil {
 			continue
 		}
-		if root := resolveRecordedRoot(string(body)); root != "" {
-			return root
+		if root, remote := resolveRecordedRoot(string(body)); root != "" {
+			return root, remote
 		}
 	}
 	return resolveRecordedRoot(lookupProjectsJSON(filepath.Join(home, "projects.json"), key))
@@ -267,19 +270,20 @@ func lookupProjectsJSON(path, key string) string {
 // path that isn't mounted here (a Windows-side session read from WSL,
 // say) would walk up from a non-existent directory. A recorded-but-
 // unmounted root is still returned verbatim — it is real information,
-// unlike the synthetic key.
-func resolveRecordedRoot(raw string) string {
+// unlike the synthetic key. remote is only populated when git.Resolve
+// actually ran.
+func resolveRecordedRoot(raw string) (root, remote string) {
 	p := pathnorm.Normalize(strings.TrimSpace(raw))
 	if p == "" {
-		return ""
+		return "", ""
 	}
 	if _, err := os.Stat(p); err != nil {
-		return p
+		return p, ""
 	}
 	if info, err := git.Resolve(p); err == nil {
-		return info.Root
+		return info.Root, git.NormalizeRemote(info.Remote)
 	}
-	return p
+	return p, ""
 }
 
 // geminiHomeFromSessionPath walks up from a session file to the

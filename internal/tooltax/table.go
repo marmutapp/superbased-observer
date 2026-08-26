@@ -20,6 +20,7 @@ const (
 	toolDeepSeek        = "deepseek"
 	toolDevin           = "devin"
 	toolDroid           = "droid"
+	toolFreebuff        = "freebuff"
 	toolGeminiCLI       = "gemini-cli"
 	toolGoose           = "goose"
 	toolGrok            = "grok"
@@ -28,6 +29,7 @@ const (
 	toolKiloCodeCLI     = "kilo-code-cli"
 	toolKimiCode        = "kimi-code"
 	toolKiroCLI         = "kiro-cli"
+	toolMistralCode     = "mistral-code"
 	toolMuse            = "muse"
 	toolOpenClaw        = "openclaw"
 	toolOpenCode        = "opencode"
@@ -37,6 +39,7 @@ const (
 	toolQoder           = "qoder"
 	toolQwenCode        = "qwen-code"
 	toolRooCode         = "roo-code"
+	toolZcode           = "zcode"
 )
 
 // table is THE canonical taxonomy table: ordered, walked top-down by
@@ -162,6 +165,9 @@ var specificRows = concat(
 	aiderRows,
 	museRows,
 	deepSeekRows,
+	zcodeRows,
+	mistralCodeRows,
+	freebuffRows,
 )
 
 // --- claude-code -----------------------------------------------------
@@ -560,7 +566,7 @@ var gooseRows = concat(
 // already a single stable snake_case spelling.
 var deepSeekRows = concat(
 	rows(toolDeepSeek, SurfaceBuiltin, ActionAskUser, "ask_user_question"),
-	rows(toolDeepSeek, SurfaceBuiltin, ActionRunCommand, "bash"),
+	rows(toolDeepSeek, SurfaceBuiltin, ActionRunCommand, "bash", "pwsh"),
 	// create_goal / get_goal / update_goal are DSH's own goal-tracking
 	// trio — they record state back INTO the harness, not workspace
 	// state.
@@ -924,6 +930,77 @@ var museRows = concat(
 	rows(toolMuse, SurfaceBuiltin, ActionTodoUpdate,
 		"todowrite", "todo", "updateplan", "updatetodos"),
 	rows(toolMuse, SurfaceBuiltin, ActionAskUser, "askuser", "askuserquestion"),
+)
+
+// --- zcode ---------------------------------------------------------
+// code: internal/adapter/zcode/adapter.go:1105-1156 (mapTool). zcode is
+// Z.AI's OpenCode fork; its own tool-name switch is an OpenCode-derived
+// vocabulary (short-name aliases like "read"/"cat"/"view" rather than
+// OpenCode's own "readfile"/"viewfile" spellings). The default case's
+// `strings.Contains(part.Tool, "mcp")` heuristic stays adapter-private
+// (the same precedent as opencode/droid/qoder/etc — a guess, not an
+// identity, per the globalGlobRows note below).
+//
+// code: internal/adapter/zcode/adapter.go:824-831 — a `step-finish` part
+// (turn-boundary marker, same OpenCode-derived shape as opencode's own
+// step_finish) is emitted as RawToolName "zcode.step_finish", WP-T4
+// harness_call family (see the opencode/kilo-code-cli precedent below).
+var zcodeRows = concat(
+	rows(toolZcode, SurfaceBuiltin, ActionRunCommand,
+		"bash", "shell", "command", "powershell", "pwsh", "cmd", "cmd.exe"),
+	rows(toolZcode, SurfaceBuiltin, ActionReadFile, "read", "cat", "view"),
+	rows(toolZcode, SurfaceBuiltin, ActionWriteFile, "write", "create"),
+	rows(toolZcode, SurfaceBuiltin, ActionEditFile,
+		"edit", "patch", "replace", "multiedit", "applypatch", "apply_patch"),
+	rows(toolZcode, SurfaceBuiltin, ActionSearchText, "grep", "search", "rg"),
+	rows(toolZcode, SurfaceBuiltin, ActionSearchFiles, "glob", "find", "ls"),
+	rows(toolZcode, SurfaceBuiltin, ActionWebFetch, "webfetch", "fetch", "http"),
+	rows(toolZcode, SurfaceBuiltin, ActionWebSearch, "websearch"),
+	rows(toolZcode, SurfaceOrchestration, ActionSpawnSubagent, "task", "agent", "subagent"),
+	rows(toolZcode, SurfaceBuiltin, ActionTodoUpdate, "todoread", "todowrite", "todo"),
+	rows(toolZcode, SurfaceMeta, ActionHarnessCall, "zcode.step_finish"),
+)
+
+// --- mistral-code (vibe) ---------------------------------------------
+// code: internal/adapter/mistralcode/adapter.go:350-378 (mapVibeTool).
+// Mistral Code's own function-name vocabulary — snake_case, distinct
+// from both Claude Code's and OpenCode's spellings.
+var mistralCodeRows = concat(
+	rows(toolMistralCode, SurfaceBuiltin, ActionRunCommand,
+		"bash", "bash_output", "bash_stdin", "bash_sessions", "bash_log_file"),
+	rows(toolMistralCode, SurfaceBuiltin, ActionReadFile, "read_file"),
+	rows(toolMistralCode, SurfaceBuiltin, ActionWriteFile, "write_file"),
+	rows(toolMistralCode, SurfaceBuiltin, ActionEditFile, "edit"),
+	rows(toolMistralCode, SurfaceBuiltin, ActionSearchText, "grep"),
+	rows(toolMistralCode, SurfaceOrchestration, ActionSpawnSubagent, "task"),
+	rows(toolMistralCode, SurfaceBuiltin, ActionWebFetch, "web_fetch"),
+	rows(toolMistralCode, SurfaceBuiltin, ActionWebSearch, "web_search"),
+	rows(toolMistralCode, SurfaceBuiltin, ActionTodoUpdate, "todo"),
+	rows(toolMistralCode, SurfaceBuiltin, ActionAskUser, "ask_user_question"),
+	rows(toolMistralCode, SurfaceBuiltin, ActionSkillInvoke, "skill"),
+)
+
+// --- freebuff ----------------------------------------------------------
+// code: internal/adapter/freebuff/adapter.go:231-249 (mapFreebuffTool).
+// Freebuff (the Manicode -> Codebuff -> Freebuff lineage) has its own
+// snake_case tool-name vocabulary with several Claude-Code-style aliases
+// (read_file/write_file/edit_file accepted alongside its own
+// read_files/create_file/str_replace spellings). The distinct message
+// block kind "agent" (adapter.go's block-type switch, separate from
+// mapFreebuffTool) is a structural block DISCRIMINATOR, not a
+// model-chosen tool name — like Junie's typed block kinds — so it is
+// deliberately NOT given a row here; only real tool names appear below.
+var freebuffRows = concat(
+	rows(toolFreebuff, SurfaceBuiltin, ActionReadFile, "read_files", "read_file"),
+	rows(toolFreebuff, SurfaceBuiltin, ActionWriteFile, "write_file", "create_file"),
+	rows(toolFreebuff, SurfaceBuiltin, ActionEditFile, "str_replace", "edit_file"),
+	rows(toolFreebuff, SurfaceBuiltin, ActionRunCommand,
+		"run_terminal_command", "run_command", "bash"),
+	rows(toolFreebuff, SurfaceBuiltin, ActionSearchText, "code_search", "grep"),
+	rows(toolFreebuff, SurfaceBuiltin, ActionSearchFiles, "find_files"),
+	rows(toolFreebuff, SurfaceBuiltin, ActionWebSearch, "web_search"),
+	rows(toolFreebuff, SurfaceBuiltin, ActionWebFetch, "read_url", "web_fetch"),
+	rows(toolFreebuff, SurfaceOrchestration, ActionSpawnSubagent, "spawn_agents", "spawn_agent"),
 )
 
 // toolGlobRows are the tool-specific PREFIX globs. They sort after every

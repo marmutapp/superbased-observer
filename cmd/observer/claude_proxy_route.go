@@ -17,6 +17,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/marmutapp/superbased-observer/internal/config"
 )
 
 // bypassFilePrefix is the os.CreateTemp prefix for the one-shot CLI-scope
@@ -541,15 +543,30 @@ func withClaudeBypassSettings(baseURL string, fn func(settingsPath string) error
 // execClaudeChild runs claude with the given argv, env, and working dir, wiring
 // stdio to the terminal and forwarding the child's exit code via exitErr. Shared
 // by the direct/neutralize/empty-unset launch paths so they don't each re-spell
-// the exec + exit-code plumbing. A "" dir inherits the caller's cwd.
-func execClaudeChild(bin string, launchArgs, env []string, dir string) error {
+// the exec + exit-code plumbing. A "" dir inherits the caller's cwd. configPath
+// (the launcher's --config value) feeds the best-effort launch-seed attribution
+// row (migration 086); a config load failure just disables seeding.
+func execClaudeChild(bin string, launchArgs, env []string, dir, configPath string) error {
 	child := exec.Command(bin, launchArgs...)
 	child.Env = env
 	child.Dir = dir
 	child.Stdin = os.Stdin
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
-	if err := child.Run(); err != nil {
+	if err := child.Start(); err != nil {
+		return fmt.Errorf("exec claude: %w", err)
+	}
+	// Direct process attribution (migration 086): record the child pid now
+	// that Start has made it knowable; retract the seed when the child is
+	// reaped. Best-effort both ways — a seeding failure never affects the
+	// launch (see cmd/observer/launchseed.go). claude-code already carries
+	// hook-based attribution; the daemon sweep never overwrites that row.
+	dbPath := ""
+	if cfg, cfgErr := config.Load(config.LoadOptions{GlobalPath: configPath}); cfgErr == nil {
+		dbPath = cfg.Observer.DBPath
+	}
+	recordLaunchSeed(dbPath, "claude-code", dir, child.Process.Pid, os.Stderr)
+	if err := child.Wait(); err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
 			return exitErr(ee.ExitCode())
@@ -739,7 +756,7 @@ func runClaudeThirdPartyDirect(opts claudeLauncherOptions, bin string, route cla
 		"observer claude: honoring your configured ANTHROPIC_BASE_URL route (%s, in %s) — launching claude with your own routing untouched; turns are NOT captured through the observer proxy.\n",
 		route.value, claudeScopeLabel(route.scope))
 	// Inherit the environment unchanged — the operator's route must stand.
-	return execClaudeChild(bin, launchArgs, os.Environ(), continueDir)
+	return execClaudeChild(bin, launchArgs, os.Environ(), continueDir, opts.configPath)
 }
 
 // runClaudeBareDirect execs claude BYPASSING the observer proxy (the neutralize
@@ -773,7 +790,7 @@ func runClaudeBareDirect(opts claudeLauncherOptions, bin string, reason proxyFal
 			// remainder / injected continue-from prompt. CLI --settings outranks the
 			// process env too, so inherit the environment unchanged.
 			args := append([]string{"--settings", settingsFile}, launchArgs...)
-			return execClaudeChild(bin, args, os.Environ(), continueDir)
+			return execClaudeChild(bin, args, os.Environ(), continueDir, opts.configPath)
 		})
 		var bwe *bypassWriteError
 		if errors.As(err, &bwe) {
@@ -789,7 +806,7 @@ func runClaudeBareDirect(opts claudeLauncherOptions, bin string, reason proxyFal
 	// No baked-in route: neutralize ONLY an observer-proxy process-env value; a
 	// third-party gateway is preserved verbatim (finding 2).
 	fmt.Fprintln(opts.stderr, claudeNeutralizeNotice(reason, proxyURL, settingsPath, false, attachDownNoticed))
-	return execClaudeChild(bin, launchArgs, neutralizeBypassEnv(os.Environ(), proxyURL), continueDir)
+	return execClaudeChild(bin, launchArgs, neutralizeBypassEnv(os.Environ(), proxyURL), continueDir, opts.configPath)
 }
 
 // claudeEmptyUnsetAction is what to do about a settings scope that explicitly
@@ -930,14 +947,14 @@ func runClaudeEmptyUnset(opts claudeLauncherOptions, bin, proxyURL string, route
 				pinArgs = forceClaudeSessionID(pinArgs)
 			}
 			args := append([]string{"--settings", settingsFile}, pinArgs...)
-			return execClaudeChild(bin, args, env, continueDir)
+			return execClaudeChild(bin, args, env, continueDir, opts.configPath)
 		})
 		var bwe *bypassWriteError
 		if errors.As(err, &bwe) {
 			fmt.Fprintf(opts.stderr,
 				"observer claude: could not write the capture-restoring --settings override (%v); launching direct instead — turns are NOT captured this run.\n",
 				bwe.err)
-			return execClaudeChild(bin, launchArgs, os.Environ(), continueDir)
+			return execClaudeChild(bin, launchArgs, os.Environ(), continueDir, opts.configPath)
 		}
 		return err
 	}
@@ -955,5 +972,5 @@ func runClaudeEmptyUnset(opts claudeLauncherOptions, bin, proxyURL string, route
 	} else {
 		fmt.Fprintln(opts.stderr, claudeEmptyUnsetNotice(action, reason, proxyURL, route.file))
 	}
-	return execClaudeChild(bin, launchArgs, os.Environ(), continueDir)
+	return execClaudeChild(bin, launchArgs, os.Environ(), continueDir, opts.configPath)
 }

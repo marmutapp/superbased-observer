@@ -29,6 +29,8 @@ type fakePoster struct {
 	last  orgcontract.PolicyStateReport
 	block chan struct{} // when non-nil, PostPolicyState blocks until closed or ctx done
 	err   error
+
+	machineID string // returned by ManagedMachineIdentity; "" (unmanaged) by default
 }
 
 func (f *fakePoster) PostPolicyState(ctx context.Context, rep orgcontract.PolicyStateReport) error {
@@ -51,6 +53,15 @@ func (f *fakePoster) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
+}
+
+// ManagedMachineIdentity satisfies policyStatePoster. Individual/BYO by
+// default (""); tests that exercise the gen2 machine-identity send set
+// f.machineID directly.
+func (f *fakePoster) ManagedMachineIdentity(context.Context) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.machineID
 }
 
 // fourReaders returns a valid four-point reader map (all none/no_policy).
@@ -291,12 +302,12 @@ func TestBuildAndRunReporter(t *testing.T) {
 	}
 
 	fp := &fakePoster{}
-	rep := buildPolicyStateReporter(fp, nil, st, nil, nil, nil, nil, cfg, "v", nil)
-	// v3: six readers — the four core points plus the two OPTIONAL ones
-	// (proxy-gateway, node-dashboard), both registered even with nil
-	// handles. An omitted row is indistinguishable from an older agent,
-	// whereas an explicit none/no_policy row is an honest fact
-	// (gateway spec §2.2; admin-controlled Plane B §3.8).
+	rep := buildPolicyStateReporter(fp, nil, st, nil, nil, nil, nil, nil, cfg, "v", nil)
+	// v4: seven readers — the four core points plus the three OPTIONAL ones
+	// (proxy-gateway, node-dashboard, node-features), all registered even
+	// with nil handles. An omitted row is indistinguishable from an older
+	// agent, whereas an explicit none/no_policy row is an honest fact
+	// (gateway spec §2.2; admin-controlled Plane B §3.8; org-parity W5.1).
 	if len(rep.readers) != 4+len(policystate.OptionalPoints) {
 		t.Fatalf("readers = %d, want %d", len(rep.readers), 4+len(policystate.OptionalPoints))
 	}
@@ -720,6 +731,12 @@ func (p *rejectingPoster) snapshot() []int {
 	return append([]int(nil), p.sizes...)
 }
 
+// ManagedMachineIdentity satisfies policyStatePoster. Always "" — none of
+// the depth-ladder fixtures exercise a managed node.
+func (p *rejectingPoster) ManagedMachineIdentity(context.Context) string {
+	return ""
+}
+
 // TestReporter_PreV2ServerProbeLatchesCoreOnly is the §3.2 compat proof: a
 // v1 server 400s the five-row snapshot, the reporter immediately re-posts the
 // four CORE rows, that succeeds, and every later report is core-only. Without
@@ -898,5 +915,207 @@ func TestReporter_LadderFallsAllTheWayToCoreOnAV1Server(t *testing.T) {
 	}
 	if !rep.latched.Load() || rep.latchDepth.Load() != 0 {
 		t.Fatalf("latched=%v depth=%d, want a core-only latch", rep.latched.Load(), rep.latchDepth.Load())
+	}
+}
+
+// --- generation ladder (gen2 P4-2/W-4): [gen2 @ full depth, gen1 @ full ---
+// --- depth, gen1 @ depth-1, ...] --------------------------------------------
+
+// gen2Readers is sixReaders with the node-dashboard point backed by a REAL
+// governed nodeGovernanceHandle (rather than sixReaders' nil-handle stub), so
+// the node.governance row actually carries gen2 content
+// (AcceptedAuthority/ExtractionEffective/DroppedClasses) for the ladder tests
+// below to strip.
+func gen2Readers(t *testing.T) map[string]policystate.PointReader {
+	t.Helper()
+	h, _ := sidecarTestHandle(t, t.TempDir(), `{"schema":2,"pinned":{"guard.enabled":true}}`, startupSidecar{})
+	if err := h.SidecarWriteErr(); err != nil {
+		t.Fatalf("sidecar write: %v", err)
+	}
+	r := fiveReaders()
+	r[policystate.PointNodeDashboard] = newNodeGovernancePointReader(h, nil, time.Now)
+	return r
+}
+
+// gen2RejectingPoster models a server that understands the row SHAPE (v3,
+// six rows) but not yet the gen2 wire extension: it 400s any send that still
+// carries a non-empty MachineIdentity or any row with a gen2 field set, and
+// accepts a gen1-projected send outright — the compat case the generation
+// rung of the ladder exists for, independent of the pre-existing
+// optional-point depth rungs (which rejectingPoster already covers).
+type gen2RejectingPoster struct {
+	mu    sync.Mutex
+	calls []orgcontract.PolicyStateReport
+}
+
+func (p *gen2RejectingPoster) PostPolicyState(_ context.Context, rep orgcontract.PolicyStateReport) error {
+	p.mu.Lock()
+	p.calls = append(p.calls, rep)
+	p.mu.Unlock()
+	if rep.MachineIdentity != "" {
+		return orgclient.ErrPolicyAckRejected
+	}
+	for _, row := range rep.Rows {
+		if len(row.AcceptedAuthority) > 0 || len(row.ExtractionEffective) > 0 || len(row.DroppedClasses) > 0 {
+			return orgclient.ErrPolicyAckRejected
+		}
+	}
+	return nil
+}
+
+// ManagedMachineIdentity always returns a non-empty id, modeling a managed
+// node — the case the gen2 rung actually exists for (an individual/BYO node
+// sends "" already and skipGen1Probe would collapse straight past the gen2
+// rung, see TestReporter_SkipsGen1ProbeWhenNothingToStrip below).
+func (p *gen2RejectingPoster) ManagedMachineIdentity(context.Context) string {
+	return "org-salted-machine-id"
+}
+
+func (p *gen2RejectingPoster) snapshotSizes() []int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]int, len(p.calls))
+	for i, c := range p.calls {
+		out[i] = len(c.Rows)
+	}
+	return out
+}
+
+func (p *gen2RejectingPoster) call(i int) orgcontract.PolicyStateReport {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls[i]
+}
+
+// TestReporter_Gen2ProbedBeforeGen1AtFullDepth pins the generation rung of
+// the ladder: a server that rejects gen2 content is answered with a
+// gen1-projected send at the SAME (full) depth before the pre-existing
+// optional-point depth ladder is ever walked, and the daemon latches
+// gen1-at-full-depth for its remaining lifetime — never re-probing, never
+// additionally narrowing depth (the server understood the full row set, it
+// just doesn't know the gen2 fields yet).
+func TestReporter_Gen2ProbedBeforeGen1AtFullDepth(t *testing.T) {
+	readers := gen2Readers(t)
+	fp := &gen2RejectingPoster{}
+	rep := newPolicyStateReporter(fp, readers, seqCounter(t), "v", true, nil)
+
+	rep.report(context.Background())
+	if got := fp.snapshotSizes(); len(got) != 2 || got[0] != 6 || got[1] != 6 {
+		t.Fatalf("posted %v, want [6 6] (gen2 @ full depth rejected, then gen1 @ full depth accepted — same depth, no narrowing)", got)
+	}
+	first, second := fp.call(0), fp.call(1)
+	if first.MachineIdentity == "" {
+		t.Fatal("the first (gen2) attempt must carry the live machine identity")
+	}
+	var sawGen2NodeRow bool
+	for _, row := range first.Rows {
+		if row.EnforcementPoint == policystate.PointNodeDashboard && len(row.AcceptedAuthority) > 0 {
+			sawGen2NodeRow = true
+		}
+	}
+	if !sawGen2NodeRow {
+		t.Fatal("the first attempt must carry the real gen2 node-dashboard fields, or this test proves nothing")
+	}
+	if second.MachineIdentity != "" {
+		t.Fatal("the gen1 probe must never carry machine identity")
+	}
+	for _, row := range second.Rows {
+		if len(row.AcceptedAuthority) > 0 || len(row.ExtractionEffective) > 0 || len(row.DroppedClasses) > 0 {
+			t.Fatalf("gen1 probe row %+v still carries a gen2 field", row)
+		}
+	}
+	if !rep.latched.Load() || !rep.latchGen1.Load() {
+		t.Fatalf("latched=%v latchGen1=%v, want a gen1 latch", rep.latched.Load(), rep.latchGen1.Load())
+	}
+	if want := int32(len(policystate.OptionalPoints)); rep.latchDepth.Load() != want {
+		t.Fatalf("latchDepth = %d, want %d (full depth — the server only rejected gen2 content, not an optional point)",
+			rep.latchDepth.Load(), want)
+	}
+
+	// A later report must send the latched gen1-projected rows directly,
+	// with no further probing.
+	rep.report(context.Background())
+	if got := fp.snapshotSizes(); len(got) != 3 || got[2] != 6 {
+		t.Fatalf("posted %v, want a third entry of 6 rows (latched gen1, no re-probe)", got)
+	}
+	if third := fp.call(2); third.MachineIdentity != "" {
+		t.Fatal("a latched gen1 send must never carry machine identity")
+	}
+}
+
+// TestReporter_SkipsGen1ProbeWhenNothingToStrip is skipGen1Probe's own proof:
+// an UNMANAGED node ("" machine identity) whose six rows carry no gen2
+// content in the first place (gen1Full is byte-identical to rows) must not
+// waste a second POST re-sending the same bytes — it should fall straight
+// into the pre-existing optional-point depth ladder.
+func TestReporter_SkipsGen1ProbeWhenNothingToStrip(t *testing.T) {
+	fp := &rejectingPoster{acceptRows: 5} // rejects the six-row send, accepts five
+	rep := newPolicyStateReporter(fp, sixReaders(), seqCounter(t), "v", true, nil)
+
+	rep.report(context.Background())
+	// sixReaders' node-dashboard reader is the nil-handle stub (no gen2
+	// content), so rows == gen1Full already; skipGen1Probe must fire and the
+	// very next attempt is the depth-1 rung (5 rows), not a repeated 6-row
+	// gen1 probe.
+	if got := fp.snapshot(); len(got) != 2 || got[0] != 6 || got[1] != 5 {
+		t.Fatalf("posted %v, want [6 5] (gen1 probe skipped — no gen2 content to strip)", got)
+	}
+}
+
+// TestProjectGen1_StripsFieldsAndRemapsReasons is the byte-compat table pin:
+// every gen2-only field is unconditionally cleared, and exactly the two
+// documented gen2 Reason values fold onto their gen1 equivalent — every
+// other reason (including gen1's own not_preauthorized) passes through
+// unchanged. This is the test mutation-proof (b) targets: removing any one
+// of the three field-clears, or either remap case, must fail a case here.
+func TestProjectGen1_StripsFieldsAndRemapsReasons(t *testing.T) {
+	cases := []struct {
+		name       string
+		reason     string
+		wantReason string
+	}{
+		{"family_not_accepted folds to capability_mismatch", orgcontract.ReasonFamilyNotAccepted, orgcontract.ReasonCapabilityMismatch},
+		{"sidecar_unwritable folds to not_preauthorized", orgcontract.ReasonSidecarUnwritable, orgcontract.ReasonNotPreauthorized},
+		{"not_preauthorized passes through unchanged", orgcontract.ReasonNotPreauthorized, orgcontract.ReasonNotPreauthorized},
+		{"ok passes through unchanged", orgcontract.ReasonOK, orgcontract.ReasonOK},
+		{"no_policy passes through unchanged", orgcontract.ReasonNoPolicy, orgcontract.ReasonNoPolicy},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := []orgcontract.PolicyStateRow{{
+				EnforcementPoint:    policystate.PointNodeDashboard,
+				Family:              policystate.FamilyNodeGovernance,
+				Reason:              tc.reason,
+				AcceptedAuthority:   []string{"dashboard.visibility", "settings.pin"},
+				ExtractionEffective: []string{"extract.cache"},
+				DroppedClasses:      map[string]string{"share": "not_preauthorized"},
+			}}
+			out := projectGen1(in)
+			if len(out) != 1 {
+				t.Fatalf("got %d rows, want 1", len(out))
+			}
+			got := out[0]
+			if got.Reason != tc.wantReason {
+				t.Fatalf("Reason = %q, want %q", got.Reason, tc.wantReason)
+			}
+			if got.AcceptedAuthority != nil {
+				t.Fatalf("AcceptedAuthority = %v, want nil (gen1 must never carry it)", got.AcceptedAuthority)
+			}
+			if got.ExtractionEffective != nil {
+				t.Fatalf("ExtractionEffective = %v, want nil (gen1 must never carry it)", got.ExtractionEffective)
+			}
+			if got.DroppedClasses != nil {
+				t.Fatalf("DroppedClasses = %v, want nil (gen1 must never carry it)", got.DroppedClasses)
+			}
+			// projectGen1 must not mutate the caller's slice — report() still
+			// needs the gen2-full rows for the (rare) latchGen1==false
+			// defensive path.
+			if in[0].AcceptedAuthority == nil {
+				t.Fatal("projectGen1 mutated the input row's AcceptedAuthority")
+			}
+			if in[0].Reason != tc.reason {
+				t.Fatalf("projectGen1 mutated the input row's Reason: got %q, want unchanged %q", in[0].Reason, tc.reason)
+			}
+		})
 	}
 }

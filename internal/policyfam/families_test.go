@@ -18,6 +18,11 @@ func TestSupportedFamiliesDriveDispatch(t *testing.T) {
 		// with no restriction"), so this is the smallest real body, not a
 		// degenerate one.
 		FamilyNodeGovernance: `{"schema":1}`,
+		// node.features' minimal body is the empty object: a policy that
+		// governs none of the four features (every seam stays fail-open)
+		// is valid and meaningful, mirroring node.governance's minimal
+		// body above.
+		FamilyNodeFeatures: `{}`,
 	}
 
 	if len(minimalBody) != len(SupportedFamilies) {

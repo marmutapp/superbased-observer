@@ -87,17 +87,17 @@ func firstReadPath(a toolArgs) string {
 // equivalent, so the drive-letter string never reaches git.Resolve
 // where filepath.Abs would treat it as relative and CWD-prefix the
 // observer's own .git onto it ([[feedback-foreign-path-git-resolve]]).
-// Mirrors opencode/clinecli. Returns (projectRoot, gitBranch); a blank
-// cwd yields ("", "").
-func resolveProjectRoot(rawCWD string) (root, branch string) {
+// Mirrors opencode/clinecli. Returns (projectRoot, gitBranch,
+// gitRemote); a blank cwd yields ("", "", "").
+func resolveProjectRoot(rawCWD string) (root, branch, remote string) {
 	cwd := strings.TrimSpace(rawCWD)
 	if cwd == "" {
-		return "", ""
+		return "", "", ""
 	}
 	cwd = crossmount.TranslateForeignPath(cwd)
 	info, err := git.Resolve(cwd)
 	if err != nil {
-		return cwd, ""
+		return cwd, "", ""
 	}
-	return info.Root, info.Branch
+	return info.Root, info.Branch, git.NormalizeRemote(info.Remote)
 }

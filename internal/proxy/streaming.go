@@ -432,3 +432,39 @@ func applyOpenAIUsage(result *streamResult, promptTokens, completionTokens, inpu
 		result.OutputTokens = outputTokens
 	}
 }
+
+// injectOpenAIIncludeUsage rewrites a Chat Completions request body so a
+// streamed response carries usage: it sets
+// stream_options.include_usage = true when the body is a JSON object with
+// "stream": true and no existing stream_options. Non-streaming bodies and
+// non-objects pass through unchanged (ok=false) — OpenAI reports usage
+// natively on non-streaming responses, so there is nothing to inject.
+//
+// This is the capture-side fix for clients that count tokens client-side
+// instead of asking the API for them (aider/LiteLLM): without the option the
+// stream contains no usage at all, and the proxied api_turn row lands 0/0.
+func injectOpenAIIncludeUsage(body []byte) ([]byte, bool) {
+	var req struct {
+		Stream        bool           `json:"stream"`
+		StreamOptions map[string]any `json:"stream_options"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, false
+	}
+	if !req.Stream || req.StreamOptions != nil {
+		return nil, false
+	}
+	// Re-marshal via a generic map so unknown fields round-trip exactly as
+	// parsed (Go's json.Marshal emits map keys sorted — byte-differences vs
+	// the original are fine; the upstream parses JSON, not bytes).
+	var full map[string]any
+	if err := json.Unmarshal(body, &full); err != nil {
+		return nil, false
+	}
+	full["stream_options"] = map[string]any{"include_usage": true}
+	out, err := json.Marshal(full)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}

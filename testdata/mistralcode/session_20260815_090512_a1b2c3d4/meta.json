@@ -1,0 +1,76 @@
+{
+  "session_id": "a1b2c3d4-1111-4222-8333-444455556666",
+  "parent_session_id": null,
+  "start_time": "2026-08-15T09:05:12.123456+00:00",
+  "end_time": "2026-08-15T09:14:47.987654+00:00",
+  "git_branch": "main",
+  "git_commit": "0000000000000000000000000000000000abcd",
+  "environment": {
+    "working_directory": "/home/dev/samplerepo"
+  },
+  "stats": {
+    "steps": 9,
+    "session_prompt_tokens": 52340,
+    "session_completion_tokens": 812,
+    "session_cached_tokens": 41200,
+    "tool_calls_agreed": 8,
+    "tool_calls_rejected": 0,
+    "tool_calls_hook_denied": 0,
+    "tool_calls_failed": 1,
+    "tool_calls_succeeded": 7,
+    "context_tokens": 12100,
+    "last_turn_prompt_tokens": 9800,
+    "last_turn_completion_tokens": 301,
+    "last_turn_cached_tokens": 9500,
+    "last_turn_duration": 4.812233,
+    "tokens_per_second": 62.55,
+    "input_price_per_million": 1.5,
+    "output_price_per_million": 7.5,
+    "cached_input_price_per_million": 0.15,
+    "session_total_llm_tokens": 53152,
+    "last_turn_total_tokens": 12100,
+    "session_cost": 0.0246255
+  },
+  "config": {
+    "active_model": "",
+    "routed_default_model": "",
+    "models": {
+      "mistral-medium-3.5": {
+        "name": "mistral-medium-3.5",
+        "provider": "mistral",
+        "alias": "medium",
+        "temperature": 0.2,
+        "input_price": 1.5,
+        "output_price": 7.5,
+        "cached_input_price": 0.15,
+        "thinking": "high",
+        "supports_images": true,
+        "auto_compact_threshold": 200000
+      },
+      "devstral-small": {
+        "name": "devstral-small",
+        "provider": "mistral",
+        "alias": "small",
+        "temperature": 0.2,
+        "input_price": 0.1,
+        "output_price": 0.3,
+        "cached_input_price": 0.01,
+        "thinking": "low",
+        "supports_images": false,
+        "auto_compact_threshold": 128000
+      },
+      "local": {
+        "name": "local",
+        "provider": "llamacpp",
+        "alias": "local",
+        "temperature": 0.2,
+        "input_price": 0.0,
+        "output_price": 0.0,
+        "cached_input_price": null,
+        "thinking": "low",
+        "supports_images": false,
+        "auto_compact_threshold": 32000
+      }
+    }
+  }
+}

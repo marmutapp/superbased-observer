@@ -104,13 +104,21 @@ func TestSelectUnpushedSince_CursorAdvances(t *testing.T) {
 	if first.Empty() {
 		t.Fatal("first batch empty")
 	}
-	// Re-reading from the returned cursor yields nothing new.
+	// Re-reading from the returned cursor yields no new ROW-LEVEL data. The
+	// windowed-recompute aggregates (and, under shipsRawContent, the
+	// session-scoped enterprise wires — here the seeded run_command's
+	// command-bytes verbosity row) legitimately ride every push and are
+	// server-upsert-idempotent, so they are deliberately NOT part of this
+	// cursor assertion (they never gate cursor progress).
 	second, err := s.SelectUnpushedSince(ctx, first.Cursor, 1<<20, "o", "u", ShareOptions{FullContent: true}, ScopeOptions{})
 	if err != nil {
 		t.Fatalf("second: %v", err)
 	}
-	if !second.Empty() {
-		t.Fatalf("second batch not empty: %d rows", second.RowCount())
+	if got := second.RowCount(); got != 0 {
+		t.Fatalf("second batch row count = %d, want 0 (cursor did not advance)", got)
+	}
+	if second.Cursor != first.Cursor {
+		t.Fatalf("cursor moved on an empty re-read: %+v -> %+v", first.Cursor, second.Cursor)
 	}
 }
 

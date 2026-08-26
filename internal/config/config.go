@@ -520,8 +520,22 @@ type ObservabilityAdmissionConfig struct {
 	// Empty is treated as "observe" when Enabled.
 	Mode string `toml:"mode"`
 	// Strict = fail-closed on judge error/timeout (Deny). Default false =
-	// fail-open (Allow + recorded admission_error).
+	// fail-open (Allow + recorded admission_error). BACK-COMPAT ALIAS: prefer
+	// OnJudgeError, which is the explicit posture enum. When OnJudgeError is
+	// empty, Strict resolves the posture (strict=true → fail_closed); when
+	// OnJudgeError is set, it wins and Strict is ignored.
 	Strict bool `toml:"strict"`
+	// OnJudgeError is the explicit judge-unavailable posture:
+	// "fail_open" (Allow, today's default) or "fail_closed" (Deny). Empty =
+	// resolve from Strict. This is the enum form of Strict; the invasive
+	// request-queueing posture is deliberately NOT offered here (it would need
+	// a new proxy admit-result shape). LOCAL-ONLY, never distributed.
+	OnJudgeError string `toml:"on_judge_error"`
+	// JudgeRetries is how many EXTRA bounded in-process attempts the admission
+	// engine makes on a judge transport error before the posture fires. 0 =
+	// no retry (today's behavior). A cheap reliability lever for a flaky or
+	// cold-starting judge; it does not change the synchronous verdict contract.
+	JudgeRetries int `toml:"judge_retries"`
 	// Scope is last_user | conversation. P1 = last_user; conversation is P3.
 	Scope string `toml:"scope"`
 	// RetentionDays bounds the obs_admission_events audit table. 0 = keep.
@@ -1402,6 +1416,32 @@ type TerminalStatusConfig struct {
 type LaunchConfig struct {
 	// Tools maps a registry tool name to its per-tool launch override.
 	Tools map[string]LaunchToolConfig `toml:"tools"`
+
+	// AgentRuntimeDir relocates a launched agent's install/config/cache
+	// tree onto a rename-safe local filesystem. Empty (default) = OFF: no
+	// env is injected and launch behaviour is byte-for-byte unchanged.
+	//
+	// It exists for deployments where the developer's HOME is on a
+	// filesystem that cannot complete the atomic renames npm/bun perform
+	// during a provider-dependency install — most notably a containerized
+	// node whose HOME is an Azure Files / SMB / NFS mount (the Plane-B
+	// test-node). There, an agent like OpenCode installs its provider
+	// module into ~/.config/<tool>/node_modules, the rename fails with
+	// EACCES, and the agent can't load the provider (an opaque
+	// UnknownError before any model call).
+	//
+	// When set, every `observer <tool>` launcher points the agent's
+	// XDG_CONFIG_HOME/XDG_CACHE_HOME/XDG_STATE_HOME plus the npm/bun cache
+	// dirs under this path (see cmd/observer agentRuntimeEnv). It is
+	// deliberately adapter-agnostic — keyed on the capability "this agent
+	// needs a rename-safe runtime dir", never on a tool name — and it does
+	// NOT relocate XDG_DATA_HOME, so agents still write their session
+	// storage under $HOME/.local/share where the watcher captures it.
+	//
+	// The OBSERVER_AGENT_RUNTIME_DIR environment variable overrides this
+	// key, so a container can set it without editing config. LOCAL-ONLY;
+	// never distributed to an org.
+	AgentRuntimeDir string `toml:"agent_runtime_dir"`
 }
 
 // LaunchToolConfig is one [launch.tools.<tool>] entry.
@@ -1496,6 +1536,19 @@ type CodeIntelIndexConfig struct {
 	// DiskBudgetMB caps the index size; cold projects LRU-evict past
 	// this. Default 500. 0 = no cap.
 	DiskBudgetMB int `toml:"disk_budget_mb"`
+	// OnStartTimeoutMinutes bounds the AGGREGATE wall-clock time
+	// runCodeIntelOnStart (cmd/observer/codeintel.go) spends indexing
+	// every known project on one `observer start` boot (T2.4, 2026-08-26
+	// disk/compute remediation plan, P2-H). Per-project consent-gating
+	// (auto_index_limit) and the home/drive-root block
+	// (index.isAutoIndexBlocked) are unaffected — this is an orthogonal
+	// outer bound for a large PROJECT SET (historically a 384K-file
+	// Windows home directory's worth of discovered project roots), not a
+	// per-project limit. When the deadline passes, indexing of any
+	// remaining projects is skipped for this boot; they're picked up
+	// again next start or by `observer index`. Default 10. ≤ 0 disables
+	// the bound (unbounded, matching pre-2026-08-26 behavior).
+	OnStartTimeoutMinutes int `toml:"on_start_timeout_minutes"`
 }
 
 // CodeIntelCompressionConfig is the [codeintel.compression] block — the
@@ -1750,7 +1803,7 @@ type OrgClientConfig struct {
 	// OrgServerURL is the base URL of the customer's org server, e.g.
 	// "https://observer-org.acme.example". Required when Enabled.
 	OrgServerURL string `toml:"org_server_url"`
-	// PushIntervalSeconds is the cadence of the push loop. Default 900 (15m).
+	// PushIntervalSeconds is the cadence of the push loop. Default 120 (2m).
 	PushIntervalSeconds int `toml:"push_interval_seconds"`
 	// PolicyPollIntervalSeconds is the cadence of the org policy-bundle
 	// poll (guard spec §14.2). Default 3600 (1h). The poll also fires
@@ -1916,12 +1969,67 @@ type OrgClientShareConfig struct {
 	// provisioning; there is no server-side force override (the no-remote-force
 	// invariant holds). Default false — the zero value stays metadata-only.
 	AdminManaged bool `toml:"admin_managed"`
+	// FullToolBodies ships the four `actions` body columns — raw_tool_input,
+	// raw_tool_output, preceding_reasoning, error_message — that the local
+	// dashboard renders inline and that the org-push seam NEVER ships in any
+	// other mode. It is its OWN tier, distinct from FullContent/AdminManaged
+	// (which ship paths/targets but never these bodies), so extraction is
+	// granular per the enterprise-managed control model. Node-side opt-in,
+	// default false; on a MANAGED node the org may RAISE it remotely
+	// (extract.managed authority) — the sanctioned enterprise lift — but on an
+	// individual node it is node-only and can never be server-raised.
+	FullToolBodies bool `toml:"full_tool_bodies"`
 	// RoutingSummary opts the §R19.4 routing aggregate (counts +
 	// dollars by tier/reason ONLY — never decision rows) onto the
 	// push. Its own consent toggle, default false, node-side only —
 	// the org admin cannot force it (model-routing spec §R26.4 +
 	// the share-mode posture).
 	RoutingSummary bool `toml:"routing_summary"`
+	// CacheDetail opts the Arc 4 P5c cache-detail aggregate (day × model ×
+	// kind counts + tokens + cost delta from the node-local cache_events log)
+	// onto the wire. CONTENT-FREE — no prompt prefix, no raw scope, no path.
+	// Its own consent toggle, default false, node-side only on an individual
+	// node; on a managed node the org may RAISE it (extract.managed).
+	CacheDetail bool `toml:"cache_detail"`
+	// RoutingDetail opts the Arc 4 P5d routing-detail aggregate (day ×
+	// original_model × selected_model × turn_kind × mode counts + savings from
+	// the node-local router_decisions log) onto the wire. CONTENT-FREE but
+	// MODEL-ID-BEARING (unlike routing_summary). Its own consent toggle,
+	// default false, node-side only on an individual node; on a managed node
+	// the org may RAISE it (extract.managed).
+	RoutingDetail bool `toml:"routing_detail"`
+	// LimitGauge opts the Arc 4 P5e predictions aggregate (per day × provider
+	// rate-limit utilization from the node-local limit_snapshots log) onto the
+	// wire. CONTENT-FREE (utilization stats only). Its own consent toggle,
+	// default false, node-side only on an individual node; on a managed node
+	// the org may RAISE it (extract.managed).
+	LimitGauge bool `toml:"limit_gauge"`
+	// CodeintelDetail opts the Arc 4 P5f codeintel-detail aggregate (per
+	// project-hash × language file/symbol/edge counts from the node-local
+	// code-intelligence index) onto the wire. CONTENT-FREE STRUCTURE counts —
+	// no symbol name, fqn, signature, or raw path; the project path is one-way
+	// hashed. Its own consent toggle, default false, node-side only on an
+	// individual node; on a managed node the org may RAISE it via the DISTINCT
+	// extract.codeintel authority (NOT the umbrella extract.managed — this is
+	// the highest-sensitivity tier and gets its own explicit consent).
+	CodeintelDetail bool `toml:"codeintel_detail"`
+	// ProcessDetail opts the Arc 4 P5g process-detail aggregate (per day ×
+	// tool run/exit/duration counts from the node-local process-observability
+	// log) onto the wire. CONTENT-FREE counts — no exe path, argv, cwd,
+	// network body, or hash. Its own consent toggle, default false, node-side
+	// only on an individual node; on a managed node the org may RAISE it via
+	// the DISTINCT extract.process authority (NOT the umbrella extract.managed
+	// — the process/eBPF trees are a highest-sensitivity tier).
+	ProcessDetail bool `toml:"process_detail"`
+	// TerminalDetail opts the Arc 4 P5h terminal-detail aggregates (per
+	// day×tool×kind terminal run/command counts + per day×kind×decision×principal
+	// remote-audit event counts from the node-local terminal_* / remote_audit
+	// logs) onto the wire. CONTENT-FREE counts — no command, hash, session id,
+	// peer address, or route. Its own consent toggle, default false, node-side
+	// only on an individual node; on a managed node the org may RAISE it via the
+	// DISTINCT extract.terminal authority. The raw terminal_* / remote_audit
+	// tables stay pinned out of the wire otherwise.
+	TerminalDetail bool `toml:"terminal_detail"`
 	// PolicyState opts the P0-6 effective-policy-state reverse channel
 	// (docs/plans/plane-a-p0-6-effective-policy-state-plan.md §2.3) onto a
 	// dedicated POST /api/agent/policy-ack. CONTENT-FREE — the report carries
@@ -1981,6 +2089,10 @@ type OrgClientShareObsConfig struct {
 	// The underlying obs_eval_* tables stay node-local; only this tier's rows
 	// cross the wire, via the obs provider seam.
 	EvalItems bool `toml:"eval_items"`
+	// Egress gates the T8 egress-routing decision feed (W5.3): what the
+	// node's own compiled routing policy decided for outbound model/provider
+	// calls. Default false, node-side only, never server-forced.
+	Egress bool `toml:"egress"`
 }
 
 // Org-client push-size bounds (spec §2.4.2).
@@ -1989,8 +2101,14 @@ const (
 	DefaultMaxPushBytes int64 = 1 << 20
 	// MaxPushBytesCeiling is the hard upper bound the client clamps to (16 MiB).
 	MaxPushBytesCeiling int64 = 16 << 20
-	// DefaultPushIntervalSeconds is the default push cadence (15 minutes).
-	DefaultPushIntervalSeconds = 900
+	// DefaultPushIntervalSeconds is the default push cadence (2 minutes). Kept
+	// deliberately short so a freshly-enrolled node's activity reaches the org
+	// dashboard promptly — the 15-minute default it replaced was the dominant
+	// cause of the "org dashboard is slow to update" complaint (the push loop is
+	// async best-effort telemetry, never in a request path, so a tighter cadence
+	// costs only a small, bounded delta upload). Existing nodes keep whatever
+	// they already wrote to config; this only changes new enrollments.
+	DefaultPushIntervalSeconds = 120
 	// DefaultPolicyPollIntervalSeconds is the default org policy-bundle
 	// poll cadence (1 hour — guard spec §14.2).
 	DefaultPolicyPollIntervalSeconds = 3600
@@ -2046,6 +2164,7 @@ type ObserverConfig struct {
 	Hooks       HooksConfig       `toml:"hooks"`
 	Antigravity AntigravityConfig `toml:"antigravity"`
 	Process     ProcessConfig     `toml:"process"`
+	DB          DBConfig          `toml:"db"`
 
 	// ConfigVersion is the schema-migration stamp written by the config
 	// auto-migration rail (internal/config/migrate). It records the
@@ -2055,6 +2174,55 @@ type ObserverConfig struct {
 	// this field only keeps the key out of the decoder's Undecoded set
 	// and available to any in-process consumer. See MigrateFile.
 	ConfigVersion int `toml:"config_version"`
+}
+
+// DBConfig controls the SQLite connection/pragma layer that
+// internal/db.Open drives for the main observer.db (docs/plans/observer-
+// disk-compute-remediation-plan-2026-08-26.md Phase 1, P0-B). It exists so
+// an operator can tune the memory/disk tradeoff without a rebuild; the
+// zero-value defaults below match internal/db.Options' own built-in
+// defaults, so an unconfigured [observer.db] block is safe.
+type DBConfig struct {
+	// HardHeapLimitMB sets SQLite's process-global PRAGMA hard_heap_limit in
+	// megabytes — the memory backstop that makes TempStore == "memory" safe:
+	// a runaway unindexed sort or VACUUM fails fast with SQLITE_NOMEM
+	// instead of exhausting host RAM. Zero (unset) applies the built-in
+	// 1024 MB (1 GiB) default. A negative value explicitly disables the
+	// pragma (omitted from the DSN entirely) — use with caution, and only
+	// alongside TempStore == "file".
+	HardHeapLimitMB int `toml:"hard_heap_limit_mb"`
+	// TempStore selects SQLite's PRAGMA temp_store: "file" (spill temp
+	// b-trees / VACUUM scratch to disk — the default), "memory" (hold temp
+	// in RAM, bounded by HardHeapLimitMB), or "default" (inherit whatever
+	// the driver/SQLite build ships with). Empty (unset) applies "file".
+	// FILE is the default so the operator's `observer prune --vacuum` still
+	// works on a multi-GB DB (MEMORY would fail SQLITE_NOMEM building the
+	// whole-file temp copy in RAM) and nothing can OOM; see
+	// internal/db.Options.TempStore for the full rationale.
+	TempStore string `toml:"temp_store"`
+	// MaxOpenConns bounds the connection pool (see
+	// database/sql.DB.SetMaxOpenConns). Zero (unset) applies the built-in
+	// default of 16.
+	MaxOpenConns int `toml:"max_open_conns"`
+	// ConnMaxIdleSeconds bounds how long an idle pooled connection is kept
+	// before being closed (see database/sql.DB.SetConnMaxIdleTime). Zero
+	// (unset) applies a 300s (5-minute) default.
+	ConnMaxIdleSeconds int `toml:"conn_max_idle_seconds"`
+	// IntegrityCheckMaxGB caps the AUTOMATIC `PRAGMA quick_check` the
+	// daemon runs once per process, off its readiness path, via
+	// db.RunStartupMaintenance (cmd/observer/diag.go::
+	// runStartupDBMaintenance). quick_check checksums every page of the
+	// file, so its cost scales with the database, not with the work the
+	// daemon came to do — on a 41.8 GB install it was measured as the
+	// dominant startup CPU cost (P1-D, docs/audits/observer-disk-compute-
+	// exhaustion-audit-2026-08-26.md). Above this many GB the automatic
+	// pass is skipped with one calm log line; the schema-034 path-hash
+	// backfill still runs regardless (idempotent, cheap after its
+	// done-marker). This gates ONLY the automatic startup pass —
+	// `observer doctor` always runs its own quick_check unconditionally,
+	// on demand, regardless of size. Default 8 (GB). ≤ 0 disables the
+	// gate (quick_check always runs, matching pre-2026-08-26 behavior).
+	IntegrityCheckMaxGB int `toml:"integrity_check_max_gb"`
 }
 
 // AntigravityConfig controls the Antigravity adapter's behavior.
@@ -2429,6 +2597,16 @@ type RetentionConfig struct {
 	// (daily). ≤ 0 disables the tick (startup + manual prune only —
 	// the pre-v1.20 behavior).
 	IntervalHours int `toml:"interval_hours"`
+	// WALAlertMB is the §1e follow-through (2026-08-22 write-stall arc):
+	// the daemon's WAL watchdog WARNs and attempts a TRUNCATE checkpoint
+	// once observer.db-wal exceeds this size. The 2026-08-21 stall left
+	// the WAL pinned at 15.5 GB for hours because frames were long
+	// checkpointed but the file was never released — bounded visibility
+	// plus a reclaim attempt turns that from silent into actionable.
+	// Default 1024 (1 GiB). ≤ 0 disables the watchdog.
+	WALAlertMB int `toml:"wal_alert_mb"`
+	// WALWatchMinutes is the watchdog cadence. Default 10. ≤ 0 disables.
+	WALWatchMinutes int `toml:"wal_watch_minutes"`
 }
 
 // HooksConfig controls hook runtime.
@@ -2977,7 +3155,7 @@ func Default() Config {
 				PollIntervalSeconds: 2,
 				MaxFileSizeMB:       50,
 				EnabledAdapters: []string{
-					"claude-code", "codex", "cline", "cline-cli", "roo-code", "cursor", "copilot", "copilot-cli", "cowork", "opencode", "openclaw", "pi", "gemini-cli", "antigravity", "antigravity-cli", "hermes", "kilo-code", "kilo-code-cli", "qwen-code", "kiro-cli", "crush", "kimi-code", "grok", "devin", "qoder", "aider", "goose", "chatgpt-web", "claude-web", "perplexity-web", "gemini-web", "copilot-web", "droid", "open-interpreter", "command-code", "muse", "prime-agent", "deepseek", "junie",
+					"claude-code", "codex", "cline", "cline-cli", "roo-code", "cursor", "copilot", "copilot-cli", "cowork", "opencode", "openclaw", "pi", "gemini-cli", "antigravity", "antigravity-cli", "hermes", "kilo-code", "kilo-code-cli", "qwen-code", "kiro-cli", "crush", "kimi-code", "grok", "devin", "qoder", "aider", "goose", "chatgpt-web", "claude-web", "perplexity-web", "gemini-web", "copilot-web", "droid", "open-interpreter", "command-code", "muse", "prime-agent", "deepseek", "junie", "zcode", "mistral-code", "freebuff",
 				},
 			},
 			Freshness: FreshnessConfig{
@@ -2999,6 +3177,8 @@ func Default() Config {
 				PruneOnStartup:        true,
 				ObserverLogMaxAgeDays: 30,
 				IntervalHours:         24,
+				WALAlertMB:            1024,
+				WALWatchMinutes:       10,
 			},
 			Hooks: HooksConfig{
 				TimeoutMS:    500,
@@ -3068,6 +3248,18 @@ func Default() Config {
 					AllowNonLoopback:   false,
 					HandshakeTimeoutMS: 10000,
 				},
+			},
+			// SQLite connection/pragma tuning (docs/plans/observer-disk-
+			// compute-remediation-plan-2026-08-26.md Phase 1, P0-B). These
+			// mirror internal/db.Options' own built-in defaults; spelled out
+			// here so a partial [observer.db] section inherits sane values
+			// rather than zeros (the CacheTrack partial-merge rule).
+			DB: DBConfig{
+				HardHeapLimitMB:     1024,
+				TempStore:           "file",
+				MaxOpenConns:        16,
+				ConnMaxIdleSeconds:  300,
+				IntegrityCheckMaxGB: 8,
 			},
 		},
 		// Org client is OFF by default (solo-local invariant). The defaults
@@ -3292,10 +3484,11 @@ func Default() Config {
 			MaxFileBytes:   2_000_000,
 			RetentionDays:  90,
 			Index: CodeIntelIndexConfig{
-				OnStart:      true,
-				Watch:        true,
-				Mode:         "auto",
-				DiskBudgetMB: 500,
+				OnStart:               true,
+				Watch:                 true,
+				Mode:                  "auto",
+				DiskBudgetMB:          500,
+				OnStartTimeoutMinutes: 10,
 			},
 			Compression: CodeIntelCompressionConfig{},
 			Semantic: CodeIntelSemanticConfig{
@@ -3894,6 +4087,14 @@ func validateObservabilityJudges(cfg Config) error {
 			return errors.New("config: observability judge use_org_relay=true is ambiguous with base_url/api_key_env set on the same block — the relay ignores both")
 		}
 	}
+	switch strings.TrimSpace(cfg.Observability.Admission.OnJudgeError) {
+	case "", "fail_open", "fail_closed":
+	default:
+		return fmt.Errorf("config: observability.admission.on_judge_error %q not in {fail_open, fail_closed}", cfg.Observability.Admission.OnJudgeError)
+	}
+	if cfg.Observability.Admission.JudgeRetries < 0 {
+		return errors.New("config: observability.admission.judge_retries must be >= 0")
+	}
 	return nil
 }
 
@@ -4009,6 +4210,11 @@ var policyResourceSupportedFamilies = map[string]bool{
 	// build otherwise, which is the drift gate gateway.providers taught us
 	// to want.
 	"node.governance": true,
+	// Org-parity W5.1 (docs/plans/org-parity-full-depth-plan-2026-08-24.md
+	// §4): the per-feature enable/disable + limits family. Added here in the
+	// SAME change as policyfam.FamilyNodeFeatures for the same drift-gate
+	// reason as node.governance above.
+	"node.features": true,
 }
 
 // validateOrgClientPolicy checks [org_client.policy]: every listed family
@@ -4020,13 +4226,13 @@ func validateOrgClientPolicy(p OrgClientPolicyConfig) error {
 	accepted := make(map[string]bool, len(p.AcceptFamilies))
 	for _, f := range p.AcceptFamilies {
 		if !policyResourceSupportedFamilies[f] {
-			return fmt.Errorf("config: org_client.policy.accept_families contains unsupported family %q (want one of admission.input, egress.routing_guardrail, gateway.providers, node.governance)", f)
+			return fmt.Errorf("config: org_client.policy.accept_families contains unsupported family %q (want one of admission.input, egress.routing_guardrail, gateway.providers, node.governance, node.features)", f)
 		}
 		accepted[f] = true
 	}
 	for _, f := range p.PreauthorizeEnforce {
 		if !policyResourceSupportedFamilies[f] {
-			return fmt.Errorf("config: org_client.policy.preauthorize_enforce contains unsupported family %q (want one of admission.input, egress.routing_guardrail, gateway.providers, node.governance)", f)
+			return fmt.Errorf("config: org_client.policy.preauthorize_enforce contains unsupported family %q (want one of admission.input, egress.routing_guardrail, gateway.providers, node.governance, node.features)", f)
 		}
 		if !accepted[f] {
 			return fmt.Errorf("config: org_client.policy.preauthorize_enforce contains %q, which is not in accept_families (preauthorize_enforce must be a subset of accept_families)", f)

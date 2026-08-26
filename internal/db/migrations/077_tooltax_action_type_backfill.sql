@@ -1145,7 +1145,9 @@ UPDATE actions
    SET action_type = 'run_command'
  WHERE tool = 'deepseek'
    AND action_type = 'unknown'
-   AND raw_tool_name = 'bash';
+   AND raw_tool_name IN (
+     'bash', 'pwsh'
+   );
 
 UPDATE actions
    SET action_type = 'search_files'
@@ -1375,6 +1377,74 @@ UPDATE actions
    AND action_type = 'unknown'
    AND raw_tool_name IN (
      'Create', 'GenerateDroid', 'Write'
+   );
+
+UPDATE actions
+   SET action_type = 'edit_file'
+ WHERE tool = 'freebuff'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'edit_file', 'str_replace'
+   );
+
+UPDATE actions
+   SET action_type = 'read_file'
+ WHERE tool = 'freebuff'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'read_file', 'read_files'
+   );
+
+UPDATE actions
+   SET action_type = 'run_command'
+ WHERE tool = 'freebuff'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'bash', 'run_command', 'run_terminal_command'
+   );
+
+UPDATE actions
+   SET action_type = 'search_files'
+ WHERE tool = 'freebuff'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'find_files';
+
+UPDATE actions
+   SET action_type = 'search_text'
+ WHERE tool = 'freebuff'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'code_search', 'grep'
+   );
+
+UPDATE actions
+   SET action_type = 'spawn_subagent'
+ WHERE tool = 'freebuff'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'spawn_agent', 'spawn_agents'
+   );
+
+UPDATE actions
+   SET action_type = 'web_fetch'
+ WHERE tool = 'freebuff'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'read_url', 'web_fetch'
+   );
+
+UPDATE actions
+   SET action_type = 'web_search'
+ WHERE tool = 'freebuff'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'web_search';
+
+UPDATE actions
+   SET action_type = 'write_file'
+ WHERE tool = 'freebuff'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'create_file', 'write_file'
    );
 
 UPDATE actions
@@ -1954,6 +2024,75 @@ UPDATE actions
  WHERE tool = 'kiro-cli'
    AND action_type = 'unknown'
    AND raw_tool_name = 'fs_write';
+
+UPDATE actions
+   SET action_type = 'ask_user'
+ WHERE tool = 'mistral-code'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'ask_user_question';
+
+UPDATE actions
+   SET action_type = 'edit_file'
+ WHERE tool = 'mistral-code'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'edit';
+
+UPDATE actions
+   SET action_type = 'read_file'
+ WHERE tool = 'mistral-code'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'read_file';
+
+UPDATE actions
+   SET action_type = 'run_command'
+ WHERE tool = 'mistral-code'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'bash', 'bash_log_file', 'bash_output', 'bash_sessions',
+     'bash_stdin'
+   );
+
+UPDATE actions
+   SET action_type = 'search_text'
+ WHERE tool = 'mistral-code'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'grep';
+
+UPDATE actions
+   SET action_type = 'skill_invoke'
+ WHERE tool = 'mistral-code'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'skill';
+
+UPDATE actions
+   SET action_type = 'spawn_subagent'
+ WHERE tool = 'mistral-code'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'task';
+
+UPDATE actions
+   SET action_type = 'todo_update'
+ WHERE tool = 'mistral-code'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'todo';
+
+UPDATE actions
+   SET action_type = 'web_fetch'
+ WHERE tool = 'mistral-code'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'web_fetch';
+
+UPDATE actions
+   SET action_type = 'web_search'
+ WHERE tool = 'mistral-code'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'web_search';
+
+UPDATE actions
+   SET action_type = 'write_file'
+ WHERE tool = 'mistral-code'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'write_file';
 
 UPDATE actions
    SET action_type = 'ask_user'
@@ -2722,6 +2861,92 @@ UPDATE actions
  WHERE tool = 'roo-code'
    AND action_type = 'unknown'
    AND raw_tool_name = 'write_to_file';
+
+UPDATE actions
+   SET action_type = 'edit_file'
+ WHERE tool = 'zcode'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'apply_patch', 'applypatch', 'edit', 'multiedit', 'patch',
+     'replace'
+   );
+
+UPDATE actions
+   SET action_type = 'harness_call'
+ WHERE tool = 'zcode'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'zcode.step_finish';
+
+UPDATE actions
+   SET action_type = 'read_file'
+ WHERE tool = 'zcode'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'cat', 'read', 'view'
+   );
+
+UPDATE actions
+   SET action_type = 'run_command'
+ WHERE tool = 'zcode'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'bash', 'cmd', 'cmd.exe', 'command', 'powershell', 'pwsh',
+     'shell'
+   );
+
+UPDATE actions
+   SET action_type = 'search_files'
+ WHERE tool = 'zcode'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'find', 'glob', 'ls'
+   );
+
+UPDATE actions
+   SET action_type = 'search_text'
+ WHERE tool = 'zcode'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'grep', 'rg', 'search'
+   );
+
+UPDATE actions
+   SET action_type = 'spawn_subagent'
+ WHERE tool = 'zcode'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'agent', 'subagent', 'task'
+   );
+
+UPDATE actions
+   SET action_type = 'todo_update'
+ WHERE tool = 'zcode'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'todo', 'todoread', 'todowrite'
+   );
+
+UPDATE actions
+   SET action_type = 'web_fetch'
+ WHERE tool = 'zcode'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'fetch', 'http', 'webfetch'
+   );
+
+UPDATE actions
+   SET action_type = 'web_search'
+ WHERE tool = 'zcode'
+   AND action_type = 'unknown'
+   AND raw_tool_name = 'websearch';
+
+UPDATE actions
+   SET action_type = 'write_file'
+ WHERE tool = 'zcode'
+   AND action_type = 'unknown'
+   AND raw_tool_name IN (
+     'create', 'write'
+   );
 
 UPDATE actions
    SET action_type = 'edit_file'

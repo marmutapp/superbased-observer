@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/marmutapp/superbased-observer/internal/adapter"
+	"github.com/marmutapp/superbased-observer/internal/adapter/cacheobs"
 	"github.com/marmutapp/superbased-observer/internal/contentcap"
 	"github.com/marmutapp/superbased-observer/internal/git"
 	"github.com/marmutapp/superbased-observer/internal/models"
@@ -373,7 +374,7 @@ func ProjectAttribution(auditPath string) (sessionID, projectRoot string, ok boo
 		// the backfill should converge on the same behavior.
 		sc = sidecar{}
 	}
-	projectRoot = resolveProjectRoot(sc, map[string]string{})
+	projectRoot, _ = resolveProjectRoot(sc, map[string]projectGitInfo{})
 	return sessionID, projectRoot, true
 }
 
@@ -412,7 +413,22 @@ func instanceSessionID(auditPath string) string {
 // finds the observer's OWN .git and mis-attributes every Cowork
 // session pointing at a Windows workspace to the observer's repo.
 // That's what v1.4.54 fixed.
-func resolveProjectRoot(s sidecar, cache map[string]string) string {
+// projectGitInfo is the per-candidate cache entry for resolveProjectRoot:
+// the resolved project root and its normalized "origin" remote,
+// captured together from a single git.Resolve call so the two never
+// drift and the filesystem walk never happens twice for the same
+// candidate.
+type projectGitInfo struct {
+	Root   string
+	Remote string
+}
+
+// resolveProjectRoot returns (root, remote). remote is only populated
+// when git.Resolve actually ran and found a repo (the reachable-path
+// branch below); the sandbox-synthesis and unreachable-path branches
+// never call git.Resolve, so remote is "" there — an honest gap, not a
+// fabricated value.
+func resolveProjectRoot(s sidecar, cache map[string]projectGitInfo) (string, string) {
 	candidate := ""
 	if len(s.UserSelectedFolders) > 0 && s.UserSelectedFolders[0] != "" {
 		candidate = s.UserSelectedFolders[0]
@@ -420,7 +436,7 @@ func resolveProjectRoot(s sidecar, cache map[string]string) string {
 		candidate = s.Cwd
 	}
 	if candidate == "" {
-		return ""
+		return "", ""
 	}
 
 	// Cowork-internal cwd (the session's own .../local_<id>/outputs
@@ -443,12 +459,12 @@ func resolveProjectRoot(s sidecar, cache map[string]string) string {
 			name = s.SessionID
 		}
 		if name != "" {
-			return "/sessions/" + name
+			return "/sessions/" + name, ""
 		}
 	}
 
 	if r, ok := cache[candidate]; ok {
-		return r
+		return r.Root, r.Remote
 	}
 
 	// Translate Windows-style paths to /mnt/<drive>/ on WSL2
@@ -458,13 +474,14 @@ func resolveProjectRoot(s sidecar, cache map[string]string) string {
 
 	if _, err := os.Stat(translated); err == nil {
 		if info, err := git.Resolve(translated); err == nil && info.IsGit {
-			cache[candidate] = info.Root
-			return info.Root
+			remote := git.NormalizeRemote(info.Remote)
+			cache[candidate] = projectGitInfo{Root: info.Root, Remote: remote}
+			return info.Root, remote
 		}
 		// Path exists but isn't a git repo — return the reachable
 		// form rather than the foreign-OS string the sidecar emitted.
-		cache[candidate] = translated
-		return translated
+		cache[candidate] = projectGitInfo{Root: translated}
+		return translated, ""
 	}
 	// Translated path isn't reachable from this host (sandbox paths
 	// like "/sessions/<adj-adj-name>" hit this; so do Windows paths
@@ -472,8 +489,8 @@ func resolveProjectRoot(s sidecar, cache map[string]string) string {
 	// verbatim — git.Resolve would otherwise interpret it as relative
 	// to the observer's CWD and mis-attribute the session to the
 	// observer's own repo (v1.4.54 regression).
-	cache[candidate] = candidate
-	return candidate
+	cache[candidate] = projectGitInfo{Root: candidate}
+	return candidate, ""
 }
 
 // ParseSessionFile implements adapter.Adapter. Streams audit.jsonl
@@ -499,8 +516,8 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 	}
 
 	sessionID := instanceSessionID(path)
-	rootCache := map[string]string{}
-	projectRoot := resolveProjectRoot(sc, rootCache)
+	rootCache := map[string]projectGitInfo{}
+	projectRoot, projectRemote := resolveProjectRoot(sc, rootCache)
 
 	res := adapter.ParseResult{NewOffset: fromOffset}
 	pending := map[string]int{}            // tool_use_id → index in res.ToolEvents (PRUNED on tool_result pair)
@@ -514,6 +531,15 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 	// emitted actions. Empty when the local-instance had no sub-agent
 	// activity (or no .claude/projects/ tree at all).
 	sidechain := collectSidechainUUIDs(filepath.Dir(path))
+
+	// cacheAcc is the per-session Tier-2 cache-observation
+	// accumulator (see cachetrack.go). It receives every user +
+	// assistant content block in transcript order and emits one
+	// CacheTurnObservation per model at each `result` record — the
+	// only place cowork carries authoritative per-turn token
+	// accounting (handleAssistant's doc comment above explains why
+	// the streaming assistant.message.usage snapshot is not used).
+	cacheAcc := cacheobs.New(MaxBlocksPerSession)
 
 	// Use bufio.Reader.ReadString instead of bufio.Scanner so we get
 	// the exact byte count of each line (incl. the \r\n terminator
@@ -581,17 +607,17 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 
 		switch rec.Type {
 		case "user":
-			a.handleUser(&res, path, rec, sessionID, projectRoot, &sc, ts, pending, sidechain)
+			a.handleUser(&res, path, rec, sessionID, projectRoot, projectRemote, &sc, ts, pending, sidechain, cacheAcc)
 		case "assistant":
-			a.handleAssistant(&res, path, rec, sessionID, projectRoot, &sc, ts, pending, allToolUseIdx, &reasoning, sidechain)
+			a.handleAssistant(&res, path, rec, sessionID, projectRoot, projectRemote, &sc, ts, pending, allToolUseIdx, &reasoning, sidechain, cacheAcc)
 		case "system":
-			a.handleSystem(&res, path, rec, sessionID, projectRoot, &sc, ts, pendingPermissions)
+			a.handleSystem(&res, path, rec, sessionID, projectRoot, projectRemote, &sc, ts, pendingPermissions)
 		case "result":
-			a.handleResult(&res, path, rec, sessionID, projectRoot, &sc, ts)
+			a.handleResult(&res, path, rec, sessionID, projectRoot, projectRemote, &sc, ts, cacheAcc)
 		case "tool_use_summary":
 			handleToolUseSummary(&res, rec, allToolUseIdx)
 		case "rate_limit_event":
-			a.handleRateLimitEvent(&res, path, rec, sessionID, projectRoot, &sc, ts)
+			a.handleRateLimitEvent(&res, path, rec, sessionID, projectRoot, projectRemote, &sc, ts)
 		default:
 			res.Warnings = append(res.Warnings, fmt.Sprintf("line %d: unknown record type %q", lineNum, rec.Type))
 		}
@@ -609,11 +635,12 @@ func (a *Adapter) handleUser(
 	res *adapter.ParseResult,
 	path string,
 	rec rawRecord,
-	sessionID, projectRoot string,
+	sessionID, projectRoot, projectRemote string,
 	sc *sidecar,
 	ts time.Time,
 	pending map[string]int,
 	sidechain map[string]struct{},
+	cacheAcc *cacheobs.Accumulator,
 ) {
 	if len(rec.Message) == 0 {
 		return
@@ -623,6 +650,7 @@ func (a *Adapter) handleUser(
 		return
 	}
 	blocks := decodeContent(msg.Content)
+	cacheAcc.ObserveBlocks(accumulateCacheBlocksTier2(blocks, firstNonEmpty(msg.Role, "user")))
 	if len(blocks) == 0 {
 		return
 	}
@@ -679,6 +707,7 @@ func (a *Adapter) handleUser(
 		SourceEventID:      rec.UUID,
 		SessionID:          sessionID,
 		ProjectRoot:        projectRoot,
+		GitRemote:          projectRemote,
 		Timestamp:          ts,
 		Tool:               models.ToolCowork,
 		ActionType:         models.ActionUserPrompt,
@@ -705,13 +734,14 @@ func (a *Adapter) handleAssistant(
 	res *adapter.ParseResult,
 	path string,
 	rec rawRecord,
-	sessionID, projectRoot string,
+	sessionID, projectRoot, projectRemote string,
 	sc *sidecar,
 	ts time.Time,
 	pending map[string]int,
 	allToolUseIdx map[string]int,
 	reasoning *[]string,
 	sidechain map[string]struct{},
+	cacheAcc *cacheobs.Accumulator,
 ) {
 	_, isSidechain := sidechain[rec.UUID]
 	if len(rec.Message) == 0 {
@@ -723,6 +753,7 @@ func (a *Adapter) handleAssistant(
 	}
 
 	blocks := decodeContent(msg.Content)
+	cacheAcc.ObserveBlocks(accumulateCacheBlocksTier2(blocks, firstNonEmpty(msg.Role, "assistant")))
 	for blockIdx, b := range blocks {
 		switch b.Type {
 		case "text":
@@ -747,6 +778,7 @@ func (a *Adapter) handleAssistant(
 				SourceEventID:      fmt.Sprintf("%s:text:%d", rec.UUID, blockIdx),
 				SessionID:          sessionID,
 				ProjectRoot:        projectRoot,
+				GitRemote:          projectRemote,
 				Timestamp:          ts,
 				Tool:               models.ToolCowork,
 				Model:              msg.Model,
@@ -805,6 +837,7 @@ func (a *Adapter) handleAssistant(
 				SourceEventID:      b.ID,
 				SessionID:          sessionID,
 				ProjectRoot:        projectRoot,
+				GitRemote:          projectRemote,
 				Timestamp:          ts,
 				Tool:               models.ToolCowork,
 				Model:              msg.Model,
@@ -848,9 +881,10 @@ func (a *Adapter) handleResult(
 	res *adapter.ParseResult,
 	path string,
 	rec rawRecord,
-	sessionID, projectRoot string,
+	sessionID, projectRoot, projectRemote string,
 	sc *sidecar,
 	ts time.Time,
+	cacheAcc *cacheobs.Accumulator,
 ) {
 	preview := truncate(a.scrubber.String(rec.Result), 200)
 	meta := coworkMetadata(sc, "", "", 0, 0, rec.TotalCostUSD)
@@ -868,6 +902,7 @@ func (a *Adapter) handleResult(
 		SourceEventID:      rec.UUID,
 		SessionID:          sessionID,
 		ProjectRoot:        projectRoot,
+		GitRemote:          projectRemote,
 		Timestamp:          ts,
 		Tool:               models.ToolCowork,
 		ActionType:         models.ActionTaskComplete,
@@ -917,6 +952,7 @@ func (a *Adapter) handleResult(
 			SourceEventID:         rec.UUID + ":" + model,
 			SessionID:             sessionID,
 			ProjectRoot:           projectRoot,
+			GitRemote:             projectRemote,
 			Timestamp:             ts,
 			Tool:                  models.ToolCowork,
 			Model:                 model,
@@ -931,6 +967,9 @@ func (a *Adapter) handleResult(
 			MessageID:             "result:" + rec.UUID + ":" + model,
 		})
 	}
+
+	res.CacheObservations = append(res.CacheObservations,
+		emitCacheObservationsTier2(cacheAcc, path, sessionID, rec, ts, rec.ModelUsage, tier1hFrac, models_)...)
 }
 
 // coworkMetadata builds an ActionMetadata stamped with sidecar
@@ -1186,7 +1225,7 @@ func (a *Adapter) handleSystem(
 	res *adapter.ParseResult,
 	path string,
 	rec rawRecord,
-	sessionID, projectRoot string,
+	sessionID, projectRoot, projectRemote string,
 	sc *sidecar,
 	ts time.Time,
 	pendingPermissions map[string]int,
@@ -1213,6 +1252,7 @@ func (a *Adapter) handleSystem(
 			SourceEventID: rec.UUID,
 			SessionID:     sessionID,
 			ProjectRoot:   projectRoot,
+			GitRemote:     projectRemote,
 			Timestamp:     ts,
 			Tool:          models.ToolCowork,
 			ActionType:    models.ActionPermissionRequest,
@@ -1264,6 +1304,7 @@ func (a *Adapter) handleSystem(
 			SourceEventID: rec.UUID,
 			SessionID:     sessionID,
 			ProjectRoot:   projectRoot,
+			GitRemote:     projectRemote,
 			Timestamp:     ts,
 			Tool:          models.ToolCowork,
 			ActionType:    models.ActionPermissionDenied,
@@ -1286,6 +1327,7 @@ func (a *Adapter) handleSystem(
 			SourceEventID: "compact:" + rec.UUID,
 			SessionID:     sessionID,
 			ProjectRoot:   projectRoot,
+			GitRemote:     projectRemote,
 			Timestamp:     ts,
 			Tool:          models.ToolCowork,
 			ActionType:    models.ActionContextCompacted,
@@ -1308,7 +1350,7 @@ func (a *Adapter) handleRateLimitEvent(
 	res *adapter.ParseResult,
 	path string,
 	rec rawRecord,
-	sessionID, projectRoot string,
+	sessionID, projectRoot, projectRemote string,
 	sc *sidecar,
 	ts time.Time,
 ) {
@@ -1347,6 +1389,7 @@ func (a *Adapter) handleRateLimitEvent(
 		SourceEventID: rec.UUID,
 		SessionID:     sessionID,
 		ProjectRoot:   projectRoot,
+		GitRemote:     projectRemote,
 		Timestamp:     ts,
 		Tool:          models.ToolCowork,
 		ActionType:    models.ActionRateLimit,

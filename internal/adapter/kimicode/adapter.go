@@ -209,6 +209,7 @@ type parseState struct {
 	rootResolved bool
 	resolvedRoot string
 	gitBranch    string
+	gitRemote    string
 	// lastCwd is a project-root fallback lifted from a tool.call display
 	// hint when the sibling state.json is unavailable.
 	lastCwd string
@@ -273,6 +274,7 @@ func (st *parseState) emitSessionStart(line *wireLine, res *adapter.ParseResult)
 		SessionID:     st.sessionID,
 		ProjectRoot:   st.projectRoot(),
 		GitBranch:     st.gitBranch,
+		GitRemote:     st.gitRemote,
 		Timestamp:     unixMillis(line.CreatedAt),
 		Tool:          models.ToolKimiCode,
 		ActionType:    models.ActionSessionStart,
@@ -300,6 +302,7 @@ func (st *parseState) emitUserPrompt(line *wireLine, raw string, res *adapter.Pa
 		SessionID:     st.sessionID,
 		ProjectRoot:   st.projectRoot(),
 		GitBranch:     st.gitBranch,
+		GitRemote:     st.gitRemote,
 		Timestamp:     unixMillis(line.Time),
 		Tool:          models.ToolKimiCode,
 		ActionType:    models.ActionUserPrompt,
@@ -326,6 +329,7 @@ func (st *parseState) emitToolCall(ev *loopEvent, ts int64, res *adapter.ParseRe
 		SessionID:     st.sessionID,
 		ProjectRoot:   st.projectRoot(),
 		GitBranch:     st.gitBranch,
+		GitRemote:     st.gitRemote,
 		Timestamp:     unixMillis(ts),
 		Model:         st.lastModel,
 		Tool:          models.ToolKimiCode,
@@ -405,6 +409,7 @@ func (st *parseState) emitAssistantText(ev *loopEvent, ts int64, res *adapter.Pa
 		SessionID:     st.sessionID,
 		ProjectRoot:   st.projectRoot(),
 		GitBranch:     st.gitBranch,
+		GitRemote:     st.gitRemote,
 		Timestamp:     unixMillis(ts),
 		Model:         st.lastModel,
 		Tool:          models.ToolKimiCode,
@@ -434,6 +439,7 @@ func (st *parseState) emitToken(line *wireLine, raw string, res *adapter.ParseRe
 		SessionID:           st.sessionID,
 		ProjectRoot:         st.projectRoot(),
 		GitBranch:           st.gitBranch,
+		GitRemote:           st.gitRemote,
 		Timestamp:           unixMillis(line.Time),
 		Tool:                models.ToolKimiCode,
 		Model:               firstNonEmpty(normalizeModel(line.Model), st.lastModel),
@@ -471,6 +477,7 @@ func (st *parseState) projectRoot() string {
 	}
 	st.resolvedRoot = info.Root
 	st.gitBranch = info.Branch
+	st.gitRemote = git.NormalizeRemote(info.Remote)
 	return info.Root
 }
 

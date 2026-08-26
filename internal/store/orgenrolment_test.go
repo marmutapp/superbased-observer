@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/marmutapp/superbased-observer/internal/orgcontract"
 )
 
 func TestEnrolment_RoundTripAndDelete(t *testing.T) {
@@ -23,6 +25,9 @@ func TestEnrolment_RoundTripAndDelete(t *testing.T) {
 		OrgID: "org-1", OrgName: "Acme", OrgServerURL: "https://org.acme.example",
 		UserID: "scim-42", UserEmail: "dev@acme.example",
 		EnrolledAt: "2026-05-26T10:00:00Z", BearerKeyID: "sbo-org-bearer-v1",
+		// The zero value is normalised to individual by WriteEnrolment; set
+		// it here so the struct comparison below reflects what is stored.
+		Tenancy: orgcontract.TenancyIndividual,
 	}
 	if err := s.WriteEnrolment(ctx, want); err != nil {
 		t.Fatalf("WriteEnrolment: %v", err)
@@ -34,6 +39,9 @@ func TestEnrolment_RoundTripAndDelete(t *testing.T) {
 	}
 	if got == nil || *got != want {
 		t.Fatalf("LoadEnrolment = %+v, want %+v", got, want)
+	}
+	if got.IsManaged() {
+		t.Error("an individual enrolment reported IsManaged() = true")
 	}
 
 	// Re-write upgrades the singleton in place (id = 1 stays unique).
@@ -55,6 +63,31 @@ func TestEnrolment_RoundTripAndDelete(t *testing.T) {
 	}
 	if err := s.DeleteEnrolment(ctx); err != nil {
 		t.Fatalf("DeleteEnrolment (idempotent): %v", err)
+	}
+}
+
+// TestEnrolment_ManagedTenancyRoundTrip pins that the managed class survives
+// WriteEnrolment/LoadEnrolment and that IsManaged reflects it — the durable
+// node-side truth the T8 transparency banner reads.
+func TestEnrolment_ManagedTenancyRoundTrip(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	if err := s.WriteEnrolment(ctx, Enrolment{
+		OrgID: "org-1", OrgName: "Acme", OrgServerURL: "u",
+		UserID: "u", UserEmail: "e@acme.example", BearerKeyID: "k",
+		Tenancy: orgcontract.TenancyManaged,
+	}); err != nil {
+		t.Fatalf("WriteEnrolment: %v", err)
+	}
+	got, err := s.LoadEnrolment(ctx)
+	if err != nil || got == nil {
+		t.Fatalf("LoadEnrolment: %v (got=%+v)", err, got)
+	}
+	if got.Tenancy != orgcontract.TenancyManaged {
+		t.Fatalf("Tenancy = %q, want %q", got.Tenancy, orgcontract.TenancyManaged)
+	}
+	if !got.IsManaged() {
+		t.Error("a managed enrolment reported IsManaged() = false")
 	}
 }
 

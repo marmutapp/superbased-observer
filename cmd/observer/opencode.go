@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -200,7 +201,11 @@ func runOpencodeLauncher(opts opencodeLauncherOptions) error {
 		return err
 	}
 
-	env, baseURL, preset := prepareOpencodeEnv(os.Environ(), proxyURL)
+	// Layer the rename-safe agent runtime-dir env under OPENAI_BASE_URL, so an
+	// SMB/NFS HOME (e.g. a containerized node on Azure Files) can't break
+	// OpenCode's openrouter-provider npm/bun install (adapter-agnostic; no-op
+	// unless [launch].agent_runtime_dir is set).
+	env, baseURL, preset := prepareOpencodeEnv(applyAgentRuntimeEnv(os.Environ(), agentRuntimeDir()), proxyURL)
 	if preset {
 		fmt.Fprintf(opts.stderr,
 			"observer opencode: OPENAI_BASE_URL already set in env (%s); using yours.\n", baseURL)
@@ -219,7 +224,24 @@ func runOpencodeLauncher(opts opencodeLauncherOptions) error {
 	child.Stdin = os.Stdin
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
-	if rErr := child.Run(); rErr != nil {
+	if rErr := child.Start(); rErr != nil {
+		return fmt.Errorf("exec opencode: %w", rErr)
+	}
+	// Direct process attribution (migration 086): record the child pid now
+	// that Start has made it knowable; retract the seed when the child is
+	// reaped. Best-effort both ways — a seeding failure never affects the
+	// launch (see cmd/observer/launchseed.go).
+	recordLaunchSeed(cfg.Observer.DBPath, "opencode", opts.dir, child.Process.Pid, opts.stderr)
+	// Best-effort generic post-launch session discovery (WS-DISCOVERY): a
+	// no-op unless the trusted OOB channel is active AND "opencode" resolves
+	// to an adapter that declares session-file watch roots. Cancel the
+	// instant the child exits so a window cut short by exit never announces a
+	// candidate that only looked unique because the scan stopped early.
+	discoverCancel := maybeStartGenericDiscovery(context.Background(), "opencode", opts.dir)
+	if discoverCancel != nil {
+		defer discoverCancel()
+	}
+	if rErr := child.Wait(); rErr != nil {
 		var ee *exec.ExitError
 		if errors.As(rErr, &ee) {
 			return exitErr(ee.ExitCode())

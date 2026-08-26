@@ -1010,6 +1010,16 @@ func (s *Server) handleSessionLaunch(w http.ResponseWriter, r *http.Request, ses
 		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	// W5.1 org-governed feature gate: node.features.terminals — this path
+	// spawns an embedded terminal with no sandbox lane, so it presents
+	// requestedSandbox=false (an org sandbox_required policy therefore
+	// denies it). Fail-open on nil gate / no accepted policy.
+	if s.opts.TerminalFeatureGate != nil {
+		if allowed, reason := s.opts.TerminalFeatureGate(false); !allowed {
+			http.Error(w, reason, http.StatusForbidden)
+			return
+		}
+	}
 	sub, ok := launchSubcommand(body.To)
 	if !ok {
 		http.Error(w, "tool "+body.To+" is not launchable in the embedded terminal", http.StatusBadRequest)
@@ -1124,6 +1134,16 @@ func (s *Server) handleSessionResume(w http.ResponseWriter, r *http.Request, ses
 	if strings.TrimSpace(sessionID) == "" {
 		http.Error(w, "missing session id", http.StatusBadRequest)
 		return
+	}
+	// W5.1 org-governed feature gate: node.features.terminals — this path
+	// spawns an embedded terminal with no sandbox lane, so it presents
+	// requestedSandbox=false (an org sandbox_required policy therefore
+	// denies it). Fail-open on nil gate / no accepted policy.
+	if s.opts.TerminalFeatureGate != nil {
+		if allowed, reason := s.opts.TerminalFeatureGate(false); !allowed {
+			http.Error(w, reason, http.StatusForbidden)
+			return
+		}
 	}
 
 	// Load the session's tool + project_root (the only server-side inputs a
@@ -1280,6 +1300,15 @@ func (s *Server) handleTerminalLaunch(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
 		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
 		return
+	}
+	// W5.1 org-governed feature gate: node.features.terminals. Checked
+	// before any launch work begins. Fail-open (nil TerminalFeatureGate,
+	// or no accepted policy) — see dashboard.Options.TerminalFeatureGate.
+	if s.opts.TerminalFeatureGate != nil {
+		if allowed, reason := s.opts.TerminalFeatureGate(body.Sandbox); !allowed {
+			http.Error(w, reason, http.StatusForbidden)
+			return
+		}
 	}
 	// The reserved pseudo-tool "shell" (termsvc.ShellTool) requests a fresh
 	// PLAIN SHELL — never a member of the launchable capability set, so it

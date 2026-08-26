@@ -58,6 +58,7 @@ web2/*.log
 # is deployed from a CI checkout, so a stale copy in the tree would only
 # ever be a source of drift.
 website/model-prices/
+website/tokenomics/
 model-pricing/web/node_modules/
 model-pricing/web/out/
 
@@ -139,6 +140,14 @@ website/keys/
 /plugingen
 /track-gen
 /pricing-seedgen
+
+# Local Cloudflare wrangler state (never committed)
+.wrangler/
+# observer continue_session handoff artifacts written to repo root
+/HANDOFF-*.md
+# Python bytecode + regenerable scrape cache under model-pricing scripts
+**/__pycache__/
+model-pricing/scripts/extract-cache/
 
 # Internal docs — kept locally on the private repo for development
 # context, untracked from the public repo. The dashboard's runtime

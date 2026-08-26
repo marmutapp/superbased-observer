@@ -62,7 +62,7 @@ func TestReadSidecarFields(t *testing.T) {
 		t.Errorf("child map=%v want one entry", sc.ChildInclusiveTokenUsageBySessionID)
 	}
 
-	ev, ok := tokenEvent(sc, transcript, "sess-1", "/proj", "main", time.Unix(1700000000, 0).UTC())
+	ev, ok := tokenEvent(sc, transcript, "sess-1", "/proj", "main", "github.com/example/proj", time.Unix(1700000000, 0).UTC())
 	if !ok {
 		t.Fatal("tokenEvent not ok")
 	}
@@ -82,6 +82,9 @@ func TestReadSidecarFields(t *testing.T) {
 	if ev.ProjectRoot != "/proj" || ev.GitBranch != "main" {
 		t.Errorf("projectRoot/branch=%q/%q", ev.ProjectRoot, ev.GitBranch)
 	}
+	if ev.GitRemote != "github.com/example/proj" {
+		t.Errorf("GitRemote=%q want github.com/example/proj", ev.GitRemote)
+	}
 	if ev.Source != models.TokenSourceJSONL || ev.Reliability != models.ReliabilityApproximate {
 		t.Errorf("source/reliability=%q/%q", ev.Source, ev.Reliability)
 	}
@@ -95,7 +98,7 @@ func TestReadSidecarFields(t *testing.T) {
 // possible when it is), so subtracting again would zero it out.
 func TestTokenEventInputNotReNetted(t *testing.T) {
 	sc := &sidecar{TokenUsage: tokenBlock{InputTokens: 3131, CacheReadTokens: 23040, OutputTokens: 69}}
-	ev, ok := tokenEvent(sc, "/f.jsonl", "s", "", "", time.Time{})
+	ev, ok := tokenEvent(sc, "/f.jsonl", "s", "", "", "", time.Time{})
 	if !ok {
 		t.Fatal("tokenEvent not ok")
 	}
@@ -119,7 +122,7 @@ func TestTokenEventSuppressed(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, ok := tokenEvent(tc.sc, "/f.jsonl", tc.sessionID, "", "", time.Time{}); ok {
+			if _, ok := tokenEvent(tc.sc, "/f.jsonl", tc.sessionID, "", "", "", time.Time{}); ok {
 				t.Error("tokenEvent emitted a row it should have suppressed")
 			}
 		})

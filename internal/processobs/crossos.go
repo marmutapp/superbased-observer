@@ -77,7 +77,7 @@ var DefaultCrossOSToolBasenames = map[string][]string{
 	"kiro-cli":  {"kiro-cli.exe", "kiro-cli"},                   // AWS Kiro CLI (rebranded Amazon Q) — native binary
 	"crush":     {"crush.exe", "crush", "node.exe", "node"},     // Charm Crush — npm shim (run-crush.js) execs the Go binary
 	"kimi-code": {"kimi.exe", "kimi"},                           // Moonshot kimi-code (binary `kimi`) — native ELF (bun-compiled)
-	"grok":      {"grok.exe", "grok"},                           // xAI Grok (binary `grok`) — native ELF, NOT node-based
+	"grok":      {"grok.exe", "grok", "grok-*"},                 // xAI Grok — native ELF; live installs ship version-stamped artifacts (grok-1.0.0-linux-x86_64, observed 2026-08-21), so the prefix pattern is required
 	"devin":     {"devin.exe", "devin"},                         // Cognition Devin CLI (binary `devin`) — native binary
 	"aider":     {"aider.exe", "aider", "python.exe", "python"}, // pip aider-chat — python console-script entry
 	"qoder":     {"qoder.exe", "qoder", "node.exe", "node"},     // Alibaba Qoder CLI — CC-shaped node-family (no local install to probe)
@@ -118,6 +118,20 @@ var DefaultCrossOSToolBasenames = map[string][]string{
 	// at the process level, so the branded basename is the whole entry (the
 	// muse native-binary precedent); Windows gets junie.exe.
 	"junie": {"junie.exe", "junie"},
+	// zcode (Z.AI, 2026-08-18): npm package `zcode-app-cli`, binary `zcode`
+	// — an OpenCode fork but its own npm bin entry (the command-code/
+	// prime-agent precedent), so node belongs here alongside the branded
+	// name.
+	"zcode": {"zcode.exe", "zcode", "node.exe", "node"},
+	// Mistral Code (2026-08-18): CLI binary `vibe`, installed as a uv-tool
+	// Python console script (requires Python 3.12+) — the aider precedent,
+	// so python belongs here alongside the branded name.
+	"mistral-code": {"vibe.exe", "vibe", "python.exe", "python"},
+	// Freebuff / CodebuffAI (2026-08-18): npm `freebuff`, but the installed
+	// entry point is itself a compiled ELF/exe binary (docs/freebuff-
+	// adapter.md's off-limits note: "the `freebuff` ELF/exe binary") — the
+	// kimi-code/goose native-binary precedent, so no node/python.
+	"freebuff": {"freebuff.exe", "freebuff"},
 }
 
 // DefaultCrossOSToolLaunchers maps a session tool to the branded IDE/desktop

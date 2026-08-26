@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/marmutapp/superbased-observer/internal/config"
+	"github.com/marmutapp/superbased-observer/internal/models"
 )
 
 // newGeminiCmd implements `observer gemini` — sets GOOGLE_GEMINI_BASE_URL to
@@ -145,8 +146,10 @@ func newGeminiCmd() *cobra.Command {
 				proxyURL: resolved,
 				// Gemini base URL is the host ROOT (no /v1) — the CLI appends
 				// the /v1beta/models/<model>:generateContent path itself.
-				env:    map[string]string{"GOOGLE_GEMINI_BASE_URL": strings.TrimRight(resolved, "/")},
-				stderr: cmd.ErrOrStderr(),
+				env:      map[string]string{"GOOGLE_GEMINI_BASE_URL": strings.TrimRight(resolved, "/")},
+				dbPath:   cfg.Observer.DBPath,
+				seedTool: models.ToolGeminiCLI, // stderr label is "gemini"; sessions.tool stores "gemini-cli"
+				stderr:   cmd.ErrOrStderr(),
 			})
 		},
 	}

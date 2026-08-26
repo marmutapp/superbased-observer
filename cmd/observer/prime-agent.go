@@ -197,6 +197,7 @@ func newPrimeAgentCmd() *cobra.Command {
 				dir:      continueDir,
 				proxyURL: resolved,
 				env:      nil, // prime-agent routes via models.json, not an env var
+				dbPath:   cfg.Observer.DBPath,
 				stderr:   os.Stderr,
 			})
 		},

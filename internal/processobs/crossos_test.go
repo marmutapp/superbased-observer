@@ -152,6 +152,27 @@ func TestBasenameMatchesPrefixPattern(t *testing.T) {
 	}
 }
 
+// TestGrokVersionedArtifactBasename pins the live-observed install shape
+// (2026-08-21): grok ships as a version-stamped artifact
+// (grok-1.0.0-linux-x86_64), which the exact-name set missed — the process
+// rows persisted unattributed until the prefix pattern was added.
+func TestGrokVersionedArtifactBasename(t *testing.T) {
+	set := DefaultCrossOSToolBasenames["grok"]
+	for _, b := range []string{"grok", "grok.exe", "grok-1.0.0-linux-x86_64"} {
+		if !basenameMatches(b, set) {
+			t.Errorf("basenameMatches(%q, grok set) = false, want true", b)
+		}
+	}
+	for _, b := range []string{"grokkit", "grok"} {
+		if b == "grok" {
+			continue // exact entry, asserted above
+		}
+		if basenameMatches(b, set) {
+			t.Errorf("basenameMatches(%q, grok set) = true, want false", b)
+		}
+	}
+}
+
 // TestCorrelateCrossOSCodexDesktopWorkers pins that the Codex desktop app's
 // command-execution workers — the version-stamped codex-command-runner-<ver>.exe
 // and node_repl.exe, both spawned in the project cwd — anchor a codex session at

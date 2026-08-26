@@ -201,12 +201,11 @@ func runProcessObserver(ctx context.Context, configPath string) error {
 				swept, attributed, cerr := sweepCrossOSCorrelation(ctx, st, 60, logger)
 				if cerr != nil {
 					logger.Debug("process observability: correlation sweep — active-session query failed", "err", cerr)
-					continue
-				}
-				if swept > 0 {
+				} else if swept > 0 {
 					logger.Debug("process observability: background correlation sweep",
 						"sessions", swept, "newly_attributed", attributed)
 				}
+				consumeLaunchSeeds(ctx, st, bridge, logger)
 			}
 		}
 	}()
@@ -712,6 +711,75 @@ func sweepCrossOSCorrelation(ctx context.Context, st *store.Store, windowMinutes
 		attributed += n
 	}
 	return sessions, attributed, nil
+}
+
+// launchSeedStaleTTL bounds how long an unconsumed launch seed survives. It
+// must exceed the matcher's full window (back-skew + forward window); beyond
+// that a seed can no longer be matched reliably and only lingers because its
+// launcher died before retracting it (SIGKILL, crash).
+const launchSeedStaleTTL = time.Hour
+
+// consumeLaunchSeeds is the daemon half of launcher attribution (migration
+// 086): it expires stale seeds, pairs pending seeds against recently ingested
+// sessions with the pure processobs.MatchLaunchSeeds rule, and for each match
+// writes the authoritative HIGH-confidence session_pid_bridge row before
+// claiming (deleting) the seed.
+//
+// An EXISTING bridge row for a pid always wins: hook-written rows
+// (claude-code/codex/cursor/hermes) stay byte-authoritative and the seed is
+// merely claimed away. Fail-open throughout — any error degrades to the lazy
+// CorrelateCrossOS path and is logged at DEBUG, never fatal to the sweep.
+func consumeLaunchSeeds(ctx context.Context, st *store.Store, bridge *pidbridge.Store, logger *slog.Logger) {
+	if _, err := st.ExpireStaleLaunchSeeds(ctx, launchSeedStaleTTL); err != nil && logger != nil {
+		logger.Debug("process observability: launch-seed expiry failed", "err", err)
+	}
+	seeds, err := st.PendingLaunchSeeds(ctx, processobs.LaunchSeedBackSkew+processobs.LaunchSeedForwardWindow)
+	if err != nil {
+		if logger != nil {
+			logger.Debug("process observability: launch-seed query failed", "err", err)
+		}
+		return
+	}
+	if len(seeds) == 0 {
+		return
+	}
+	refs, err := st.RecentSessionRefsForLaunchMatch(ctx, 60)
+	if err != nil {
+		if logger != nil {
+			logger.Debug("process observability: launch-seed session query failed", "err", err)
+		}
+		return
+	}
+	matches := processobs.MatchLaunchSeeds(seeds, refs, nil)
+	byPID := make(map[int]processobs.LaunchSeed, len(seeds))
+	for _, s := range seeds {
+		byPID[s.PID] = s
+	}
+	for pid, sessionID := range matches {
+		seed := byPID[pid]
+		if _, ok, lerr := bridge.Lookup(ctx, pid); lerr == nil && ok {
+			// An existing writer (hook ancestor-walk) owns this pid already.
+			_, _ = st.ClaimLaunchSeed(ctx, pid)
+			continue
+		}
+		if werr := bridge.Write(ctx, pidbridge.Entry{
+			PID:       pid,
+			SessionID: sessionID,
+			Tool:      seed.Tool,
+			CWD:       seed.CWD,
+		}); werr != nil {
+			if logger != nil {
+				logger.Debug("process observability: launch-seed bridge write failed", "pid", pid, "err", werr)
+			}
+			continue
+		}
+		if _, cerr := st.ClaimLaunchSeed(ctx, pid); cerr != nil && logger != nil {
+			logger.Debug("process observability: launch-seed claim failed", "pid", pid, "err", cerr)
+		} else if logger != nil {
+			logger.Debug("process observability: launch seed consumed",
+				"pid", pid, "tool", seed.Tool, "session", sessionID)
+		}
+	}
 }
 
 // buildProcessScrubber maps the [observer.process] config into the pure

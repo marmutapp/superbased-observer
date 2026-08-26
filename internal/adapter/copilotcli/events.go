@@ -359,8 +359,17 @@ type parserState struct {
 	cwd            string
 	gitRoot        string
 	branch         string
+	remote         string
 	repository     string
 	projectRoot    string
+	// effortLevel is the current session's reasoning-effort SETTING
+	// ("low"/"medium"/"high", etc). Copilot CLI surfaces it as a
+	// session-scoped knob (like st.model), never per-message: it rides
+	// `session.model_change.data.reasoningEffort` and
+	// `session.resume.data.reasoningEffort`, not any per-assistant-
+	// message field. Threaded into ActionMetadata.EffortLevel on every
+	// emitted ToolEvent, mirroring st.model's session-wide fallback.
+	effortLevel string
 	// toolCalls maps toolCallId → cached tool-execution-start payload
 	// so we can pair it with tool.execution_complete and emit one
 	// ToolEvent per call.
@@ -506,13 +515,16 @@ func (a *Adapter) parseEventsJSONL(_ context.Context, path string, fromOffset in
 	// the in-stream context. Mirrors what parseProcessLog already does
 	// for the log-file path.
 	yamlPath := filepath.Join(filepath.Dir(path), "workspace.yaml")
-	if yamlRoot, yamlBranch := resolveProjectFromWorkspaceYAML(yamlPath); yamlRoot != "" {
+	if yamlRoot, yamlBranch, yamlRemote := resolveProjectFromWorkspaceYAML(yamlPath); yamlRoot != "" {
 		st.projectRoot = yamlRoot
 		if yamlBranch != "" {
 			st.branch = yamlBranch
 		}
+		if yamlRemote != "" {
+			st.remote = yamlRemote
+		}
 	} else {
-		st.projectRoot = resolveProjectRoot(st)
+		st.projectRoot, st.remote = resolveProjectRoot(st)
 	}
 	// Backfill ProjectRoot on emitted events (we built them before
 	// finalizing state).
@@ -522,6 +534,9 @@ func (a *Adapter) parseEventsJSONL(_ context.Context, path string, fromOffset in
 		}
 		if out.ToolEvents[i].GitBranch == "" {
 			out.ToolEvents[i].GitBranch = st.branch
+		}
+		if out.ToolEvents[i].GitRemote == "" {
+			out.ToolEvents[i].GitRemote = st.remote
 		}
 		if out.ToolEvents[i].SessionID == "" {
 			out.ToolEvents[i].SessionID = st.sessionID
@@ -533,6 +548,9 @@ func (a *Adapter) parseEventsJSONL(_ context.Context, path string, fromOffset in
 		}
 		if out.TokenEvents[i].GitBranch == "" {
 			out.TokenEvents[i].GitBranch = st.branch
+		}
+		if out.TokenEvents[i].GitRemote == "" {
+			out.TokenEvents[i].GitRemote = st.remote
 		}
 		if out.TokenEvents[i].SessionID == "" {
 			out.TokenEvents[i].SessionID = st.sessionID
@@ -591,6 +609,9 @@ func dispatchState(st *parserState, env eventEnvelope, sc *scrub.Scrubber) {
 			if d.NewModel != "" {
 				st.model = d.NewModel
 			}
+			if d.ReasoningEffort != "" {
+				st.effortLevel = d.ReasoningEffort
+			}
 		}
 	case "session.resume":
 		// Refresh parser state from the resume payload. Without this,
@@ -604,6 +625,9 @@ func dispatchState(st *parserState, env eventEnvelope, sc *scrub.Scrubber) {
 		if err := json.Unmarshal(env.Data, &d); err == nil {
 			if d.SelectedModel != "" {
 				st.model = d.SelectedModel
+			}
+			if d.ReasoningEffort != "" {
+				st.effortLevel = d.ReasoningEffort
 			}
 			if d.Context.CWD != "" {
 				st.cwd = d.Context.CWD
@@ -677,6 +701,14 @@ func dispatchState(st *parserState, env eventEnvelope, sc *scrub.Scrubber) {
 // emitEvent appends ToolEvents / TokenEvents for events past the cursor.
 func emitEvent(st *parserState, env eventEnvelope, path string, out *adapter.ParseResult, sc *scrub.Scrubber) {
 	ts := parseTimestamp(env.Timestamp)
+	// sidechain is true for every event carrying a non-empty AgentID —
+	// i.e. anything emitted inside a subagent's execution context (see
+	// eventEnvelope.AgentID doc comment). The spawning `task` tool call
+	// itself is invoked in the PARENT session's context (AgentID==""),
+	// so it never gets stamped — only the subagent's own work (its
+	// assistant messages, and the tool calls it makes) does. Mirrors
+	// claude-code's line.IsSidechain pass-through convention.
+	sidechain := env.AgentID != ""
 	switch env.Type {
 
 	case "user.message":
@@ -701,6 +733,8 @@ func emitEvent(st *parserState, env eventEnvelope, path string, out *adapter.Par
 			RawToolName:   "user",
 			RawToolInput:  scrub.Truncate(sc.String(content)),
 			MessageID:     env.ID,
+			IsSidechain:   sidechain,
+			Metadata:      effortMetadata(nil, st.effortLevel),
 		})
 
 	case "system.message":
@@ -728,6 +762,8 @@ func emitEvent(st *parserState, env eventEnvelope, path string, out *adapter.Par
 			RawToolName:   "system",
 			RawToolInput:  scrub.Truncate(sc.String(d.Content)),
 			MessageID:     env.ID,
+			IsSidechain:   sidechain,
+			Metadata:      effortMetadata(nil, st.effortLevel),
 		})
 
 	case "assistant.message":
@@ -775,6 +811,7 @@ func emitEvent(st *parserState, env eventEnvelope, path string, out *adapter.Par
 				Source:        models.TokenSourceJSONL,
 				Reliability:   models.ReliabilityUnreliable,
 				MessageID:     d.RequestID,
+				IsSidechain:   sidechain,
 			})
 			// Buffer for post-loop patch when data.model is missing
 			// AND we're under a subagent context but haven't yet seen
@@ -827,6 +864,8 @@ func emitEvent(st *parserState, env eventEnvelope, path string, out *adapter.Par
 				RawToolInput:       scrub.Truncate(sc.String(d.Content)),
 				PrecedingReasoning: reasoning,
 				MessageID:          d.MessageID,
+				IsSidechain:        sidechain,
+				Metadata:           effortMetadata(nil, st.effortLevel),
 			})
 			if d.Model == "" && env.AgentID != "" {
 				st.pendingSubagentToolEmits = append(st.pendingSubagentToolEmits, pendingSubagentEmit{idx: idx, agentID: env.AgentID})
@@ -886,6 +925,8 @@ func emitEvent(st *parserState, env eventEnvelope, path string, out *adapter.Par
 			RawToolInput:  scrub.Truncate(sc.RawJSON([]byte(raw))),
 			ToolOutput:    scrub.Truncate(sc.String(toolOutput)),
 			MessageID:     d.InteractionID,
+			IsSidechain:   sidechain,
+			Metadata:      effortMetadata(nil, st.effortLevel),
 		})
 		// Clear the cache entry — call complete.
 		delete(st.toolCalls, d.ToolCallID)
@@ -942,7 +983,8 @@ func emitEvent(st *parserState, env eventEnvelope, path string, out *adapter.Par
 			Success:       success,
 			RawToolName:   pr.Kind,
 			RawToolInput:  scrub.Truncate(sc.String(rawInput)),
-			Metadata:      meta,
+			Metadata:      effortMetadata(meta, st.effortLevel),
+			IsSidechain:   sidechain,
 		})
 		delete(st.permRequests, d.RequestID)
 
@@ -958,6 +1000,8 @@ func emitEvent(st *parserState, env eventEnvelope, path string, out *adapter.Par
 			Target:        "resume",
 			Success:       true,
 			RawToolName:   "session.resume",
+			IsSidechain:   sidechain,
+			Metadata:      effortMetadata(nil, st.effortLevel),
 		})
 
 	case "session.shutdown":
@@ -972,6 +1016,8 @@ func emitEvent(st *parserState, env eventEnvelope, path string, out *adapter.Par
 			Target:        "shutdown",
 			Success:       true,
 			RawToolName:   "session.shutdown",
+			IsSidechain:   sidechain,
+			Metadata:      effortMetadata(nil, st.effortLevel),
 		})
 		// Tier 0 capture — `session.shutdown.data.modelMetrics` carries
 		// the per-model cumulative usage delta for the work span between
@@ -1115,14 +1161,16 @@ func emitEvent(st *parserState, env eventEnvelope, path string, out *adapter.Par
 // Prefers gitRoot from session.start.context; falls back to cwd. Both
 // are translated through crossmount.TranslateForeignPath so a Windows-
 // formatted path captured on WSL2 lands on the real /mnt/c/... mount
-// instead of being CWD-prefixed by filepath.Abs.
-func resolveProjectRoot(st *parserState) string {
+// instead of being CWD-prefixed by filepath.Abs. remote is the
+// normalized "origin" remote when git.Resolve found a repo; "" when it
+// didn't (honest gap, not fabricated).
+func resolveProjectRoot(st *parserState) (root, remote string) {
 	candidate := st.gitRoot
 	if candidate == "" {
 		candidate = st.cwd
 	}
 	if candidate == "" {
-		return ""
+		return "", ""
 	}
 	translated := crossmount.TranslateForeignPath(candidate)
 	if translated == "" {
@@ -1130,9 +1178,9 @@ func resolveProjectRoot(st *parserState) string {
 	}
 	info, err := git.Resolve(translated)
 	if err == nil && info.Root != "" {
-		return info.Root
+		return info.Root, git.NormalizeRemote(info.Remote)
 	}
-	return translated
+	return translated, ""
 }
 
 // classifyToolName picks an action_type using the bare toolName first,
@@ -1237,6 +1285,29 @@ func deriveTarget(name string, args json.RawMessage) string {
 // blob's LENGTH is deliberately not surfaced: it told the operator
 // nothing they could act on and read as if reasoning content had been
 // captured.
+// effortMetadata folds a session's reasoning-effort SETTING into an
+// ActionMetadata, allocating one when meta is nil and preserving any
+// fields already set on it (e.g. PermissionApprovalKind). Returns meta
+// unchanged (possibly nil) when effort is empty, so rows from sessions
+// that never surfaced session.model_change/session.resume with a
+// reasoningEffort value keep a NULL metadata column rather than an
+// empty-but-allocated one. Mirrors zcode's effortMetadata /
+// codex's withEffort convention.
+func effortMetadata(meta *models.ActionMetadata, effort string) *models.ActionMetadata {
+	e := strings.TrimSpace(effort)
+	if e == "" {
+		return meta
+	}
+	if meta == nil {
+		meta = &models.ActionMetadata{}
+	} else {
+		cp := *meta
+		meta = &cp
+	}
+	meta.EffortLevel = e
+	return meta
+}
+
 func threadableReasoning(text string) string {
 	if strings.TrimSpace(text) == "" {
 		return ""

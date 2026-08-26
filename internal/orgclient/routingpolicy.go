@@ -144,6 +144,14 @@ func (c *Client) fireRoutingReload(ctx context.Context) {
 //   - the Ed25519 signature verifies against the PINNED server key —
 //     TOFU: the first received key is pinned with the cache row; a
 //     later key change is REFUSED loudly (re-enrol to rotate trust).
+//     WHICH signature is verified depends on what the document offers:
+//     a doc carrying SignatureV2 is checked against the version-bound
+//     v2 message and never falls back; a doc from a pre-v2 server is
+//     checked against the legacy body-only signature
+//     (docs/security.md ROUTING-SIG-1).
+//   - a SERVED VERSION LOWER than the cached one is WARN-logged before
+//     the monotonic short-circuit swallows it — visible in the routing
+//     logs regardless of signature rail.
 //
 // Caching a policy never enables anything (§R23): the composer ignores
 // enabled/mode keys; the node's own [routing] config is the only
@@ -231,6 +239,21 @@ func (c *Client) fetchRoutingPolicy(ctx context.Context) (bool, routingFetchSign
 					prefix8(cached.ServerPubkey), prefix8(doc.PublicKey))
 		}
 		pinned = cached.ServerPubkey
+		if doc.Version < cached.Version {
+			// INDEPENDENT of which signature rail the document rides:
+			// a genuine org server's version is monotonic, so a LOWER
+			// version means either a rollback the admin performed
+			// out-of-band or a replay of an older document. Neither is
+			// silently ignorable, and until now the monotonic
+			// short-circuit below swallowed both without a word. This
+			// WARN is deliberately not an error — the short-circuit
+			// still correctly keeps the newer cached policy — but it
+			// makes the regression VISIBLE in the routing logs
+			// (docs/security.md ROUTING-SIG-1, the mitigation that
+			// holds even for a pre-v2 server).
+			c.logger.Warn("org routing policy version REGRESSION — server served an OLDER version than the node has cached; keeping the cached policy",
+				"served_version", doc.Version, "cached_version", cached.Version)
+		}
 		if cached.Version >= doc.Version {
 			// SF7: fire the reload on the already-current arm too — a boot that
 			// rejected the cache then gets an already-current poll must still
@@ -256,12 +279,25 @@ func (c *Client) fetchRoutingPolicy(ctx context.Context) (bool, routingFetchSign
 		}
 		return false, routingFetchSignal{stage: rfStageKeyMismatch, version: doc.Version}, fmt.Errorf("orgclient.FetchRoutingPolicy: %w", err)
 	}
-	if err := orgcontract.VerifyRoutingPolicy(doc, pinned); err != nil {
+	// Rail selection is by PRESENCE, and it is one-way: a document that
+	// carries a v2 signature is verified against the DOMAIN-SEPARATED,
+	// VERSION-BOUND message and is NEVER re-tried on the v1 rail if that
+	// fails. Falling back would restore exactly the replay v2 refuses (a
+	// genuinely signed old body re-presented under an inflated version) by
+	// letting an attacker strip nothing at all — just serve a broken v2.
+	// The v1 leg remains only for a pre-078 org server, whose documents
+	// carry no v2 signature at all (docs/security.md ROUTING-SIG-1).
+	verify := orgcontract.VerifyRoutingPolicy
+	if doc.SignatureV2 != "" {
+		verify = orgcontract.VerifyRoutingPolicyV2
+	}
+	if err := verify(doc, pinned); err != nil {
 		return false, routingFetchSignal{stage: rfStageSigInvalid, version: doc.Version}, fmt.Errorf("orgclient.FetchRoutingPolicy: %w", err)
 	}
 	if err := c.store.UpsertOrgRoutingPolicy(ctx, store.OrgRoutingPolicyRow{
 		Version: doc.Version, Body: doc.Body, BodyHash: doc.BodyHash,
-		Signature: doc.Signature, ServerPubkey: pinned, ReceivedAt: time.Now().UTC(),
+		Signature: doc.Signature, SignatureV2: doc.SignatureV2,
+		ServerPubkey: pinned, ReceivedAt: time.Now().UTC(),
 	}); err != nil {
 		return false, routingFetchSignal{stage: rfStageCacheWriteLocal}, err
 	}

@@ -18,6 +18,7 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/govern"
 	"github.com/marmutapp/superbased-observer/internal/govern/sidecar"
 	"github.com/marmutapp/superbased-observer/internal/orgclient"
+	"github.com/marmutapp/superbased-observer/internal/orgcontract"
 	"github.com/marmutapp/superbased-observer/internal/policyfam"
 	"github.com/marmutapp/superbased-observer/internal/policyfam/nodegov"
 	"github.com/marmutapp/superbased-observer/internal/policystate"
@@ -475,6 +476,25 @@ type governanceFacts struct {
 	// share stay hot, so a body that changes only those converges to
 	// `effective` without a restart.
 	PinnedConverged bool
+
+	// --- gen2 (P4-2) — see policystate.PointFacts's own doc comments for
+	// the exact semantics; these are computed only when d.Present (there is
+	// nothing accepted to describe otherwise) and are copied verbatim onto
+	// policystate.PointFacts by newNodeGovernancePointReader, which then
+	// lets internal/policystate.Resolve gate them onto the wire row to the
+	// node-dashboard point alone.
+
+	// AcceptedAuthority is govern.HonoredAuthority(grant).
+	AcceptedAuthority []string
+	// ExtractionEffective is govern.ExtractionTokensInForce(eff,
+	// AcceptedAuthority).
+	ExtractionEffective []string
+	// DroppedClasses maps a directive class name to the wire reason it was
+	// not applied — either translated from eff.Dropped (the
+	// eff.State != StateApplied case) or synthesized for the classes that
+	// depend on a sidecar write that then failed (the writeErr != nil
+	// case). Nil when nothing was dropped.
+	DroppedClasses map[string]string
 }
 
 // Facts snapshots the handle for the P0-6 reader. The resolved posture
@@ -484,26 +504,25 @@ type governanceFacts struct {
 // effective — that is the §3.7 honesty rule ("a partial application can
 // never masquerade as convergence").
 //
-// WHAT THE ADMIN CAN AND CANNOT SEE (review M4). This function COLLAPSES
-// every non-applied resolution to the single wire reason
-// not_preauthorized. govern.Effective.Dropped — which names WHICH directive
-// class was refused and why — is NODE-LOCAL: it is rendered on the
-// developer's own Enrolment page and by `observer org grant show`, and it is
-// folded into Effective.Hash so a partial application cannot hash-match the
-// delivered body, but it NEVER TRAVELS. The wire carries only
-// (status, reason, hash).
+// WHAT THE ADMIN CAN AND CANNOT SEE (review M4, revised by P4-2).
+// govern.Effective.Dropped — which names WHICH directive class was refused
+// and why — used to be NODE-LOCAL only: rendered on the developer's own
+// Enrolment page and by `observer org grant show`, folded into
+// Effective.Hash so a partial application cannot hash-match the delivered
+// body, but never travelling. P4-2 is exactly the wire-shape change that
+// residual 7 (Phase-2 wire item) named: DroppedClasses now carries a
+// per-directive-class reason, translated through the closed gen2 vocabulary
+// (orgcontract.ReasonNotPreauthorized / ReasonSidecarUnwritable — never a
+// raw govern-internal string), alongside AcceptedAuthority and
+// ExtractionEffective. All three are gated onto the wire row by
+// internal/policystate.Resolve to the node-dashboard point alone: the
+// server 400s the whole report if they appear on any other family/point, so
+// do not thread them through any other PointReader.
 //
-// So the admin sees an undifferentiated accepted_inert / not_preauthorized
-// and cannot distinguish "your sharing directive was a no-op against this
-// node's local setting" from "this node was never offered settings.pin" from
-// "the whole body was refused" from "the node cannot write its sidecar".
-// Per-directive drop visibility is a Phase-2 WIRE item (residual 7), and it
-// is the same wire-shape change as the accepted-authority readback. Do not
-// write admin-console copy that implies the distinction exists today, and do
-// NOT "helpfully" plumb the richer govern reason through to the ack: the
-// server validates ack reasons against a closed set and 400s the WHOLE
-// report on an unknown one, so doing that would take the fleet's reporting
-// down.
+// Do NOT "helpfully" plumb an unrecognized govern reason through to the ack
+// as-is: the server validates ack reasons against a closed set and 400s the
+// WHOLE report on an unknown one, so every govDroppedToWire /
+// sidecarUnwritableDroppedClasses value must stay inside that closed set.
 func (h *nodeGovernanceHandle) Facts(ctx context.Context) governanceFacts {
 	if h == nil {
 		return governanceFacts{}
@@ -527,23 +546,80 @@ func (h *nodeGovernanceHandle) Facts(ctx context.Context) governanceFacts {
 		return f
 	}
 	eff := h.Effective(ctx)
+	h.mu.Lock()
+	grant := h.grant
+	h.mu.Unlock()
+	f.AcceptedAuthority = govern.HonoredAuthority(grant)
+	f.ExtractionEffective = govern.ExtractionTokensInForce(eff, f.AcceptedAuthority)
 	f.PinnedConverged = governancePinnedHash(eff.Pinned) == startup.PinnedHash
 	switch {
 	case eff.State != govern.StateApplied:
-		f.InertReason = "not_preauthorized"
+		f.InertReason = orgcontract.ReasonNotPreauthorized
+		f.DroppedClasses = govDroppedToWire(eff.Dropped)
 	case writeErr != nil:
 		// §1.4.1: the daemon resolved StateApplied but cannot materialize
 		// the posture, so NO process on this machine can read the pins.
 		// Reporting `effective` here would be the exact false compliance
-		// claim Phase 1b exists to remove.
-		//
-		// not_preauthorized is the only reason available on the wire today —
-		// the server validates ack reasons against a closed set and 400s the
-		// WHOLE report on an unknown one. A distinct `sidecar_unwritable`
-		// reason is a Phase-2 wire item (residual 7); do NOT emit one here.
-		f.InertReason = "not_preauthorized"
+		// claim Phase 1b exists to remove. Distinct from the
+		// eff.State != StateApplied case above: govern itself dropped
+		// nothing (StateApplied ⟺ eff.Dropped is empty — see
+		// applyIntersection), so DroppedClasses is synthesized from the
+		// delivered spec's own PRESENT sidecar-dependent classes instead of
+		// translated from eff.Dropped.
+		f.InertReason = orgcontract.ReasonSidecarUnwritable
+		f.DroppedClasses = sidecarUnwritableDroppedClasses(d.Spec)
 	}
 	return f
+}
+
+// govDroppedToWire translates govern.Effective.Dropped entries into the
+// gen2 wire's closed DroppedClasses vocabulary (P4-2). Every govern-internal
+// reason for the eff.State != StateApplied case (ReasonNotPreauthorized,
+// ReasonAuthorityRetired — see internal/govern/resolve.go's
+// directiveClasses) folds onto orgcontract.ReasonNotPreauthorized: gen2 has
+// no retired-specific wire value, and "not currently authorized" is the
+// honest generalization of "authorized only by a token this org has since
+// retired". A future govern drop reason this function does not recognize
+// also folds here rather than forwarding an unvetted string past the wire's
+// closed vocabulary.
+func govDroppedToWire(dropped []govern.Dropped) map[string]string {
+	if len(dropped) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(dropped))
+	for _, d := range dropped {
+		out[d.Directive] = orgcontract.ReasonNotPreauthorized
+	}
+	return out
+}
+
+// sidecarUnwritableDroppedClasses scopes the ReasonSidecarUnwritable
+// DroppedClasses entries to exactly the directive classes that were PRESENT
+// in the delivered spec AND actually depend on the sidecar to reach another
+// process. "sections" is deliberately excluded: the dashboard route guard
+// and the SPA both read Effective directly (never the sidecar), so a
+// sidecar write failure never affects it.
+//
+// This scoping is sound because eff.State == govern.StateApplied (Facts's
+// precondition for reaching this branch) implies eff.Dropped is empty —
+// applyIntersection sets StateInert if and only if len(Dropped) > 0 — so
+// every class PRESENT in the delivered spec really was authorized and
+// applied in memory; the sidecar write is the only thing that then failed.
+func sidecarUnwritableDroppedClasses(spec nodegov.PolicySpec) map[string]string {
+	out := map[string]string{}
+	if len(spec.Pinned) > 0 {
+		out["pinned"] = orgcontract.ReasonSidecarUnwritable
+	}
+	if len(spec.Share) > 0 {
+		out["share"] = orgcontract.ReasonSidecarUnwritable
+	}
+	if len(spec.Features) > 0 {
+		out["features"] = orgcontract.ReasonSidecarUnwritable
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // newNodeGovernancePointReader builds the node.governance PointReader (spec
@@ -583,6 +659,9 @@ func newNodeGovernancePointReader(
 			RejectCode:          reject,
 			RejectedVersion:     o.Version,
 			Unreachable:         o.Unreachable,
+			AcceptedAuthority:   g.AcceptedAuthority,
+			ExtractionEffective: g.ExtractionEffective,
+			DroppedClasses:      g.DroppedClasses,
 		}
 		switch {
 		case g.HasOrgRail && g.InertReason != "":

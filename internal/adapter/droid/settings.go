@@ -124,7 +124,7 @@ func readSidecar(transcript string) (*sidecar, time.Time, bool) {
 //
 // Returns ok=false when the block carries no usage at all, so a
 // freshly-created session doesn't get an all-zero token row.
-func tokenEvent(sc *sidecar, sourceFile, sessionID, projectRoot, gitBranch string, ts time.Time) (models.TokenEvent, bool) {
+func tokenEvent(sc *sidecar, sourceFile, sessionID, projectRoot, gitBranch, gitRemote string, ts time.Time) (models.TokenEvent, bool) {
 	if sc == nil || sessionID == "" || sc.TokenUsage.empty() {
 		return models.TokenEvent{}, false
 	}
@@ -135,6 +135,7 @@ func tokenEvent(sc *sidecar, sourceFile, sessionID, projectRoot, gitBranch strin
 		SessionID:           sessionID,
 		ProjectRoot:         projectRoot,
 		GitBranch:           gitBranch,
+		GitRemote:           gitRemote,
 		Timestamp:           ts,
 		Tool:                models.ToolDroid,
 		Model:               strings.TrimSpace(sc.Model),

@@ -297,6 +297,44 @@ func (r *Registrar) Installed() []string {
 	return ids
 }
 
+// ManifestStatus reports whether one detected browser's dir-based
+// native-messaging host manifest file is present on disk. It is a PRESENCE
+// check only (no content comparison against what Register would write) —
+// the read-only health signal `observer doctor` uses to tell "extension not
+// yet registered" apart from "browser not installed on this host".
+type ManifestStatus struct {
+	// Browser is the stable browser id (chrome/edge/brave/chromium).
+	Browser string
+	// Name is the human-readable label.
+	Name string
+	// Path is the manifest's on-disk location.
+	Path string
+	// Present is true when a file exists at Path.
+	Present bool
+}
+
+// Manifests reports manifest presence for every browser Detect() finds
+// installed on this host (dir-based Linux/macOS only — a Windows browser
+// reached from a WSL daemon has no dir-based NativeMessagingHosts location;
+// see WindowsBrowsersInstalled / WindowsRegistrar for that topology). The
+// result is sorted by browser ID for deterministic output. A browser this
+// registrar has no grounded dir for on the current GOOS is never returned by
+// Detect(), so it never appears here either.
+func (r *Registrar) Manifests() []ManifestStatus {
+	det := r.Detect()
+	out := make([]ManifestStatus, 0, len(det))
+	for _, b := range det {
+		dir, ok := b.nativeMessagingDir(r.home, r.goos)
+		if !ok {
+			continue
+		}
+		path := filepath.Join(dir, manifestFileName)
+		_, err := os.Stat(path)
+		out = append(out, ManifestStatus{Browser: b.ID, Name: b.Name, Path: path, Present: err == nil})
+	}
+	return out
+}
+
 // RegisterResult reports the outcome of writing one browser's manifest.
 type RegisterResult struct {
 	Browser    string

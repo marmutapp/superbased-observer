@@ -30,6 +30,7 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/adapter/deepseek"
 	"github.com/marmutapp/superbased-observer/internal/adapter/devin"
 	"github.com/marmutapp/superbased-observer/internal/adapter/droid"
+	"github.com/marmutapp/superbased-observer/internal/adapter/freebuff"
 	"github.com/marmutapp/superbased-observer/internal/adapter/gemini"
 	"github.com/marmutapp/superbased-observer/internal/adapter/goose"
 	"github.com/marmutapp/superbased-observer/internal/adapter/grok"
@@ -38,6 +39,7 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/adapter/kilocode"
 	"github.com/marmutapp/superbased-observer/internal/adapter/kimicode"
 	"github.com/marmutapp/superbased-observer/internal/adapter/kirocli"
+	"github.com/marmutapp/superbased-observer/internal/adapter/mistralcode"
 	"github.com/marmutapp/superbased-observer/internal/adapter/muse"
 	"github.com/marmutapp/superbased-observer/internal/adapter/openclaw"
 	"github.com/marmutapp/superbased-observer/internal/adapter/opencode"
@@ -45,6 +47,7 @@ import (
 	"github.com/marmutapp/superbased-observer/internal/adapter/primeagent"
 	"github.com/marmutapp/superbased-observer/internal/adapter/qoder"
 	"github.com/marmutapp/superbased-observer/internal/adapter/qwencode"
+	"github.com/marmutapp/superbased-observer/internal/adapter/zcode"
 	"github.com/marmutapp/superbased-observer/internal/models"
 )
 
@@ -120,6 +123,15 @@ func Adapters() []adapter.Adapter {
 		// session directory under ~/.junie/sessions/<session-id>/, blocks
 		// (Terminal/FileChanges/Result) collapsed by a stable stepId.
 		junie.New(),
+		// 2026-08-24 wave. zcode (Z.AI's OpenCode fork): SQLite
+		// ~/.zcode/cli/db/db.sqlite, tokens from its own model_usage
+		// table. mistral-code (Mistral AI's `vibe` CLI): session-level
+		// token stats in meta.json, no per-message usage. freebuff
+		// (Manicode -> Codebuff -> Freebuff lineage): no billable
+		// tokens at all, sessions + actions only.
+		zcode.New(),
+		mistralcode.New(),
+		freebuff.New(),
 		// Browser-chatbot rail. Hook-only: no WatchPaths (capture arrives
 		// via the browser extension's native-messaging bridge / loopback
 		// listener, not the file watcher). One adapter per *-web site; the

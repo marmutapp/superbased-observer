@@ -11,6 +11,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { Sidebar } from "@/components/Sidebar";
 import { TopBar } from "@/components/TopBar";
 import { RestartPendingBanner } from "@/components/RestartPendingBanner";
+import { ManagedBanner } from "@/components/ManagedBanner";
 import { DemoBanner } from "@/components/DemoBanner";
 import { AnnouncementBanner } from "@/components/AnnouncementBanner";
 import { BudgetBanner } from "@/components/BudgetBanner";
@@ -309,6 +310,7 @@ export default function App() {
           <main className="flex min-w-0 flex-1 flex-col">
             <TopBar onHelp={openHelp} onMenu={() => setMobileNavOpen(true)} />
             <RestartPendingBanner />
+            <ManagedBanner gov={gov.data} />
             <DemoBanner />
             <AnnouncementBanner />
             <BudgetBanner />

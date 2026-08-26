@@ -60,6 +60,19 @@ type ExtraRoute struct {
 	Section Section
 }
 
+// Feature name strings passed to Options.FeatureGate / TerminalFeatureGate.
+// These are duplicated, plain-string copies of
+// internal/policyfam/nodefeatures.Feature* — this package never imports
+// policyfam (module-boundary discipline: cmd/observer is the only thing
+// that knows both the policy family's compiled types AND this package's
+// closure signatures; the two sides agree only on these literal strings).
+const (
+	nodeFeatureTerminals     = "terminals"
+	nodeFeatureRemote        = "remote"
+	nodeFeatureRoutingApply  = "routing_apply"
+	nodeFeaturePatternsWrite = "patterns_write"
+)
+
 type Options struct {
 	// DB is the observer database.
 	DB *sql.DB
@@ -96,6 +109,29 @@ type Options struct {
 	// GET /api/governance answers with the dormant posture. Non-nil only
 	// when cmd/observer wired a node.governance install seam.
 	Governance GovernanceProvider
+	// FeatureGate, when non-nil, answers "may this node use <feature>
+	// right now" for the org-parity W5.1 node.features policy family
+	// (docs/plans/org-parity-full-depth-plan-2026-08-24.md §4). feature
+	// is one of the internal/policyfam/nodefeatures.Feature* constants
+	// (this package never imports policyfam — the same module-boundary
+	// discipline as Governance/RecognizesSessionFile: cmd/observer
+	// resolves the accepted policy_resource into a plain closure).
+	// Called at each of the four gated seams (terminal launch, remote
+	// arm/pair, routing-apply, patterns-write) immediately before the
+	// action would take effect. Returns (allowed, reason) — reason is
+	// only meaningful when allowed is false, and is the exact string to
+	// surface to the caller. NIL on every solo node and every node with
+	// no accepted node.features policy — every seam fails OPEN in that
+	// case, matching Governance's nil-safe convention.
+	FeatureGate func(feature string) (bool, string)
+	// TerminalFeatureGate is FeatureGate's terminals-specific sibling: the
+	// terminals stanza of node.features additionally carries
+	// sandbox_required, which depends on what the CALLER is requesting
+	// (the launch body's own Sandbox flag) — a piece of request state
+	// FeatureGate's single-string signature has no room for. requestedSandbox
+	// is the launch request's own sandbox flag. NIL has the same fail-open
+	// meaning as FeatureGate being nil.
+	TerminalFeatureGate func(requestedSandbox bool) (bool, string)
 	// MonthlyBudgetUSD surfaces on the Analysis tab as a spend-budget
 	// progress tile. Zero hides the budget readout. Sourced from
 	// `intelligence.monthly_budget_usd` in config.toml.
@@ -804,6 +840,10 @@ func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[st
 	// side effects. Distinct from the fail-CLOSED validation inside
 	// handleTerminalLaunch, which actually refuses a launch.
 	reg("/api/terminal/sandbox", V, secTerminals, s.handleTerminalSandbox)
+	// Sandbox config editor. LOCAL + confirm-token-gated: unlike the probe
+	// above, this writes [terminal.sandbox], including authority-expanding
+	// remote-clone / extra-rw-bind escape hatches.
+	reg("/api/terminal/sandbox/config", L, secTerminals, s.handleTerminalSandboxConfig)
 	// Guided one-click install (tool-binary-resolution arc). LOCAL + confirm-
 	// token-gated, EXACTLY like the Tailscale setup handlers: it spawns a
 	// grounded, compile-time-constant install command in a visible local-only
@@ -1057,6 +1097,20 @@ func (s *Server) registerRoutes(remote RemoteController) (*http.ServeMux, map[st
 	// live-applies to the PTY manager with no restart, unlike the start-captured
 	// launch policy above.
 	reg("/api/terminal/limits", L, secTerminals, s.handleTerminalLimits)
+	// Agent Arena (plan: agent-arena-terminal-multi-harness-2026-08-22.md).
+	// Reads are View; the mutation POSTs auto-escalate to Execute via the
+	// standard V-route rule AND re-check the confirm token in-handler
+	// (spend + code-mutation surface).
+	reg("/api/arena/runs", V, secTerminals, s.handleArenaRuns)
+	reg("/api/arena/runs/{id}", V, secTerminals, func(w http.ResponseWriter, r *http.Request) {
+		s.handleArenaRunDetail(w, r, r.PathValue("id"))
+	})
+	reg("/api/arena/runs/{id}/diff/{cid}", V, secTerminals, func(w http.ResponseWriter, r *http.Request) {
+		s.handleArenaRunDiff(w, r, r.PathValue("id"), r.PathValue("cid"))
+	})
+	reg("/api/arena/runs/{id}/action/{cid}", V, secTerminals, func(w http.ResponseWriter, r *http.Request) {
+		s.handleArenaCandidateAction(w, r, r.PathValue("id"), r.PathValue("cid"))
+	})
 	// ExtraRoutes lets a separable subsystem (e.g. internal/obs) register its
 	// own /api/* handlers WITHOUT this package importing it (decision D4). Each
 	// MUST carry a Capability; New() rejects an unclassified ExtraRoute when a
@@ -2974,6 +3028,15 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 		s.handleSessionNetwork(w, r, id)
 		return
 	}
+	// Sub-route: /api/session/<id>/subagents → per-sub-agent summaries for
+	// sessions whose sub-agent activity rides the parent's session row
+	// flagged is_sidechain (claude-code model, migration 010). Codex child
+	// sessions surface through lineage instead (children[] below).
+	if strings.HasSuffix(id, "/subagents") {
+		id = strings.TrimSuffix(id, "/subagents")
+		s.handleSessionSubagents(w, r, id)
+		return
+	}
 	// Sub-route: /api/session/<id>/raw-events → on-demand source JSONL row
 	// browser. Re-reads local source files; nothing is persisted.
 	if strings.HasSuffix(id, "/raw-events") {
@@ -3069,11 +3132,20 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 		CacheCreationCostUSD float64 `json:"cache_creation_cost_usd"`
 	}
 	// lineageChild is one spawned (forked/subagent) session in the
-	// codex-lineage children list (migration 069). Emitted as [] not null.
+	// lineage children list (migration 069; opencode included since the
+	// 2026-08-21 parent_id linkage). Token/cost/action rollups let the
+	// LineageBanner show what each sub-agent session cost without
+	// navigating into it. Emitted as [] not null.
 	type lineageChild struct {
 		ID           string `json:"id"`
 		ThreadSource string `json:"thread_source,omitempty"`
 		StartedAt    string `json:"started_at"`
+		// Rollups over the child's own rows (omitempty so a fork with no
+		// usage yet renders exactly as before).
+		InputTokens  int64   `json:"input_tokens,omitempty"`
+		OutputTokens int64   `json:"output_tokens,omitempty"`
+		CostUSD      float64 `json:"cost_usd,omitempty"`
+		ActionCount  int64   `json:"action_count,omitempty"`
 	}
 	type sessionDetail struct {
 		ID        string  `json:"id"`
@@ -3089,13 +3161,18 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 		// shows start→last-activity instead of start→now (the 583h bug).
 		// Mirrors the sessions-list endpoint's COALESCE (see the list query).
 		// Empty only when the session has neither ended_at nor any action.
-		LastActivityAt  string   `json:"last_activity_at,omitempty"`
-		TotalActions    int      `json:"total_actions"`
-		SuccessActions  int      `json:"success_actions"`
-		FailureActions  int      `json:"failure_actions"`
-		QualityScore    *float64 `json:"quality_score,omitempty"`
-		ErrorRate       *float64 `json:"error_rate,omitempty"`
-		RedundancyRatio *float64 `json:"redundancy_ratio,omitempty"`
+		LastActivityAt string `json:"last_activity_at,omitempty"`
+		TotalActions   int    `json:"total_actions"`
+		SuccessActions int    `json:"success_actions"`
+		FailureActions int    `json:"failure_actions"`
+		// SidechainActionCount is the inline sub-agent activity volume
+		// (migration 010 model: sub-agents share the parent's session row,
+		// flagged is_sidechain). Drives the LineageBanner's sidechain note
+		// and the System tab's Sub-agents section.
+		SidechainActionCount int      `json:"sidechain_action_count"`
+		QualityScore         *float64 `json:"quality_score,omitempty"`
+		ErrorRate            *float64 `json:"error_rate,omitempty"`
+		RedundancyRatio      *float64 `json:"redundancy_ratio,omitempty"`
 		// Spec §14.1 freshness/stale-read split — populated only
 		// when the session has cache_events (Tier 3 / pre-backfill
 		// sessions leave these nil, no fake zeros).
@@ -3231,9 +3308,11 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 		`SELECT COUNT(*),
 		        COALESCE(SUM(CASE WHEN success = 0 THEN 0 ELSE 1 END), 0),
 		        COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0),
-		        MAX(timestamp)
+		        MAX(timestamp),
+		        COALESCE(SUM(CASE WHEN is_sidechain = 1 THEN 1 ELSE 0 END), 0)
 		 FROM actions WHERE session_id = ?`, id,
-	).Scan(&d.TotalActions, &d.SuccessActions, &d.FailureActions, &maxActionTs); err != nil {
+	).Scan(&d.TotalActions, &d.SuccessActions, &d.FailureActions, &maxActionTs,
+		&d.SidechainActionCount); err != nil {
 		writeErr(w, err)
 		return
 	}
@@ -3557,10 +3636,10 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Codex fork/subagent lineage (migration 069). Best-effort: a query
-	// failure leaves the lineage fields at their zero value and the modal
-	// simply hides the badge + spawned-sessions list. Children is normalized
-	// to [] below so the frontend can map unconditionally.
+	// Fork/subagent lineage (migration 069; codex + opencode). Best-effort:
+	// a query failure leaves the lineage fields at their zero value and the
+	// modal simply hides the badge + spawned-sessions list. Children is
+	// normalized to [] below so the frontend can map unconditionally.
 	if lin, lerr := store.New(s.db()).LoadSessionLineage(r.Context(), id); lerr == nil {
 		d.ForkedFromID = lin.ForkedFromID
 		d.ParentThreadID = lin.ParentThreadID
@@ -3571,6 +3650,10 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 				ID:           c.ID,
 				ThreadSource: c.ThreadSource,
 				StartedAt:    c.StartedAt,
+				InputTokens:  c.InputTokens,
+				OutputTokens: c.OutputTokens,
+				CostUSD:      c.CostUSD,
+				ActionCount:  c.ActionCount,
 			})
 		}
 	}
@@ -4824,6 +4907,15 @@ func (s *Server) handleSuggestWrite(w http.ResponseWriter, r *http.Request) {
 		path += "/"
 	}
 	path += filename
+	// W5.1 org-governed feature gate: node.features.patterns_write.
+	// Fail-open (nil FeatureGate, or no accepted policy) — see
+	// dashboard.Options.FeatureGate.
+	if s.opts.FeatureGate != nil {
+		if allowed, reason := s.opts.FeatureGate(nodeFeaturePatternsWrite); !allowed {
+			http.Error(w, reason, http.StatusForbidden)
+			return
+		}
+	}
 	changed, err := suggest.Apply(path, body)
 	if err != nil {
 		writeErr(w, err)

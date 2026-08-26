@@ -101,13 +101,13 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 	}
 	defer database.Close()
 
-	projectRoot := a.resolveProjectRoot(dbPath)
+	projectRoot, gitRemote := a.resolveProjectRoot(dbPath)
 
-	tools, err := a.loadMessageEvents(ctx, database, dbPath, projectRoot, fromOffset)
+	tools, err := a.loadMessageEvents(ctx, database, dbPath, projectRoot, gitRemote, fromOffset)
 	if err != nil {
 		return adapter.ParseResult{}, fmt.Errorf("crush.ParseSessionFile: messages: %w", err)
 	}
-	tokens, err := a.loadTokenEvents(ctx, database, dbPath, projectRoot, fromOffset)
+	tokens, err := a.loadTokenEvents(ctx, database, dbPath, projectRoot, gitRemote, fromOffset)
 	if err != nil {
 		return adapter.ParseResult{}, fmt.Errorf("crush.ParseSessionFile: tokens: %w", err)
 	}
@@ -188,7 +188,7 @@ type toolResult struct {
 // tool_result parts are consumed into the pairing map and never emitted
 // on their own; `reasoning` parts never mint a row of their own either —
 // they ride the next event as PrecedingReasoning (see threadState).
-func (a *Adapter) loadMessageEvents(ctx context.Context, db *sql.DB, sourceFile, projectRoot string, fromOffset int64) ([]models.ToolEvent, error) {
+func (a *Adapter) loadMessageEvents(ctx context.Context, db *sql.DB, sourceFile, projectRoot, gitRemote string, fromOffset int64) ([]models.ToolEvent, error) {
 	if !tableExists(ctx, db, "messages") {
 		return nil, nil
 	}
@@ -226,7 +226,7 @@ func (a *Adapter) loadMessageEvents(ctx context.Context, db *sql.DB, sourceFile,
 		if err := json.Unmarshal([]byte(m.Parts), &parts); err != nil {
 			continue // malformed parts blob — skip, don't fail the batch
 		}
-		out = append(out, a.eventsForMessage(sourceFile, projectRoot, m, parts, results, &pending)...)
+		out = append(out, a.eventsForMessage(sourceFile, projectRoot, gitRemote, m, parts, results, &pending)...)
 	}
 	return out, nil
 }
@@ -312,7 +312,7 @@ func collectToolResults(msgs []messageRow) map[string]toolResult {
 // eventsForMessage converts one message's parts into ToolEvents.
 // `pending` carries reasoning across parts AND across messages; see
 // threadState for the consumption semantics.
-func (a *Adapter) eventsForMessage(sourceFile, projectRoot string, m messageRow, parts []crushPart, results map[string]toolResult, pending *threadState) []models.ToolEvent {
+func (a *Adapter) eventsForMessage(sourceFile, projectRoot, gitRemote string, m messageRow, parts []crushPart, results map[string]toolResult, pending *threadState) []models.ToolEvent {
 	var out []models.ToolEvent
 	when := secondsToTime(m.CreatedAt)
 	for i, p := range parts {
@@ -327,9 +327,9 @@ func (a *Adapter) eventsForMessage(sourceFile, projectRoot string, m messageRow,
 				continue
 			}
 			if strings.EqualFold(m.Role, "user") {
-				out = append(out, a.userPromptEvent(sourceFile, projectRoot, m, i, body, pending))
+				out = append(out, a.userPromptEvent(sourceFile, projectRoot, gitRemote, m, i, body, pending))
 			} else if strings.EqualFold(m.Role, "assistant") {
-				out = append(out, a.assistantTextEvent(sourceFile, projectRoot, m, i, body, pending))
+				out = append(out, a.assistantTextEvent(sourceFile, projectRoot, gitRemote, m, i, body, pending))
 			}
 		case "reasoning":
 			// B3: a reasoning part mints NO action row of its own. Its
@@ -347,7 +347,7 @@ func (a *Adapter) eventsForMessage(sourceFile, projectRoot string, m messageRow,
 			if err := json.Unmarshal(p.Data, &d); err != nil {
 				continue
 			}
-			out = append(out, a.toolCallEvent(sourceFile, projectRoot, m, when, d, results, pending))
+			out = append(out, a.toolCallEvent(sourceFile, projectRoot, gitRemote, m, when, d, results, pending))
 		}
 	}
 	return out
@@ -356,7 +356,7 @@ func (a *Adapter) eventsForMessage(sourceFile, projectRoot string, m messageRow,
 // userPromptEvent emits the operator's prompt. A user turn is a reasoning
 // boundary: any thinking still pending from the previous turn is dropped
 // rather than stamped onto the new turn's rows.
-func (a *Adapter) userPromptEvent(sourceFile, projectRoot string, m messageRow, idx int, body string, pending *threadState) models.ToolEvent {
+func (a *Adapter) userPromptEvent(sourceFile, projectRoot, gitRemote string, m messageRow, idx int, body string, pending *threadState) models.ToolEvent {
 	pending.clear()
 	preview := a.scrub(truncate(body, 500))
 	return models.ToolEvent{
@@ -364,6 +364,7 @@ func (a *Adapter) userPromptEvent(sourceFile, projectRoot string, m messageRow, 
 		SourceEventID: fmt.Sprintf("prompt:%s:%d", m.ID, idx),
 		SessionID:     m.SessionID,
 		ProjectRoot:   projectRoot,
+		GitRemote:     gitRemote,
 		Timestamp:     secondsToTime(m.CreatedAt),
 		Tool:          models.ToolCrush,
 		ActionType:    models.ActionUserPrompt,
@@ -374,7 +375,7 @@ func (a *Adapter) userPromptEvent(sourceFile, projectRoot string, m messageRow, 
 	}
 }
 
-func (a *Adapter) assistantTextEvent(sourceFile, projectRoot string, m messageRow, idx int, body string, pending *threadState) models.ToolEvent {
+func (a *Adapter) assistantTextEvent(sourceFile, projectRoot, gitRemote string, m messageRow, idx int, body string, pending *threadState) models.ToolEvent {
 	preview := a.scrub(truncate(body, 200))
 	output := a.scrub(contentcap.Cap(body, contentcap.DefaultMaxBytes))
 	return models.ToolEvent{
@@ -382,6 +383,7 @@ func (a *Adapter) assistantTextEvent(sourceFile, projectRoot string, m messageRo
 		SourceEventID: fmt.Sprintf("text:%s:%d", m.ID, idx),
 		SessionID:     m.SessionID,
 		ProjectRoot:   projectRoot,
+		GitRemote:     gitRemote,
 		Timestamp:     secondsToTime(m.CreatedAt),
 		Model:         m.Model,
 		Tool:          models.ToolCrush,
@@ -402,7 +404,7 @@ func (a *Adapter) assistantTextEvent(sourceFile, projectRoot string, m messageRo
 // pure text. Pre-B3 it minted its own ActionTaskComplete row
 // (`crush.reasoning`) — a phantom action for something the model never
 // did. It is now threaded onto the successor event instead (threadState).
-func (a *Adapter) toolCallEvent(sourceFile, projectRoot string, m messageRow, when time.Time, d crushToolCallData, results map[string]toolResult, pending *threadState) models.ToolEvent {
+func (a *Adapter) toolCallEvent(sourceFile, projectRoot, gitRemote string, m messageRow, when time.Time, d crushToolCallData, results map[string]toolResult, pending *threadState) models.ToolEvent {
 	actionType, target := mapTool(d.Name, []byte(d.Input))
 
 	success := true
@@ -427,6 +429,7 @@ func (a *Adapter) toolCallEvent(sourceFile, projectRoot string, m messageRow, wh
 		SourceEventID:      sourceID,
 		SessionID:          m.SessionID,
 		ProjectRoot:        projectRoot,
+		GitRemote:          gitRemote,
 		Timestamp:          when,
 		Model:              m.Model,
 		Tool:               models.ToolCrush,
@@ -449,7 +452,7 @@ func (a *Adapter) toolCallEvent(sourceFile, projectRoot string, m messageRow, wh
 // the monotonically-growing counts correct. Model+provider come from the
 // newest assistant message in the session (so a provider-failover session
 // reports the provider that finished the turn).
-func (a *Adapter) loadTokenEvents(ctx context.Context, db *sql.DB, sourceFile, projectRoot string, fromOffset int64) ([]models.TokenEvent, error) {
+func (a *Adapter) loadTokenEvents(ctx context.Context, db *sql.DB, sourceFile, projectRoot, gitRemote string, fromOffset int64) ([]models.TokenEvent, error) {
 	if !tableExists(ctx, db, "sessions") {
 		return nil, nil
 	}
@@ -496,6 +499,7 @@ func (a *Adapter) loadTokenEvents(ctx context.Context, db *sql.DB, sourceFile, p
 			SourceEventID:    "tokens:" + s.ID,
 			SessionID:        s.ID,
 			ProjectRoot:      projectRoot,
+			GitRemote:        gitRemote,
 			Timestamp:        secondsToTime(s.UpdatedAt),
 			Tool:             models.ToolCrush,
 			Model:            model,
@@ -571,17 +575,19 @@ func mapTool(name string, input []byte) (actionType, target string) {
 // crush.db) — Crush does not store cwd anywhere. Foreign-mount Windows
 // paths are translated to their /mnt/c equivalent before git.Resolve so a
 // Windows-side project doesn't misfile under the observer's own repo.
-func (a *Adapter) resolveProjectRoot(dbPath string) string {
+// Returns (root, gitRemote); gitRemote is "" when the project isn't
+// inside a git repo.
+func (a *Adapter) resolveProjectRoot(dbPath string) (root, gitRemote string) {
 	proj := filepath.Dir(filepath.Dir(dbPath))
 	if proj == "" || proj == "." || proj == string(filepath.Separator) {
-		return "[crush]"
+		return "[crush]", ""
 	}
 	proj = crossmount.TranslateForeignPath(proj)
 	info, err := git.Resolve(proj)
 	if err != nil {
-		return proj
+		return proj, ""
 	}
-	return info.Root
+	return info.Root, git.NormalizeRemote(info.Remote)
 }
 
 // scrub applies the plaintext scrubber, tolerating a nil scrubber.

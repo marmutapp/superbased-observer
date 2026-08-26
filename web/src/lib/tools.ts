@@ -33,6 +33,9 @@ export type ToolKey =
   | "droid"
   | "open-interpreter"
   | "command-code"
+  | "zcode"
+  | "mistral-code"
+  | "freebuff"
   // Browser-chatbot rail (Phase 2) — captured by the opt-in MV3 browser
   // extension, NOT coding CLIs. Tokens are ALWAYS estimated.
   | "chatgpt-web"
@@ -244,6 +247,30 @@ const TOOLS: Record<string, ToolMeta> = {
     key: "command-code",
     label: "Command Code",
     colorVar: "var(--tool-command-code)",
+    provider: "agnostic",
+  },
+  // 2026-08 wave. zcode (Z.AI's OpenCode fork) and mistral-code (Mistral's
+  // `vibe` CLI) each authenticate to their own vendor's backend, but
+  // neither Z.AI nor Mistral has a slot in the provider union above, so
+  // both stay "agnostic" (the devin/kimi-code precedent — a single true
+  // vendor whose name isn't one of the five modeled providers). freebuff
+  // (CodebuffAI) is the same shape.
+  zcode: {
+    key: "zcode",
+    label: "zcode",
+    colorVar: "var(--tool-zcode)",
+    provider: "agnostic",
+  },
+  "mistral-code": {
+    key: "mistral-code",
+    label: "Mistral Code",
+    colorVar: "var(--tool-mistral-code)",
+    provider: "agnostic",
+  },
+  freebuff: {
+    key: "freebuff",
+    label: "Freebuff",
+    colorVar: "var(--tool-freebuff)",
     provider: "agnostic",
   },
   // Browser-chatbot rail (Phase 2). provider names the vendor whose web app

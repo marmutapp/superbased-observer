@@ -3,12 +3,15 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 
 	"github.com/spf13/cobra"
+
+	"github.com/marmutapp/superbased-observer/internal/config"
 )
 
 // newQwenCmd implements `observer qwen` — launches Qwen Code (`qwen`). Its
@@ -18,12 +21,13 @@ import (
 // interactive mode"), so a migration INTO Qwen Code opens the interactive
 // session pre-loaded with the mission.
 //
-// NON-PROXIED on purpose. Qwen Code documents an OpenAI-compatible base-URL
-// lane (OPENAI_BASE_URL), but no observer-routed turn has confirmed
-// api_turns capture (RouteStatusProbeRequired in the integration registry) —
-// and overriding OPENAI_BASE_URL would silently redirect an operator's
-// already-configured provider through the proxy's DEFAULT upstream, breaking
-// non-OpenAI providers. So the launcher execs `qwen` with the caller's own
+// NON-PROXIED on purpose. Qwen Code's OpenAI-compatible base-URL lane is
+// PROMOTED in the integration registry (routable_now, live-verified
+// 2026-07-09, api_turns 23728-23730) — but it routes via the
+// `observer init` config writer (~/.qwen/settings.json model.baseUrl +
+// matching modelProviders entry), NOT via this launcher: OPENAI_BASE_URL is
+// INERT for qwen (the id,baseUrl pair resolution wins), so injecting it here
+// would silently do nothing. This launcher execs `qwen` with the caller's own
 // environment; token capture happens via observer's local qwen-code
 // transcript adapter (in-transcript ui_telemetry records), not the proxy.
 // It never sets an API key or a base URL.
@@ -128,7 +132,13 @@ func newQwenCmd() *cobra.Command {
 				continueDir = cwd
 			}
 
-			return runSeedOnlyLaunch("qwen", bin, args, continueDir)
+			// Best-effort attribution config: a load failure just disables
+			// the launch seed (recordLaunchSeed treats "" as off).
+			dbPath := ""
+			if cfg, cErr := config.Load(config.LoadOptions{GlobalPath: configPath}); cErr == nil {
+				dbPath = cfg.Observer.DBPath
+			}
+			return runSeedOnlyLaunchSeeded(dbPath, "qwen-code", "qwen", bin, args, continueDir)
 		},
 	}
 	cmd.Flags().StringVar(&configPath, "config", "", "Path to config.toml (defaults to ~/.observer/config.toml); used to resolve the source session for --continue-from")
@@ -152,20 +162,33 @@ func qwenAttachPassthrough(qwenPath string) []string {
 }
 
 // runSeedOnlyLaunch execs a tool NON-PROXIED (child inherits os.Environ()
-// with no base-URL redirect), forwarding stdio and the exit code — the same
-// shape as `observer run`. It is the shared exec tail for the pure seeding
-// launchers (antigravity-cli, qwen, kiro) whose token capture happens via a
-// local adapter rather than the proxy. dir ("" inherits the caller's cwd) is
-// set by --continue-from to the source session's translated project root so
-// a cross-OS continuation lands in the real project folder.
-func runSeedOnlyLaunch(label, bin string, args []string, dir string) error {
+// runSeedOnlyLaunchSeeded is runSeedOnlyLaunch plus best-effort direct process
+// attribution (migration 086): when dbPath and tool are set it records a
+// launch_seeds row for the successfully started child so the daemon's
+// correlation sweep can bind it to the ingested session, retracting the seed
+// when the child is reaped. A seeding failure never affects the launch (see
+// cmd/observer/launchseed.go); empty dbPath/tool disable seeding entirely.
+func runSeedOnlyLaunchSeeded(dbPath, tool, label, bin string, args []string, dir string) error {
 	child := exec.Command(bin, args...) //nolint:gosec // user-launched tool; argv is the seeded handover + forwarded args
 	child.Env = os.Environ()
 	child.Dir = dir
 	child.Stdin = os.Stdin
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
-	if err := child.Run(); err != nil {
+	if err := child.Start(); err != nil {
+		return fmt.Errorf("exec %s: %w", label, err)
+	}
+	recordLaunchSeed(dbPath, tool, dir, child.Process.Pid, os.Stderr)
+	// Best-effort generic post-launch session discovery (WS-DISCOVERY): a
+	// no-op unless the trusted OOB channel is active AND tool resolves to an
+	// adapter that declares session-file watch roots. Cancel the instant the
+	// child exits so a window cut short by exit never announces a candidate
+	// that only looked unique because the scan stopped early.
+	discoverCancel := maybeStartGenericDiscovery(context.Background(), tool, dir)
+	if discoverCancel != nil {
+		defer discoverCancel()
+	}
+	if err := child.Wait(); err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
 			return exitErr(ee.ExitCode())

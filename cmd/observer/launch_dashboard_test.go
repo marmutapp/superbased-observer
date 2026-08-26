@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/marmutapp/superbased-observer/internal/config"
+	"github.com/marmutapp/superbased-observer/internal/integration"
 	"github.com/marmutapp/superbased-observer/internal/intelligence/dashboard"
 	"github.com/marmutapp/superbased-observer/internal/platform/crossmount"
 	"github.com/marmutapp/superbased-observer/internal/termsvc"
@@ -139,6 +140,59 @@ func TestToolPreflightSeam_ConfigOverrideParity(t *testing.T) {
 			t.Errorf("expected a note naming the stale config key, got %v", pf.Notes)
 		}
 	})
+}
+
+func TestDashboardInstallPlanPrefersExactOS(t *testing.T) {
+	hints := []integration.InstallHint{
+		{Channel: "npm", Argv: []string{"npm", "install", "-g", "pkg"}, Display: "npm install -g pkg"},
+		{OS: "linux", Channel: "brew", Argv: []string{"brew", "install", "pkg"}, Display: "brew install pkg"},
+		{OS: "linux", Channel: "script", Argv: []string{"bash", "-lc", "vendor installer"}, Display: "vendor installer"},
+	}
+	got, ok := dashboardInstallPlanFor(hints, "linux", "/home/u")
+	if !ok {
+		t.Fatal("expected an install plan")
+	}
+	if got.Display != "vendor installer" || strings.Join(got.Argv, "|") != "bash|-lc|vendor installer" {
+		t.Fatalf("exact-OS plan did not win: %+v", got)
+	}
+}
+
+func TestDashboardInstallPlanUsesUserLocalNPMPrefix(t *testing.T) {
+	hints := []integration.InstallHint{{
+		Channel: "npm",
+		Argv:    []string{"npm", "install", "-g", "--ignore-scripts", "pkg"},
+		Display: "npm install -g --ignore-scripts pkg",
+	}}
+	got, ok := dashboardInstallPlanFor(hints, "linux", "/home/azureuser")
+	if !ok {
+		t.Fatal("expected an install plan")
+	}
+	want := "npm|install|--global|--prefix|/home/azureuser/.local|--ignore-scripts|pkg"
+	if strings.Join(got.Argv, "|") != want {
+		t.Fatalf("argv = %v, want %s", got.Argv, want)
+	}
+	if strings.Contains(got.Display, " -g ") || !strings.Contains(got.Display, "--prefix /home/azureuser/.local") {
+		t.Fatalf("display does not match permission-safe argv: %q", got.Display)
+	}
+
+	windows, ok := dashboardInstallPlanFor(hints, "windows", `C:\Users\u`)
+	if !ok || strings.Join(windows.Argv, "|") != "npm|install|-g|--ignore-scripts|pkg" {
+		t.Fatalf("Windows npm plan must remain native: %+v ok=%v", windows, ok)
+	}
+}
+
+func TestDashboardOpenCodeInstallUsesOfficialLinuxInstaller(t *testing.T) {
+	row, ok := integration.For("opencode")
+	if !ok || row.Binary == nil {
+		t.Fatal("opencode binary registry row missing")
+	}
+	got, ok := dashboardInstallPlanFor(row.Binary.Installs, "linux", "/home/u")
+	if !ok {
+		t.Fatal("opencode Linux install plan missing")
+	}
+	if got.Display != "curl -fsSL https://opencode.ai/install | bash" {
+		t.Fatalf("opencode plan = %q, want official user installer", got.Display)
+	}
 }
 
 // TestDashResolveEnvTTL pins F7: the dashboard's toolresolve.Env is a TTL cache,

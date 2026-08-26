@@ -109,20 +109,20 @@ func writeSnapshot(conversationID string, data []byte) {
 // already paid its cost, but writing a same-quality snapshot would
 // burn IO without changing observer's view.
 //
-// projectRoot + path are passed through to ParseStructuredTrajectory
-// for both the new and (when present) the cached parse so the
-// returned StructuredEnrichment carries the correct attribution
-// regardless of which payload won.
+// projectRoot + gitRemote + path are passed through to
+// ParseStructuredTrajectory for both the new and (when present) the
+// cached parse so the returned StructuredEnrichment carries the
+// correct attribution regardless of which payload won.
 func (a *Adapter) reconcileWithSnapshot(
-	conversationID, projectRoot, path string, raw []byte,
+	conversationID, projectRoot, gitRemote, path string, raw []byte,
 ) StructuredEnrichment {
-	newEn := ParseStructuredTrajectory(raw, conversationID, projectRoot, path, a.scrubber)
+	newEn := ParseStructuredTrajectory(raw, conversationID, projectRoot, gitRemote, path, a.scrubber)
 	cached, ok := readSnapshot(conversationID)
 	if !ok {
 		writeSnapshot(conversationID, raw)
 		return newEn
 	}
-	cachedEn := ParseStructuredTrajectory(cached, conversationID, projectRoot, path, a.scrubber)
+	cachedEn := ParseStructuredTrajectory(cached, conversationID, projectRoot, gitRemote, path, a.scrubber)
 	if len(cachedEn.TokenEvents) > len(newEn.TokenEvents) {
 		tracef("snapshot_kept_cached conv=%s cached_tokens=%d new_tokens=%d",
 			conversationID, len(cachedEn.TokenEvents), len(newEn.TokenEvents))
@@ -138,13 +138,13 @@ func (a *Adapter) reconcileWithSnapshot(
 // has no `raw` to compare against — the only choice is "use cache
 // or surface nothing".
 func (a *Adapter) loadSnapshotEnrichment(
-	conversationID, projectRoot, path string,
+	conversationID, projectRoot, gitRemote, path string,
 ) (StructuredEnrichment, bool) {
 	cached, ok := readSnapshot(conversationID)
 	if !ok {
 		return StructuredEnrichment{}, false
 	}
-	en := ParseStructuredTrajectory(cached, conversationID, projectRoot, path, a.scrubber)
+	en := ParseStructuredTrajectory(cached, conversationID, projectRoot, gitRemote, path, a.scrubber)
 	tracef("snapshot_fallback conv=%s bytes=%d tools=%d tokens=%d",
 		conversationID, len(cached), len(en.ToolEvents), len(en.TokenEvents))
 	return en, true

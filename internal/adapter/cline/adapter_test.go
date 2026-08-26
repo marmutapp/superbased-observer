@@ -120,7 +120,7 @@ func TestInferProjectContext_PrefersEnvDetailsOverLegacyUIKey(t *testing.T) {
 	if err := os.WriteFile(uiPath, []byte(uiBody), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	root, _ := New().inferProjectContext(apiPath)
+	root, _, _ := New().inferProjectContext(apiPath)
 	// git.Resolve is unlikely to find a repo at d:/winner under tests
 	// — root falls through to the normalised cwd.
 	if !strings.Contains(strings.ReplaceAll(root, "\\", "/"), "d:/winner") {
@@ -144,7 +144,7 @@ func TestInferProjectContext_FallsBackToUIMessagesCwd(t *testing.T) {
 	if err := os.WriteFile(uiPath, []byte(`[{"ts":1,"type":"say","cwd":"/legacy/cwd"}]`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	root, _ := New().inferProjectContext(apiPath)
+	root, _, _ := New().inferProjectContext(apiPath)
 	if !strings.Contains(strings.ReplaceAll(root, "\\", "/"), "/legacy/cwd") {
 		t.Errorf("project root: got %q want substring /legacy/cwd", root)
 	}

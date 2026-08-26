@@ -20,9 +20,18 @@ package egress
 // hand-built local spec that never went through Compile cannot leave the
 // composed spec in an unnormalized posture.
 //
+// orgEnforce is the Arc 4 P3 §R23 LIFT (managed tenancy + enforce.egress,
+// carried in on OrgLayerMeta.ManagedEnforce): when true the org body's mode is
+// HONORED as authored (the org may turn the guardrail on), with NO coercion —
+// observe/off stays a real per-cohort opt-out. Always false on the individual
+// plane, so the "never server-forced" posture is untouched there.
+//
 // local may be nil (no local layer installed).
-func ComposeOrgSpec(local *PolicySpec, org PolicySpec) PolicySpec {
+func ComposeOrgSpec(local *PolicySpec, org PolicySpec, orgEnforce bool) PolicySpec {
 	out := org
+	if orgEnforce {
+		return out // org.Mode honored as authored
+	}
 	out.Mode = ModeOff
 	if local != nil {
 		out.Mode = normalizeMode(local.Mode)

@@ -62,6 +62,16 @@ type EnrolmentGrant struct {
 	// that stops authorizing a node stops governing it.
 	GrantedAt string `json:"granted_at"`
 	ExpiresAt string `json:"expires_at"`
+	// ConsentMode / ConsentActor are the ACP-P6c consent EVIDENCE: the
+	// server's own statement of how this enrolment was consented to, bound
+	// into the signature so the node records what the organization actually
+	// asserted rather than what an envelope field claimed. Populated only for
+	// a mint on the IdP device-code rail ("idp" plus the verified address of
+	// the member who approved the pairing); every token-rail grant leaves
+	// both empty and is byte-identical to a pre-P6c grant on the wire and in
+	// the signing message.
+	ConsentMode  string `json:"consent_mode,omitempty"`
+	ConsentActor string `json:"consent_actor,omitempty"`
 	// Signature is base64url(Ed25519) over EnrolmentGrantSigningMessage.
 	Signature string `json:"signature"`
 }
@@ -88,6 +98,22 @@ func CanonicalAuthority(tokens []string) []string {
 // grant: a fixed domain prefix plus every semantic field, NUL-separated so
 // no field can shift a boundary into another. The signature does NOT cover
 // itself, obviously; every other field is bound.
+//
+// PRESENCE-VERSIONED (ACP-P6c §3e). The consent evidence is appended, marker-
+// prefixed like authority, ONLY when ConsentMode is non-empty. A grant with
+// no consent evidence — every token-rail grant, which is every grant minted
+// before P6c — therefore produces BYTE-IDENTICAL bytes to the pre-P6c
+// algorithm, so no existing signature stops verifying and no version
+// negotiation is needed. A golden test pins that equality.
+//
+// The compat consequence is deliberate and is the honest degradation, not an
+// oversight: only an idp-minted grant carries the fields, and only a P6c-aware
+// agent can initiate the device-code flow that produces one. If an OLD binary
+// somehow redeemed a leaked idp enrolment code, it would compute the message
+// without the consent writes, VerifyEnrolmentGrant would fail, and
+// evaluateGrantOffer would refuse the grant through its existing named-error
+// path — enrolling the node ungoverned and LOUDLY. An old binary can never be
+// handed a managed grant silently.
 func EnrolmentGrantSigningMessage(g EnrolmentGrant) []byte {
 	h := sha256.New()
 	write := func(s string) {
@@ -104,6 +130,12 @@ func EnrolmentGrantSigningMessage(g EnrolmentGrant) []byte {
 	}
 	write(g.GrantedAt)
 	write(g.ExpiresAt)
+	if g.ConsentMode != "" {
+		write("consent_mode")
+		write(g.ConsentMode)
+		write("consent_actor")
+		write(g.ConsentActor)
+	}
 	return h.Sum(nil)
 }
 

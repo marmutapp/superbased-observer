@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { fetchJSON } from "@/lib/api";
 import type {
   ProjectRow,
@@ -14,7 +14,7 @@ import {
   isTerminalCapabilityError,
   useRemoteTerminalGate,
 } from "@/lib/remoteTerminal";
-import { Tooltip, TooltipSpan } from "@/components/primitives";
+import { ComboChip, Tooltip, TooltipSpan, type ComboOption } from "@/components/primitives";
 
 // Sentinel <select> value for the "type a path by hand" escape hatch. A NUL
 // byte can never be a real project root, so it can't collide with one. The NUL
@@ -125,21 +125,46 @@ function isPermittedRoot(path: string, allowedRoots: string[]): boolean {
 // when the operator hasn't enabled it the POST returns 403 and we surface the
 // honest reason rather than pretending it worked.
 
+export type NewTerminalDraft = {
+  tool: string;
+  rootSel: string;
+  customRoot: string;
+  modelSel: string;
+  sandboxOn: boolean;
+  workspaceSource: string;
+  workspaceRemote: string;
+  workspaceBranch: string;
+};
+
 type Props = {
   onClose: () => void;
+  initialDraft?: NewTerminalDraft;
+  resumedAfterInstall?: boolean;
   /**
    * Called with the minted handle + tool once a fresh launch succeeds. The
    * third arg (review finding 8) reports whether the launch was given a project
-   * root, so the dock enables Files/Git without a reload. Absence ≡ false.
+   * root, so the dock enables Files/Git without a reload. The fourth arg is
+   * present only for a guided installer: the dock restores that exact launch
+   * draft when the installer terminal exits. Absence ≡ false/no resume.
    */
-  onLaunched: (handle: string, tool: string, hasProjectRoot?: boolean) => void;
+  onLaunched: (
+    handle: string,
+    tool: string,
+    hasProjectRoot?: boolean,
+    resumeDraft?: NewTerminalDraft,
+  ) => void;
 };
 
 type FreshLaunchResponse = { token: string; tool: string; subcommand: string; has_project_root?: boolean };
 
-export function NewTerminalDialog({ onClose, onLaunched }: Props) {
+export function NewTerminalDialog({
+  onClose,
+  onLaunched,
+  initialDraft,
+  resumedAfterInstall = false,
+}: Props) {
   const [tools, setTools] = useState<string[]>([]);
-  const [tool, setTool] = useState("");
+  const [tool, setTool] = useState(initialDraft?.tool ?? "");
   // Known project roots (GET /api/projects, ordered most-recent-first) power
   // the working-directory dropdown; the user can still pick "Custom path…" to
   // type an arbitrary one. `rootSel` is the <select> value; `customRoot` holds
@@ -153,8 +178,8 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
   // [terminal.launch].allow_shell opt-in that gates the Shell option below,
   // independent of allow_fresh_agent / allowed_tools.
   const [shellEnabled, setShellEnabled] = useState(false);
-  const [rootSel, setRootSel] = useState("");
-  const [customRoot, setCustomRoot] = useState("");
+  const [rootSel, setRootSel] = useState(initialDraft?.rootSel ?? "");
+  const [customRoot, setCustomRoot] = useState(initialDraft?.customRoot ?? "");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   // Pre-launch binary-resolution verdict for the selected tool (tool-binary-
@@ -171,7 +196,18 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
   const [toolModels, setToolModels] = useState<ToolModels | null>(null);
   // The user's explicit model choice; "" means "use the tool's own default"
   // and is never sent on the launch POST.
-  const [modelSel, setModelSel] = useState("");
+  const [modelSel, setModelSel] = useState(initialDraft?.modelSel ?? "");
+  const previousTool = useRef(tool);
+
+  // Preserve an installer-resumed model on the first render, then clear it on
+  // every real adapter transition — including a server-driven fallback when a
+  // resumed adapter is no longer launchable. A dropdown-only reset misses that
+  // fallback and can send one adapter's model to another.
+  useEffect(() => {
+    if (previousTool.current === tool) return;
+    previousTool.current = tool;
+    setModelSel("");
+  }, [tool]);
   // Sandbox probe result (B9 U7), from GET /api/terminal/sandbox. Null when
   // unfetched, the seam is disabled (an older daemon has no such route), or
   // the fetch failed — mirrors the preflight/model-picker fail-silent
@@ -180,14 +216,19 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
   // map covering every launchable tool, so a tool-change never needs its own
   // refetch — see sandboxDisabledReason).
   const [sandboxProbe, setSandboxProbe] = useState<SandboxAvailability | null>(null);
-  // Whether the user has opted into a sandboxed launch. There is no
-  // default_on signal in the probe response (only the server-local
-  // [terminal.sandbox].default_on config key, not wire-exposed) — defaults
-  // unchecked.
-  const [sandboxOn, setSandboxOn] = useState(false);
-  const [workspaceSource, setWorkspaceSource] = useState("live");
-  const [workspaceRemote, setWorkspaceRemote] = useState("");
-  const [workspaceBranch, setWorkspaceBranch] = useState("");
+  // Whether the user has opted into a sandboxed launch. Seeded from the
+  // server's [terminal.sandbox].default_on signal once the probe resolves;
+  // the checkbox remains an explicit per-launch override.
+  const [sandboxOn, setSandboxOn] = useState(initialDraft?.sandboxOn ?? false);
+  const [workspaceSource, setWorkspaceSource] = useState(
+    initialDraft?.workspaceSource ?? "live",
+  );
+  const [workspaceRemote, setWorkspaceRemote] = useState(
+    initialDraft?.workspaceRemote ?? "",
+  );
+  const [workspaceBranch, setWorkspaceBranch] = useState(
+    initialDraft?.workspaceBranch ?? "",
+  );
   // Remote-device launch gate: a paired device can only fresh-launch when the
   // owner has enabled [remote].allow_terminal. When it's off we say so up front
   // and disable Start, rather than letting the POST fail with a raw 403.
@@ -204,7 +245,11 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
         if (cancelled) return;
         const list = d.launchable_tools ?? [];
         setTools(list);
-        if (list.length > 0) setTool(list[0]);
+        setTool((current) => {
+          if (current === SHELL_TOOL && d.shell_enabled) return current;
+          if (current && list.includes(current)) return current;
+          return list[0] ?? "";
+        });
         setAllowedRoots(d.allowed_project_roots ?? []);
         setShellEnabled(d.shell_enabled ?? false);
       })
@@ -260,7 +305,6 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
   // selected model is reset whenever the tool changes, whether or not the
   // fetch succeeds — a model picked for one tool must never leak into another.
   useEffect(() => {
-    setModelSel("");
     if (!tool || tool === SHELL_TOOL) {
       setToolModels(null);
       return;
@@ -290,7 +334,10 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
     let cancelled = false;
     fetchJSON<SandboxAvailability>("/api/terminal/sandbox")
       .then((d) => {
-        if (!cancelled) setSandboxProbe(d);
+        if (!cancelled) {
+          setSandboxProbe(d);
+          if (!initialDraft) setSandboxOn(d.default_on ?? false);
+        }
       })
       .catch(() => {
         if (!cancelled) setSandboxProbe(null);
@@ -327,7 +374,16 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
           body: JSON.stringify({ tool }),
         },
       );
-      onLaunched(r.handle, `${tool} install`, false);
+      onLaunched(r.handle, `${tool} install`, false, {
+        tool,
+        rootSel,
+        customRoot,
+        modelSel,
+        sandboxOn,
+        workspaceSource,
+        workspaceRemote,
+        workspaceBranch,
+      });
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -385,6 +441,54 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
     ? "No project roots are allow-listed — add one in [terminal.launch].allowed_project_roots (Terminals page → launch policy)"
     : "Not in [terminal.launch].allowed_project_roots — add it in the Terminals page → launch policy";
 
+  // The searchable folder-selector's option list (ComboChip): the agent's
+  // default directory, then every permitted root, then every blocked known
+  // project (shown but disabled, honest-reason tooltip — same partition the
+  // native <select> used, now with type-ahead search over BOTH groups so a
+  // large project index stays navigable). There is no filesystem-browse/
+  // listdir daemon endpoint (as of this writing) to power a true directory-
+  // tree picker, so this searchable list over the operator's allow-list +
+  // observed-project index is the selector — not a live filesystem browser.
+  // A "Custom path…" escape hatch below covers any allow-listed folder that
+  // isn't yet a known project.
+  const rootOptions = useMemo<ComboOption[]>(() => {
+    const opts: ComboOption[] = [
+      {
+        value: "",
+        label: "Agent's default directory (where SuperBased runs)",
+        searchable: "agent's default directory where superbased runs",
+        title:
+          "No project root: the fresh agent runs in the SuperBased daemon's own working directory (where observer start / observer dashboard was launched from).",
+      },
+    ];
+    for (const r of permittedRoots) {
+      opts.push({
+        value: r,
+        label: <span className="font-mono text-[11px]">{shortenPath(r)}</span>,
+        searchable: r.toLowerCase(),
+        title: r,
+        groupLabel: "Permitted",
+      });
+    }
+    for (const p of blockedProjects) {
+      opts.push({
+        value: p.root_path,
+        label: <span className="font-mono text-[11px]">{shortenPath(p.root_path)}</span>,
+        searchable: p.root_path.toLowerCase(),
+        title: `${p.root_path} — ${blockedTitle}`,
+        disabled: true,
+        groupLabel: "Not permitted",
+      });
+    }
+    opts.push({
+      value: CUSTOM_ROOT,
+      label: "Custom path…",
+      searchable: "custom path type manually",
+      title: "Type an absolute path by hand — it must be allow-listed to launch.",
+    });
+    return opts;
+  }, [permittedRoots, blockedProjects, blockedTitle]);
+
   // Sandbox toggle (B9 U7): null when the checkbox should be enabled, else the
   // honest disabled-copy string (see sandboxDisabledReason above).
   const sandboxReason = useMemo(
@@ -409,8 +513,8 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
   // stale "on" that the POST body would silently drop (sandbox fields are
   // only added when sandboxOn is true — see submit()).
   useEffect(() => {
-    if (sandboxCheckboxDisabled) setSandboxOn(false);
-  }, [sandboxCheckboxDisabled]);
+    if (sandboxCheckboxDisabled && sandboxOn) setSandboxOn(false);
+  }, [sandboxCheckboxDisabled, sandboxOn]);
 
   async function submit() {
     if (!tool) {
@@ -513,12 +617,21 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
           </div>
         )}
 
+        {resumedAfterInstall && (
+          <div className="mb-3 rounded-2 border border-ok/40 bg-ok/10 px-2 py-1.5 text-[11px] text-ok">
+            Installer terminal finished. Your adapter, project, model, and sandbox choices were preserved;
+            the availability check below has been refreshed.
+          </div>
+        )}
+
         <label className="mb-1 block text-[11px] font-medium text-fg-2">
           Tool
         </label>
         <select
           value={tool}
-          onChange={(e) => setTool(e.target.value)}
+          onChange={(e) => {
+            setTool(e.target.value);
+          }}
           className="mb-3 w-full rounded-2 border bg-bg-0 px-2 py-1.5 text-[12px] text-fg-1"
         >
           {tools.length === 0 && <option value="">no launchable tools</option>}
@@ -574,55 +687,24 @@ export function NewTerminalDialog({ onClose, onLaunched }: Props) {
           </>
         )}
 
-        <label
-          htmlFor="new-terminal-root"
-          className="mb-1 block text-[11px] font-medium text-fg-2"
-        >
+        <label className="mb-1 block text-[11px] font-medium text-fg-2">
           Project root <span className="text-fg-3">(optional)</span>
         </label>
-        <select
-          id="new-terminal-root"
+        <ComboChip
           value={rootSel}
-          onChange={(e) => setRootSel(e.target.value)}
-          className="w-full rounded-2 border bg-bg-0 px-2 py-1.5 text-[12px] text-fg-1"
-        >
-          {/* Native <option> can't host a React tooltip (the browser owns
-              the select popup rendering) — keep the native title= here. */}
-          <option
-            value=""
-            title="No project root: the fresh agent runs in the SuperBased daemon's own working directory (where observer start / observer dashboard was launched from)."
-          >
-            Agent's default directory (where SuperBased runs)
-          </option>
-          {permittedRoots.length > 0 && (
-            <optgroup label="Permitted">
-              {permittedRoots.map((r) => (
-                // Native <option> — title= stays (React tooltip can't render
-                // inside the browser-owned select popup).
-                <option key={r} value={r} title={r}>
-                  {shortenPath(r)}
-                </option>
-              ))}
-            </optgroup>
+          onChange={setRootSel}
+          options={rootOptions}
+          label="Folder"
+          fullWidth
+          popoverWidth={396}
+          placeholder="Search permitted folders…"
+          emptyHint="No folders match. Try “Custom path…” or add a root in Terminals → Settings → Folder Selection."
+          buttonValueRender={(sel) => (
+            <span className="min-w-0 flex-1 truncate text-left font-semibold text-fg-0">
+              {sel?.label ?? "Agent's default directory (where SuperBased runs)"}
+            </span>
           )}
-          {blockedProjects.length > 0 && (
-            <optgroup label="Not permitted (configure in Terminals → launch policy)">
-              {blockedProjects.map((p) => (
-                // Native <option> — title= stays (React tooltip can't render
-                // inside the browser-owned select popup).
-                <option
-                  key={p.root_path}
-                  value={p.root_path}
-                  disabled
-                  title={`${p.root_path} — ${blockedTitle}`}
-                >
-                  {shortenPath(p.root_path)}
-                </option>
-              ))}
-            </optgroup>
-          )}
-          <option value={CUSTOM_ROOT}>Custom path…</option>
-        </select>
+        />
         {noAllowList && projects.length > 0 && (
           <p className="mt-1 text-[10.5px] leading-relaxed text-fg-3">
             No project roots are allow-listed, so only the agent's default

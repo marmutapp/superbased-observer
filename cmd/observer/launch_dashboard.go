@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -801,11 +804,11 @@ func installOSForGOOS(goos string) string {
 //     falls open to the ladder (a broken config never blocks a preflight).
 //  2. the pure internal/toolresolve ladder over the registry Binary row.
 //
-// InstallCommand is the first daemon-GOOS-matching grounded hint's Display
-// (toolresolve already filters Installs to the daemon OS); CanInstall is true
-// only when such a hint exists AND the live allow_install kill-switch is on. The
-// argv NEVER crosses this seam — it is the install endpoint's own registry-
-// constant lookup.
+// InstallCommand is the same preferred + permission-safe plan the install
+// endpoint will run: an exact-OS official channel wins over a generic one, and
+// a Unix npm-global fallback is redirected to the user's ~/.local prefix.
+// CanInstall is true only when such a plan exists AND the live allow_install
+// kill-switch is on. The argv NEVER crosses this seam.
 func toolPreflightSeam(configPath string, allowInstall func() bool) func(string) (dashboard.ToolPreflight, bool) {
 	return func(tool string) (dashboard.ToolPreflight, bool) {
 		ic, ok := integration.For(tool)
@@ -843,8 +846,8 @@ func toolPreflightSeam(configPath string, allowInstall func() bool) func(string)
 			Bin:     r.Bin,
 			Notes:   r.Notes,
 		}
-		if len(r.Installs) > 0 {
-			pf.InstallCommand = r.Installs[0].Display
+		if plan, ok := dashboardInstallPlanFor(ic.Binary.Installs, runtime.GOOS, dashboardInstallHome()); ok {
+			pf.InstallCommand = plan.Display
 			pf.CanInstall = allowInstall != nil && allowInstall()
 		}
 		return pf, true
@@ -855,23 +858,119 @@ func toolPreflightSeam(configPath string, allowInstall func() bool) func(string)
 // returns the SERVER-SIDE install argv + display for a tool NAME, sourced ONLY
 // from the compile-time registry (tool-binary-resolution arc §Security — the
 // request contributes only the map key, so the argv-injection surface is zero).
-// It returns the first grounded hint whose OS is empty (any) or matches the
-// daemon GOOS; a tool with no grounded hint yields ok=false (the endpoint's
-// 400).
+// Exact-OS hints win over generic hints. Unix npm-global hints are made
+// permission-safe by installing beneath ~/.local instead of npm's frequently
+// root-owned /usr/lib/node_modules prefix. A tool with no usable grounded hint
+// yields ok=false (the endpoint's 400).
 func toolInstallHintSeam() func(string) ([]string, string, bool) {
 	return func(tool string) ([]string, string, bool) {
 		ic, ok := integration.For(tool)
 		if !ok || ic.Binary == nil {
 			return nil, "", false
 		}
-		want := installOSForGOOS(runtime.GOOS)
-		for _, h := range ic.Binary.Installs {
-			if h.OS == "" || h.OS == want {
-				return h.Argv, h.Display, true
+		plan, ok := dashboardInstallPlanFor(ic.Binary.Installs, runtime.GOOS, dashboardInstallHome())
+		if !ok {
+			return nil, "", false
+		}
+		return plan.Argv, plan.Display, true
+	}
+}
+
+type dashboardInstallPlan struct {
+	Argv    []string
+	Display string
+}
+
+func dashboardInstallHome() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return home
+}
+
+// dashboardInstallPlanFor selects and normalizes one registry-grounded install
+// hint for the dashboard. Exact OS beats OS-agnostic, and an exact-OS vendor
+// script beats an exact package-manager fallback: a user-local installer should
+// not lose to a generic npm -g (or Linux Homebrew) row merely because the
+// registry lists it first.
+func dashboardInstallPlanFor(hints []integration.InstallHint, goos, home string) (dashboardInstallPlan, bool) {
+	want := installOSForGOOS(goos)
+	var chosen *integration.InstallHint
+	for i := range hints {
+		if hints[i].OS == want && (chosen == nil || dashboardInstallChannelRank(hints[i].Channel) < dashboardInstallChannelRank(chosen.Channel)) {
+			chosen = &hints[i]
+		}
+	}
+	if chosen == nil {
+		for i := range hints {
+			if hints[i].OS == "" {
+				chosen = &hints[i]
+				break
 			}
 		}
-		return nil, "", false
 	}
+	if chosen == nil || len(chosen.Argv) == 0 {
+		return dashboardInstallPlan{}, false
+	}
+
+	argv := append([]string(nil), chosen.Argv...)
+	if chosen.Channel != "npm" || goos == "windows" || !hasNPMGlobalFlag(argv) {
+		return dashboardInstallPlan{Argv: argv, Display: chosen.Display}, true
+	}
+	if strings.TrimSpace(home) == "" {
+		// Do not fall back to a likely root-owned global prefix. An absent home is
+		// an honest inability to construct the permission-safe guided plan.
+		return dashboardInstallPlan{}, false
+	}
+
+	prefix := filepath.Join(home, ".local")
+	localized := make([]string, 0, len(argv)+2)
+	insertedPrefix := false
+	for _, arg := range argv {
+		switch arg {
+		case "-g", "--global":
+			if !insertedPrefix {
+				localized = append(localized, "--global", "--prefix", prefix)
+				insertedPrefix = true
+			}
+		default:
+			localized = append(localized, arg)
+		}
+	}
+	return dashboardInstallPlan{Argv: localized, Display: displayInstallArgv(localized)}, true
+}
+
+func dashboardInstallChannelRank(channel string) int {
+	switch channel {
+	case "script":
+		return 0
+	case "brew", "winget":
+		return 1
+	default:
+		return 2
+	}
+}
+
+func hasNPMGlobalFlag(argv []string) bool {
+	for _, arg := range argv {
+		if arg == "-g" || arg == "--global" {
+			return true
+		}
+	}
+	return false
+}
+
+func displayInstallArgv(argv []string) string {
+	out := make([]string, len(argv))
+	for i, arg := range argv {
+		if arg != "" && !strings.ContainsAny(arg, " \t\r\n\"'\\") {
+			out[i] = arg
+			continue
+		}
+		out[i] = strconv.Quote(arg)
+	}
+	return strings.Join(out, " ")
 }
 
 // recentModelsSeam builds the dashboard.Options.RecentModels closure: it

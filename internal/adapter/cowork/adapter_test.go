@@ -433,19 +433,19 @@ func TestProjectRootResolution_PrefersUserSelectedFolders(t *testing.T) {
 	cases := []struct {
 		name      string
 		sc        sidecar
-		seedCache map[string]string
+		seedCache map[string]projectGitInfo
 		want      string
 	}{
 		{
 			name:      "selected-folders-wins",
 			sc:        sidecar{UserSelectedFolders: []string{"/synthetic/ws"}, Cwd: "/synthetic/cwd"},
-			seedCache: map[string]string{"/synthetic/ws": "/synthetic/ws"},
+			seedCache: map[string]projectGitInfo{"/synthetic/ws": {Root: "/synthetic/ws"}},
 			want:      "/synthetic/ws",
 		},
 		{
 			name:      "cwd-fallback",
 			sc:        sidecar{Cwd: "/synthetic/cwd"},
-			seedCache: map[string]string{"/synthetic/cwd": "/synthetic/cwd"},
+			seedCache: map[string]projectGitInfo{"/synthetic/cwd": {Root: "/synthetic/cwd"}},
 			want:      "/synthetic/cwd",
 		},
 		{
@@ -456,7 +456,7 @@ func TestProjectRootResolution_PrefersUserSelectedFolders(t *testing.T) {
 		{
 			name:      "empty-folders-fallback",
 			sc:        sidecar{UserSelectedFolders: []string{""}, Cwd: "/synthetic/cwd"},
-			seedCache: map[string]string{"/synthetic/cwd": "/synthetic/cwd"},
+			seedCache: map[string]projectGitInfo{"/synthetic/cwd": {Root: "/synthetic/cwd"}},
 			want:      "/synthetic/cwd",
 		},
 	}
@@ -464,9 +464,9 @@ func TestProjectRootResolution_PrefersUserSelectedFolders(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cache := tc.seedCache
 			if cache == nil {
-				cache = map[string]string{}
+				cache = map[string]projectGitInfo{}
 			}
-			got := resolveProjectRoot(tc.sc, cache)
+			got, _ := resolveProjectRoot(tc.sc, cache)
 			if got != tc.want {
 				t.Fatalf("resolveProjectRoot=%q want %q", got, tc.want)
 			}
@@ -491,15 +491,15 @@ func TestResolveProjectRoot_WindowsPathDoesNotLeakToCWD(t *testing.T) {
 	sc := sidecar{
 		UserSelectedFolders: []string{`Z:\nonexistent\someproject`},
 	}
-	cache := map[string]string{}
-	got := resolveProjectRoot(sc, cache)
+	cache := map[string]projectGitInfo{}
+	got, _ := resolveProjectRoot(sc, cache)
 	want := `Z:\nonexistent\someproject`
 	if got != want {
 		t.Fatalf("resolveProjectRoot(unreachable windows path)=%q, want %q (must NOT walk CWD's git tree)", got, want)
 	}
 	// Verify cache is sealed too, so a repeat call doesn't re-trigger
 	// the bad path.
-	got2 := resolveProjectRoot(sc, cache)
+	got2, _ := resolveProjectRoot(sc, cache)
 	if got2 != want {
 		t.Fatalf("repeat call resolved differently: %q vs %q", got2, want)
 	}
@@ -523,8 +523,8 @@ func TestResolveProjectRoot_CoworkInternalCwdSynthesisesSandbox(t *testing.T) {
 		UserSelectedFolders: []string{},
 		Cwd:                 `C:\Users\u\AppData\Roaming\Claude\local-agent-mode-sessions\sess\dev\local_aaaa\outputs`,
 	}
-	cache := map[string]string{}
-	got := resolveProjectRoot(sc, cache)
+	cache := map[string]projectGitInfo{}
+	got, _ := resolveProjectRoot(sc, cache)
 	want := "/sessions/gifted-kind-euler"
 	if got != want {
 		t.Fatalf("resolveProjectRoot(cowork-internal cwd, no workspace picked)=%q, want %q", got, want)
@@ -543,8 +543,8 @@ func TestResolveProjectRoot_CoworkInternalCwdRespectsUserChoice(t *testing.T) {
 		UserSelectedFolders: []string{`Z:\workspace`},
 		Cwd:                 `C:\Users\u\AppData\Roaming\Claude\local-agent-mode-sessions\sess\dev\local_aaaa\outputs`,
 	}
-	cache := map[string]string{}
-	got := resolveProjectRoot(sc, cache)
+	cache := map[string]projectGitInfo{}
+	got, _ := resolveProjectRoot(sc, cache)
 	want := `Z:\workspace`
 	if got != want {
 		t.Fatalf("got=%q, want %q (user's selection must override cwd-fallback synthesis)", got, want)
@@ -559,8 +559,8 @@ func TestResolveProjectRoot_CoworkInternalCwdRespectsUserChoice(t *testing.T) {
 func TestResolveProjectRoot_SandboxPathPreserved(t *testing.T) {
 	t.Parallel()
 	sc := sidecar{Cwd: "/sessions/clever-festive-mendel"}
-	cache := map[string]string{}
-	got := resolveProjectRoot(sc, cache)
+	cache := map[string]projectGitInfo{}
+	got, _ := resolveProjectRoot(sc, cache)
 	if got != "/sessions/clever-festive-mendel" {
 		t.Fatalf("resolveProjectRoot(sandbox path)=%q, want %q", got, "/sessions/clever-festive-mendel")
 	}

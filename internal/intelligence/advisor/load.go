@@ -30,6 +30,11 @@ func LoadFacts(ctx context.Context, db *sql.DB, opts Options) (*Facts, error) {
 	// Proxy rows first — they win dedup.
 	turnIDs := map[string]map[string]bool{}   // session → request_id set
 	shapeKeys := map[string]map[string]bool{} // session → shape-key set
+	// No ORDER BY: api_turns is large and un-indexed on (session_id,
+	// timestamp), so a DB-side sort would spill a temp B-tree (P1-C).
+	// Ordering is produced in Go below — every session's Rows is
+	// re-sorted by timestamp after both arms are merged, so a
+	// pre-sorted arm here would be redundant even before removal.
 	proxyQ := `
 		SELECT at.session_id, COALESCE(s.tool,''), COALESCE(s.model,''), COALESCE(p.root_path,''),
 		       at.timestamp, COALESCE(at.model,''), COALESCE(at.request_id,''),
@@ -40,8 +45,7 @@ func LoadFacts(ctx context.Context, db *sql.DB, opts Options) (*Facts, error) {
 		FROM api_turns at
 		JOIN sessions s ON s.id = at.session_id
 		LEFT JOIN projects p ON p.id = s.project_id
-		WHERE at.timestamp >= ?` + scopeFilter(opts) + `
-		ORDER BY at.session_id, at.timestamp`
+		WHERE at.timestamp >= ?` + scopeFilter(opts)
 	if err := loadRows(ctx, db, proxyQ, since, opts, func(sid, tool, smodel, root, ts, model, eventID string, in, out, cr, cc, cc1, reasoning, fast, compOrig, compOut int64) {
 		s := ensureSession(sessions, sid, tool, smodel, root)
 		t, ok := parseTS(ts)
@@ -66,6 +70,8 @@ func LoadFacts(ctx context.Context, db *sql.DB, opts Options) (*Facts, error) {
 		return nil, fmt.Errorf("advisor.LoadFacts: proxy rows: %w", err)
 	}
 
+	// Same reasoning as proxyQ above: token_usage is large and
+	// un-indexed on (session_id, timestamp); ordering is produced in Go.
 	jsonlQ := `
 		SELECT tu.session_id, COALESCE(s.tool,''), COALESCE(s.model,''), COALESCE(p.root_path,''),
 		       tu.timestamp, COALESCE(tu.model,''), COALESCE(tu.source_event_id,''),
@@ -76,8 +82,7 @@ func LoadFacts(ctx context.Context, db *sql.DB, opts Options) (*Facts, error) {
 		FROM token_usage tu
 		JOIN sessions s ON s.id = tu.session_id
 		LEFT JOIN projects p ON p.id = s.project_id
-		WHERE tu.timestamp >= ?` + scopeFilter(opts) + `
-		ORDER BY tu.session_id, tu.timestamp`
+		WHERE tu.timestamp >= ?` + scopeFilter(opts)
 	if err := loadRows(ctx, db, jsonlQ, since, opts, func(sid, tool, smodel, root, ts, model, eventID string, in, out, cr, cc, cc1, reasoning, fast, compOrig, compOut int64) {
 		if turnIDs[sid][eventID] {
 			return // level-1 dedup: proxy captured this exact turn id
@@ -100,7 +105,10 @@ func LoadFacts(ctx context.Context, db *sql.DB, opts Options) (*Facts, error) {
 		if len(s.Rows) < minSessionRows {
 			continue
 		}
-		sort.Slice(s.Rows, func(i, j int) bool { return s.Rows[i].TS.Before(s.Rows[j].TS) })
+		// Stable: with the SQL ORDER BY removed, ties (rows sharing an
+		// exact timestamp) fall back to arrival order rather than an
+		// unstable-sort shuffle.
+		sort.SliceStable(s.Rows, func(i, j int) bool { return s.Rows[i].TS.Before(s.Rows[j].TS) })
 		f.Sessions = append(f.Sessions, *s)
 	}
 	sort.Slice(f.Sessions, func(i, j int) bool { return f.Sessions[i].ID < f.Sessions[j].ID })

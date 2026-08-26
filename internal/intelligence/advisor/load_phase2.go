@@ -17,32 +17,48 @@ func loadPhase2(ctx context.Context, db *sql.DB, since string, f *Facts) error {
 		idx[f.Sessions[i].ID] = &f.Sessions[i]
 	}
 
-	// Action mix + effort. json_extract on the nullable metadata blob —
-	// NULL-safe (returns NULL → not counted).
+	// Action mix + effort. actions has no index covering
+	// (session_id, timestamp), so a SQL-side `GROUP BY session_id` over
+	// the timestamp-filtered window would force the same kind of temp
+	// B-tree spill as an ORDER BY on this table (P1-C). Instead: fetch
+	// the per-row flags (still computed in SQL — json_extract on the
+	// nullable metadata blob is NULL-safe, returns NULL → not counted)
+	// unaggregated, and sum them per session in Go.
 	mixQ := `SELECT session_id,
-	       COUNT(*),
-	       SUM(CASE WHEN action_type IN ('read_file','search_text','search_files') THEN 1 ELSE 0 END),
-	       SUM(CASE WHEN action_type IN ('edit_file','write_file') THEN 1 ELSE 0 END),
-	       SUM(CASE WHEN json_extract(metadata,'$.effort_level') IN ('xhigh','max') THEN 1 ELSE 0 END)
-	FROM actions WHERE timestamp >= ? GROUP BY session_id`
+	       CASE WHEN action_type IN ('read_file','search_text','search_files') THEN 1 ELSE 0 END,
+	       CASE WHEN action_type IN ('edit_file','write_file') THEN 1 ELSE 0 END,
+	       CASE WHEN json_extract(metadata,'$.effort_level') IN ('xhigh','max') THEN 1 ELSE 0 END
+	FROM actions WHERE timestamp >= ?`
 	rows, err := db.QueryContext(ctx, mixQ, since)
 	if err != nil {
 		return fmt.Errorf("advisor.loadPhase2: action mix: %w", err)
 	}
+	mix := map[string]*ActionMix{}
 	for rows.Next() {
 		var sid string
-		var total, reads, edits, eff int
-		if err := rows.Scan(&sid, &total, &reads, &edits, &eff); err != nil {
+		var isRead, isEdit, isEff int
+		if err := rows.Scan(&sid, &isRead, &isEdit, &isEff); err != nil {
 			rows.Close()
 			return fmt.Errorf("advisor.loadPhase2: mix scan: %w", err)
 		}
-		if s := idx[sid]; s != nil {
-			s.Mix = ActionMix{Total: total, Reads: reads, Edits: edits, EffortHigh: eff}
+		m, ok := mix[sid]
+		if !ok {
+			m = &ActionMix{}
+			mix[sid] = m
 		}
+		m.Total++
+		m.Reads += isRead
+		m.Edits += isEdit
+		m.EffortHigh += isEff
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
+	}
+	for sid, m := range mix {
+		if s := idx[sid]; s != nil {
+			s.Mix = *m
+		}
 	}
 
 	// Cachetrack verdicts (may be empty until Anthropic traffic proxies).

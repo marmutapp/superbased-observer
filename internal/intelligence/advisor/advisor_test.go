@@ -2,6 +2,7 @@ package advisor
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -428,5 +429,213 @@ func TestLoadFacts_ProxyJSONLDedup(t *testing.T) {
 	}
 	if proxyN != 1 || in7510 != 1 {
 		t.Errorf("proxy rows = %d (want 1), rows with input 7510 = %d (want 1 — the twin must be dropped)", proxyN, in7510)
+	}
+}
+
+// TestLoadFacts_RowsOrderedWithoutSQLSort pins the T2.1 de-spill contract:
+// LoadFacts's api_turns/token_usage queries no longer carry
+// `ORDER BY session_id, timestamp` (removed to avoid a temp B-tree spill
+// on a large, un-indexed table — P1-C), so this seeds two sessions with
+// their api_turns + token_usage rows inserted in an order that is
+// deliberately NEITHER grouped by session NOR chronological (mimicking
+// what an un-ordered SQLite scan could hand back), then asserts LoadFacts
+// still returns each session's rows in strict ascending-timestamp order
+// with no cross-session contamination — i.e. that Go-side sorting after
+// the query, not the SQL, is what's now producing correctness.
+func TestLoadFacts_RowsOrderedWithoutSQLSort(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "order.db")
+	database, err := db.Open(ctx, db.Options{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	st := store.New(database)
+	if _, err := st.UpsertProject(ctx, "/tmp/proj", ""); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, sid := range []string{"sess-a", "sess-b"} {
+		if err := st.UpsertSession(ctx, models.Session{ID: sid, ProjectID: 1, Tool: "claude-code", Model: "claude-opus-4-7", StartedAt: now.Add(-2 * time.Hour)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Interleave insertion across sessions AND scramble timestamp order
+	// within each session, so neither insertion (rowid) order nor a
+	// naive per-arm scan would already be sorted.
+	turn := func(sid string, minutesAgo int, in int64) models.APITurn {
+		return models.APITurn{
+			SessionID: sid, ProjectID: 1, Provider: "anthropic", Model: "claude-opus-4-7",
+			RequestID:   fmt.Sprintf("%s-req-%d", sid, minutesAgo),
+			Timestamp:   now.Add(-time.Duration(minutesAgo) * time.Minute),
+			InputTokens: in, OutputTokens: 50,
+		}
+	}
+	// sess-a proxy rows at 50m, 10m ago; sess-b proxy rows at 40m, 5m ago —
+	// inserted in an order that matches neither session grouping nor time.
+	for _, tn := range []models.APITurn{
+		turn("sess-a", 50, 100), turn("sess-b", 5, 400),
+		turn("sess-b", 40, 300), turn("sess-a", 10, 200),
+	} {
+		if _, err := st.InsertAPITurn(ctx, tn); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ev := func(sid, id string, minutesAgo int, in int64) models.TokenEvent {
+		return models.TokenEvent{
+			SourceFile: "/x/r.jsonl", SourceEventID: id, SessionID: sid,
+			Timestamp: now.Add(-time.Duration(minutesAgo) * time.Minute),
+			Tool:      "claude-code", Model: "claude-opus-4-7",
+			InputTokens: in, OutputTokens: 10,
+			Source: models.TokenSourceJSONL, Reliability: models.ReliabilityApproximate,
+		}
+	}
+	// Padding jsonl rows (distinct from the proxy turns above) scrambled
+	// the same way, so each session clears minSessionRows (5) with a
+	// fully-known, order-scrambled timestamp set.
+	evs := []models.TokenEvent{
+		ev("sess-b", "b3", 45, 310),
+		ev("sess-a", "a3", 35, 130),
+		ev("sess-a", "a4", 20, 150),
+		ev("sess-b", "b4", 25, 330),
+		ev("sess-a", "a5", 55, 90),
+		ev("sess-b", "b5", 15, 350),
+	}
+	if _, err := st.InsertTokenEvents(ctx, evs); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := LoadFacts(ctx, database, Options{WindowDays: 14}.withDefaults())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Sessions) != 2 {
+		t.Fatalf("sessions = %d, want 2", len(f.Sessions))
+	}
+	// f.Sessions is sorted by ID (existing contract) — sess-a then sess-b.
+	if f.Sessions[0].ID != "sess-a" || f.Sessions[1].ID != "sess-b" {
+		t.Fatalf("session order = [%s, %s], want [sess-a, sess-b]", f.Sessions[0].ID, f.Sessions[1].ID)
+	}
+
+	wantSessA := []int64{90, 100, 130, 150, 200}  // ascending by TS: 55m,50m,35m,20m,10m ago
+	wantSessB := []int64{310, 300, 330, 350, 400} // ascending by TS: 45m,40m,25m,15m,5m ago
+	assertRowsSortedAndMatch := func(t *testing.T, rows []TurnFact, want []int64) {
+		t.Helper()
+		if len(rows) != len(want) {
+			t.Fatalf("rows = %d, want %d: %+v", len(rows), len(want), rows)
+		}
+		for i := 1; i < len(rows); i++ {
+			if rows[i].TS.Before(rows[i-1].TS) {
+				t.Fatalf("rows not ascending-TS at index %d: %+v", i, rows)
+			}
+		}
+		for i, r := range rows {
+			if r.Input != want[i] {
+				t.Errorf("row %d input = %d, want %d (rows: %+v)", i, r.Input, want[i], rows)
+			}
+		}
+	}
+	assertRowsSortedAndMatch(t, f.Sessions[0].Rows, wantSessA)
+	assertRowsSortedAndMatch(t, f.Sessions[1].Rows, wantSessB)
+}
+
+// TestLoadPhase2_ActionMixWithoutSQLGroupBy pins the T2.1 de-spill
+// contract for the actions loader: loadPhase2's mixQ no longer
+// `GROUP BY session_id` in SQL (removed to avoid a temp B-tree spill on
+// the large, un-indexed actions table — P1-C); per-session totals are
+// now summed in Go from unaggregated per-row flags. This seeds two
+// sessions' actions interleaved in insertion order (neither grouped by
+// session nor otherwise ordered) and asserts each session's ActionMix
+// still comes out with the exact right totals.
+func TestLoadPhase2_ActionMixWithoutSQLGroupBy(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "mix.db")
+	database, err := db.Open(ctx, db.Options{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	st := store.New(database)
+	if _, err := st.UpsertProject(ctx, "/tmp/proj", ""); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, sid := range []string{"sess-a", "sess-b"} {
+		if err := st.UpsertSession(ctx, models.Session{ID: sid, ProjectID: 1, Tool: "claude-code", Model: "claude-opus-4-7", StartedAt: now.Add(-2 * time.Hour)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Padding token_usage so both sessions clear minSessionRows(5) and
+	// survive into f.Sessions — loadPhase2 only attaches Mix to
+	// sessions already indexed there.
+	var evs []models.TokenEvent
+	for _, sid := range []string{"sess-a", "sess-b"} {
+		for i := 0; i < 5; i++ {
+			evs = append(evs, models.TokenEvent{
+				SourceFile: "/x/pad.jsonl", SourceEventID: fmt.Sprintf("%s-pad-%d", sid, i), SessionID: sid,
+				Timestamp: now.Add(-time.Duration(60+i) * time.Minute),
+				Tool:      "claude-code", Model: "claude-opus-4-7",
+				InputTokens: 100, OutputTokens: 10,
+				Source: models.TokenSourceJSONL, Reliability: models.ReliabilityApproximate,
+			})
+		}
+	}
+	if _, err := st.InsertTokenEvents(ctx, evs); err != nil {
+		t.Fatal(err)
+	}
+
+	act := func(sid, id, actionType, target string, minutesAgo int, effort string) models.Action {
+		var meta *models.ActionMetadata
+		if effort != "" {
+			meta = &models.ActionMetadata{EffortLevel: effort}
+		}
+		return models.Action{
+			SessionID: sid, ProjectID: 1, Tool: "claude-code",
+			Timestamp:  now.Add(-time.Duration(minutesAgo) * time.Minute),
+			ActionType: actionType, Target: target, Success: true,
+			SourceFile: "/x/pad.jsonl", SourceEventID: id, Metadata: meta,
+		}
+	}
+	// Interleaved insertion order — sess-a and sess-b rows alternate and
+	// are not chronological, mirroring an un-ordered scan.
+	// sess-a: 2 reads, 1 edit, 1 effort-high run_command, 1 plain other = 5 total.
+	// sess-b: 3 reads, 2 edits (one also effort-high) = 5 total.
+	actions := []models.Action{
+		act("sess-b", "b1", models.ActionSearchText, "x", 5, ""),
+		act("sess-a", "a1", models.ActionReadFile, "x", 40, ""),
+		act("sess-b", "b2", models.ActionWriteFile, "x", 30, "xhigh"),
+		act("sess-a", "a2", models.ActionEditFile, "x", 10, ""),
+		act("sess-b", "b3", models.ActionSearchFiles, "x", 20, ""),
+		act("sess-a", "a3", models.ActionReadFile, "x", 35, ""),
+		act("sess-b", "b4", models.ActionWriteFile, "x", 15, ""),
+		act("sess-a", "a4", models.ActionRunCommand, "go test ./...", 25, "max"),
+		act("sess-b", "b5", models.ActionSearchText, "x", 8, ""),
+		act("sess-a", "a5", models.ActionPermissionMode, "plan", 3, ""),
+	}
+	if _, err := st.InsertActions(ctx, actions); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := LoadFacts(ctx, database, Options{WindowDays: 14}.withDefaults())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Sessions) != 2 {
+		t.Fatalf("sessions = %d, want 2", len(f.Sessions))
+	}
+	byID := map[string]*SessionFacts{}
+	for i := range f.Sessions {
+		byID[f.Sessions[i].ID] = &f.Sessions[i]
+	}
+	wantA := ActionMix{Total: 5, Reads: 2, Edits: 1, EffortHigh: 1}
+	wantB := ActionMix{Total: 5, Reads: 3, Edits: 2, EffortHigh: 1}
+	if got := byID["sess-a"].Mix; got != wantA {
+		t.Errorf("sess-a Mix = %+v, want %+v", got, wantA)
+	}
+	if got := byID["sess-b"].Mix; got != wantB {
+		t.Errorf("sess-b Mix = %+v, want %+v", got, wantB)
 	}
 }

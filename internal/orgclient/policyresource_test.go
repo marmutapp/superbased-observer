@@ -262,6 +262,14 @@ func TestFetchAndAcceptPolicyResource_DeliveredUnaccepted(t *testing.T) {
 	if res.Status != PRDeliveredUnaccepted {
 		t.Fatalf("result = %+v, want delivered_unaccepted", res)
 	}
+	// W-2: the accept_families gate must report its OWN honest reject code,
+	// distinct from the generic PRRejectCapabilityMismatch — the resource
+	// verified fine, this node's own accept_families allow-list just doesn't
+	// name it. MUTATION intent: reverting this call site back to
+	// PRRejectCapabilityMismatch fails this assertion.
+	if res.RejectCode != PRRejectFamilyNotAccepted {
+		t.Fatalf("RejectCode = %q, want %q (W-2 honest reject code)", res.RejectCode, PRRejectFamilyNotAccepted)
+	}
 	if _, statErr := os.Stat(filepath.Join(cacheDir, orgKeyForTest(t, c), "1", policyfamAdmissionInput+".json")); !os.IsNotExist(statErr) {
 		t.Error("unaccepted family must not be cached")
 	}

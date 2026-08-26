@@ -127,6 +127,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 		adapter:     a,
 		path:        path,
 		rootCache:   map[string]string{},
+		remoteCache: map[string]string{},
 		pendingCall: map[string]int{},
 		byName:      map[string][]int{},
 		firstOffset: fromOffset,
@@ -275,6 +276,10 @@ type parseState struct {
 	// records that (rarely) omit them still resolve a project root.
 	lastCwd    string
 	lastBranch string
+	// remoteCache memoizes cwd → normalized git remote (see projectRoot).
+	// Unlike lastBranch, the record never states its own remote, so this
+	// comes ONLY from git.Resolve.
+	remoteCache map[string]string
 }
 
 // handle dispatches one record onto the appropriate emit path.
@@ -298,29 +303,31 @@ func (st *parseState) handle(rec *rawRecord, res *adapter.ParseResult) {
 }
 
 // projectRoot resolves the record cwd (translating a foreign-OS path
-// before git.Resolve) and memoizes the result.
-func (st *parseState) projectRoot() string {
+// before git.Resolve) and memoizes the result, along with its normalized
+// git remote.
+func (st *parseState) projectRoot() (root, remote string) {
 	cwd := st.lastCwd
 	if cwd == "" {
-		return ""
+		return "", ""
 	}
 	cwd = crossmount.TranslateForeignPath(cwd)
 	if root, ok := st.rootCache[cwd]; ok {
-		return root
+		return root, st.remoteCache[cwd]
 	}
 	info, err := git.Resolve(cwd)
 	if err != nil {
 		st.rootCache[cwd] = cwd
-		return cwd
+		return cwd, ""
 	}
 	st.rootCache[cwd] = info.Root
-	return info.Root
+	st.remoteCache[cwd] = git.NormalizeRemote(info.Remote)
+	return info.Root, st.remoteCache[cwd]
 }
 
 // emitUserPrompt records a user prompt, and (only when parsing from the
 // top of the file, on the transcript root record) a session-start marker.
 func (st *parseState) emitUserPrompt(rec *rawRecord, res *adapter.ParseResult) {
-	root := st.projectRoot()
+	root, remote := st.projectRoot()
 	if st.firstOffset == 0 && !st.sessionStarted && rec.ParentUUID == nil {
 		st.sessionStarted = true
 		res.ToolEvents = append(res.ToolEvents, models.ToolEvent{
@@ -330,6 +337,7 @@ func (st *parseState) emitUserPrompt(rec *rawRecord, res *adapter.ParseResult) {
 			ProjectRoot:   root,
 			Timestamp:     parseTimestamp(rec.Timestamp),
 			GitBranch:     st.lastBranch,
+			GitRemote:     remote,
 			Tool:          models.ToolQwenCode,
 			ActionType:    models.ActionSessionStart,
 			Target:        "startup",
@@ -350,6 +358,7 @@ func (st *parseState) emitUserPrompt(rec *rawRecord, res *adapter.ParseResult) {
 		ProjectRoot:   root,
 		Timestamp:     parseTimestamp(rec.Timestamp),
 		GitBranch:     st.lastBranch,
+		GitRemote:     remote,
 		Tool:          models.ToolQwenCode,
 		ActionType:    models.ActionUserPrompt,
 		Target:        truncate(scrubbed, 200),
@@ -365,7 +374,7 @@ func (st *parseState) emitAssistant(rec *rawRecord, res *adapter.ParseResult) {
 	if rec.Message == nil {
 		return
 	}
-	root := st.projectRoot()
+	root, remote := st.projectRoot()
 	ts := parseTimestamp(rec.Timestamp)
 	callIdx := 0
 	for _, part := range rec.Message.Parts {
@@ -382,6 +391,7 @@ func (st *parseState) emitAssistant(rec *rawRecord, res *adapter.ParseResult) {
 				ProjectRoot:   root,
 				Timestamp:     ts,
 				GitBranch:     st.lastBranch,
+				GitRemote:     remote,
 				Model:         rec.Model,
 				Tool:          models.ToolQwenCode,
 				ActionType:    mapToolName(fc.Name),
@@ -404,6 +414,7 @@ func (st *parseState) emitAssistant(rec *rawRecord, res *adapter.ParseResult) {
 				ProjectRoot:   root,
 				Timestamp:     ts,
 				GitBranch:     st.lastBranch,
+				GitRemote:     remote,
 				Model:         rec.Model,
 				Tool:          models.ToolQwenCode,
 				ActionType:    models.ActionAssistantMessage,
@@ -558,12 +569,14 @@ func (st *parseState) emitTelemetry(rec *rawRecord, res *adapter.ParseResult) {
 // emitTokenEvent turns an api_response event into a NET-token TokenEvent.
 func (st *parseState) emitTokenEvent(rec *rawRecord, ev *rawUIEvent, res *adapter.ParseResult) {
 	tp := tokenBundle(ev)
+	root, remote := st.projectRoot()
 	res.TokenEvents = append(res.TokenEvents, models.TokenEvent{
 		SourceFile:      st.path,
 		SourceEventID:   "tok:" + rec.UUID,
 		SessionID:       rec.SessionID,
-		ProjectRoot:     st.projectRoot(),
+		ProjectRoot:     root,
 		GitBranch:       st.lastBranch,
+		GitRemote:       remote,
 		Timestamp:       parseTimestamp(firstNonEmpty(ev.Timestamp, rec.Timestamp)),
 		Tool:            models.ToolQwenCode,
 		Model:           ev.Model,
@@ -610,13 +623,15 @@ func (st *parseState) emitAPIError(rec *rawRecord, ev *rawUIEvent, res *adapter.
 	if ev.StatusCode > 0 {
 		target = fmt.Sprintf("%s (HTTP %d)", ev.Model, ev.StatusCode)
 	}
+	root, remote := st.projectRoot()
 	res.ToolEvents = append(res.ToolEvents, models.ToolEvent{
 		SourceFile:    st.path,
 		SourceEventID: "api_error:" + rec.UUID,
 		SessionID:     rec.SessionID,
-		ProjectRoot:   st.projectRoot(),
+		ProjectRoot:   root,
 		Timestamp:     parseTimestamp(firstNonEmpty(ev.Timestamp, rec.Timestamp)),
 		GitBranch:     st.lastBranch,
+		GitRemote:     remote,
 		Model:         ev.Model,
 		Tool:          models.ToolQwenCode,
 		ActionType:    models.ActionAPIError,
@@ -643,13 +658,15 @@ func (st *parseState) emitSlashCommand(rec *rawRecord, res *adapter.ParseResult)
 		return
 	}
 	scrubbed := st.adapter.scrubber.String(cmd)
+	root, remote := st.projectRoot()
 	res.ToolEvents = append(res.ToolEvents, models.ToolEvent{
 		SourceFile:    st.path,
 		SourceEventID: "slash:" + rec.UUID,
 		SessionID:     rec.SessionID,
-		ProjectRoot:   st.projectRoot(),
+		ProjectRoot:   root,
 		Timestamp:     parseTimestamp(rec.Timestamp),
 		GitBranch:     st.lastBranch,
+		GitRemote:     remote,
 		Tool:          models.ToolQwenCode,
 		ActionType:    models.ActionUserPromptExpansion,
 		Target:        truncate(scrubbed, 200),

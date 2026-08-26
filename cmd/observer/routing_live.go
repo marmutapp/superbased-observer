@@ -50,6 +50,19 @@ type RoutingStateHandle struct {
 	// wireRouting to liveRouter.ReloadOrgPolicy. Unexported-set,
 	// exported-invoke via Reload; nil-safe.
 	reload func(context.Context) error
+	// setME forwards to liveRouter.SetManagedEnforce (Arc 4 P3b). Set by
+	// wireRouting; invoked via SetManagedEnforce from start.go once the
+	// governance handle exists. nil-safe.
+	setME func(func() bool)
+}
+
+// SetManagedEnforce injects the routing managed-enforce predicate (Arc 4 P3b)
+// onto the live router after buildProxy, where the governance handle exists.
+// Nil-safe: a build with routing off (setME unset) ignores it.
+func (h *RoutingStateHandle) SetManagedEnforce(fn func() bool) {
+	if h != nil && h.setME != nil {
+		h.setME(fn)
+	}
 }
 
 // store publishes a new routingState (construction + hot-reload).
@@ -125,11 +138,26 @@ type liveRouter struct {
 	// and dereferences, so an in-flight decision keeps its consistent
 	// snapshot across a reload (routing.Decide takes Policy BY VALUE).
 	policy    atomic.Pointer[routing.Policy]
-	mode      string // advise | enforce
+	mode      string // advise | enforce (the node-LOCAL [routing].mode)
 	refresher *store.RoutingRefresher
 	store     *store.Store
 	logger    *slog.Logger
 	now       func() time.Time
+
+	// effMode is the EFFECTIVE routing mode the hot path reads (Decide),
+	// resolved from lr.mode and — for a managed node holding enforce.routing
+	// (Arc 4 P3b §R23 lift) — the org body's mode. Atomic so Decide is
+	// lock-free; recomputed only under reloadMu (SetManagedEnforce /
+	// ReloadOrgPolicy). Nil ⇒ fall back to lr.mode (the pre-P3b behaviour).
+	effMode atomic.Pointer[string]
+	// managedEnforce reports, live, whether this node may honor the org
+	// routing body's mode (managed tenancy + enforce.routing). Injected from
+	// start.go via the RoutingStateHandle after buildProxy; nil on any node
+	// with no governance handle. Read only under reloadMu.
+	managedEnforce func() bool
+	// orgMode is the last composed org body's [routing].mode ("" when none).
+	// Written under reloadMu; the managed-enforce source for effMode.
+	orgMode string
 
 	// localSpec is the IMMUTABLE node-local routing spec captured at
 	// construction (routingconfig.Spec of [routing], BEFORE any org
@@ -237,6 +265,45 @@ func newLiveRouter(policy routing.Policy, mode string, refresher *store.RoutingR
 	}
 	lr.policy.Store(&policy)
 	return lr
+}
+
+// effectiveMode returns the routing mode the hot path acts on: the
+// managed-enforce-resolved effMode when set, else the node-local mode.
+// Lock-free (atomic load), so Decide never contends with a reload.
+func (lr *liveRouter) effectiveMode() string {
+	if p := lr.effMode.Load(); p != nil {
+		return *p
+	}
+	return lr.mode
+}
+
+// recomputeEffModeLocked recomputes effMode from lr.mode and — for a managed
+// node holding enforce.routing (Arc 4 P3b §R23 lift) — the last composed org
+// body's mode. Caller holds reloadMu. Per the operator's Option-1 decision the
+// org mode is HONORED AS AUTHORED (no coercion): "enforce" turns routing
+// enforcement on, anything else leaves it advisory. A non-managed node (or one
+// without the authority / without an org routing body) always resolves to the
+// node-local mode, so the individual plane is untouched.
+func (lr *liveRouter) recomputeEffModeLocked() {
+	m := lr.mode
+	if lr.managedEnforce != nil && lr.managedEnforce() && lr.orgMode != "" {
+		if lr.orgMode == "enforce" {
+			m = "enforce"
+		} else {
+			m = "advise"
+		}
+	}
+	lr.effMode.Store(&m)
+}
+
+// SetManagedEnforce injects the managed-enforce predicate (managed tenancy +
+// enforce.routing) after buildProxy (start.go, where the governance handle
+// exists) and recomputes the effective mode. Serialized with ReloadOrgPolicy.
+func (lr *liveRouter) SetManagedEnforce(fn func() bool) {
+	lr.reloadMu.Lock()
+	defer lr.reloadMu.Unlock()
+	lr.managedEnforce = fn
+	lr.recomputeEffModeLocked()
 }
 
 // SetSelfObs injects the P1-10 emit sink + routing sample rate (plan
@@ -351,13 +418,19 @@ func (lr *liveRouter) ReloadOrgPolicy(ctx context.Context) error {
 	}
 
 	spec := lr.localSpec
+	lr.orgMode = ""
 	if ok {
 		composed, cerr := routingconfig.ComposeOrgPolicy(spec, orgPol.Body)
 		if cerr != nil {
 			return fmt.Errorf("routing.ReloadOrgPolicy: compose org policy: %w", cerr)
 		}
 		spec = composed
+		// Arc 4 P3b: capture the org body's mode so recomputeEffModeLocked can
+		// honor it on a managed node holding enforce.routing. ComposeOrgPolicy
+		// itself still ignores it (§R23) — the lift lives only in effMode.
+		lr.orgMode = routingconfig.OrgBodyMode(orgPol.Body)
 	}
+	lr.recomputeEffModeLocked()
 	policy, issues := routing.Compile(spec)
 	// routing.Compile never returns an error (fail-open); the promotion
 	// gate is LintHasErrors (P0-7 B5) — an error-severity lint on the
@@ -373,8 +446,9 @@ func (lr *liveRouter) ReloadOrgPolicy(ctx context.Context) error {
 		return fmt.Errorf("routing.ReloadOrgPolicy: refresher reload: %w", err)
 	}
 	lr.policy.Store(&policy)
+	effMode := lr.effectiveMode()
 	if lr.handle != nil {
-		next := routingState{mode: lr.mode}
+		next := routingState{mode: effMode}
 		if composedOrgVersion > 0 {
 			next.version = composedOrgVersion
 			next.hash = policy.Hash()
@@ -382,7 +456,7 @@ func (lr *liveRouter) ReloadOrgPolicy(ctx context.Context) error {
 		lr.handle.store(next)
 	}
 	lr.logger.Info("routing: org policy hot-reloaded",
-		"version", composedOrgVersion, "hash", policy.Hash(), "mode", lr.mode)
+		"version", composedOrgVersion, "hash", policy.Hash(), "mode", effMode)
 	return nil
 }
 
@@ -446,8 +520,11 @@ func (lr *liveRouter) Decide(shape proxy.RouterShape, sess proxy.RouterSession) 
 	d := routing.Decide(*lr.policy.Load(), snap, in)
 
 	// Effort-only decisions (§R6.5) apply without a model change —
-	// the lowest-risk enforce action (zero cache loss).
-	apply := lr.mode == "enforce" && !d.AdviseOnly && (d.Changed || d.SetEffort != "")
+	// the lowest-risk enforce action (zero cache loss). effectiveMode folds
+	// in the Arc 4 P3b managed-enforce lift (org mode on a managed node
+	// holding enforce.routing); it equals lr.mode on every other node.
+	effMode := lr.effectiveMode()
+	apply := effMode == "enforce" && !d.AdviseOnly && (d.Changed || d.SetEffort != "")
 
 	// Calibration demotion (§R18.3): a rule the calibration job graded
 	// as regressing logs its decision but never acts.
@@ -475,7 +552,7 @@ func (lr *liveRouter) Decide(shape proxy.RouterShape, sess proxy.RouterSession) 
 	lr.nextTok++
 	token := lr.nextTok
 	lr.pending[token] = pendingDecision{
-		row:     decisionRow(d, lr.mode, sess.SessionID, apply, lr.now()),
+		row:     decisionRow(d, effMode, sess.SessionID, apply, lr.now()),
 		created: lr.now(),
 	}
 	lr.mu.Unlock()
@@ -488,7 +565,7 @@ func (lr *liveRouter) Decide(shape proxy.RouterShape, sess proxy.RouterSession) 
 		v.Apply = true
 		v.SetEffort = d.SetEffort
 	}
-	if lr.mode == "enforce" {
+	if effMode == "enforce" {
 		// Fallback chains (§R12.1) are an enforce-class action — a
 		// fallback rewrites the model. Advise mode returns no chain.
 		v.FallbackModels = d.FallbackModels

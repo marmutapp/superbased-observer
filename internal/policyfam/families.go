@@ -5,6 +5,7 @@ import (
 
 	"github.com/marmutapp/superbased-observer/internal/policyfam/admission"
 	"github.com/marmutapp/superbased-observer/internal/policyfam/egress"
+	"github.com/marmutapp/superbased-observer/internal/policyfam/nodefeatures"
 	"github.com/marmutapp/superbased-observer/internal/policyfam/nodegov"
 	"github.com/marmutapp/superbased-observer/internal/policyfam/providers"
 )
@@ -38,12 +39,23 @@ const (
 	// cmd/observer intersects with the machine's enrolment GRANT
 	// (internal/govern) before anything is applied.
 	FamilyNodeGovernance = "node.governance"
+	// FamilyNodeFeatures is the org-parity W5.1 per-feature enable/disable
+	// + limits family (docs/plans/org-parity-full-depth-plan-2026-08-24.md
+	// §4 "W5.1"): the org DECIDES whether a dev's node may use embedded
+	// terminals / remote / routing-apply / patterns-write, and with what
+	// limits. It compiles into internal/policyfam/nodefeatures.PolicySpec,
+	// which cmd/observer's four enforcement seams consult directly — there
+	// is no grant-intersection with internal/govern (unlike
+	// FamilyNodeGovernance) and no live-lane apply (unlike
+	// FamilyGatewayProviders): the compiled spec is only ever READ at the
+	// moment of a local action, never pushed into a running subsystem.
+	FamilyNodeFeatures = "node.features"
 )
 
 // SupportedFamilies is the v1 closed enum, in a stable order. New families
 // are appended last so an index into this slice stays stable across
 // releases for any caller that persisted one.
-var SupportedFamilies = []string{FamilyAdmissionInput, FamilyEgressGuardrail, FamilyGatewayProviders, FamilyNodeGovernance}
+var SupportedFamilies = []string{FamilyAdmissionInput, FamilyEgressGuardrail, FamilyGatewayProviders, FamilyNodeGovernance, FamilyNodeFeatures}
 
 // IsSupportedFamily reports whether family is one of the v1 closed set.
 func IsSupportedFamily(family string) bool {
@@ -88,6 +100,12 @@ func CompileFamilyBody(family string, raw []byte, maxBytes int64) (spec any, can
 			return nil, nil, cerr
 		}
 		return s, canon, nil
+	case FamilyNodeFeatures:
+		s, canon, cerr := nodefeatures.CompileBody(raw, maxBytes)
+		if cerr != nil {
+			return nil, nil, cerr
+		}
+		return s, canon, nil
 	default:
 		return nil, nil, fmt.Errorf("policyfam.CompileFamilyBody: unsupported family %q", family)
 	}
@@ -125,6 +143,14 @@ func SpecRequestsEnforceMode(family string, spec any) bool {
 		// of (and additional to) the enrolment grant — a body must clear
 		// both, and neither alone suffices (spec §1.3 Quote 6).
 		_ = spec.(nodegov.PolicySpec) //nolint:forcetypeassert // caller contract: spec came from CompileFamilyBody(family, ...)
+		return true
+	case FamilyNodeFeatures:
+		// node.features has no mode field either: disabling a local
+		// capability always takes effect the moment the body is accepted —
+		// there is no "observe" posture for "can this dev launch a
+		// terminal right now." Same unconditional-enforce reasoning as
+		// gateway.providers/node.governance above.
+		_ = spec.(nodefeatures.PolicySpec) //nolint:forcetypeassert // caller contract: spec came from CompileFamilyBody(family, ...)
 		return true
 	default:
 		panic(fmt.Sprintf("policyfam.SpecRequestsEnforceMode: unsupported family %q", family))

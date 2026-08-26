@@ -3,6 +3,7 @@ package diag
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -72,6 +73,33 @@ type StatusSnapshot struct {
 	// wrong, so a healthy daemon's response is byte-identical to before this
 	// field existed and no client is required to know about it.
 	QueryErrors int `json:"query_errors,omitempty"`
+}
+
+// MarshalJSON preserves StatusSnapshot's public wire shape while actually
+// honoring the optional contract for time.Time fields. encoding/json's
+// `omitempty` does not consider a zero struct empty, so without this projection
+// a fresh database emits `0001-01-01T00:00:00Z` as last_action_at. Dashboard
+// relative-time formatters then honestly-but-uselessly render roughly 17.7
+// million hours of "activity". Internal callers keep ordinary time.Time values
+// and their IsZero checks; only the JSON boundary uses nullable timestamps.
+func (s StatusSnapshot) MarshalJSON() ([]byte, error) {
+	type snapshotAlias StatusSnapshot
+	type snapshotWire struct {
+		snapshotAlias
+		LastActionAt *time.Time `json:"last_action_at,omitempty"`
+		StartedAt    *time.Time `json:"started_at,omitempty"`
+	}
+
+	w := snapshotWire{snapshotAlias: snapshotAlias(s)}
+	if !s.LastActionAt.IsZero() {
+		last := s.LastActionAt
+		w.LastActionAt = &last
+	}
+	if !s.StartedAt.IsZero() {
+		started := s.StartedAt
+		w.StartedAt = &started
+	}
+	return json.Marshal(w)
 }
 
 // SnapshotCounts holds the row counts for each table the user cares about.

@@ -797,6 +797,11 @@ export type SessionDetail = {
   total_actions: number;
   success_actions: number;
   failure_actions: number;
+  /** Inline sub-agent activity volume (claude-code same-session sidechain
+   *  model): actions flagged is_sidechain on this session. Drives the
+   *  LineageBanner sidechain note; per-sub-agent breakdown lives in the
+   *  System tab's Sub-agents section (/api/session/<id>/subagents). */
+  sidechain_action_count: number;
   quality_score?: number;
   error_rate?: number;
   redundancy_ratio?: number;
@@ -912,10 +917,17 @@ export type SessionResumeResponse = SessionLaunchResponse & {
 };
 
 // One spawned (forked/subagent) session in a parent's lineage list.
+// The rollup fields (omitempty server-side) surface what each sub-agent
+// session cost without navigating into it — opencode sub-agents are
+// separate sessions, unlike claude-code's same-session sidechains.
 export type SessionLineageChild = {
   id: string;
   thread_source?: string;
   started_at: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  cost_usd?: number;
+  action_count?: number;
 };
 
 // ---------- /api/session/<id>/cache (C13) ----------
@@ -2533,6 +2545,7 @@ export type SandboxAvailability = {
   backend?: string;
   backend_version?: string;
   home_mode?: string;
+  default_on: boolean;
   sources?: SandboxSourceAvail[];
   tools?: Record<string, SandboxToolAvail>;
 };

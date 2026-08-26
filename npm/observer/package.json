@@ -1,6 +1,6 @@
 {
   "name": "@superbased/observer",
-  "version": "1.31.0",
+  "version": "1.32.0",
   "description": "Claude Code cost tracking, Cursor token usage, Codex spend — AI coding agent observability across 33 adapters, proxy-accurate token counts and cost.",
   "keywords": [
     "ai",
@@ -42,23 +42,23 @@
     "LICENSE"
   ],
   "optionalDependencies": {
-    "@superbased/observer-linux-x64": "1.31.0",
-    "@superbased/observer-linux-arm64": "1.31.0",
-    "@superbased/observer-darwin-x64": "1.31.0",
-    "@superbased/observer-darwin-arm64": "1.31.0",
-    "@superbased/observer-win32-x64": "1.31.0"
+    "@superbased/observer-linux-x64": "1.32.0",
+    "@superbased/observer-linux-arm64": "1.32.0",
+    "@superbased/observer-darwin-x64": "1.32.0",
+    "@superbased/observer-darwin-arm64": "1.32.0",
+    "@superbased/observer-win32-x64": "1.32.0"
   },
   "scripts": {
     "test": "node bin/observer.js --version"
   },
   "superbased": {
     "announcement": {
-      "id": "2026-08-plugin-coverage",
-      "severity": "info",
-      "title": "SuperBased now installs as a native plugin in 22 AI coding tools",
-      "body": "Claude Code, Codex, Cursor, Copilot, Gemini, OpenCode and 16 more now have a native SuperBased plugin. See the plugins repo for the install command for your tool.",
-      "url": "https://github.com/superbasedapp/plugins",
-      "expires_at": "2026-10-01T00:00:00Z",
+      "id": "2026-08-26-disk-maintenance-fix",
+      "severity": "notice",
+      "title": "v1.32.0 fixes unbounded database maintenance that could fill the disk",
+      "body": "Large databases could trigger automatic full-database VACUUM and integrity scans, silently consuming tens of GB of disk plus sustained CPU. v1.32.0 removes the unbounded paths, bounds SQLite memory and temp use, and adds a watchdog. Upgrade any machines on older versions.",
+      "url": "https://github.com/superbasedapp/observer/releases",
+      "expires_at": "2026-11-01T00:00:00Z",
       "source": "release"
     }
   }

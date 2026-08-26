@@ -434,3 +434,59 @@ func TestWindowsHasNoGroundedDir(t *testing.T) {
 		t.Errorf("Detect on windows = %v, want none (registry-based, not wired)", got)
 	}
 }
+
+// TestManifests pins the PRESENCE-only contract of the doctor's
+// browser-extension health probe (internal/diag): a detected browser with no
+// manifest file on disk reports Present=false; after Register writes it,
+// Present flips to true; a browser with no grounded dir on this GOOS (e.g.
+// windows) never appears in the result at all.
+func TestManifests(t *testing.T) {
+	home := t.TempDir()
+	mkProfile(t, home, "linux", "chrome")
+	mkProfile(t, home, "linux", "brave")
+	r, err := NewRegistrar(Options{Home: home, GOOS: "linux"})
+	if err != nil {
+		t.Fatalf("NewRegistrar: %v", err)
+	}
+
+	before := r.Manifests()
+	if len(before) != 2 {
+		t.Fatalf("Manifests before Register = %d entries, want 2: %+v", len(before), before)
+	}
+	for _, m := range before {
+		if m.Present {
+			t.Errorf("Manifests before Register: %s reported Present=true", m.Browser)
+		}
+		if m.Path == "" {
+			t.Errorf("Manifests: %s has an empty Path", m.Browser)
+		}
+	}
+	// Deterministic sort by browser ID: brave, chrome.
+	if before[0].Browser != "brave" || before[1].Browser != "chrome" {
+		t.Errorf("Manifests order = %v, want [brave chrome]", []string{before[0].Browser, before[1].Browser})
+	}
+
+	rw, err := NewRegistrar(Options{Home: home, GOOS: "linux", HostPath: "/x", ExtensionIDs: []string{"id"}})
+	if err != nil {
+		t.Fatalf("NewRegistrar: %v", err)
+	}
+	rw.Register()
+
+	after := r.Manifests()
+	for _, m := range after {
+		if !m.Present {
+			t.Errorf("Manifests after Register: %s still reports Present=false (path %s)", m.Browser, m.Path)
+		}
+	}
+
+	// windows has no dir-based entry in the per-browser table, so it never
+	// appears in Manifests() even though a "browser" could be detected on
+	// this GOOS in principle — see TestWindowsHasNoGroundedDir.
+	rWin, err := NewRegistrar(Options{Home: home, GOOS: "windows"})
+	if err != nil {
+		t.Fatalf("NewRegistrar: %v", err)
+	}
+	if got := rWin.Manifests(); len(got) != 0 {
+		t.Errorf("Manifests on windows = %v, want none (registry-based, not dir-based)", got)
+	}
+}

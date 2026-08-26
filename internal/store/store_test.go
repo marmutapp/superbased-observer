@@ -271,6 +271,79 @@ func TestLoadSessionLineage(t *testing.T) {
 	if _, err := s.LoadSessionLineage(ctx, "does-not-exist"); !errors.Is(err, sql.ErrNoRows) {
 		t.Errorf("LoadSessionLineage(missing) err = %v; want sql.ErrNoRows", err)
 	}
+}
+
+// TestLoadSessionLineage_OpencodeChildren pins the 2026-08-21 extension:
+// children linked ONLY via parent_thread_id (the opencode sub-agent model —
+// no forked_from_id) are listed by the parent's view, and each child row
+// carries its non-sidechain token/cost/action rollups so the LineageBanner
+// can show what the sub-agent cost without navigating into it.
+func TestLoadSessionLineage_OpencodeChildren(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+
+	pid, _ := s.UpsertProject(ctx, "/tmp/lineage-oc", "")
+	mk := func(id string, at time.Time) {
+		if err := s.UpsertSession(ctx, models.Session{
+			ID: id, ProjectID: pid, Tool: models.ToolOpenCode, StartedAt: at,
+		}); err != nil {
+			t.Fatalf("UpsertSession(%s): %v", id, err)
+		}
+	}
+	base := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	mk("oc-parent", base)
+	mk("oc-child", base.Add(time.Minute))
+
+	// opencode-style lineage: parent_thread_id only.
+	if _, err := s.SetSessionLineage(ctx, models.SessionLineage{
+		SessionID: "oc-child", ParentThreadID: "oc-parent", ThreadSource: "subagent",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Child usage: two non-sidechain rows + one sidechain row that must be
+	// excluded from the rollup; plus recorded cost on one row.
+	for _, tok := range []models.TokenEvent{
+		{
+			SessionID: "oc-child", Timestamp: base.Add(time.Second), Model: "m",
+			InputTokens: 100, OutputTokens: 10, EstimatedCostUSD: 0.25,
+		},
+		{
+			SessionID: "oc-child", Timestamp: base.Add(2 * time.Second), Model: "m",
+			InputTokens: 30, OutputTokens: 5, EstimatedCostUSD: 0.05,
+		},
+		{
+			SessionID: "oc-child", Timestamp: base.Add(3 * time.Second), Model: "m",
+			InputTokens: 999, IsSidechain: true,
+		},
+	} {
+		if _, err := s.InsertTokenEvents(ctx, []models.TokenEvent{tok}); err != nil {
+			t.Fatalf("InsertTokenEvents: %v", err)
+		}
+	}
+
+	view, err := s.LoadSessionLineage(ctx, "oc-parent")
+	if err != nil {
+		t.Fatalf("LoadSessionLineage(oc-parent): %v", err)
+	}
+	if len(view.Children) != 1 {
+		t.Fatalf("children = %d; want 1 (parent_thread_id-only link must list)", len(view.Children))
+	}
+	c := view.Children[0]
+	if c.ID != "oc-child" || c.ThreadSource != "subagent" {
+		t.Errorf("child = %s/%s; want oc-child/subagent", c.ID, c.ThreadSource)
+	}
+	if c.InputTokens != 130 || c.OutputTokens != 15 {
+		t.Errorf("child tokens = %d/%d; want 130/15 (sidechain row excluded)", c.InputTokens, c.OutputTokens)
+	}
+	if c.CostUSD < 0.2999 || c.CostUSD > 0.3001 {
+		t.Errorf("child CostUSD = %v; want ~0.30", c.CostUSD)
+	}
+	if c.ActionCount != 0 {
+		t.Errorf("child ActionCount = %d; want 0 (no actions ingested)", c.ActionCount)
+	}
+
 	// Empty id → error.
 	if _, err := s.LoadSessionLineage(ctx, ""); err == nil {
 		t.Error("LoadSessionLineage(\"\"): want error, got nil")

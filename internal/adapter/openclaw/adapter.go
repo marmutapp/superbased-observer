@@ -19,6 +19,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/marmutapp/superbased-observer/internal/adapter"
+	"github.com/marmutapp/superbased-observer/internal/adapter/cacheobs"
 	"github.com/marmutapp/superbased-observer/internal/contentcap"
 	"github.com/marmutapp/superbased-observer/internal/git"
 	"github.com/marmutapp/superbased-observer/internal/models"
@@ -126,17 +127,24 @@ func (a *Adapter) parseTaskRuns(ctx context.Context, dbPath string, fromOffset i
 		return adapter.ParseResult{}, fmt.Errorf("openclaw.ParseSessionFile: latest task watermark: %w", err)
 	}
 	res := adapter.ParseResult{NewOffset: latest}
-	if latest <= fromOffset {
-		return res, nil
-	}
-
-	sessionAliases := loadSessionAliases(filepath.Join(filepath.Dir(filepath.Dir(dbPath)), "agents"))
-
 	db, err := openReadOnlyDB(dbPath)
 	if err != nil {
 		return adapter.ParseResult{}, fmt.Errorf("openclaw.ParseSessionFile: open task DB: %w", err)
 	}
 	defer db.Close()
+
+	// Lineage upserts can be a no-op when the task row arrives before the child
+	// session row. Re-emit every durable task link on every parse so a later
+	// child-session ingest converges even when the task watermark did not move.
+	res.SessionLineages, err = loadTaskRunLineages(ctx, db)
+	if err != nil {
+		return adapter.ParseResult{}, fmt.Errorf("openclaw.ParseSessionFile: task lineages: %w", err)
+	}
+	if latest <= fromOffset {
+		return res, nil
+	}
+
+	sessionAliases := loadSessionAliases(filepath.Join(filepath.Dir(filepath.Dir(dbPath)), "agents"))
 
 	rows, err := db.QueryContext(ctx, `
 		SELECT task_id, runtime, COALESCE(source_id, ''), COALESCE(requester_session_key, ''),
@@ -152,7 +160,7 @@ func (a *Adapter) parseTaskRuns(ctx context.Context, dbPath string, fromOffset i
 	}
 	defer rows.Close()
 
-	rootCache := map[string]string{}
+	rootCache := map[string]projectGitInfo{}
 	for rows.Next() {
 		var tr taskRun
 		if err := rows.Scan(
@@ -173,6 +181,60 @@ func (a *Adapter) parseTaskRuns(ctx context.Context, dbPath string, fromOffset i
 		}
 	}
 	return res, rows.Err()
+}
+
+func loadTaskRunLineages(ctx context.Context, db *sql.DB) ([]models.SessionLineage, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT COALESCE(requester_session_key, ''), owner_key,
+		       COALESCE(child_session_key, '')
+		  FROM task_runs
+		 WHERE COALESCE(child_session_key, '') <> ''
+		 ORDER BY task_id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []models.SessionLineage
+	seen := map[models.SessionLineage]bool{}
+	for rows.Next() {
+		var tr taskRun
+		if err := rows.Scan(&tr.RequesterKey, &tr.OwnerKey, &tr.ChildSessionKey); err != nil {
+			return nil, err
+		}
+		lin, ok := taskRunLineage(tr)
+		if !ok || seen[lin] {
+			continue
+		}
+		seen[lin] = true
+		out = append(out, lin)
+	}
+	return out, rows.Err()
+}
+
+// taskRunLineage projects a spawned child session's parent linkage into
+// the generic migration-069 lineage columns (forked_from_id /
+// parent_thread_id / thread_source) so openclaw sub-agents light up the
+// same LineageBanner / children[] read model codex and opencode already
+// feed — closing the capture gap the 2026-08-22 cross-adapter audit
+// flagged (task_runs carries requester_session_key / owner_key /
+// child_session_key but they were only ever used for identity and
+// duplicate suppression). Parent preference: the requesting session (the
+// conversation that asked for the task), falling back to the owner key.
+// Self-runs (child == parent, e.g. agent main-tasking itself with no
+// distinct child key) emit nothing.
+func taskRunLineage(tr taskRun) (models.SessionLineage, bool) {
+	if tr.ChildSessionKey == "" {
+		return models.SessionLineage{}, false
+	}
+	parent := firstNonEmpty(tr.RequesterKey, tr.OwnerKey)
+	if parent == "" || parent == tr.ChildSessionKey {
+		return models.SessionLineage{}, false
+	}
+	return models.SessionLineage{
+		SessionID:      tr.ChildSessionKey,
+		ParentThreadID: parent,
+		ThreadSource:   "subagent",
+	}, true
 }
 
 // findTaskAlias mirrors suppressTaskRun's key-priority chain but
@@ -201,13 +263,15 @@ func aliasModel(alias sessionIndexEntry) string {
 	return model
 }
 
-func (a *Adapter) taskPromptEvent(sourceFile string, tr taskRun, alias sessionIndexEntry, rootCache map[string]string) models.ToolEvent {
+func (a *Adapter) taskPromptEvent(sourceFile string, tr taskRun, alias sessionIndexEntry, rootCache map[string]projectGitInfo) models.ToolEvent {
 	prompt := stripTaskTimestamp(tr.Task)
+	root, remote := a.resolveProjectRoot(alias.SystemPromptReport.WorkspaceDir, rootCache)
 	return models.ToolEvent{
 		SourceFile:         sourceFile,
 		SourceEventID:      "task:" + tr.TaskID + ":prompt",
 		SessionID:          sessionID(tr),
-		ProjectRoot:        a.resolveProjectRoot(alias.SystemPromptReport.WorkspaceDir, rootCache),
+		ProjectRoot:        root,
+		GitRemote:          remote,
 		Timestamp:          millisToTime(tr.CreatedAt),
 		Model:              aliasModel(alias),
 		Tool:               models.ToolOpenClaw,
@@ -221,18 +285,20 @@ func (a *Adapter) taskPromptEvent(sourceFile string, tr taskRun, alias sessionIn
 	}
 }
 
-func (a *Adapter) taskCompleteEvent(sourceFile string, tr taskRun, alias sessionIndexEntry, rootCache map[string]string) models.ToolEvent {
+func (a *Adapter) taskCompleteEvent(sourceFile string, tr taskRun, alias sessionIndexEntry, rootCache map[string]projectGitInfo) models.ToolEvent {
 	success := strings.EqualFold(tr.Status, "succeeded")
 	errMsg := ""
 	if !success {
 		errMsg = firstNonEmpty(nullString(tr.Error), nullString(tr.TerminalOutcome), nullString(tr.TerminalSummary))
 	}
 	summary := firstNonEmpty(nullString(tr.ProgressSummary), nullString(tr.TerminalSummary), nullString(tr.TerminalOutcome))
+	root, remote := a.resolveProjectRoot(alias.SystemPromptReport.WorkspaceDir, rootCache)
 	return models.ToolEvent{
 		SourceFile:         sourceFile,
 		SourceEventID:      "task:" + tr.TaskID + ":complete",
 		SessionID:          sessionID(tr),
-		ProjectRoot:        a.resolveProjectRoot(alias.SystemPromptReport.WorkspaceDir, rootCache),
+		ProjectRoot:        root,
+		GitRemote:          remote,
 		Timestamp:          taskEndTime(tr),
 		Model:              aliasModel(alias),
 		Tool:               models.ToolOpenClaw,
@@ -280,7 +346,7 @@ func (a *Adapter) parseSessionsIndex(path string, fromOffset int64) (adapter.Par
 	}
 	var latest int64
 	res := adapter.ParseResult{}
-	rootCache := map[string]string{}
+	rootCache := map[string]projectGitInfo{}
 	for key, sess := range idx {
 		if sess.UpdatedAt > latest {
 			latest = sess.UpdatedAt
@@ -288,11 +354,13 @@ func (a *Adapter) parseSessionsIndex(path string, fromOffset int64) (adapter.Par
 		if sess.UpdatedAt <= fromOffset || !isTerminalStatus(sess.Status) || strings.TrimSpace(sess.SessionFile) != "" {
 			continue
 		}
+		root, remote := a.resolveProjectRoot(sess.SystemPromptReport.WorkspaceDir, rootCache)
 		res.ToolEvents = append(res.ToolEvents, models.ToolEvent{
 			SourceFile:    path,
 			SourceEventID: "session:" + key + ":complete",
 			SessionID:     canonicalSessionID(sess, key),
-			ProjectRoot:   a.resolveProjectRoot(sess.SystemPromptReport.WorkspaceDir, rootCache),
+			ProjectRoot:   root,
+			GitRemote:     remote,
 			Timestamp:     millisToTime(firstNonZero(sess.EndedAt, sess.UpdatedAt)),
 			Model:         modelName(&sessionContext{Provider: firstNonEmpty(sess.ModelProvider, sess.SystemPromptReport.Provider), Model: firstNonEmpty(sess.Model, sess.SystemPromptReport.Model)}),
 			Tool:          models.ToolOpenClaw,
@@ -352,10 +420,11 @@ type tokenUsage struct {
 }
 
 type sessionContext struct {
-	SessionID   string
-	ProjectRoot string
-	Provider    string
-	Model       string
+	SessionID     string
+	ProjectRoot   string
+	ProjectRemote string
+	Provider      string
+	Model         string
 }
 
 func (a *Adapter) parseSessionJSONL(ctx context.Context, path string, fromOffset int64) (adapter.ParseResult, error) {
@@ -377,11 +446,11 @@ func (a *Adapter) parseSessionJSONL(ctx context.Context, path string, fromOffset
 		ProjectRoot: "[openclaw]",
 	}
 	applySessionAlias(path, &state, state.SessionID)
-	rootCache := map[string]string{}
+	rootCache := map[string]projectGitInfo{}
 	// Resolve any aliased ProjectRoot the alias lookup just installed so
 	// downstream events get the same git-root treatment as freshly-set cwds.
 	if state.ProjectRoot != "" && state.ProjectRoot != "[openclaw]" {
-		state.ProjectRoot = a.resolveProjectRoot(state.ProjectRoot, rootCache)
+		state.ProjectRoot, state.ProjectRemote = a.resolveProjectRoot(state.ProjectRoot, rootCache)
 	}
 	pending := map[string]int{}
 	// Lazily-read harness prompt preamble for this run (WP-T6 O2). Only a
@@ -400,6 +469,10 @@ func (a *Adapter) parseSessionJSONL(ctx context.Context, path string, fromOffset
 	// OpenClaw bootstrap-context:full events can be re-emitted on
 	// resume; same content → one row.
 	seenSystemPrompts := map[string]bool{}
+	// cacheAcc accumulates content-block deltas across the message log —
+	// see cachetrack.go for why only this file (not the trajectory) is
+	// wired.
+	cacheAcc := cacheobs.New(MaxBlocksPerSession)
 
 	scanner := bufio.NewScanner(f)
 	const maxLine = 16 * 1024 * 1024
@@ -433,17 +506,17 @@ func (a *Adapter) parseSessionJSONL(ctx context.Context, path string, fromOffset
 				state.SessionID = line.ID
 				applySessionAlias(path, &state, line.ID)
 				if state.ProjectRoot != "" && state.ProjectRoot != "[openclaw]" {
-					state.ProjectRoot = a.resolveProjectRoot(state.ProjectRoot, rootCache)
+					state.ProjectRoot, state.ProjectRemote = a.resolveProjectRoot(state.ProjectRoot, rootCache)
 				}
 			}
 			if line.Cwd != "" {
-				state.ProjectRoot = a.resolveProjectRoot(line.Cwd, rootCache)
+				state.ProjectRoot, state.ProjectRemote = a.resolveProjectRoot(line.Cwd, rootCache)
 			}
 		case "model_change":
 			state.Provider = line.Provider
 			state.Model = line.ModelID
 		case "message":
-			a.parseMessageLine(path, line, lineNum, ts, &state, pending, bootstrapPrefix, &res)
+			a.parseMessageLine(path, line, lineNum, ts, &state, pending, bootstrapPrefix, cacheAcc, &res)
 		case "custom":
 			// OpenClaw emits typed `custom` events for runtime
 			// notifications. customType="model-snapshot" is redundant
@@ -466,6 +539,7 @@ func (a *Adapter) parseSessionJSONL(ctx context.Context, path string, fromOffset
 							SourceEventID: fmt.Sprintf("sysprompt:bootstrap:%s:L%d", hash, lineNum),
 							SessionID:     state.SessionID,
 							ProjectRoot:   state.ProjectRoot,
+							GitRemote:     state.ProjectRemote,
 							Timestamp:     ts,
 							Model:         modelName(&state),
 							Tool:          models.ToolOpenClaw,
@@ -557,9 +631,9 @@ func (a *Adapter) parseTrajectoryJSONL(ctx context.Context, path string, fromOff
 	fallbackSession := strings.TrimSuffix(strings.TrimSuffix(filepath.Base(path), ".jsonl"), ".trajectory")
 	state := sessionContext{SessionID: fallbackSession, ProjectRoot: "[openclaw]"}
 	applySessionAlias(path, &state, fallbackSession)
-	rootCache := map[string]string{}
+	rootCache := map[string]projectGitInfo{}
 	if state.ProjectRoot != "" && state.ProjectRoot != "[openclaw]" {
-		state.ProjectRoot = a.resolveProjectRoot(state.ProjectRoot, rootCache)
+		state.ProjectRoot, state.ProjectRemote = a.resolveProjectRoot(state.ProjectRoot, rootCache)
 	}
 	aliasCache := map[string]string{}
 	// Lazily-loaded set of message-log calls that already have a
@@ -620,9 +694,10 @@ func (a *Adapter) parseTrajectoryJSONL(ctx context.Context, path string, fromOff
 		}
 		sessionID := trajectorySessionID(path, line, state, fallbackSession, aliasCache)
 		projectRoot := state.ProjectRoot
+		projectRemote := state.ProjectRemote
 		if projectRoot == "" || projectRoot == "[openclaw]" {
 			if wd := strings.TrimSpace(line.WorkspaceDir); wd != "" {
-				projectRoot = a.resolveProjectRoot(wd, rootCache)
+				projectRoot, projectRemote = a.resolveProjectRoot(wd, rootCache)
 			}
 		}
 		res.TokenEvents = append(res.TokenEvents, models.TokenEvent{
@@ -635,6 +710,7 @@ func (a *Adapter) parseTrajectoryJSONL(ctx context.Context, path string, fromOff
 			SourceEventID:       fmt.Sprintf("traj:%s:%d", fallbackSession, lineStart),
 			SessionID:           sessionID,
 			ProjectRoot:         projectRoot,
+			GitRemote:           projectRemote,
 			Timestamp:           parseTimestamp(line.Timestamp),
 			Tool:                models.ToolOpenClaw,
 			Model:               line.ModelID,
@@ -871,6 +947,7 @@ func (a *Adapter) parseMessageLine(
 	state *sessionContext,
 	pending map[string]int,
 	bootstrapPrefix func() string,
+	cacheAcc *cacheobs.Accumulator,
 	res *adapter.ParseResult,
 ) {
 	msg := line.Message
@@ -902,11 +979,14 @@ func (a *Adapter) parseMessageLine(
 		if human, ok := splitBootstrapPrompt(text, bootstrapPrefix); ok {
 			preview = human
 		}
+		scrubbedText := a.scrubber.String(text)
+		accumulateUserTextCache(cacheAcc, scrubbedText)
 		res.ToolEvents = append(res.ToolEvents, models.ToolEvent{
 			SourceFile:         sourceFile,
 			SourceEventID:      firstNonEmpty(line.ID, fmt.Sprintf("user:L%d", lineNum)),
 			SessionID:          state.SessionID,
 			ProjectRoot:        state.ProjectRoot,
+			GitRemote:          state.ProjectRemote,
 			Timestamp:          ts,
 			Model:              modelName(state),
 			Tool:               models.ToolOpenClaw,
@@ -915,7 +995,7 @@ func (a *Adapter) parseMessageLine(
 			Success:            true,
 			PrecedingReasoning: truncate(preview, 200),
 			RawToolName:        "message.user",
-			RawToolInput:       a.scrubber.String(text),
+			RawToolInput:       scrubbedText,
 			MessageID:          userMessageID(line.ID, lineNum),
 		})
 	case "assistant":
@@ -952,11 +1032,14 @@ func (a *Adapter) parseMessageLine(
 				// one preamble carries the same string).
 				if body != "" && content.Type == "text" {
 					preview := truncate(a.scrubber.String(body), 200)
+					cappedBody := a.scrubber.String(contentcap.Cap(body, contentcap.DefaultMaxBytes))
+					accumulateAssistantTextCache(cacheAcc, cappedBody)
 					res.ToolEvents = append(res.ToolEvents, models.ToolEvent{
 						SourceFile:         sourceFile,
 						SourceEventID:      fmt.Sprintf("asst:%s:L%d:P%d:%s", firstNonEmpty(line.ID, "noid"), lineNum, partIdx, openclawShortHash(body)),
 						SessionID:          state.SessionID,
 						ProjectRoot:        state.ProjectRoot,
+						GitRemote:          state.ProjectRemote,
 						Timestamp:          ts,
 						Model:              modelName(state),
 						Tool:               models.ToolOpenClaw,
@@ -965,12 +1048,13 @@ func (a *Adapter) parseMessageLine(
 						Success:            true,
 						PrecedingReasoning: preview,
 						RawToolName:        "openclaw.assistant_text",
-						ToolOutput:         a.scrubber.String(contentcap.Cap(body, contentcap.DefaultMaxBytes)),
+						ToolOutput:         cappedBody,
 						MessageID:          assistantMessageID,
 					})
 				}
 			case "toolCall":
 				ev := a.toolCallEvent(sourceFile, line, lineNum, ts, *state, content, assistantMessageID, preceding)
+				accumulateToolCallCache(cacheAcc, content.Name, ev.RawToolInput)
 				pending[content.ID] = len(res.ToolEvents)
 				res.ToolEvents = append(res.ToolEvents, ev)
 			}
@@ -982,6 +1066,7 @@ func (a *Adapter) parseMessageLine(
 				SourceEventID:      firstNonEmpty("complete:"+line.ID, fmt.Sprintf("complete:L%d", lineNum)),
 				SessionID:          state.SessionID,
 				ProjectRoot:        state.ProjectRoot,
+				GitRemote:          state.ProjectRemote,
 				Timestamp:          ts,
 				Model:              modelName(state),
 				Tool:               models.ToolOpenClaw,
@@ -1016,6 +1101,7 @@ func (a *Adapter) parseMessageLine(
 				SourceEventID: firstNonEmpty("error:"+line.ID, fmt.Sprintf("error:L%d", lineNum)),
 				SessionID:     state.SessionID,
 				ProjectRoot:   state.ProjectRoot,
+				GitRemote:     state.ProjectRemote,
 				Timestamp:     ts,
 				Model:         modelName(state),
 				Tool:          models.ToolOpenClaw,
@@ -1028,11 +1114,16 @@ func (a *Adapter) parseMessageLine(
 			})
 		}
 		if hasUsage(msg.Usage) {
+			usageSourceEventID := firstNonEmpty("usage:"+line.ID, fmt.Sprintf("usage:L%d", lineNum))
+			if obs := emitCacheObservation(cacheAcc, sourceFile, state.SessionID, usageSourceEventID, modelName(state), ts, msg.Usage); obs != nil {
+				res.CacheObservations = append(res.CacheObservations, *obs)
+			}
 			res.TokenEvents = append(res.TokenEvents, models.TokenEvent{
 				SourceFile:          sourceFile,
-				SourceEventID:       firstNonEmpty("usage:"+line.ID, fmt.Sprintf("usage:L%d", lineNum)),
+				SourceEventID:       usageSourceEventID,
 				SessionID:           state.SessionID,
 				ProjectRoot:         state.ProjectRoot,
+				GitRemote:           state.ProjectRemote,
 				Timestamp:           ts,
 				Tool:                models.ToolOpenClaw,
 				Model:               modelName(state),
@@ -1065,7 +1156,9 @@ func (a *Adapter) parseMessageLine(
 			return
 		}
 		output := messageText(msg.Content)
-		res.ToolEvents[idx].ToolOutput = a.scrubber.String(output)
+		scrubbedOutput := a.scrubber.String(output)
+		accumulateToolResultCache(cacheAcc, scrubbedOutput)
+		res.ToolEvents[idx].ToolOutput = scrubbedOutput
 		res.ToolEvents[idx].Success = !msg.IsError
 		if msg.IsError {
 			res.ToolEvents[idx].ErrorMessage = truncate(output, 500)
@@ -1080,6 +1173,7 @@ func (a *Adapter) toolCallEvent(sourceFile string, line jsonlLine, lineNum int, 
 		SourceEventID:      firstNonEmpty(content.ID, fmt.Sprintf("tool:%s:L%d", content.Name, lineNum)),
 		SessionID:          state.SessionID,
 		ProjectRoot:        state.ProjectRoot,
+		GitRemote:          state.ProjectRemote,
 		Timestamp:          ts,
 		Model:              modelName(&state),
 		Tool:               models.ToolOpenClaw,
@@ -1269,29 +1363,38 @@ func mapToolName(name string) string {
 	}
 }
 
-// resolveProjectRoot turns a recorded cwd into a stable project root.
-// Mirrors the codex / opencode pattern: empty input yields the
-// "[openclaw]" placeholder so historical rows continue to coalesce;
-// real paths inside a git working tree resolve to the repo root.
-// The cache lives for one parse call.
-func (a *Adapter) resolveProjectRoot(cwd string, cache map[string]string) string {
+// projectGitInfo pairs a resolved project root with its git remote (when
+// the cwd sat inside a real git working tree), so one resolveProjectRoot
+// call — and one cache entry — carries both together.
+type projectGitInfo struct {
+	Root   string
+	Remote string
+}
+
+// resolveProjectRoot turns a recorded cwd into a stable project root plus
+// its normalized git remote. Mirrors the codex / opencode pattern: empty
+// input yields the "[openclaw]" placeholder so historical rows continue to
+// coalesce; real paths inside a git working tree resolve to the repo root
+// and its remote. The cache lives for one parse call.
+func (a *Adapter) resolveProjectRoot(cwd string, cache map[string]projectGitInfo) (string, string) {
 	if cwd == "" {
-		return "[openclaw]"
+		return "[openclaw]", ""
 	}
-	if root, ok := cache[cwd]; ok {
-		return root
+	if info, ok := cache[cwd]; ok {
+		return info.Root, info.Remote
 	}
 	translated := crossmount.TranslateForeignPath(cwd)
 	if _, err := os.Stat(translated); err == nil {
 		if info, err := git.Resolve(translated); err == nil && info.IsGit {
-			cache[cwd] = info.Root
-			return info.Root
+			remote := git.NormalizeRemote(info.Remote)
+			cache[cwd] = projectGitInfo{Root: info.Root, Remote: remote}
+			return info.Root, remote
 		}
-		cache[cwd] = translated
-		return translated
+		cache[cwd] = projectGitInfo{Root: translated}
+		return translated, ""
 	}
-	cache[cwd] = cwd
-	return cwd
+	cache[cwd] = projectGitInfo{Root: cwd}
+	return cwd, ""
 }
 
 func targetFromArgs(args map[string]any, fallback string) string {

@@ -102,6 +102,12 @@
   --tool-droid: #93c5fd;
   --tool-open-interpreter: #efef8f;
   --tool-command-code: #fca5a5;
+  /* 2026-08 wave (zcode / mistral-code / freebuff) — RGB-distance
+     screened >= 39 against all 33 prior tool hues in both themes and
+     >= 197 pairwise among the three. */
+  --tool-zcode: #4cd742;
+  --tool-mistral-code: #3106e0;
+  --tool-freebuff: #e25acb;
   /* Browser-chatbot rail (Phase 2, 2026-07-10) — brand-evocative hues,
      CIE76 ΔE-validated ≥ 21 vs every existing tool + each other (same
      check as wave 3). chatgpt teal-green, claude terracotta, perplexity
@@ -244,6 +250,10 @@
   --tool-droid: #312e81;
   --tool-open-interpreter: #a1a112;
   --tool-command-code: #b91c1c;
+  /* 2026-08 wave — light-theme variants (min RGB-distance >= 39). */
+  --tool-zcode: #2db923;
+  --tool-mistral-code: #2202a7;
+  --tool-freebuff: #dd22bd;
   /* Browser-chatbot rail (Phase 2) — light-theme variants, ΔE-validated. */
   --tool-chatgpt-web: #19e6ce;
   --tool-claude-web: #bf5b40;

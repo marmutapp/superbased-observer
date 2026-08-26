@@ -131,6 +131,17 @@ const (
 	// grammar gate (PRRejectClosedEnvelope) — the envelope is well-formed
 	// and correctly signed, it just is not addressed to this node.
 	PRRejectSelectorMismatch PolicyResourceRejectCode = "selector_mismatch"
+	// PRRejectFamilyNotAccepted is the gen2 P4-2 reject code: the envelope
+	// verified, decoded, and passed every capability/selector gate, but this
+	// node's own [org_client.policy].accept_families allow-list does not
+	// name the family — the node declined it, as opposed to being unable to
+	// honor it. Distinct from PRRejectCapabilityMismatch, which stays
+	// reserved for true capability/version-subset failures (and the earlier
+	// closed-envelope/decode gates keep their own codes) — conflating a
+	// deliberate opt-out with an incapability would corrupt the honest
+	// accounting orgcontract.ReasonFamilyNotAccepted exists to give. It
+	// pairs with PRDeliveredUnaccepted only (see acceptPolicyResource).
+	PRRejectFamilyNotAccepted PolicyResourceRejectCode = "family_not_accepted"
 )
 
 // PolicyResourceResult summarises one policy-resource fetch+accept cycle.
@@ -522,7 +533,7 @@ func (c *Client) acceptPolicyResourceGates(
 	if !stringInSet(family, opts.AcceptFamilies) {
 		return nil, false, "", PolicyResourceResult{
 			Status: PRDeliveredUnaccepted, Version: resource.Version,
-			RejectCode: PRRejectCapabilityMismatch,
+			RejectCode: PRRejectFamilyNotAccepted,
 			Detail:     "family verified but not in [org_client.policy].accept_families — not installed",
 		}, true, nil
 	}

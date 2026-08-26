@@ -185,7 +185,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 		firstOffset: fromOffset,
 		pendingTool: map[string]pendingMark{},
 	}
-	st.projectRoot, st.gitBranch = resolveProjectRoot(hdr.cwd)
+	st.projectRoot, st.gitBranch, st.gitRemote = resolveProjectRoot(hdr.cwd)
 	if hasSidecar {
 		st.model = strings.TrimSpace(sc.Model)
 	}
@@ -208,7 +208,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 		if ts.IsZero() {
 			ts = sidecarMod
 		}
-		if ev, ok := tokenEvent(sc, path, st.sessionID, st.projectRoot, st.gitBranch, ts); ok {
+		if ev, ok := tokenEvent(sc, path, st.sessionID, st.projectRoot, st.gitBranch, st.gitRemote, ts); ok {
 			res.TokenEvents = append(res.TokenEvents, ev)
 		}
 	}
@@ -341,19 +341,19 @@ func (st *parseState) replayRecord(rec *rawRecord) {
 // \\wsl.localhost) BEFORE git.Resolve. The translation is UNCONDITIONAL:
 // a drive-letter path reaching git.Resolve would be treated as relative
 // by filepath.Abs and get the observer's OWN cwd prefixed onto it
-// (feedback_foreign_path_git_resolve). Returns (projectRoot, gitBranch);
-// a blank cwd yields ("", "").
-func resolveProjectRoot(rawCWD string) (root, branch string) {
+// (feedback_foreign_path_git_resolve). Returns (projectRoot, gitBranch,
+// gitRemote); a blank cwd yields ("", "", "").
+func resolveProjectRoot(rawCWD string) (root, branch, remote string) {
 	cwd := strings.TrimSpace(rawCWD)
 	if cwd == "" {
-		return "", ""
+		return "", "", ""
 	}
 	cwd = crossmount.TranslateForeignPath(cwd)
 	info, err := git.Resolve(cwd)
 	if err != nil {
-		return cwd, ""
+		return cwd, "", ""
 	}
-	return info.Root, info.Branch
+	return info.Root, info.Branch, git.NormalizeRemote(info.Remote)
 }
 
 // parseState carries the per-call bookkeeping the record handlers share.
@@ -363,6 +363,7 @@ type parseState struct {
 	sessionID   string
 	projectRoot string
 	gitBranch   string
+	gitRemote   string
 	// model is the current model id: seeded from the sidecar's `model`
 	// and upgraded by each assistant message's own `modelId`.
 	model string
@@ -424,6 +425,7 @@ func (st *parseState) event(eventID, actionType string, ts time.Time) models.Too
 		SessionID:     st.sessionID,
 		ProjectRoot:   st.projectRoot,
 		GitBranch:     st.gitBranch,
+		GitRemote:     st.gitRemote,
 		Timestamp:     ts,
 		Tool:          models.ToolDroid,
 		ActionType:    actionType,

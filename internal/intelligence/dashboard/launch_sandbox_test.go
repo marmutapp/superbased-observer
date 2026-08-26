@@ -329,6 +329,7 @@ func TestTerminalSandboxProbeReturnsSeamResult(t *testing.T) {
 		Backend:        "bwrap",
 		BackendVersion: "0.8.0",
 		HomeMode:       "tmpfs",
+		DefaultOn:      true,
 		Sources:        []SandboxSourceAvail{{ID: "live", Available: true}},
 		Tools:          map[string]SandboxToolAvail{"claude-code": {Available: true}},
 	}}
@@ -343,7 +344,7 @@ func TestTerminalSandboxProbeReturnsSeamResult(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatalf("decode response: %v (body=%s)", err, rec.Body.String())
 	}
-	if !out.Available || out.Backend != "bwrap" || out.BackendVersion != "0.8.0" || out.HomeMode != "tmpfs" {
+	if !out.Available || out.Backend != "bwrap" || out.BackendVersion != "0.8.0" || out.HomeMode != "tmpfs" || !out.DefaultOn {
 		t.Fatalf("out = %+v, want the probe's fields passed through verbatim", out)
 	}
 }

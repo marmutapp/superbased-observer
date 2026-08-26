@@ -1,0 +1,21 @@
+-- 084_org_enrolment_tenancy.sql — Enterprise-Managed Tenancy, node-side half
+-- (docs/plans/org-admin-comprehensive-control-plane-2026-08-19.md §1, Arc 4 P1).
+--
+-- Records the tenancy CLASS this machine enrolled under: 'individual'
+-- (today's default, the only behaviour for a BYO node) vs 'managed' (an
+-- org-provisioned node that opts into comprehensive admin control). It is the
+-- durable node-side truth the developer's own dashboard reads to render the
+-- unhideable "this machine is managed by <org>" transparency panel, and the
+-- signal the govern resolver branches on (via the grant's ConsentMode) to
+-- decide whether managed-only authorities are honoured.
+--
+-- Every existing row and every enrolment that predates a managed token is
+-- 'individual', so an already-enrolled node keeps behaving exactly as today.
+-- It is written at exactly one place — internal/orgclient Enroll, from the
+-- Tenancy field on the enrol response — and read everywhere else (one owner).
+--
+-- Paired with server migration 066 (tenancy on enrolment_tokens). The org
+-- server is the source of truth; this column caches what the node was told at
+-- enrol time so the transparency panel does not require a live server.
+
+ALTER TABLE org_enrolment ADD COLUMN tenancy TEXT NOT NULL DEFAULT 'individual';

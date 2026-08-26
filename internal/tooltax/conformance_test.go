@@ -136,6 +136,8 @@ func TestToolIDValuesMatchModels(t *testing.T) {
 		models.ToolPi: true, models.ToolPrimeAgent: true,
 		models.ToolQoder:    true,
 		models.ToolQwenCode: true, models.ToolRooCode: true,
+		models.ToolZcode: true, models.ToolMistralCode: true,
+		models.ToolFreebuff: true,
 	}
 	for _, tool := range tooltax.Tools() {
 		if !known[tool] {

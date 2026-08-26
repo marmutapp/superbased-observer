@@ -248,6 +248,7 @@ func newHermesCmd() *cobra.Command {
 				dir:      continueDir,
 				proxyURL: resolved,
 				env:      nil, // hermes routes via config.yaml, not an env var
+				dbPath:   cfg.Observer.DBPath,
 				stderr:   cmd.ErrOrStderr(),
 			})
 		},
@@ -986,8 +987,8 @@ func hermesConfiguredModel(path string) (string, error) {
 // the providers.observer entry is written; every other key (the top-level
 // model block, other providers) is preserved, so repeated runs and a changed
 // proxy port both converge without disturbing the operator's defaults. The
-// config is reserialized via yaml.v3 (matching proxyroute.RegisterHermes's
-// established whole-file rewrite), backed up to config.yaml.bak first. The
+// config is reserialized via yaml.v3 (a whole-file rewrite, same discipline
+// this function established), backed up to config.yaml.bak first. The
 // key_env value is the env var NAME, never a literal key.
 func ensureHermesObserverProvider(path, baseURL, keyEnv string) error {
 	data, rerr := os.ReadFile(path) //nolint:gosec // operator's own config path
@@ -1022,8 +1023,8 @@ func ensureHermesObserverProvider(path, baseURL, keyEnv string) error {
 		return fmt.Errorf("encode %s: %w", path, err)
 	}
 	// Back up before the rewrite (yaml reserialization is lossier than JSON;
-	// mirrors proxyroute.RegisterHermes's .bak discipline) so the operator's
-	// prior config is recoverable.
+	// same .bak-before-overwrite discipline used elsewhere) so the
+	// operator's prior config is recoverable.
 	if err := os.WriteFile(path+".bak", data, 0o600); err != nil {
 		return fmt.Errorf("backup %s: %w", path, err)
 	}

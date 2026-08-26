@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
+
+	"github.com/marmutapp/superbased-observer/internal/orgcontract"
 )
 
 // Enrolment is the agent's singleton org_enrolment row (id = 1). It records
@@ -19,6 +21,20 @@ type Enrolment struct {
 	UserEmail    string
 	EnrolledAt   string // RFC3339
 	BearerKeyID  string // keychain service handle (not the secret itself)
+	// Tenancy is the enrolment class: "individual" (default/zero, BYO —
+	// "Never server-forced" holds absolutely) or "managed" (org-provisioned,
+	// opted into comprehensive admin control at enrolment). It is written only
+	// here from the enrol response and read everywhere else; the empty string
+	// is treated as "individual".
+	Tenancy string
+}
+
+// IsManaged reports whether this enrolment opted into Enterprise-Managed
+// Tenancy. Nil-safe: a nil Enrolment (not enrolled) is never managed. The
+// canonical class strings live in internal/orgcontract (the wire package both
+// the node and the org server share) so the two sides cannot drift.
+func (e *Enrolment) IsManaged() bool {
+	return e != nil && e.Tenancy == orgcontract.TenancyManaged
 }
 
 // WriteEnrolment upserts the singleton org_enrolment row. EnrolledAt defaults
@@ -27,10 +43,13 @@ func (s *Store) WriteEnrolment(ctx context.Context, e Enrolment) error {
 	if e.EnrolledAt == "" {
 		e.EnrolledAt = time.Now().UTC().Format(time.RFC3339)
 	}
+	if e.Tenancy == "" {
+		e.Tenancy = orgcontract.TenancyIndividual
+	}
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO org_enrolment
-		   (id, org_id, org_name, org_server_url, user_id, user_email, enrolled_at, bearer_key_id)
-		 VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+		   (id, org_id, org_name, org_server_url, user_id, user_email, enrolled_at, bearer_key_id, tenancy)
+		 VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   org_id         = excluded.org_id,
 		   org_name       = excluded.org_name,
@@ -38,8 +57,9 @@ func (s *Store) WriteEnrolment(ctx context.Context, e Enrolment) error {
 		   user_id        = excluded.user_id,
 		   user_email     = excluded.user_email,
 		   enrolled_at    = excluded.enrolled_at,
-		   bearer_key_id  = excluded.bearer_key_id`,
-		e.OrgID, e.OrgName, e.OrgServerURL, e.UserID, e.UserEmail, e.EnrolledAt, e.BearerKeyID)
+		   bearer_key_id  = excluded.bearer_key_id,
+		   tenancy        = excluded.tenancy`,
+		e.OrgID, e.OrgName, e.OrgServerURL, e.UserID, e.UserEmail, e.EnrolledAt, e.BearerKeyID, e.Tenancy)
 	if err != nil {
 		return fmt.Errorf("store.WriteEnrolment: %w", err)
 	}
@@ -52,14 +72,17 @@ func (s *Store) WriteEnrolment(ctx context.Context, e Enrolment) error {
 func (s *Store) LoadEnrolment(ctx context.Context) (*Enrolment, error) {
 	var e Enrolment
 	err := s.db.QueryRowContext(ctx,
-		`SELECT org_id, org_name, org_server_url, user_id, user_email, enrolled_at, bearer_key_id
+		`SELECT org_id, org_name, org_server_url, user_id, user_email, enrolled_at, bearer_key_id, tenancy
 		   FROM org_enrolment WHERE id = 1`).
-		Scan(&e.OrgID, &e.OrgName, &e.OrgServerURL, &e.UserID, &e.UserEmail, &e.EnrolledAt, &e.BearerKeyID)
+		Scan(&e.OrgID, &e.OrgName, &e.OrgServerURL, &e.UserID, &e.UserEmail, &e.EnrolledAt, &e.BearerKeyID, &e.Tenancy)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("store.LoadEnrolment: %w", err)
+	}
+	if e.Tenancy == "" {
+		e.Tenancy = orgcontract.TenancyIndividual
 	}
 	return &e, nil
 }

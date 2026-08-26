@@ -315,6 +315,84 @@ const (
 	ResumeFork ResumeKind = "handoff"
 )
 
+// HeadlessResultKind names WHERE a headless one-shot run's final answer
+// lands, so the arena runner extracts it without branching on tool identity.
+type HeadlessResultKind string
+
+const (
+	// HeadlessResultNone (zero value): no grounded extraction contract.
+	HeadlessResultNone HeadlessResultKind = ""
+	// HeadlessResultStdoutJSON: the tool prints a machine-readable JSON
+	// envelope on stdout whose shape the runner parses (claude-code's
+	// `--output-format json` result object).
+	HeadlessResultStdoutJSON HeadlessResultKind = "stdout_json"
+	// HeadlessResultOutputFile: the tool writes its final message to a file
+	// named by an -o-style flag (codex exec's `-o <file>`).
+	HeadlessResultOutputFile HeadlessResultKind = "output_file"
+	// HeadlessResultGrokJSON: grok's `-p … --output-format json` prints a
+	// single JSON object keyed text/sessionId/usage/total_cost_usd —
+	// claude-shaped but with different keys (live-verified 2026-08-22).
+	HeadlessResultGrokJSON HeadlessResultKind = "grok_json"
+	// HeadlessResultOpenCodeEvents: opencode run --format json streams
+	// NDJSON events (step_start/text/step_finish), each carrying sessionID;
+	// the final answer is the last `text` part (live-verified 2026-08-22).
+	HeadlessResultOpenCodeEvents HeadlessResultKind = "opencode_events"
+	// HeadlessResultStdoutText: the tool's stdout IS the answer channel —
+	// plain text, no envelope (aider --message; live-verified 2026-08-22).
+	HeadlessResultStdoutText HeadlessResultKind = "stdout_text"
+)
+
+// HeadlessContextMode declares how a headless harness receives operator-
+// selected project files as explicit argv context. The zero value means the
+// harness discovers files from the prompt/workspace without extra arguments.
+type HeadlessContextMode string
+
+const (
+	// HeadlessContextNone leaves context-file argv untouched.
+	HeadlessContextNone HeadlessContextMode = ""
+	// HeadlessContextPositional appends project-relative context files as bare
+	// positional arguments (aider's `aider [files...] --message ...` contract).
+	HeadlessContextPositional HeadlessContextMode = "positional"
+)
+
+// HeadlessSpec declares that a tool has a GROUNDED headless one-shot form:
+// prompt in on argv, final answer out somewhere parseable, no interactive
+// TUI involved. It is the capability the Agent Arena dispatches on (plan:
+// docs/plans/agent-arena-terminal-multi-harness-2026-08-22.md §3). A nil
+// Headless means "no live-verified one-shot contract" — the honest floor;
+// rows are populated only after a real drive proves the argv (same
+// grounding rule as LaunchSpec). Composition is declarative so the runner
+// builds exact args without a tool-name branch (CLAUDE.md #3).
+type HeadlessSpec struct {
+	// Lead is the leading argv tokens before the prompt, typically a
+	// subcommand (codex: ["exec"]). Usually nil.
+	Lead []string
+	// PromptFlag is the flag that introduces the prompt value ("-p" for
+	// claude-code); empty when the prompt is a bare positional after Lead.
+	PromptFlag string
+	// OutputArgs are extra argv required for machine-readable output
+	// (claude-code: ["--output-format", "json"]).
+	OutputArgs []string
+	// Result names where the final answer is extracted from.
+	Result HeadlessResultKind
+	// ResultFlag is the flag naming the output file when Result ==
+	// HeadlessResultOutputFile ("-o" for codex).
+	ResultFlag string
+	// ContextMode declares how optional run-level context files land on argv.
+	// Only live-grounded modes are populated; zero means no explicit delivery.
+	ContextMode HeadlessContextMode
+	// ProxyModelPrefix constrains model selection when the arena supplies a
+	// proxy URL. Some tools expose both a proprietary hosted provider and an
+	// OpenAI-compatible provider, while their base-URL env only affects the
+	// latter (OpenCode: OPENAI_BASE_URL applies to openai/*). Empty means the
+	// proxy route is provider-agnostic.
+	ProxyModelPrefix string
+	// ProxyDefaultModel is selected when ProxyModelPrefix is non-empty and the
+	// operator leaves the candidate model blank. It must include that prefix
+	// and must be grounded by a live routed drive.
+	ProxyDefaultModel string
+}
+
 // ResumeSpec declares the native-resume contract for a tool. It is
 // meaningful only when Kind == ResumeNative; a zero value (Kind ==
 // ResumeNone) means "no grounded native resume" — never a fabricated

@@ -163,6 +163,7 @@ func newClineCLICmd() *cobra.Command {
 				dir:      continueDir,
 				proxyURL: resolved,
 				env:      nil,
+				dbPath:   cfg.Observer.DBPath,
 				stderr:   cmd.ErrOrStderr(),
 			})
 		},

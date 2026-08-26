@@ -16,6 +16,7 @@ import { isRemoteView } from "@/lib/remote";
 import { LaunchTerminal, isLiveStatus } from "@/components/LaunchTerminal";
 import type { Status } from "@/components/LaunchTerminal";
 import { NewTerminalDialog } from "@/components/NewTerminalDialog";
+import type { NewTerminalDraft } from "@/components/NewTerminalDialog";
 import {
   useTerminalStatuses,
   AgentStatusBadge,
@@ -218,6 +219,17 @@ export function LaunchDockProvider({ children }: { children: ReactNode }) {
   const [activeToken, setActiveToken] = useState<string | null>(null);
   const [statuses, setStatuses] = useState<Record<string, Status>>({});
   const [newOpen, setNewOpen] = useState(false);
+  // Guided installers run in a visible setup PTY and normally exit when the
+  // package is installed. Preserve the launcher's exact choices while that PTY
+  // owns the screen, then reopen New Terminal against a fresh preflight when
+  // it exits so the operator does not have to choose tool/root/model/sandbox
+  // all over again.
+  const [newTerminalDraft, setNewTerminalDraft] = useState<NewTerminalDraft>();
+  const [resumedAfterInstall, setResumedAfterInstall] = useState(false);
+  const [pendingInstall, setPendingInstall] = useState<{
+    token: string;
+    draft: NewTerminalDraft;
+  } | null>(null);
   // The per-terminal floating panels — project panels (file tree + git) AND
   // session cockpit panels. ONE shared array for both kinds: multi-panel, one
   // entry per terminal token × kind, all simultaneously open, rendered at
@@ -286,6 +298,19 @@ export function LaunchDockProvider({ children }: { children: ReactNode }) {
     setStatuses((prev) => (prev[token] === s ? prev : { ...prev, [token]: s }));
   }, []);
 
+  useEffect(() => {
+    if (!pendingInstall) return;
+    const status = statuses[pendingInstall.token];
+    if (status !== "exited" && status !== "error") return;
+    setNewTerminalDraft(pendingInstall.draft);
+    setPendingInstall(null);
+    setResumedAfterInstall(true);
+    setActiveToken((current) =>
+      current === pendingInstall.token ? null : current,
+    );
+    setNewOpen(true);
+  }, [pendingInstall, statuses]);
+
   const registerWorkspaceCell = useCallback(
     (token: string, el: HTMLElement | null) => {
       setCells((prev) => {
@@ -302,7 +327,13 @@ export function LaunchDockProvider({ children }: { children: ReactNode }) {
     [],
   );
 
-  const openNewTerminal = useCallback(() => setNewOpen(true), []);
+  const openNewTerminal = useCallback(() => {
+    // A manual reopen supersedes the pending automatic one, but deliberately
+    // keeps the saved draft so an impatient operator still resumes in place.
+    setPendingInstall(null);
+    setResumedAfterInstall(false);
+    setNewOpen(true);
+  }, []);
 
   // Open/toggle the project panel for a token. Same-tab reopen closes it
   // (toggle); other-tab reopen retargets the tab and raises; a new token
@@ -562,13 +593,26 @@ export function LaunchDockProvider({ children }: { children: ReactNode }) {
         statuses={statuses}
         onRestore={restore}
         onClose={closeSession}
-        onNew={() => setNewOpen(true)}
+        onNew={openNewTerminal}
       />
       {newOpen && (
         <NewTerminalDialog
-          onClose={() => setNewOpen(false)}
-          onLaunched={(handle, tool, hasProjectRoot) => {
+          initialDraft={newTerminalDraft}
+          resumedAfterInstall={resumedAfterInstall}
+          onClose={() => {
             setNewOpen(false);
+            setResumedAfterInstall(false);
+          }}
+          onLaunched={(handle, tool, hasProjectRoot, resumeDraft) => {
+            setNewOpen(false);
+            setResumedAfterInstall(false);
+            if (resumeDraft) {
+              setNewTerminalDraft(resumeDraft);
+              setPendingInstall({ token: handle, draft: resumeDraft });
+            } else {
+              setNewTerminalDraft(undefined);
+              setPendingInstall(null);
+            }
             launch({ token: handle, tool, sessionId: "", hasProjectRoot: hasProjectRoot ?? false });
           }}
         />

@@ -40,6 +40,12 @@ const (
 	// guard plus its SPA, which is why it is named for the surface and not
 	// for a proxy lane.
 	PointNodeDashboard = "node-dashboard"
+	// PointNodeFeatures is the v4 node.features point (org-parity W5.1: an
+	// org-governed feature enable/disable + limits gate consulted at four
+	// dashboard enforcement seams — terminal launch, remote arm/pair,
+	// routing apply, patterns write). Named for the family it reports,
+	// exactly like node-dashboard is named for its own surface.
+	PointNodeFeatures = "node-features"
 )
 
 // Family identifiers (§2.4). One family per enforcement point.
@@ -58,6 +64,11 @@ const (
 	// family (v3). Same literal as policyfam.FamilyNodeGovernance,
 	// duplicated for the same dependency-graph reason as the others.
 	FamilyNodeGovernance = "node.governance"
+	// FamilyNodeFeatures is the org-parity W5.1 node feature-governance
+	// family (v4). Same literal as policyfam.FamilyNodeFeatures / policyfam/
+	// nodefeatures's own package, duplicated for the same dependency-graph
+	// reason as the others.
+	FamilyNodeFeatures = "node.features"
 )
 
 // PointFacts is the resolved input for ONE enforcement point (§4.1). The split
@@ -118,6 +129,31 @@ type PointFacts struct {
 	InertReason string
 	// LastSeen is the point's liveness instant at report time (RFC3339 on wire).
 	LastSeen time.Time
+
+	// --- gen2 (P4-2), meaningful ONLY when point == PointNodeDashboard ---
+	// The server 400s a report that populates any of these three on a row
+	// for a different point/family, so Resolve gates copying them onto the
+	// wire row to the node-dashboard point alone; a reader for any other
+	// point may leave them zero-valued without consequence.
+
+	// AcceptedAuthority is govern.HonoredAuthority(grant): the grant's own
+	// authority tokens, honoured (a Managed-only token is stripped unless
+	// the node's consent mode allows it). Says nothing about whether any of
+	// it currently raises anything on THIS delivered body — see
+	// ExtractionEffective for that.
+	AcceptedAuthority []string
+	// ExtractionEffective is govern.ExtractionTokensInForce(eff,
+	// AcceptedAuthority): the subset of AcceptedAuthority that both is an
+	// extraction authority and currently gates a live raise under the
+	// node's resolved govern.Effective — the honest "what is this grant's
+	// extraction authority actually DOING right now" list.
+	ExtractionEffective []string
+	// DroppedClasses maps a govern directive class name (sections/pinned/
+	// share/features) to the wire reason it was not applied, translated
+	// from govern.Effective.Dropped through the closed gen2 vocabulary
+	// (orgcontract.ReasonNotPreauthorized / ReasonSidecarUnwritable). Nil
+	// when nothing was dropped.
+	DroppedClasses map[string]string
 }
 
 // PointReader resolves the live PointFacts for one enforcement point. It is the
@@ -296,6 +332,15 @@ func Resolve(point, family string, f PointFacts) orgcontract.PolicyStateRow {
 		RestartRequired: f.HasOrgRail && f.CachedAcceptedVersion > 0 && f.RunningVersion < f.CachedAcceptedVersion,
 		LastSeen:        f.LastSeen.UTC().Format(time.RFC3339),
 	}
+	// gen2 (P4-2): these three fields are meaningful only on the
+	// node-dashboard row — the server 400s a report that populates them on
+	// any other family/point, so the copy is gated here, in the one place
+	// every point's row is built, rather than trusted to every PointReader.
+	if point == PointNodeDashboard {
+		row.AcceptedAuthority = f.AcceptedAuthority
+		row.ExtractionEffective = f.ExtractionEffective
+		row.DroppedClasses = f.DroppedClasses
+	}
 	for _, rule := range resolveTable {
 		if rule.match(c) {
 			row.Status = rule.status
@@ -337,6 +382,7 @@ var pointFamily = map[string]string{
 	PointProxyEgress:   FamilyEgressGuardrail,
 	PointProxyGateway:  FamilyGatewayProviders,
 	PointNodeDashboard: FamilyNodeGovernance,
+	PointNodeFeatures:  FamilyNodeFeatures,
 }
 
 // CorePoints is the v1 (four-point) subset of the snapshot — the row set a
@@ -370,7 +416,7 @@ func IsCorePoint(point string) bool {
 // server would happily have taken.
 //
 // ORDER IS THE CONTRACT: append new optional points, never insert.
-var OptionalPoints = []string{PointProxyGateway, PointNodeDashboard}
+var OptionalPoints = []string{PointProxyGateway, PointNodeDashboard, PointNodeFeatures}
 
 // IsOptionalPoint reports whether point is an optional (post-v1) point.
 func IsOptionalPoint(point string) bool {

@@ -1,0 +1,4 @@
+{"role":"user","content":"Add a .gitignore file","message_id":"u1"}
+{"role":"assistant","content":"Sure, working on it now.","message_id":"a1"}
+{"role":"assistant","content":null,"message_id":"a2","tool_calls":[{"id":"tc1","index":0,"type":"function","function":{"name":"write_file","arguments":"{\"file_path\":\"/home/dev/samplerepo/.gitignore\",\"content\":\"__pycache__/\\n\"}"}}]}
+{"role":"tool","name":"write_file","tool_call_id":"tc1","content":"command: write_file\nsession_id: deadbeef\nstatus: completed\nbytes_written: 13\n","tool_result":{"path":"/home/dev/samplerepo/.gitignore","bytes_written":13}}

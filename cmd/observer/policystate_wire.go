@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -40,6 +41,12 @@ import (
 // interface so the reporter unit-tests with a fake poster, no live daemon.
 type policyStatePoster interface {
 	PostPolicyState(ctx context.Context, report orgcontract.PolicyStateReport) error
+	// ManagedMachineIdentity returns this host's org-salted machine
+	// fingerprint when enrolled under managed tenancy, "" otherwise
+	// (fail-open — see *orgclient.Client.ManagedMachineIdentity). The
+	// generation-ladder report() calls this once per report() invocation
+	// to stamp the gen2 send; a gen1-projected send always sends "".
+	ManagedMachineIdentity(ctx context.Context) string
 }
 
 // policyStateNotifier is the on-change seam (§4.3 / R2-B7): a buffered-size-1
@@ -308,6 +315,71 @@ func newGatewayPointReader(
 	}
 }
 
+// newNodeFeaturesPointReader builds the node.features PointReader (org-parity
+// W5.1). Its facts come from the nodeFeaturesHandle install seam — the only
+// holder of the accepted spec's identity — via Facts(), never from a live
+// read of the compiled *nodefeatures.PolicySpec itself (the reader has no
+// business knowing the family's own decoded shape; that stays behind
+// nodeFeaturesHandle.Allowed/TerminalAllowed).
+//
+// Mode is a PROJECTION exactly as for gateway.providers/node.governance: the
+// node.features body carries no mode field, because a feature is either
+// governing this node's enforcement seams right now or it isn't. enforce =
+// the spec is installed and every gated seam consults it; observe = a body
+// was accepted but is inert (not preauthorized — every seam stays fail-open,
+// which is also what the server's accepted_inert => observe rule requires);
+// off = no org rail at all (an ungoverned/solo node — there is no local
+// overlay to fall back to, so this is always no_policy, never
+// local_effective, matching node.governance's same reasoning).
+//
+// pending_restart is unreachable today: nodeFeaturesHandle.Facts() is read
+// live at the moment of each enforcement seam (terminal launch, remote arm/
+// pair, routing apply, patterns write), never cached into a restart-bound
+// process-startup snapshot the way node.governance's pinned config is.
+func newNodeFeaturesPointReader(
+	nf *nodeFeaturesHandle,
+	lastFetch func() orgclient.PolicyResourceFetchOutcome,
+	now func() time.Time,
+) policystate.PointReader {
+	return func(context.Context) (policystate.PointFacts, error) {
+		g := nf.Facts()
+		o := orgclient.PolicyResourceFetchOutcome{}
+		if lastFetch != nil {
+			o = lastFetch()
+		}
+		reject := wirePolicyResourceRejectReason(o.RejectCode)
+		f := policystate.PointFacts{
+			HasOrgRail:          g.HasOrgRail,
+			InertReason:         g.InertReason,
+			LastSeen:            now(),
+			LatestFetchRejected: reject != "",
+			RejectCode:          reject,
+			RejectedVersion:     o.Version,
+			Unreachable:         o.Unreachable,
+		}
+		switch {
+		case g.HasOrgRail && !g.InEffect:
+			// Accepted, durably committed, deliberately NOT governing (the
+			// preauthorization gate rejected it) — every seam stays fail-open.
+			f.CachedAcceptedVersion = g.Version
+			f.RunningVersion = g.Version
+			f.EffectiveHash = g.BodyHash
+			f.EnforceMode = "observe"
+		case g.HasOrgRail:
+			f.CachedAcceptedVersion = g.Version
+			f.RunningVersion = g.Version
+			f.EffectiveHash = g.BodyHash
+			f.EnforceMode = "enforce"
+		default:
+			// No org rail. There is no local feature-governance overlay — a
+			// solo node's features are simply ungoverned — so this is always
+			// no_policy, never local_effective.
+			f.EnforceMode = "off"
+		}
+		return f, nil
+	}
+}
+
 // wirePolicyResourceRejectReason maps an orgclient PolicyResourceRejectCode
 // onto the closed orgcontract Reason enum the PolicyAck server allowlist
 // accepts for delivered_unaccepted (plan §7.1/§7.2). Codes with no wire
@@ -333,6 +405,14 @@ func wirePolicyResourceRejectReason(code orgclient.PolicyResourceRejectCode) str
 		// a server does not allow 400s the WHOLE policy-state snapshot, not
 		// just this row.
 		return orgcontract.ReasonSelectorMismatch
+	case orgclient.PRRejectFamilyNotAccepted:
+		// gen2 P4-2: the resource verified but this node's
+		// [org_client.policy].accept_families does not list the family — it
+		// was never installed at all, which is a DIFFERENT fact than a
+		// capability-shape mismatch on a family the node DID accept. Pairs
+		// only with PRDeliveredUnaccepted (see acceptPolicyResourceGates),
+		// so this is a delivered_unaccepted row, never accepted_inert.
+		return orgcontract.ReasonFamilyNotAccepted
 	case orgclient.PRRejectVersionDowngrade:
 		return orgcontract.ReasonVersionDowngrade
 	case orgclient.PRRejectVersionReplay:
@@ -436,6 +516,14 @@ type policyStateReporter struct {
 	logger       *slog.Logger
 	notifier     *policyStateNotifier
 
+	// ngov is the node.governance handle, consulted (W-9) so an org
+	// "policy_state" share directive can LOWER this channel off even though
+	// [org_client.share].policy_state is configured true locally. nil in the
+	// raw newPolicyStateReporter test constructor (report() falls back to
+	// r.enabled unchanged in that case) — only buildPolicyStateReporter,
+	// which owns a live handle, populates it.
+	ngov *nodeGovernanceHandle
+
 	mu           sync.Mutex
 	lastGuard    orgclient.GuardFetchOutcome
 	lastRouting  orgclient.RoutingFetchOutcome
@@ -443,6 +531,7 @@ type policyStateReporter struct {
 	lastEgress   orgclient.PolicyResourceFetchOutcome
 	lastGateway  orgclient.PolicyResourceFetchOutcome
 	lastGovern   orgclient.PolicyResourceFetchOutcome
+	lastFeatures orgclient.PolicyResourceFetchOutcome
 
 	running     atomic.Bool // single-flight guard for report()
 	unsupported atomic.Bool // 404/405 latch (S8)
@@ -468,6 +557,13 @@ type policyStateReporter struct {
 	latched    atomic.Bool
 	latchDepth atomic.Int32
 	probed     atomic.Bool
+
+	// latchGen1 records WHICH generation the latched depth was accepted at
+	// (the generation ladder, gen2 P4-2/W-4). true once any gen1-projected
+	// send has been accepted — including the very first ladder rung, since
+	// the ladder loop only ever walks gen1-projected rows (see report()). It
+	// is meaningless while !latched and is never read there.
+	latchGen1 atomic.Bool
 }
 
 // newPolicyStateReporter constructs a reporter over injected dependencies (so
@@ -543,6 +639,8 @@ func (r *policyStateReporter) recordPolicyResource(family string, o orgclient.Po
 		r.lastGateway = mergePolicyResourceOutcome(r.lastGateway, o)
 	case policyfam.FamilyNodeGovernance:
 		r.lastGovern = mergePolicyResourceOutcome(r.lastGovern, o)
+	case policyfam.FamilyNodeFeatures:
+		r.lastFeatures = mergePolicyResourceOutcome(r.lastFeatures, o)
 	}
 	r.mu.Unlock()
 	r.notifier.Poke()
@@ -570,6 +668,12 @@ func (r *policyStateReporter) governanceSlot() orgclient.PolicyResourceFetchOutc
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.lastGovern
+}
+
+func (r *policyStateReporter) featuresSlot() orgclient.PolicyResourceFetchOutcome {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastFeatures
 }
 
 // mergePolicyResourceOutcome mirrors mergeRoutingOutcome for the P0-5
@@ -647,8 +751,58 @@ func mergeRoutingOutcome(prev, o orgclient.RoutingFetchOutcome) orgclient.Routin
 // channel off for the daemon lifetime (S8); a 400 on the FIRST attempt
 // triggers the v2 core-only probe (§3.2). It honors ctx (a cancel abandons
 // the in-flight POST) and never propagates an error (P1 posture).
+// report() implements a two-axis compat ladder: GENERATION (gen2 full-fidelity
+// rows carrying the top-level MachineIdentity + the node.governance row's
+// AcceptedAuthority/ExtractionEffective/DroppedClasses, vs. gen1 — those four
+// fields stripped/remapped by projectGen1) crossed with the pre-existing
+// optional-POINT depth ladder. The combined walk is strictly linear:
+//
+//	[gen2 @ full depth, gen1 @ full depth, gen1 @ depth-1, ..., gen1 @ 0]
+//
+// gen2 is attempted ONLY at full depth, never at a reduced depth. This is not
+// a simplification that loses coverage: the gen2 fields exist ONLY on the
+// node.governance row (P4-2), which is registered unconditionally and is
+// itself the LAST entry in policystate.OptionalPoints, so gen2 content is
+// present in a snapshot if and only if that snapshot is at full depth. And no
+// server can be "new enough to understand a reduced-but-nonzero optional-point
+// set, yet too old for gen2": gen2 ships in the same release as every
+// optional point this build knows about, so a server old enough to reject any
+// gen2 field is old enough to reject SOME optional point too — which the
+// gen1-at-full-depth rung already probes for. Once gen2-at-full is rejected,
+// every later rung in the ladder (including the depth walk) is gen1-projected
+// for the rest of the daemon's lifetime; only depth is still open to probe.
+// effectiveEnabled resolves whether this report() call should run at all
+// (W-9): the configured [org_client.share].policy_state value (r.enabled),
+// LOWERED by a live "policy_state" node.governance share directive when one
+// is present. It reuses govern.Effective.LowerBool — the SAME merge
+// primitive the push seam and the Privacy card both use — rather than
+// hand-rolling the algebra here.
+//
+// Only LowerBool is exercised, never MergeBool/RaiseBool: "policy_state" is
+// one of W-8's two conscious extraction-tier exemptions (no
+// GrantsXxxExtraction token maps to it — see sharetiers.go), so an org
+// directive can turn this channel OFF but can structurally never turn it ON.
+// A node with r.enabled==false therefore stays off regardless of the org
+// body; only the true→false direction is live here. r.ngov==nil (the raw
+// newPolicyStateReporter test constructor, or a daemon build that never
+// wired node.governance) falls back to r.enabled unchanged — the same
+// fail-open posture every other org-directive consumer in this codebase
+// uses when its handle is absent.
+func (r *policyStateReporter) effectiveEnabled(ctx context.Context) bool {
+	if !r.enabled {
+		return false
+	}
+	if r.ngov == nil {
+		return true
+	}
+	return r.ngov.Effective(ctx).LowerBool("policy_state", true)
+}
+
 func (r *policyStateReporter) report(ctx context.Context) {
-	if r == nil || !r.enabled || r.unsupported.Load() {
+	if r == nil || r.unsupported.Load() {
+		return
+	}
+	if !r.effectiveEnabled(ctx) {
 		return
 	}
 	if !r.running.CompareAndSwap(false, true) {
@@ -667,37 +821,115 @@ func (r *policyStateReporter) report(ctx context.Context) {
 			"rows", len(rows), "want", len(r.readers))
 		return
 	}
+	gen1Full := projectGen1(rows)
+
 	if r.latched.Load() {
-		r.post(ctx, rowsAtDepth(rows, int(r.latchDepth.Load())))
+		depth := int(r.latchDepth.Load())
+		if r.latchGen1.Load() {
+			r.post(ctx, rowsAtDepth(gen1Full, depth), "")
+		} else {
+			// Defensive / should be unreachable via this function: every
+			// latching branch below sets latchGen1 together with latched, so
+			// a gen2 latch can only arise from a future code path that sets
+			// latched some other way. Falls back to the live identity + full
+			// rows rather than silently downgrading.
+			r.post(ctx, rowsAtDepth(rows, depth), r.poster.ManagedMachineIdentity(ctx))
+		}
 		return
 	}
-	if outcome := r.post(ctx, rows); outcome != postRejected {
+
+	mid := r.poster.ManagedMachineIdentity(ctx)
+	if outcome := r.post(ctx, rows, mid); outcome != postRejected {
 		return
 	}
-	// The full snapshot was REFUSED (400). Walk the optional-point ladder
-	// ONCE per daemon lifetime, newest optional point first, and latch at the
-	// highest depth the server accepts. A rejection that survives all the way
-	// to core-only is NOT latched: it was about something else (a genuinely
-	// malformed core row), and latching would hide a real bug behind a compat
-	// story.
+	// The full gen2 snapshot was REFUSED (400). Probe ONCE per daemon
+	// lifetime: first gen1-at-full-depth (unless this snapshot carries no
+	// gen2 content to strip in the first place — skipGen1Probe — in which
+	// case that rung would be a byte-identical repeat of the send that was
+	// just rejected, so it is skipped straight into the existing
+	// optional-point depth ladder, now walked over gen1-projected rows), then
+	// the depth ladder, newest optional point first, latching at the highest
+	// rung accepted. A rejection that survives all the way to gen1-depth-0 is
+	// NOT latched: it was about something else (a genuinely malformed core
+	// row), and latching would hide a real bug behind a compat story.
 	if !r.probed.CompareAndSwap(false, true) {
 		return
 	}
+	skipGen1Probe := mid == "" && rowsEqualContent(rows, gen1Full)
+	if !skipGen1Probe {
+		if r.post(ctx, gen1Full, "") == postOK {
+			r.latched.Store(true)
+			r.latchGen1.Store(true)
+			r.latchDepth.Store(int32(len(policystate.OptionalPoints)))
+			r.logger.Info("policystate: server rejected the gen2 snapshot but accepted the gen1 projection — older server, dropping gen2 fields for this daemon lifetime")
+			return
+		}
+	}
 	for depth := len(policystate.OptionalPoints) - 1; depth >= 0; depth-- {
-		candidate := rowsAtDepth(rows, depth)
-		if len(candidate) == len(rows) {
+		candidate := rowsAtDepth(gen1Full, depth)
+		if len(candidate) == len(gen1Full) {
 			continue // this snapshot carries no row at that depth to drop
 		}
-		if r.post(ctx, candidate) != postOK {
+		if r.post(ctx, candidate, "") != postOK {
 			continue
 		}
 		r.latched.Store(true)
+		r.latchGen1.Store(true)
 		r.latchDepth.Store(int32(depth))
 		dropped := policystate.OptionalPoints[depth:]
 		r.logger.Info("policystate: server rejected the full snapshot but accepted a narrower one — older server, dropping the newest optional points for this daemon lifetime",
 			"dropped_points", dropped, "sent_rows", len(candidate), "full_rows", len(rows))
 		return
 	}
+}
+
+// projectGen1 returns a copy of rows with every gen2-only field cleared: the
+// three node.governance row fields (meaningless, and 400-rejected by the
+// server, on any row that isn't family="node.governance" — but cleared
+// unconditionally here since only that row ever carries them) and the two
+// gen2 Reason values remapped to their nearest gen1 equivalent, so a gen1
+// server sees exactly the reason vocabulary it already understands:
+//   - ReasonFamilyNotAccepted (the resource verified but the family isn't in
+//     accept_families) folds into ReasonCapabilityMismatch, the closest gen1
+//     reason for "this node did not install what was delivered".
+//   - ReasonSidecarUnwritable (the governance sidecar file could not be
+//     written) folds into ReasonNotPreauthorized, the gen1 reason
+//     newNodeGovernancePointReader used for every accepted-but-inert case
+//     before gen2 gave sidecar-unwritable its own identity.
+//
+// It does not mutate rows — the caller may still need the gen2-full slice for
+// the (rare) latchGen1==false defensive path in report().
+func projectGen1(rows []orgcontract.PolicyStateRow) []orgcontract.PolicyStateRow {
+	out := make([]orgcontract.PolicyStateRow, len(rows))
+	for i, row := range rows {
+		row.AcceptedAuthority = nil
+		row.ExtractionEffective = nil
+		row.DroppedClasses = nil
+		switch row.Reason {
+		case orgcontract.ReasonFamilyNotAccepted:
+			row.Reason = orgcontract.ReasonCapabilityMismatch
+		case orgcontract.ReasonSidecarUnwritable:
+			row.Reason = orgcontract.ReasonNotPreauthorized
+		}
+		out[i] = row
+	}
+	return out
+}
+
+// rowsEqualContent reports whether a and b carry identical rows in the same
+// order — used to detect a snapshot that has no gen2 content to strip (a pre-
+// gen2 reader set, or a gen2 node.governance row that happens to carry no
+// gen2 fields this cycle) so report() can skip a byte-identical repeat POST.
+func rowsEqualContent(a, b []orgcontract.PolicyStateRow) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !reflect.DeepEqual(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // postOutcome is the classified result of one policy-ack POST. It exists so
@@ -721,19 +953,27 @@ const (
 )
 
 // post draws a fresh ReportSeq and POSTs one snapshot, returning the
-// classified outcome.
+// classified outcome. machineIdentity rides the top-level
+// PolicyStateReport.MachineIdentity field (W-4) — the caller passes the live
+// ManagedMachineIdentity() value only on the gen2-at-full-depth attempt, and
+// "" on every gen1-projected attempt (see report()).
 //
 // Each POST draws its OWN seq. Reusing one would be wrong: the server's
 // upsert predicate is `excluded.report_seq > policy_state.report_seq`, so a
 // same-seq retry against an existing row would be silently discarded. A
 // skipped seq value is harmless — gaps already occur on any failed POST.
-func (r *policyStateReporter) post(ctx context.Context, rows []orgcontract.PolicyStateRow) postOutcome {
+func (r *policyStateReporter) post(ctx context.Context, rows []orgcontract.PolicyStateRow, machineIdentity string) postOutcome {
 	seq, err := r.seq.Next()
 	if err != nil {
 		r.logger.Warn("policystate: report_seq persist failed; skipping POST", "err", err)
 		return postFailed
 	}
-	rep := orgcontract.PolicyStateReport{AgentVersion: r.agentVersion, ReportSeq: seq, Rows: rows}
+	rep := orgcontract.PolicyStateReport{
+		AgentVersion:    r.agentVersion,
+		ReportSeq:       seq,
+		Rows:            rows,
+		MachineIdentity: machineIdentity,
+	}
 	perr := r.poster.PostPolicyState(ctx, rep)
 	switch {
 	case perr == nil:
@@ -820,6 +1060,7 @@ func buildPolicyStateReporter(
 	routingHandle *RoutingStateHandle,
 	gw *gatewayProvidersHandle,
 	ngov *nodeGovernanceHandle,
+	nf *nodeFeaturesHandle,
 	cfg config.Config,
 	agentVersion string,
 	logger *slog.Logger,
@@ -833,6 +1074,7 @@ func buildPolicyStateReporter(
 		enabled:      cfg.OrgClient.Share.PolicyState,
 		logger:       logger,
 		notifier:     newPolicyStateNotifier(),
+		ngov:         ngov,
 	}
 	if rep.logger == nil {
 		rep.logger = slog.Default()
@@ -866,6 +1108,13 @@ func buildPolicyStateReporter(
 		// review's grant-implies-new-server coupling was dropped in favour of
 		// the optional-point ladder.
 		policystate.PointNodeDashboard: newNodeGovernancePointReader(ngov, rep.governanceSlot, now),
+		// v4 (org-parity W5.1): registered UNCONDITIONALLY, including when
+		// no node.features policy exists — the same optional-point ladder
+		// reasoning as the other two: an omitted row is indistinguishable
+		// from an older agent, an explicit none/no_policy row is the honest
+		// "this node's terminals/remote/routing-apply/patterns-write are
+		// ungoverned" fact.
+		policystate.PointNodeFeatures: newNodeFeaturesPointReader(nf, rep.featuresSlot, now),
 	}
 	return rep
 }

@@ -38,6 +38,15 @@ func (s *Store) LoadModelValueFacts(ctx context.Context, opts modelvalue.LoadOpt
 	// Queries are assembled here (the only dynamic part is the optional
 	// project predicate, always parameter-bound) and executed by the
 	// per-arm loaders — the advisor-loader structure.
+	//
+	// No ORDER BY on any of the three: api_turns/token_usage/actions
+	// are large tables with no index covering (session_id, timestamp),
+	// so a DB-side sort here would spill a temp B-tree (P1-C). Ordering
+	// is load-bearing but produced downstream instead — report.go's
+	// indexFacts sorts turns globally by (session, timestamp) and
+	// actions per session by timestamp (both stably) before any
+	// classification runs, so a pre-sorted arm here would already have
+	// been redundant.
 	proxyQ := `
 		SELECT at.session_id, COALESCE(s.project_id, 0), COALESCE(p.root_path, ''),
 		       at.timestamp, COALESCE(at.model, ''), COALESCE(at.request_id, ''),
@@ -51,8 +60,7 @@ func (s *Store) LoadModelValueFacts(ctx context.Context, opts modelvalue.LoadOpt
 		FROM api_turns at
 		JOIN sessions s ON s.id = at.session_id
 		LEFT JOIN projects p ON p.id = s.project_id
-		WHERE at.timestamp >= ?` + mvScope(opts) + `
-		ORDER BY at.session_id, at.timestamp`
+		WHERE at.timestamp >= ?` + mvScope(opts)
 	jsonlQ := `
 		SELECT tu.session_id, COALESCE(s.project_id, 0), COALESCE(p.root_path, ''),
 		       tu.timestamp, COALESCE(tu.model, ''), COALESCE(tu.source_event_id, ''),
@@ -63,8 +71,7 @@ func (s *Store) LoadModelValueFacts(ctx context.Context, opts modelvalue.LoadOpt
 		FROM token_usage tu
 		JOIN sessions s ON s.id = tu.session_id
 		LEFT JOIN projects p ON p.id = s.project_id
-		WHERE tu.timestamp >= ?` + mvScope(opts) + `
-		ORDER BY tu.session_id, tu.timestamp`
+		WHERE tu.timestamp >= ?` + mvScope(opts)
 	actionsQ := `
 		SELECT a.session_id, a.timestamp, a.action_type,
 		       COALESCE(a.success, 1), COALESCE(a.is_sidechain, 0),
@@ -73,8 +80,7 @@ func (s *Store) LoadModelValueFacts(ctx context.Context, opts modelvalue.LoadOpt
 		FROM actions a
 		JOIN sessions s ON s.id = a.session_id
 		LEFT JOIN projects p ON p.id = s.project_id
-		WHERE a.timestamp >= ?` + mvScope(opts) + `
-		ORDER BY a.session_id, a.timestamp`
+		WHERE a.timestamp >= ?` + mvScope(opts)
 
 	if err := s.loadModelValueProxyTurns(ctx, proxyQ, since, opts, f, turnIDs, shapeKeys); err != nil {
 		return nil, fmt.Errorf("store.LoadModelValueFacts: proxy rows: %w", err)

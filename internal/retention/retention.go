@@ -21,15 +21,20 @@ type Result struct {
 	DBSizeBytesBefore       int64
 	DBSizeBytesAfter        int64
 	DurationMs              int64
-	// SizeCapUnmet is set when the size-cap shrink stopped while the DB
-	// was still over MaxDBSizeMB — because shedding aged `actions` (the
-	// only table the size loop prunes) couldn't bring it under cap. That
-	// means the bulk is in OTHER tables (token_usage / cache_*), and the
-	// operator should raise max_db_size_mb or add token retention rather
-	// than have the size loop destroy the actions table. The caller logs
-	// a WARN. Pre-fix the loop kept deleting actions to (near) zero
-	// chasing an unreachable cap; now it respects an action-keep floor
-	// and stops here instead.
+	// SizeCapUnmet is set when the single bounded size-cap shed pass
+	// (shrinkToCap) left the DB still over MaxDBSizeMB — because shedding
+	// aged `actions` (the only table this pass prunes) couldn't bring it
+	// under cap, either because the keep-floor stopped it or because a
+	// DELETE alone (no automatic full VACUUM — see shrinkToCap) doesn't
+	// shrink the file. That means the bulk is in OTHER tables
+	// (token_usage / cache_*), or the file needs the operator-triggered
+	// `observer prune --vacuum` compaction. The operator should raise
+	// max_db_size_mb, add token retention, or run `observer prune
+	// --vacuum` in a restart window rather than have this pass destroy
+	// the actions table chasing an unreachable cap. The caller logs a
+	// WARN. Historically (pre-2026-08-fix) this path looped a bare
+	// `VACUUM` up to 12x per pass, which is exactly the incident this
+	// field's guard now prevents.
 	SizeCapUnmet bool
 	// CacheRowsDeleted is the count of cache_* table rows removed
 	// by the cachetrack sweep (spec §9). The retention package
@@ -377,68 +382,89 @@ func (p *Pruner) deleteOrphanedSessions(ctx context.Context, res *Result) error 
 // the non-actions bulk.
 const sizeCapActionFloorDays = 30
 
-// shrinkToCap iteratively drops the oldest 30-day window of actions until
-// the DB file is under the size cap OR the action-keep floor is reached.
-// Capped at 12 iterations as a safety rail against an unexpectedly small
-// max_db_size_mb (e.g. 1MB while individual sessions stay open).
+// shrinkToCap performs AT MOST ONE bounded reclamation pass when the DB
+// file exceeds the size cap: it sheds a single 30-day window of the
+// oldest `actions` (never crossing the sizeCapActionFloorDays keep-floor),
+// checkpoints the WAL, and runs the existing bounded incrementalVacuum
+// (a no-op unless the DB has already been converted to
+// auto_vacuum=INCREMENTAL via the daemon-down `observer prune --vacuum`
+// step — that's fine and correct; it's live-safe either way).
+//
+// It NEVER issues a bare `VACUUM` and NEVER loops. A full VACUUM rewrites
+// the entire file under an exclusive lock and needs ~2x disk headroom —
+// on a many-GB DB that is a minutes-long stall and can itself exhaust
+// disk. That reclamation class is operator-triggered only
+// (ConvertToIncrementalVacuum / `observer prune --vacuum` in a restart
+// window), never automatic (2026-08-26 incident: this loop ran a bare
+// VACUUM up to 12x per pass, rewriting a ~40GB file to a /var/tmp temp
+// copy on every startup and every retention tick).
+//
+// If, after the single pass, the DB is still over cap — because the
+// oldest action is already within the keep-floor (actions can't be shed
+// further so the bulk lives in other tables), because there are no
+// actions left to shave, or because the pass didn't bring the file under
+// cap (expected on an unconverted auto_vacuum=NONE DB, since a DELETE
+// alone only frees pages to the internal freelist without a VACUUM) —
+// shrinkToCap sets res.SizeCapUnmet and returns. The caller WARNs once,
+// naming the real bulk and pointing at raising max_db_size_mb or running
+// the daemon-down `observer prune --vacuum` compaction.
 func (p *Pruner) shrinkToCap(ctx context.Context, opts Options, res *Result) error {
 	cap := int64(opts.MaxDBSizeMB) * 1024 * 1024
-	floor := nowUTC().AddDate(0, 0, -sizeCapActionFloorDays)
-	for i := 0; i < 12; i++ {
-		size := sizeOf(opts.DBPath)
-		if size <= cap {
-			return nil
-		}
-		var minTS sql.NullString
-		if err := p.db.QueryRowContext(ctx,
-			`SELECT MIN(timestamp) FROM actions`).Scan(&minTS); err != nil {
-			return fmt.Errorf("retention: min timestamp: %w", err)
-		}
-		if !minTS.Valid {
-			// No actions left to shave, yet still over cap → the bulk is
-			// in other tables. Stop and flag rather than no-op silently.
-			res.SizeCapUnmet = true
-			return nil
-		}
-		min, err := time.Parse(time.RFC3339Nano, minTS.String)
-		if err != nil {
-			return fmt.Errorf("retention: parse min timestamp %q: %w", minTS.String, err)
-		}
-		// Floor guard: if the oldest action is already within the keep-
-		// floor, we must not delete it — actions can't be shed further, so
-		// the over-cap condition is owned by other tables.
-		if !min.Before(floor) {
-			res.SizeCapUnmet = true
-			return nil
-		}
-		cutoff := min.Add(30 * 24 * time.Hour)
-		if cutoff.After(floor) {
-			cutoff = floor // clamp: never cross the keep-floor in one pass
-		}
-		actionsBefore := res.ActionsDeleted
-		if err := p.deleteActionsOlder(ctx, cutoff.Format(time.RFC3339Nano), res); err != nil {
-			return err
-		}
-		if err := p.deleteOrphanedSessions(ctx, res); err != nil {
-			return err
-		}
-		_, _ = p.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
-		// VACUUM compacts the main file to reflect deletes; this is the
-		// only way to shrink the .db file without auto_vacuum enabled.
-		if _, err := p.db.ExecContext(ctx, `VACUUM`); err != nil {
-			// VACUUM can fail under heavy concurrent load; non-fatal.
-			break
-		}
-		res.SizePassesRun++
-		// If a pass deleted no actions OR the file didn't shrink, actions
-		// aren't the bulk — stop churning and flag rather than loop to the
-		// floor pointlessly.
-		if res.ActionsDeleted == actionsBefore || sizeOf(opts.DBPath) >= size {
-			res.SizeCapUnmet = true
-			return nil
-		}
+	size := sizeOf(opts.DBPath)
+	if size <= cap {
+		return nil
 	}
-	if sizeOf(opts.DBPath) > cap {
+
+	var minTS sql.NullString
+	if err := p.db.QueryRowContext(ctx,
+		`SELECT MIN(timestamp) FROM actions`).Scan(&minTS); err != nil {
+		return fmt.Errorf("retention: min timestamp: %w", err)
+	}
+	if !minTS.Valid {
+		// No actions left to shave, yet still over cap → the bulk is in
+		// other tables. Stop and flag rather than no-op silently.
+		res.SizeCapUnmet = true
+		return nil
+	}
+	min, err := time.Parse(time.RFC3339Nano, minTS.String)
+	if err != nil {
+		return fmt.Errorf("retention: parse min timestamp %q: %w", minTS.String, err)
+	}
+
+	// Floor guard: if the oldest action is already within the keep-floor,
+	// we must not delete it — actions can't be shed further, so the
+	// over-cap condition is owned by other tables. Gate here, before any
+	// work, so an unreachable cap costs nothing beyond the MIN() lookup
+	// above.
+	floor := nowUTC().AddDate(0, 0, -sizeCapActionFloorDays)
+	if !min.Before(floor) {
+		res.SizeCapUnmet = true
+		return nil
+	}
+
+	cutoff := min.Add(30 * 24 * time.Hour)
+	if cutoff.After(floor) {
+		cutoff = floor // clamp: never cross the keep-floor in one pass
+	}
+	actionsBefore := res.ActionsDeleted
+	if err := p.deleteActionsOlder(ctx, cutoff.Format(time.RFC3339Nano), res); err != nil {
+		return err
+	}
+	if err := p.deleteOrphanedSessions(ctx, res); err != nil {
+		return err
+	}
+	_, _ = p.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
+	// Bounded, live-safe reclamation — a no-op unless the DB is already
+	// auto_vacuum=INCREMENTAL. Never a bare VACUUM.
+	p.incrementalVacuum(ctx, opts.IncrementalVacuumPages)
+	res.SizePassesRun++
+
+	// Report whether the single pass actually shed the bulk. A DELETE
+	// with no incremental/full vacuum doesn't shrink the file at all
+	// (freed pages just join the freelist), so on an unconverted DB this
+	// will almost always still be over cap — that's expected; the fix is
+	// `observer prune --vacuum`, not another automatic pass here.
+	if res.ActionsDeleted == actionsBefore || sizeOf(opts.DBPath) > cap {
 		res.SizeCapUnmet = true
 	}
 	return nil

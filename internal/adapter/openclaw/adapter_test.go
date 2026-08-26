@@ -525,7 +525,7 @@ func TestParseSessionFile_SessionsIndexUsesCanonicalSessionKey(t *testing.T) {
 func TestResolveProjectRoot_PreservesUnreachableForeignPath(t *testing.T) {
 	a := NewWithOptions(nil, []string{t.TempDir()})
 	const foreign = `C:\definitely-missing\observer-openclaw`
-	if got := a.resolveProjectRoot(foreign, map[string]string{}); got != foreign {
+	if got, _ := a.resolveProjectRoot(foreign, map[string]projectGitInfo{}); got != foreign {
 		t.Fatalf("resolveProjectRoot(%q) = %q, want unchanged foreign path", foreign, got)
 	}
 }
@@ -1197,5 +1197,93 @@ func TestParseSessionFile_ThinkingNeverMintsAnAction(t *testing.T) {
 	}
 	if got := tools[2].PrecedingReasoning; got != two {
 		t.Errorf("tool[2] PrecedingReasoning = %q, want %q (a newer preamble replaces the older)", got, two)
+	}
+}
+
+// Lineage emission: a task run with a DISTINCT child session key stamps a
+// migration-069 lineage (parent = requester, thread_source=subagent); a
+// self-run (child == requester == owner) emits nothing.
+func TestParseSessionFile_TaskRunsEmitChildLineages(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "runs.sqlite")
+	setupTaskRunsDB(t, dbPath)
+	// Add a proper spawn row: distinct requester and child keys.
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO task_runs (
+			task_id, runtime, source_id, requester_session_key, owner_key,
+			scope_kind, child_session_key, agent_id, run_id, label, task, status,
+			delivery_status, notify_policy, created_at, started_at, ended_at,
+			last_event_at, cleanup_after
+		) VALUES (
+			'task_spawn', 'cli', 'run_2', 'agent:main:explicit:parent-conv',
+			'agent:worker', 'session',
+			'agent:worker:child-sess-key', 'worker', 'run_2', '',
+			'do the subtask',
+			'succeeded', 'not_applicable', 'silent', 1776892400000, 1776892401000,
+			1776892402000, 1776892402000, 1777497202000
+		)`)
+	db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a := NewWithOptions(nil, []string{root})
+	res, err := a.ParseSessionFile(context.Background(), dbPath, 0)
+	if err != nil {
+		t.Fatalf("ParseSessionFile: %v", err)
+	}
+	if len(res.SessionLineages) != 1 {
+		t.Fatalf("got %d lineages (%+v), want 1", len(res.SessionLineages), res.SessionLineages)
+	}
+	lin := res.SessionLineages[0]
+	if lin.SessionID != "agent:worker:child-sess-key" ||
+		lin.ParentThreadID != "agent:main:explicit:parent-conv" ||
+		lin.ThreadSource != "subagent" {
+		t.Fatalf("lineage wrong: %+v", lin)
+	}
+}
+
+// A task lineage can be stored before its child session row exists, making the
+// store upsert a no-op. The unchanged task watermark must still replay that
+// durable link on the next scan so the later child ingest converges.
+func TestParseSessionFile_TaskRunsReplayLineagePastWatermark(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "runs.sqlite")
+	setupTaskRunsDB(t, dbPath)
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO task_runs (
+			task_id, runtime, requester_session_key, owner_key, scope_kind,
+			child_session_key, task, status, delivery_status, notify_policy,
+			created_at, last_event_at
+		) VALUES (
+			'replay_spawn', 'cli', 'parent-late', 'worker', 'session',
+			'child-late', 'late child', 'running', 'not_applicable', 'silent',
+			1776892500000, 1776892500000
+		)`)
+	db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a := NewWithOptions(nil, []string{root})
+	first, err := a.ParseSessionFile(context.Background(), dbPath, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := a.ParseSessionFile(context.Background(), dbPath, first.NewOffset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.ToolEvents) != 0 {
+		t.Fatalf("watermarked events replayed: %+v", second.ToolEvents)
+	}
+	if len(second.SessionLineages) != 1 || second.SessionLineages[0].SessionID != "child-late" || second.SessionLineages[0].ParentThreadID != "parent-late" {
+		t.Fatalf("durable lineage did not replay past watermark: %+v", second.SessionLineages)
 	}
 }

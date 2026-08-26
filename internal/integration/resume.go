@@ -17,7 +17,7 @@ import (
 // (CLAUDE.md #3). Adding a new mechanism here is the one edit a future
 // launcher-translation needs.
 var knownResumeMechanisms = map[string]bool{
-	"flag:--resume":     true, // tool takes `--resume <id>` (claude-code, gemini-cli, qwen-code, grok, devin, hermes, qoder)
+	"flag:--resume":     true, // tool takes `--resume <id>` (claude-code, gemini-cli, qwen-code, grok, devin, hermes, qoder, prime-agent, zcode, mistral-code)
 	"subcommand:resume": true, // tool takes `resume <id>` (codex)
 	"positional":        true, // tool takes a bare `<id>` positional
 	// The 2026-07-24 live-verified native-resume wave (15 launchers). Each key
@@ -29,6 +29,8 @@ var knownResumeMechanisms = map[string]bool{
 	"flag:--id":           true, // `--id <id>` (cline-cli)
 	"flag:--conversation": true, // `--conversation <id>` (antigravity-cli)
 	"flag:--resume-id":    true, // `--resume-id <id>` (kiro-cli, under its `chat` subcommand)
+	// 2026-08 wave (zcode / mistral-code / freebuff).
+	"flag:--continue": true, // `--continue=<id>` (freebuff, joined `=` spelling — an optional-value commander.js flag)
 }
 
 // ResumeArgs composes the argv TAIL appended after `observer <spec.Subcommand>`

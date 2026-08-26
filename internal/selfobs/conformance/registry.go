@@ -49,8 +49,16 @@ type Component struct {
 }
 
 // RegisteredComponents is the single registry of decision components.
-// Routing/advisor/admission/eval + SyntheticReference are Wired:true after
-// P1-10 Phases B–D; insight-agent stays Wired:false until P2-7.
+// Routing/advisor/admission/eval + SyntheticReference were wired Wired:true
+// by P1-10 Phases B-D (real production emit call sites: internal/routing via
+// cmd/observer/routing_live.go, the advisor via cmd/observer/advise.go,
+// admission/eval via cmd/observer/obs_wire.go + proxy.go). Insight-agent
+// joined them Wired:true this wave (P2-7 close-out): its real production
+// call site is internal/orgserver/insightstore/runplaybook.go's RunPlaybook,
+// which covers BOTH the manual admin-triggered path
+// (intelligence_opamp_handlers.go) and the scheduled path (insightsched) —
+// both fund through that one function. All six entries below are now
+// genuinely Wired:true; none is tracked-not-failed.
 var RegisteredComponents = []Component{
 	{Name: ComponentRouting, Wired: true, Conformer: routingConformer},
 	{Name: ComponentAdvisor, Wired: true, Conformer: advisorConformer},
@@ -111,6 +119,16 @@ func evalConformer(ctx context.Context, sink emit.Sink) {
 	})
 }
 
+// insightConformer is the Wired reference for the insight-agent retrofit
+// (P2-7): shaped exactly like its four siblings above, INCLUDING
+// InitiatedBy: provenance.ActorHuman — an insight-agent run is never
+// initiated BY an insight agent (that would be a circular, meaningless
+// self-reference: the fixed system_agent producer already IS the insight
+// agent for this run, via Component=ComponentInsightAgent). Its real
+// InitiatedBy is a human (an admin's manual trigger) or provenance.ActorSystem
+// (the scheduler) — see
+// internal/orgserver/insightstore/runplaybook.go's selfObsInitiatedBy, which
+// this conformer's ActorHuman choice mirrors as the illustrative case.
 func insightConformer(ctx context.Context, sink emit.Sink) {
 	sink.Emit(ctx, run.DecisionRun{
 		RunID:       "insight-conformer-run",
@@ -119,7 +137,7 @@ func insightConformer(ctx context.Context, sink emit.Sink) {
 		Component:   ComponentInsightAgent,
 		Decisions:   []string{"playbook:conformer", "outcome:abstain"},
 		Outcome:     "verified",
-		InitiatedBy: provenance.ActorInsightAgent,
+		InitiatedBy: provenance.ActorHuman,
 	})
 }
 

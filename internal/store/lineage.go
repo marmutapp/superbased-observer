@@ -8,15 +8,27 @@ import (
 )
 
 // SessionLineageChild is a compact descriptor of a session spawned from
-// (forked or subagent-of) a parent codex session — surfaced in the
-// parent's session-detail "spawned sessions" list. Token/cost rollups are
-// deliberately NOT included: the per-session cost is a heavy per-turn CTE
-// (handleSessionDetail) and building a fresh aggregate here would violate
-// the single-owner rule for no user-visible gain in the child rows.
+// (forked or subagent-of) a parent session — surfaced in the parent's
+// session-detail "spawned sessions" list. Since the 2026-08-21 operator
+// ruling that per-sub-agent usage must be visible on the parent's detail
+// view (opencode sub-agents are separate sessions, unlike claude-code's
+// same-session sidechains), each child carries lightweight rollups:
+// token sums over its non-sidechain token_usage rows, their recorded
+// estimated cost, and its action count. These are plain indexed GROUP BY
+// aggregates — deliberately NOT the heavy per-turn cost-engine CTE, which
+// stays single-owned by handleSessionDetail.
 type SessionLineageChild struct {
 	ID           string
 	ThreadSource string
 	StartedAt    string
+	// InputTokens / OutputTokens sum the child's non-sidechain token_usage
+	// rows; CostUSD sums their recorded estimated_cost_usd (zero when the
+	// adapter doesn't record cost). ActionCount is the child's actions row
+	// count (zero when pruned or not yet ingested).
+	InputTokens  int64
+	OutputTokens int64
+	CostUSD      float64
+	ActionCount  int64
 }
 
 // SessionLineageView is the codex fork/subagent lineage for one session
@@ -32,8 +44,10 @@ type SessionLineageView struct {
 	// ParentInDB reports whether a session row exists for ForkedFromID.
 	// Only queried when ForkedFromID is non-empty; false otherwise.
 	ParentInDB bool
-	// Children are the sessions whose forked_from_id equals this session
-	// id, ordered by start time. Nil when there are none.
+	// Children are the sessions whose forked_from_id OR parent_thread_id
+	// equals this session id (codex user-forks stamp forked_from_id;
+	// codex + opencode sub-agent spawns stamp parent_thread_id), ordered
+	// by start time. Nil when there are none.
 	Children []SessionLineageChild
 }
 
@@ -73,16 +87,33 @@ func (s *Store) LoadSessionLineage(ctx context.Context, sessionID string) (Sessi
 	}
 
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, COALESCE(thread_source, ''), started_at
-		 FROM sessions WHERE forked_from_id = ?
-		 ORDER BY started_at`, sessionID)
+		`SELECT s.id, COALESCE(s.thread_source, ''), s.started_at,
+		        COALESCE(tu.input_tokens, 0), COALESCE(tu.output_tokens, 0),
+		        COALESCE(tu.cost_usd, 0), COALESCE(ac.action_count, 0)
+		 FROM sessions s
+		 LEFT JOIN (
+		       SELECT session_id,
+		              SUM(input_tokens) AS input_tokens,
+		              SUM(output_tokens) AS output_tokens,
+		              SUM(estimated_cost_usd) AS cost_usd
+		         FROM token_usage
+		        WHERE COALESCE(is_sidechain, 0) = 0
+		        GROUP BY session_id
+		 ) tu ON tu.session_id = s.id
+		 LEFT JOIN (
+		       SELECT session_id, COUNT(*) AS action_count
+		         FROM actions GROUP BY session_id
+		 ) ac ON ac.session_id = s.id
+		 WHERE s.forked_from_id = ? OR s.parent_thread_id = ?
+		 ORDER BY s.started_at`, sessionID, sessionID)
 	if err != nil {
 		return v, fmt.Errorf("store.LoadSessionLineage: children: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var c SessionLineageChild
-		if err := rows.Scan(&c.ID, &c.ThreadSource, &c.StartedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.ThreadSource, &c.StartedAt,
+			&c.InputTokens, &c.OutputTokens, &c.CostUSD, &c.ActionCount); err != nil {
 			return v, fmt.Errorf("store.LoadSessionLineage: scan child: %w", err)
 		}
 		v.Children = append(v.Children, c)

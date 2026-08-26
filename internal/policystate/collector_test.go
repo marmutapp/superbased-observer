@@ -401,6 +401,54 @@ func TestAssemble_MapsGatewayPointToItsFamily(t *testing.T) {
 	}
 }
 
+// TestAssemble_MapsNodeFeaturesPointToItsFamily is TestAssemble_MapsGatewayPointToItsFamily's
+// sibling for the org-parity W5.1 point (docs/plans/org-parity-full-depth-plan-2026-08-24.md
+// §4): PointNodeFeatures resolves to FamilyNodeFeatures — the mapping the
+// node.features ACK, and the Fleet-state "Feature gates" column, depend on.
+func TestAssemble_MapsNodeFeaturesPointToItsFamily(t *testing.T) {
+	readers := map[string]PointReader{
+		PointNodeFeatures: func(context.Context) (PointFacts, error) {
+			return PointFacts{EffectiveHash: hex64, EnforceMode: "enforce"}, nil
+		},
+	}
+	rows, err := Assemble(context.Background(), readers)
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	if rows[0].Family != FamilyNodeFeatures {
+		t.Fatalf("family = %q, want %q", rows[0].Family, FamilyNodeFeatures)
+	}
+	if rows[0].EnforcementPoint != PointNodeFeatures {
+		t.Fatalf("point = %q, want %q", rows[0].EnforcementPoint, PointNodeFeatures)
+	}
+}
+
+// TestOptionalPoints_IncludesNodeFeaturesNotCore pins node-features as the
+// third OptionalPoints member (alongside proxy-gateway/node-dashboard) —
+// see collector.go's "ORDER IS THE CONTRACT" comment on OptionalPoints. A
+// v1-server downgrade must drop it exactly like the other two, never treat
+// it as one of the required four.
+func TestOptionalPoints_IncludesNodeFeaturesNotCore(t *testing.T) {
+	found := false
+	for _, p := range OptionalPoints {
+		if p == PointNodeFeatures {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("OptionalPoints = %v, want it to include %q", OptionalPoints, PointNodeFeatures)
+	}
+	if IsCorePoint(PointNodeFeatures) {
+		t.Fatalf("IsCorePoint(%q) = true, want false — it is optional, not one of the v1 four", PointNodeFeatures)
+	}
+	if _, ok := pointFamily[PointNodeFeatures]; !ok {
+		t.Errorf("node-features point has no family mapping — Assemble would silently drop it")
+	}
+}
+
 // TestCorePoints_IsTheV1FourAndExcludesGateway pins the core/optional split
 // the reporter's pre-v2 downgrade depends on (spec §3.2). If the gateway
 // point ever leaks into CorePoints, the downgrade posts a five-row snapshot
@@ -440,5 +488,58 @@ func TestResolve_GatewayLocalEffective(t *testing.T) {
 	}
 	if row.RestartRequired {
 		t.Error("restart_required = true, want false for a local row")
+	}
+}
+
+// TestResolve_Gen2FieldsGatedToNodeDashboardOnly is the P4-2 gate: the
+// server 400s a report that populates AcceptedAuthority/ExtractionEffective/
+// DroppedClasses on any row other than node.governance's, so Resolve must
+// copy them onto the wire row ONLY for PointNodeDashboard — even when a
+// (misbehaving) reader supplies them for another point. This is the
+// collector-side half of the P4-2 gate the wire-shape doc comment on
+// PointFacts describes; cmd/observer/nodegov_wire.go's reader is the only
+// one that ever actually populates these three fields, but Resolve must not
+// rely on that.
+func TestResolve_Gen2FieldsGatedToNodeDashboardOnly(t *testing.T) {
+	gen2 := PointFacts{
+		EffectiveHash:       hex64,
+		EnforceMode:         "enforce",
+		AcceptedAuthority:   []string{"extract.cache"},
+		ExtractionEffective: []string{"extract.cache"},
+		DroppedClasses:      map[string]string{"pinned": orgcontract.ReasonNotPreauthorized},
+	}
+
+	nodeRow := Resolve(PointNodeDashboard, FamilyNodeGovernance, gen2)
+	if len(nodeRow.AcceptedAuthority) != 1 || nodeRow.AcceptedAuthority[0] != "extract.cache" {
+		t.Fatalf("node-dashboard AcceptedAuthority = %v, want [extract.cache]", nodeRow.AcceptedAuthority)
+	}
+	if len(nodeRow.ExtractionEffective) != 1 || nodeRow.ExtractionEffective[0] != "extract.cache" {
+		t.Fatalf("node-dashboard ExtractionEffective = %v, want [extract.cache]", nodeRow.ExtractionEffective)
+	}
+	if nodeRow.DroppedClasses["pinned"] != orgcontract.ReasonNotPreauthorized {
+		t.Fatalf("node-dashboard DroppedClasses = %v, want pinned->%s", nodeRow.DroppedClasses, orgcontract.ReasonNotPreauthorized)
+	}
+
+	others := []struct {
+		point  string
+		family string
+	}{
+		{PointGuard, FamilyGuardCoding},
+		{PointRouter, FamilyRoutingOptimization},
+		{PointProxyAdmitter, FamilyAdmissionInput},
+		{PointProxyEgress, FamilyEgressGuardrail},
+		{PointProxyGateway, FamilyGatewayProviders},
+	}
+	for _, o := range others {
+		row := Resolve(o.point, o.family, gen2)
+		if row.AcceptedAuthority != nil {
+			t.Errorf("%s: AcceptedAuthority = %v, want nil (gen2 fields must never leak off node-dashboard)", o.point, row.AcceptedAuthority)
+		}
+		if row.ExtractionEffective != nil {
+			t.Errorf("%s: ExtractionEffective = %v, want nil", o.point, row.ExtractionEffective)
+		}
+		if row.DroppedClasses != nil {
+			t.Errorf("%s: DroppedClasses = %v, want nil", o.point, row.DroppedClasses)
+		}
 	}
 }

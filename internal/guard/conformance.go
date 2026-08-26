@@ -126,6 +126,11 @@ func ConformanceMatrix() []ConformanceEntry {
 		// for both, so the post-hoc watcher row is their only guard
 		// surface — same shape as muse/prime-agent.
 		models.ToolDeepSeek, models.ToolJunie,
+		// zcode + mistral-code + freebuff (2026-08-18 wave): watcher-path
+		// adapters (SQLite/JSONL tail), registry Hook HookNone for all
+		// three, so the post-hoc watcher row is their only guard
+		// surface — same shape as the 2026-07 wave above.
+		models.ToolZcode, models.ToolMistralCode, models.ToolFreebuff,
 	} {
 		entries = append(entries, watcherEntry(client))
 	}

@@ -161,6 +161,7 @@ func newCopilotCLICmd() *cobra.Command {
 				dir:      continueDir,
 				proxyURL: resolved,
 				env:      env,
+				dbPath:   cfg.Observer.DBPath,
 				stderr:   cmd.ErrOrStderr(),
 			})
 		},

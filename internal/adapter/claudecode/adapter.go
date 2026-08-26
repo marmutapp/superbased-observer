@@ -365,7 +365,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 	// then sum up.
 	msgIDToIdx := map[string]int{}
 	// Cache of project root per cwd.
-	rootCache := map[string]string{}
+	rootCache := map[string]projectGitInfo{}
 	reasoningByTurn := []string{}
 	// V7d / audit B4 — track the last seen line context for the four
 	// metadata line types Claude Code emits without their own
@@ -481,7 +481,8 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 			if line.Type == "system" && line.Subtype == "api_error" && len(line.Error) > 0 {
 				ts := parseTimestamp(line.Timestamp)
 				projectRoot := a.resolveProjectRoot(line.Cwd, rootCache)
-				ev := buildAPIErrorEvent(path, line, ts, projectRoot)
+				projectRemote := a.resolveProjectRemote(line.Cwd, rootCache)
+				ev := buildAPIErrorEvent(path, line, ts, projectRoot, projectRemote)
 				if ev != nil {
 					res.ToolEvents = append(res.ToolEvents, *ev)
 				}
@@ -518,6 +519,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 					ts = lastTs
 				}
 				projectRoot := a.resolveProjectRoot(firstNonEmpty(line.Cwd, lastCwd), rootCache)
+				projectRemote := a.resolveProjectRemote(firstNonEmpty(line.Cwd, lastCwd), rootCache)
 				target := fmt.Sprintf("%s: ~%d tokens reclaimed", line.CompactMetadata.Trigger, line.CompactMetadata.PreTokens)
 				rawIn, _ := json.Marshal(line.CompactMetadata)
 				res.ToolEvents = append(res.ToolEvents, models.ToolEvent{
@@ -526,6 +528,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 					SessionID:     line.SessionID,
 					ProjectRoot:   projectRoot,
 					GitBranch:     firstNonEmpty(line.GitBranch, lastBranch),
+					GitRemote:     projectRemote,
 					Timestamp:     ts,
 					Tool:          models.ToolClaudeCode,
 					ActionType:    models.ActionContextCompacted,
@@ -560,6 +563,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 					ts = lastTs
 				}
 				projectRoot := a.resolveProjectRoot(firstNonEmpty(line.Cwd, lastCwd), rootCache)
+				projectRemote := a.resolveProjectRemote(firstNonEmpty(line.Cwd, lastCwd), rootCache)
 				target := fmt.Sprintf("%dms wallclock / %d msgs", line.DurationMs, line.MessageCount)
 				res.ToolEvents = append(res.ToolEvents, models.ToolEvent{
 					SourceFile:    path,
@@ -567,6 +571,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 					SessionID:     line.SessionID,
 					ProjectRoot:   projectRoot,
 					GitBranch:     firstNonEmpty(line.GitBranch, lastBranch),
+					GitRemote:     projectRemote,
 					Timestamp:     ts,
 					Tool:          models.ToolClaudeCode,
 					ActionType:    models.ActionPostToolBatch,
@@ -592,12 +597,14 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 				}
 				lastAgentName = line.AgentName
 				projectRoot := a.resolveProjectRoot(lastCwd, rootCache)
+				projectRemote := a.resolveProjectRemote(lastCwd, rootCache)
 				res.ToolEvents = append(res.ToolEvents, models.ToolEvent{
 					SourceFile:    path,
 					SourceEventID: "agent-name:" + line.AgentName,
 					SessionID:     line.SessionID,
 					ProjectRoot:   projectRoot,
 					GitBranch:     lastBranch,
+					GitRemote:     projectRemote,
 					Timestamp:     lastTs,
 					Tool:          models.ToolClaudeCode,
 					ActionType:    models.ActionSubagentStart,
@@ -605,7 +612,11 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 					Success:       true,
 					RawToolName:   "agent-name",
 					RawToolInput:  fmt.Sprintf(`{"agentName":%q}`, line.AgentName),
-					IsSidechain:   line.IsSidechain,
+					// Structured sub-agent identity so the /subagents read
+					// model can label transcript-derived windows without
+					// raw-field scraping (mirrors the hook path).
+					Metadata:    &models.ActionMetadata{AgentID: line.AgentName},
+					IsSidechain: line.IsSidechain,
 				})
 				continue
 			}
@@ -621,12 +632,14 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 				}
 				lastPermissionMode = line.PermissionMode
 				projectRoot := a.resolveProjectRoot(lastCwd, rootCache)
+				projectRemote := a.resolveProjectRemote(lastCwd, rootCache)
 				res.ToolEvents = append(res.ToolEvents, models.ToolEvent{
 					SourceFile:    path,
 					SourceEventID: "permission-mode:" + line.PermissionMode,
 					SessionID:     line.SessionID,
 					ProjectRoot:   projectRoot,
 					GitBranch:     lastBranch,
+					GitRemote:     projectRemote,
 					Timestamp:     lastTs,
 					Tool:          models.ToolClaudeCode,
 					ActionType:    models.ActionPermissionMode,
@@ -650,6 +663,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 
 			ts := parseTimestamp(line.Timestamp)
 			projectRoot := a.resolveProjectRoot(line.Cwd, rootCache)
+			projectRemote := a.resolveProjectRemote(line.Cwd, rootCache)
 
 			if msg.Usage != nil {
 				// Drop Claude Code's synthetic placeholder rows. The CLI emits
@@ -680,6 +694,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 					SessionID:             line.SessionID,
 					ProjectRoot:           projectRoot,
 					GitBranch:             line.GitBranch,
+					GitRemote:             projectRemote,
 					Timestamp:             ts,
 					Tool:                  models.ToolClaudeCode,
 					Model:                 msg.Model,
@@ -702,6 +717,12 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 					Source:      models.TokenSourceJSONL,
 					Reliability: models.ReliabilityUnreliable,
 					MessageID:   msg.ID,
+					// Sub-agent usage attribution (migration 087): the
+					// same line-level isSidechain bit the tool events
+					// carry. Without it a sub-agent's turns are counted
+					// in the session totals but can't be bucketed into
+					// its window by the dashboard's sub-agents view.
+					IsSidechain: line.IsSidechain,
 				}
 				if msg.ID != "" {
 					if idx, ok := msgIDToIdx[msg.ID]; ok {
@@ -790,6 +811,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 						ProjectRoot:        projectRoot,
 						Timestamp:          ts,
 						GitBranch:          line.GitBranch,
+						GitRemote:          projectRemote,
 						Tool:               models.ToolClaudeCode,
 						ActionType:         models.ActionUserPrompt,
 						Target:             truncated,
@@ -808,12 +830,12 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 				case "text":
 					if msg.Role == "assistant" && strings.TrimSpace(block.Text) != "" {
 						reasoningByTurn = appendCapped(reasoningByTurn, block.Text, 20)
-						ev := a.assistantTextEvent(path, line, msg.ID, projectRoot, ts, blockIdx, block.Text)
+						ev := a.assistantTextEvent(path, line, msg.ID, projectRoot, projectRemote, ts, blockIdx, block.Text)
 						stampTurnMeta(&ev, msg)
 						res.ToolEvents = append(res.ToolEvents, ev)
 					}
 				case "tool_use":
-					evt := a.toolUseEvent(path, line, block, projectRoot, ts, msg.ID)
+					evt := a.toolUseEvent(path, line, block, projectRoot, projectRemote, ts, msg.ID)
 					evt.PrecedingReasoning = truncateReasoning(lastReasoning(reasoningByTurn))
 					stampTurnMeta(&evt, msg)
 					idx := len(res.ToolEvents)
@@ -1238,6 +1260,7 @@ func (a *Adapter) assistantTextEvent(
 	line rawLine,
 	messageID string,
 	projectRoot string,
+	projectRemote string,
 	ts time.Time,
 	blockIdx int,
 	text string,
@@ -1255,6 +1278,7 @@ func (a *Adapter) assistantTextEvent(
 		ProjectRoot:   projectRoot,
 		Timestamp:     ts,
 		GitBranch:     line.GitBranch,
+		GitRemote:     projectRemote,
 		Tool:          models.ToolClaudeCode,
 		// Per-text-block row: one per `text` content block of EVERY
 		// assistant message, mid-turn included (85% of claude-code turns
@@ -1288,6 +1312,7 @@ func (a *Adapter) toolUseEvent(
 	line rawLine,
 	block rawContentBlock,
 	projectRoot string,
+	projectRemote string,
 	ts time.Time,
 	messageID string,
 ) models.ToolEvent {
@@ -1313,6 +1338,7 @@ func (a *Adapter) toolUseEvent(
 		ProjectRoot:   projectRoot,
 		Timestamp:     ts,
 		GitBranch:     line.GitBranch,
+		GitRemote:     projectRemote,
 		Tool:          models.ToolClaudeCode,
 		ActionType:    actionType,
 		Target:        target,
@@ -1415,10 +1441,20 @@ func (a *Adapter) extractTarget(toolName string, rawInput []byte, projectRoot st
 	return ""
 }
 
+// projectGitInfo is the per-cwd cache entry for resolveProjectRoot /
+// resolveProjectRemote: the resolved project root and its normalized
+// "origin" remote, captured together from a single git.Resolve call so
+// the two never drift and the filesystem walk never happens twice for
+// the same cwd.
+type projectGitInfo struct {
+	Root   string
+	Remote string
+}
+
 // resolveProjectRoot is cached per cwd because git.Resolve walks the
 // filesystem — Claude Code sessions often contain hundreds of events sharing
 // one cwd.
-func (a *Adapter) resolveProjectRoot(cwd string, cache map[string]string) string {
+func (a *Adapter) resolveProjectRoot(cwd string, cache map[string]projectGitInfo) string {
 	if cwd == "" {
 		return ""
 	}
@@ -1436,16 +1472,31 @@ func (a *Adapter) resolveProjectRoot(cwd string, cache map[string]string) string
 	// already look like native paths. Mirrors codex adapter.go:2494
 	// (#54, [[feedback-foreign-path-git-resolve]]).
 	cwd = crossmount.TranslateForeignPath(cwd)
-	if root, ok := cache[cwd]; ok {
-		return root
+	if entry, ok := cache[cwd]; ok {
+		return entry.Root
 	}
 	info, err := git.Resolve(cwd)
 	if err != nil {
-		cache[cwd] = cwd
+		cache[cwd] = projectGitInfo{Root: cwd}
 		return cwd
 	}
-	cache[cwd] = info.Root
+	cache[cwd] = projectGitInfo{Root: info.Root, Remote: git.NormalizeRemote(info.Remote)}
 	return info.Root
+}
+
+// resolveProjectRemote returns the normalized git remote for cwd, cached
+// alongside the project root by resolveProjectRoot. Claude Code's own
+// JSONL session lines never carry a remote (unlike GitBranch, which is
+// sourced from line.GitBranch), so this is the adapter's only remote
+// source. Callers must invoke resolveProjectRoot for the same cwd first
+// so the cache entry exists — this never triggers its own git.Resolve
+// call, to avoid resolving the same cwd twice.
+func (a *Adapter) resolveProjectRemote(cwd string, cache map[string]projectGitInfo) string {
+	if cwd == "" {
+		return ""
+	}
+	cwd = crossmount.TranslateForeignPath(cwd)
+	return cache[cwd].Remote
 }
 
 // buildAPIErrorEvent decodes a Claude Code system/api_error JSONL
@@ -1476,7 +1527,7 @@ func (a *Adapter) resolveProjectRoot(cwd string, cache map[string]string) string
 // Returns nil when the line lacks the minimum fields the row needs
 // (request id + non-empty message); these are recorded as a warning
 // so silent ingest gaps surface in `observer status`.
-func buildAPIErrorEvent(path string, line rawLine, ts time.Time, projectRoot string) *models.ToolEvent {
+func buildAPIErrorEvent(path string, line rawLine, ts time.Time, projectRoot, projectRemote string) *models.ToolEvent {
 	var env struct {
 		Status    int             `json:"status"`
 		RequestID string          `json:"requestID"`
@@ -1512,6 +1563,7 @@ func buildAPIErrorEvent(path string, line rawLine, ts time.Time, projectRoot str
 		SessionID:     line.SessionID,
 		ProjectRoot:   projectRoot,
 		GitBranch:     line.GitBranch,
+		GitRemote:     projectRemote,
 		Timestamp:     ts,
 		Tool:          models.ToolClaudeCode,
 		ActionType:    models.ActionAPIError,

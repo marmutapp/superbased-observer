@@ -137,6 +137,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 		adapter:     a,
 		path:        path,
 		rootCache:   map[string]string{},
+		remoteCache: map[string]string{},
 		pendingCall: map[string]int{},
 		firstOffset: fromOffset,
 	}
@@ -208,6 +209,9 @@ type parseState struct {
 	path    string
 	// rootCache memoizes cwd → resolved project root.
 	rootCache map[string]string
+	// remoteCache memoizes cwd → resolved (normalized) git remote,
+	// alongside rootCache from the same git.Resolve call.
+	remoteCache map[string]string
 	// pendingCall maps a tool_use id to the index of its ToolEvent, so the
 	// later tool_result block can stamp success/output onto it.
 	pendingCall map[string]int
@@ -220,10 +224,16 @@ type parseState struct {
 	// lastCwd / lastBranch carry the most recent envelope context.
 	lastCwd    string
 	lastBranch string
+	// lastRemote is the normalized git remote resolved for lastCwd (see
+	// projectRoot). Unlike lastBranch, the record never states its own
+	// remote, so this comes ONLY from git.Resolve.
+	lastRemote string
 	// sessionID + projectRoot are recovered for segment run-logs (whose
 	// records carry neither directly on the token line).
 	sessionID   string
 	segProjRoot string
+	// segRemote is the normalized git remote resolved for segProjRoot.
+	segRemote string
 }
 
 // handleTranscript decodes and dispatches one transcript JSONL line.
@@ -250,29 +260,31 @@ func (st *parseState) handleTranscript(raw []byte, lineNum int, res *adapter.Par
 }
 
 // projectRoot resolves a cwd (translating a foreign-OS path before
-// git.Resolve) and memoizes the result. An empty cwd yields "".
-func (st *parseState) projectRoot(cwd string) string {
+// git.Resolve) to its project root and normalized git remote, and
+// memoizes both. An empty cwd yields "", "".
+func (st *parseState) projectRoot(cwd string) (root, remote string) {
 	if cwd == "" {
-		return ""
+		return "", ""
 	}
 	cwd = crossmount.TranslateForeignPath(cwd)
 	if root, ok := st.rootCache[cwd]; ok {
-		return root
+		return root, st.remoteCache[cwd]
 	}
 	info, err := git.Resolve(cwd)
 	if err != nil {
 		st.rootCache[cwd] = cwd
-		return cwd
+		return cwd, ""
 	}
 	st.rootCache[cwd] = info.Root
-	return info.Root
+	st.remoteCache[cwd] = git.NormalizeRemote(info.Remote)
+	return info.Root, st.remoteCache[cwd]
 }
 
 // emitUser records a user prompt (message.content is a bare string) plus a
 // one-shot session-start marker, or applies tool results (content is an
 // array of tool_result blocks).
 func (st *parseState) emitUser(rec *rawRecord, res *adapter.ParseResult) {
-	root := st.projectRoot(st.lastCwd)
+	root, remote := st.projectRoot(st.lastCwd)
 	if text := rec.Message.contentString(); text != "" {
 		if st.firstOffset == 0 && !st.sessionStarted && (rec.ParentUUID == nil || *rec.ParentUUID == "") {
 			st.sessionStarted = true
@@ -283,6 +295,7 @@ func (st *parseState) emitUser(rec *rawRecord, res *adapter.ParseResult) {
 				ProjectRoot:   root,
 				Timestamp:     parseTimestamp(rec.Timestamp),
 				GitBranch:     st.lastBranch,
+				GitRemote:     remote,
 				Tool:          models.ToolQoder,
 				ActionType:    models.ActionSessionStart,
 				Target:        "startup",
@@ -299,6 +312,7 @@ func (st *parseState) emitUser(rec *rawRecord, res *adapter.ParseResult) {
 			ProjectRoot:   root,
 			Timestamp:     parseTimestamp(rec.Timestamp),
 			GitBranch:     st.lastBranch,
+			GitRemote:     remote,
 			Tool:          models.ToolQoder,
 			ActionType:    models.ActionUserPrompt,
 			Target:        truncate(scrubbed, 200),
@@ -323,7 +337,7 @@ func (st *parseState) emitAssistant(rec *rawRecord, res *adapter.ParseResult) {
 	if rec.Message == nil {
 		return
 	}
-	root := st.projectRoot(st.lastCwd)
+	root, remote := st.projectRoot(st.lastCwd)
 	ts := parseTimestamp(rec.Timestamp)
 	msgID := rec.Message.ID
 	model := rec.Message.Model // empty in live capture; never fabricated
@@ -341,6 +355,7 @@ func (st *parseState) emitAssistant(rec *rawRecord, res *adapter.ParseResult) {
 				ProjectRoot:   root,
 				Timestamp:     ts,
 				GitBranch:     st.lastBranch,
+				GitRemote:     remote,
 				Model:         model,
 				Tool:          models.ToolQoder,
 				ActionType:    action,
@@ -367,6 +382,7 @@ func (st *parseState) emitAssistant(rec *rawRecord, res *adapter.ParseResult) {
 				ProjectRoot:   root,
 				Timestamp:     ts,
 				GitBranch:     st.lastBranch,
+				GitRemote:     remote,
 				Model:         model,
 				Tool:          models.ToolQoder,
 				ActionType:    models.ActionAssistantMessage,
@@ -454,7 +470,7 @@ func (st *parseState) handleSegment(raw []byte, lineNum int, res *adapter.ParseR
 		if cwd == "" {
 			cwd = cfg.TargetDir
 		}
-		st.segProjRoot = st.projectRoot(cwd)
+		st.segProjRoot, st.segRemote = st.projectRoot(cwd)
 	case "model.response.completed":
 		var r segResponse
 		if err := json.Unmarshal(seg.Data, &r); err != nil {
@@ -471,6 +487,7 @@ func (st *parseState) handleSegment(raw []byte, lineNum int, res *adapter.ParseR
 			SourceEventID:       segTokenID(seg, lineNum),
 			SessionID:           st.sessionID,
 			ProjectRoot:         st.segProjRoot,
+			GitRemote:           st.segRemote,
 			Timestamp:           parseTimestamp(seg.Ts),
 			Tool:                models.ToolQoder,
 			Model:               r.Model,

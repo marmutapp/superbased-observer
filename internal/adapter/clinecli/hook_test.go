@@ -268,6 +268,181 @@ func TestDispatchHookEvent_AgentMetadataPropagates(t *testing.T) {
 	if tools[0].Metadata.ParentAgentID != "agt_lead" {
 		t.Errorf("Metadata.ParentAgentID = %q; want agt_lead", tools[0].Metadata.ParentAgentID)
 	}
+	if !tools[0].Metadata.IsSubagent {
+		t.Error("Metadata.IsSubagent = false; want true when parentAgentId is present")
+	}
+}
+
+// TestDispatchHookEvent_SubagentCapture pins capture-side child brackets and
+// sidechain attribution. Cline writes these hooks even without user-installed
+// hook commands, so parentAgentId is the authoritative child discriminator.
+func TestDispatchHookEvent_SubagentCapture(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		event      hookEvent
+		wantAction string
+		wantTarget string
+	}{
+		{
+			name:       "lead start stays session lifecycle",
+			event:      hookEvent{HookName: "agent_start", SessionID: "session-1", AgentID: "lead"},
+			wantAction: models.ActionSessionStart,
+			wantTarget: "cli",
+		},
+		{
+			name:       "child start opens bracket",
+			event:      hookEvent{HookName: "agent_start", SessionID: "session-1", AgentID: "child-a", ParentAgentID: "lead"},
+			wantAction: models.ActionSubagentStart,
+			wantTarget: "subagent",
+		},
+		{
+			name:       "child resume opens a new bracket",
+			event:      hookEvent{HookName: "agent_resume", SessionID: "session-1", AgentID: "child-a", ParentAgentID: "lead", Iteration: 2},
+			wantAction: models.ActionSubagentStart,
+			wantTarget: "subagent",
+		},
+		{
+			name:       "child end closes bracket",
+			event:      hookEvent{HookName: "agent_end", SessionID: "session-1", AgentID: "child-a", ParentAgentID: "lead", Iteration: 3, Turn: &hookTurn{Status: "completed"}},
+			wantAction: models.ActionSubagentStop,
+			wantTarget: "subagent",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tools, _, warnings := dispatchHookEvent(&tc.event, "", scrub.New(), map[string]int{}, 0)
+			if len(warnings) != 0 {
+				t.Fatalf("warnings = %v; want none", warnings)
+			}
+			if len(tools) != 1 {
+				t.Fatalf("tools = %d; want 1", len(tools))
+			}
+			got := tools[0]
+			if got.ActionType != tc.wantAction {
+				t.Errorf("ActionType = %q; want %q", got.ActionType, tc.wantAction)
+			}
+			if got.Target != tc.wantTarget {
+				t.Errorf("Target = %q; want %q", got.Target, tc.wantTarget)
+			}
+			wantSidechain := tc.event.ParentAgentID != ""
+			if got.IsSidechain != wantSidechain {
+				t.Errorf("IsSidechain = %v; want %v", got.IsSidechain, wantSidechain)
+			}
+			if wantSidechain && (got.Metadata == nil || !got.Metadata.IsSubagent) {
+				t.Errorf("Metadata = %+v; want is_subagent=true", got.Metadata)
+			}
+		})
+	}
+}
+
+func TestDispatchHookEvent_SubagentActionsCarrySidechain(t *testing.T) {
+	t.Parallel()
+	ev := &hookEvent{
+		HookName:      "tool_call",
+		SessionID:     "session-1",
+		AgentID:       "child-a",
+		ParentAgentID: "lead",
+		Iteration:     2,
+		ToolCall: &hookToolCall{
+			ID:    "call-1",
+			Name:  "read_files",
+			Input: json.RawMessage(`{"files":[{"path":"PROGRESS.md"}]}`),
+		},
+	}
+	tools, _, warnings := dispatchHookEvent(ev, "", scrub.New(), map[string]int{}, 0)
+	if len(warnings) != 0 || len(tools) != 1 {
+		t.Fatalf("tools/warnings = %d/%v; want 1/none", len(tools), warnings)
+	}
+	if !tools[0].IsSidechain {
+		t.Error("child tool action IsSidechain = false; want true")
+	}
+	if tools[0].Metadata == nil || tools[0].Metadata.AgentID != "child-a" || !tools[0].Metadata.IsSubagent {
+		t.Errorf("Metadata = %+v; want child identity + is_subagent", tools[0].Metadata)
+	}
+}
+
+func TestDispatchHookEvent_SubagentAbortClosesFailedBracket(t *testing.T) {
+	t.Parallel()
+	ev := &hookEvent{
+		HookName:      "agent_abort",
+		SessionID:     "session-1",
+		AgentID:       "child-a",
+		ParentAgentID: "lead",
+		Iteration:     4,
+		Reason:        "operator cancelled",
+	}
+
+	got, _, warnings := dispatchHookEvent(ev, "", scrub.New(), map[string]int{}, 0)
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %v; want none", warnings)
+	}
+	if len(got) != 2 {
+		t.Fatalf("tools = %d; want abort outcome + stop bracket", len(got))
+	}
+	if got[0].ActionType != models.ActionTurnAborted || got[0].Success {
+		t.Fatalf("abort outcome = %+v", got[0])
+	}
+	if got[1].ActionType != models.ActionSubagentStop || got[1].Success {
+		t.Fatalf("closing bracket = %+v", got[1])
+	}
+	if got[1].ErrorMessage != "operator cancelled" || got[1].Target != "subagent" {
+		t.Fatalf("closing bracket detail = %+v", got[1])
+	}
+	if got[0].SourceEventID == got[1].SourceEventID {
+		t.Fatalf("abort rows share source_event_id %q", got[0].SourceEventID)
+	}
+	for i := range got {
+		if !got[i].IsSidechain || got[i].Metadata == nil || !got[i].Metadata.IsSubagent {
+			t.Errorf("row %d lost child identity: %+v", i, got[i])
+		}
+	}
+}
+
+func TestSubagentHookEventIDSeparatesChildren(t *testing.T) {
+	t.Parallel()
+	a := &hookEvent{SessionID: "shared", AgentID: "child-a", Iteration: 1}
+	b := &hookEvent{SessionID: "shared", AgentID: "child-b", Iteration: 1}
+	if gotA, gotB := subagentHookEventID("start", a), subagentHookEventID("start", b); gotA == gotB {
+		t.Fatalf("child lifecycle IDs collided: %q", gotA)
+	}
+	if start, stop := subagentHookEventID("start", a), subagentHookEventID("stop", a); start == stop {
+		t.Fatalf("start/stop lifecycle IDs collided: %q", start)
+	}
+}
+
+func TestDispatchHookEvent_SubagentPayloadIDsSeparateChildren(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		event hookEvent
+	}{
+		{name: "prompt", event: hookEvent{HookName: "prompt_submit", UserPromptSubmit: &hookUserPromptSubmit{Prompt: "work"}}},
+		{name: "tool call", event: hookEvent{HookName: "tool_call", ToolCall: &hookToolCall{ID: "call-1", Name: "read_file", Input: json.RawMessage(`{"path":"a.go"}`)}}},
+		{name: "abort", event: hookEvent{HookName: "agent_abort", Reason: "cancelled"}},
+		{name: "error", event: hookEvent{HookName: "agent_error", Error: &hookError{Name: "boom", Message: "failed"}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ids := make([]string, 0, 2)
+			for _, agentID := range []string{"child-a", "child-b"} {
+				ev := tc.event
+				ev.SessionID = "shared-session"
+				ev.ParentAgentID = "lead"
+				ev.AgentID = agentID
+				ev.Iteration = 1
+				got, _, _ := dispatchHookEvent(&ev, "", scrub.New(), map[string]int{}, 0)
+				if len(got) == 0 {
+					t.Fatalf("child %s emitted no action", agentID)
+				}
+				ids = append(ids, got[0].SourceEventID)
+			}
+			if ids[0] == ids[1] {
+				t.Fatalf("two children collided on source_event_id %q", ids[0])
+			}
+		})
+	}
 }
 
 // TestIntToStr covers the inline int-formatter (a hot-path

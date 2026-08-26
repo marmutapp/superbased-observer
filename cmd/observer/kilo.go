@@ -3,12 +3,15 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 
 	"github.com/spf13/cobra"
+
+	"github.com/marmutapp/superbased-observer/internal/config"
 )
 
 // newKiloCmd implements `observer kilo` — a PURE SEEDING wrapper around the
@@ -128,7 +131,13 @@ func newKiloCmd() *cobra.Command {
 				args = seeded
 				continueDir = cwd
 			}
-			return runKiloLauncher(bin, args, continueDir)
+			// Best-effort attribution config: a load failure just disables
+			// the launch seed (recordLaunchSeed treats "" as off).
+			dbPath := ""
+			if cfg, cErr := config.Load(config.LoadOptions{GlobalPath: configPath}); cErr == nil {
+				dbPath = cfg.Observer.DBPath
+			}
+			return runKiloLauncher(dbPath, bin, args, continueDir)
 		},
 	}
 	cmd.Flags().StringVar(&configPath, "config", "", "Path to config.toml (defaults to ~/.observer/config.toml)")
@@ -159,14 +168,34 @@ func kiloAttachPassthrough(kiloPath string) []string {
 // runKiloLauncher execs `kilo` with the (optionally seeded) argv, wiring the
 // child's stdio to the parent's and forwarding the exit code via exitErr (the
 // same shape as the other launchers). No proxy env is injected — kilo-code-cli
-// is native-exempt.
-func runKiloLauncher(bin string, args []string, dir string) error {
+// is native-exempt. dbPath (cfg.Observer.DBPath, "" to disable) records a
+// best-effort launch_seeds row for the started child so the daemon's
+// correlation sweep can attribute the session directly.
+func runKiloLauncher(dbPath, bin string, args []string, dir string) error {
 	child := exec.Command(bin, args...) //nolint:gosec // user-launched tool, args are theirs
 	child.Dir = dir                     // "" inherits the caller's cwd; set by --continue-from to the source project root
 	child.Stdin = os.Stdin
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
-	if rErr := child.Run(); rErr != nil {
+	if rErr := child.Start(); rErr != nil {
+		return fmt.Errorf("exec kilo: %w", rErr)
+	}
+	// Direct process attribution (migration 086): record the child pid now
+	// that Start has made it knowable; retract the seed when the child is
+	// reaped. Best-effort both ways — a seeding failure never affects the
+	// launch (see cmd/observer/launchseed.go).
+	recordLaunchSeed(dbPath, "kilo-code-cli", dir, child.Process.Pid, os.Stderr)
+	// Best-effort generic post-launch session discovery (WS-DISCOVERY): a
+	// no-op unless the trusted OOB channel is active AND "kilo-code-cli"
+	// resolves to an adapter that declares session-file watch roots. Cancel
+	// the instant the child exits so a window cut short by exit never
+	// announces a candidate that only looked unique because the scan stopped
+	// early.
+	discoverCancel := maybeStartGenericDiscovery(context.Background(), "kilo-code-cli", dir)
+	if discoverCancel != nil {
+		defer discoverCancel()
+	}
+	if rErr := child.Wait(); rErr != nil {
 		var ee *exec.ExitError
 		if errors.As(rErr, &ee) {
 			return exitErr(ee.ExitCode())

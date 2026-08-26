@@ -9,11 +9,15 @@
 // Conformer against a capturing fake sink and proves the emitted telemetry is
 // attributable (system_agent producer + initiating actor + run id).
 //
-// This club ships ONE Wired conformer — the synthetic reference — as the
-// executable proof of the emission contract; the real routing / advisor /
-// admission / eval / insight-agent components are registered Wired:false
-// (tracked-not-failed, retrofit DEFERRED until the Plane-B cmd/observer sink
-// construction lands). P1-10 is therefore PARTIAL.
+// All six registered components — routing, advisor, admission, eval,
+// insight-agent, and the synthetic reference — are Wired:true: each has a
+// real production emit call site (see RegisteredComponents' doc comment in
+// registry.go for the current per-component wiring map), and Conformer here
+// is an executable SHAPE-proof fixture per component, not a substitute for
+// that real call site. A Wired:false entry remains a supported registry
+// state (tracked-not-failed, for a component whose retrofit is still
+// staged) — there simply are none outstanding as of the insight-agent
+// close-out (P2-7).
 //
 // The package is pure-ish: it imports only internal/selfobs/emit,
 // internal/selfobs/run, and internal/provenance (plus context). It never

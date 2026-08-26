@@ -230,7 +230,7 @@ func extractUserRequestText(content string) string {
 // the (source_file, source_event_id) UNIQUE constraint rejects
 // duplicate inserts cleanly.
 func synthesizeTranscriptEvents(
-	sessionPath, conversationID, projectRoot, sessionID string,
+	sessionPath, conversationID, projectRoot, gitRemote, sessionID string,
 	scrubber Scrubber,
 	entries []cliTranscriptEntry,
 	existing []models.ToolEvent,
@@ -285,6 +285,7 @@ func synthesizeTranscriptEvents(
 				SourceEventID: eid,
 				SessionID:     sessionID,
 				ProjectRoot:   projectRoot,
+				GitRemote:     gitRemote,
 				Timestamp:     ts.UTC(),
 				Tool:          models.ToolAntigravity,
 				ActionType:    models.ActionUserPrompt,
@@ -305,6 +306,7 @@ func synthesizeTranscriptEvents(
 				SourceEventID: eid,
 				SessionID:     sessionID,
 				ProjectRoot:   projectRoot,
+				GitRemote:     gitRemote,
 				Timestamp:     ts.UTC(),
 				Tool:          models.ToolAntigravity,
 				// One row per MODEL/PLANNER_RESPONSE step, many steps per

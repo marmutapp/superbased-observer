@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/marmutapp/superbased-observer/internal/adapter"
+	"github.com/marmutapp/superbased-observer/internal/adapter/cacheobs"
 	"github.com/marmutapp/superbased-observer/internal/contentcap"
 	"github.com/marmutapp/superbased-observer/internal/git"
 	"github.com/marmutapp/superbased-observer/internal/models"
@@ -141,6 +142,8 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 		stepIdx:     map[string]int{},
 		firstOffset: fromOffset,
 		sessionID:   sessionIDFromPath(path),
+		cacheAcc:    cacheobs.New(MaxBlocksPerSession),
+		cacheDone:   map[string]bool{},
 	}
 	if err := st.readHeader(f); err != nil {
 		return adapter.ParseResult{}, err
@@ -238,6 +241,9 @@ type parseState struct {
 	// git.Resolve. Junie's log states no branch of its own, unlike Muse's
 	// workspace_branch record.
 	branch string
+	// remote is the normalized git remote, resolved alongside the project
+	// root (see projectRoot).
+	remote string
 	// model is the most recent model id seen (from
 	// LlmResponseMetadataEvent), stamped onto the surrounding
 	// Terminal/FileChanges/Result actions, which carry no model of their
@@ -249,6 +255,18 @@ type parseState struct {
 	// update of an existing one, since a thought's own stepId never
 	// matches the block it precedes) and cleared once consumed.
 	pendingReasoning string
+	// cacheAcc accumulates this parse call's running Tier-2
+	// content-block delta for cachetrack observation, drained once per
+	// LlmResponseMetadataEvent (see emitTokens / emitCacheObservations
+	// in cachetrack.go). Scoped to a single ParseSessionFile call, like
+	// every other incrementally-parsed Tier-2 producer (cline, cowork).
+	cacheAcc *cacheobs.Accumulator
+	// cacheDone guards Terminal/FileChanges/Thought block cache
+	// accumulation against the completion rebroadcast (see the package
+	// doc's rebroadcast-after-terminal finding), keyed by the same
+	// "step:"+stepId string as stepIdx, so a block's content is fed into
+	// cacheAcc exactly once.
+	cacheDone map[string]bool
 }
 
 // sessionIDFromPath recovers the canonical session id from the log path:
@@ -358,6 +376,7 @@ func (st *parseState) projectRoot() string {
 	if st.branch == "" {
 		st.branch = info.Branch
 	}
+	st.remote = git.NormalizeRemote(info.Remote)
 	return info.Root
 }
 
@@ -378,6 +397,7 @@ func (st *parseState) base(rec *rawRecord) models.ToolEvent {
 		ProjectRoot: st.projectRoot(),
 		Timestamp:   parseTimestamp(rec.TimestampMs),
 		GitBranch:   st.branch,
+		GitRemote:   st.remote,
 		Tool:        models.ToolJunie,
 		Success:     true,
 	}
@@ -437,6 +457,7 @@ func (st *parseState) emitUserPrompt(rec *rawRecord, lineStart int64, res *adapt
 		return
 	}
 	scrubbed := st.adapter.scrubber.String(rec.Prompt)
+	accumulatePromptCache(st.cacheAcc, scrubbed)
 	ev := st.base(rec)
 	ev.SourceEventID = "prompt:" + eventKey(rec.RequestID, lineStart)
 	ev.ActionType = models.ActionUserPrompt
@@ -471,6 +492,7 @@ func (st *parseState) bufferReasoning(ae *agentEventRaw) {
 		return
 	}
 	st.pendingReasoning = st.adapter.scrubber.String(ae.Text)
+	accumulateThoughtCache(st.cacheAcc, st.cacheDone, "thought:"+ae.StepID, st.pendingReasoning)
 }
 
 // takeReasoning returns and clears the buffered reasoning, for attachment
@@ -490,6 +512,7 @@ func (st *parseState) emitTerminalBlock(rec *rawRecord, ae *agentEventRaw, res *
 	key := "step:" + ae.StepID
 	if idx, ok := st.stepIdx[key]; ok && idx < len(res.ToolEvents) {
 		st.applyTerminalFields(&res.ToolEvents[idx], ae)
+		accumulateTerminalCache(st.cacheAcc, st.cacheDone, key, ae)
 		return
 	}
 	ev := st.base(rec)
@@ -499,6 +522,7 @@ func (st *parseState) emitTerminalBlock(rec *rawRecord, ae *agentEventRaw, res *
 	ev.Model = st.model
 	ev.PrecedingReasoning = st.takeReasoning()
 	st.applyTerminalFields(&ev, ae)
+	accumulateTerminalCache(st.cacheAcc, st.cacheDone, key, ae)
 	idx := len(res.ToolEvents)
 	res.ToolEvents = append(res.ToolEvents, ev)
 	st.stepIdx[key] = idx
@@ -537,6 +561,7 @@ func (st *parseState) emitFileChangesBlock(rec *rawRecord, ae *agentEventRaw, re
 	key := "step:" + ae.StepID
 	if idx, ok := st.stepIdx[key]; ok && idx < len(res.ToolEvents) {
 		st.applyFileChangesFields(&res.ToolEvents[idx], ae)
+		accumulateFileChangesCache(st.cacheAcc, st.cacheDone, key, ae)
 		return
 	}
 	ev := st.base(rec)
@@ -549,6 +574,7 @@ func (st *parseState) emitFileChangesBlock(rec *rawRecord, ae *agentEventRaw, re
 	ev.Model = st.model
 	ev.PrecedingReasoning = st.takeReasoning()
 	st.applyFileChangesFields(&ev, ae)
+	accumulateFileChangesCache(st.cacheAcc, st.cacheDone, key, ae)
 	idx := len(res.ToolEvents)
 	res.ToolEvents = append(res.ToolEvents, ev)
 	st.stepIdx[key] = idx
@@ -597,6 +623,7 @@ func (st *parseState) emitResultBlock(rec *rawRecord, ae *agentEventRaw, res *ad
 	ev.RawToolName = models.ToolJunie + ".result"
 	ev.Model = st.model
 	st.applyResultFields(&ev, rec, ae)
+	accumulateResultCache(st.cacheAcc, ae)
 	idx := len(res.ToolEvents)
 	res.ToolEvents = append(res.ToolEvents, ev)
 	st.stepIdx[key] = idx
@@ -639,6 +666,7 @@ func (st *parseState) emitTokens(rec *rawRecord, ae *agentEventRaw, lineStart in
 			SessionID:           st.sessionID,
 			ProjectRoot:         st.projectRoot(),
 			GitBranch:           st.branch,
+			GitRemote:           st.remote,
 			Timestamp:           parseTimestamp(rec.TimestampMs),
 			Tool:                models.ToolJunie,
 			Model:               m.Model,
@@ -651,6 +679,8 @@ func (st *parseState) emitTokens(rec *rawRecord, ae *agentEventRaw, lineStart in
 			Reliability:         models.ReliabilityAccurate,
 		})
 	}
+	res.CacheObservations = append(res.CacheObservations,
+		emitCacheObservations(st.cacheAcc, st.path, st.sessionID, lineStart, parseTimestamp(rec.TimestampMs), ae.ModelUsage)...)
 }
 
 // compile-time interface check.

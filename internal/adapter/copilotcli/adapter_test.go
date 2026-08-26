@@ -1960,3 +1960,161 @@ func TestThreadableReasoning(t *testing.T) {
 		})
 	}
 }
+
+// TestParseEventsJSONL_SubagentEventsStampedSidechain pins that every
+// row emitted inside a subagent's execution context (env.agentId != "")
+// gets IsSidechain=true, on BOTH ToolEvents and TokenEvents — while the
+// spawning context (parent-level rows with no agentId, including the
+// asst.message that precedes subagent.started) stays IsSidechain=false.
+// This covers the copilot-cli half of the WS-SUBAGENT/EFFORT work-stream
+// (adapter-parity-audit-2026-08-25.md §2.4): the deferred subagent
+// model-attribution mechanism existed, but nothing derived from it ever
+// flagged the child rows as sidechain.
+func TestParseEventsJSONL_SubagentEventsStampedSidechain(t *testing.T) {
+	uuid := "5c51d44b-5a9f-4b23-85ff-0fddaadf2212"
+	// Parent-context control: no agentId anywhere on this row.
+	parentAsst := `{"type":"assistant.message","data":{"messageId":"m-parent","content":"parent reply","outputTokens":11,"requestId":"00000-rid-parent"},"id":"asP","timestamp":"2026-04-20T18:37:00.000Z","parentId":"e1"}`
+	subStarted := `{"type":"subagent.started","data":{"toolCallId":"agent-T","agentName":"rubber-duck"},"id":"sa-t","timestamp":"2026-04-20T18:38:21.175Z","parentId":"e1","agentId":"agent-T"}`
+	// Child asst.message + tool call, both carrying agentId="agent-T".
+	toolStart := `{"type":"tool.execution_start","data":{"toolCallId":"call-1","toolName":"grep","arguments":{"pattern":"foo"},"turnId":"0"},"id":"ts1","timestamp":"2026-04-20T18:38:21.500Z","parentId":"sa-t","agentId":"agent-T"}`
+	toolCompl := `{"type":"tool.execution_complete","data":{"toolCallId":"call-1","model":"gpt-5.4","interactionId":"i1","turnId":"0","success":true,"result":{"content":"found"}},"id":"tc1","timestamp":"2026-04-20T18:38:22.000Z","parentId":"ts1","agentId":"agent-T"}`
+	asstUnderAgent := `{"type":"assistant.message","data":{"messageId":"mA1","content":"subagent says hi","outputTokens":1234,"requestId":"00000-rid-A"},"id":"asA1","timestamp":"2026-04-20T18:38:23.000Z","parentId":"tc1","agentId":"agent-T"}`
+	subCompleted := `{"type":"subagent.completed","data":{"toolCallId":"agent-T","agentName":"rubber-duck","model":"gpt-5.4","totalTokens":18791,"totalToolCalls":1,"durationMs":73305},"id":"sc1","timestamp":"2026-04-20T18:39:33.943Z","parentId":"asA1","agentId":"agent-T"}`
+
+	evt := writeMinimalEventsFile(t, uuid, parentAsst, subStarted, toolStart, toolCompl, asstUnderAgent, subCompleted)
+	ssRoot := filepath.Dir(filepath.Dir(evt))
+	a := NewWithOptions(nil, ssRoot)
+	res, err := a.ParseSessionFile(context.Background(), evt, 0)
+	if err != nil {
+		t.Fatalf("ParseSessionFile: %v", err)
+	}
+
+	toolEventsByMsg := map[string]models.ToolEvent{}
+	for _, te := range res.ToolEvents {
+		toolEventsByMsg[te.SourceEventID] = te
+	}
+	tokenEventsByMsg := map[string]models.TokenEvent{}
+	for _, te := range res.TokenEvents {
+		tokenEventsByMsg[te.MessageID] = te
+	}
+
+	// Parent-context rows: IsSidechain must be false.
+	if got := tokenEventsByMsg["00000-rid-parent"].IsSidechain; got {
+		t.Errorf("parent asst.message TokenEvent IsSidechain = %v, want false", got)
+	}
+	// Child rows under agent-T: IsSidechain must be true.
+	toolCompleteRow, ok := toolEventsByMsg["tc1"]
+	if !ok {
+		t.Fatalf("tool.execution_complete ToolEvent (id=tc1) not found among %d ToolEvents", len(res.ToolEvents))
+	}
+	if !toolCompleteRow.IsSidechain {
+		t.Errorf("subagent tool.execution_complete IsSidechain = %v, want true", toolCompleteRow.IsSidechain)
+	}
+	if got := tokenEventsByMsg["00000-rid-A"].IsSidechain; !got {
+		t.Errorf("subagent asst.message TokenEvent IsSidechain = %v, want true", got)
+	}
+	assistantTextRow, ok := toolEventsByMsg["asA1"]
+	if !ok {
+		t.Fatalf("subagent assistant_text ToolEvent (id=asA1) not found among %d ToolEvents", len(res.ToolEvents))
+	}
+	if !assistantTextRow.IsSidechain {
+		t.Errorf("subagent assistant_text IsSidechain = %v, want true", assistantTextRow.IsSidechain)
+	}
+	// The spawning subagent.started/completed markers themselves don't
+	// mint rows (no ToolEvent case for those types) — nothing further
+	// to assert there; the point is the CHILD work rows above are the
+	// ones flagged, per the convention documented on emitEvent.
+}
+
+// TestParseEventsJSONL_ReasoningEffortWiredIntoMetadata pins the
+// copilot-cli half of adapter-parity-audit-2026-08-25.md §2.5:
+// session.model_change.data.reasoningEffort and
+// session.resume.data.reasoningEffort were parsed into structs but
+// never referenced — this asserts they now land in
+// ActionMetadata.EffortLevel on subsequently emitted rows, persist as
+// session state across further rows until changed, and compose safely
+// with metadata already set for another reason (permission grants).
+func TestParseEventsJSONL_ReasoningEffortWiredIntoMetadata(t *testing.T) {
+	uuid := "5c51d44b-5a9f-4b23-85ff-0fddaadf2212"
+	// Before any reasoningEffort is seen: no EffortLevel.
+	preAsst := `{"type":"assistant.message","data":{"messageId":"m-pre","content":"before effort is set","outputTokens":5,"requestId":"00000-rid-pre"},"id":"as-pre","timestamp":"2026-04-20T18:00:00.000Z","parentId":"e1"}`
+	modelChange := `{"type":"session.model_change","data":{"previousModel":"gpt-5-mini","newModel":"claude-opus-4.7","previousReasoningEffort":"low","reasoningEffort":"high"},"id":"mc1","timestamp":"2026-04-20T18:01:00.000Z","parentId":"e1"}`
+	postAsst := `{"type":"assistant.message","data":{"messageId":"m-post","content":"after effort is set","outputTokens":9,"requestId":"00000-rid-post"},"id":"as-post","timestamp":"2026-04-20T18:02:00.000Z","parentId":"mc1"}`
+	// A second unrelated row after: EffortLevel must persist (session state).
+	laterAsst := `{"type":"assistant.message","data":{"messageId":"m-later","content":"still after effort is set","outputTokens":3,"requestId":"00000-rid-later"},"id":"as-later","timestamp":"2026-04-20T18:03:00.000Z","parentId":"as-post"}`
+
+	evt := writeMinimalEventsFile(t, uuid, preAsst, modelChange, postAsst, laterAsst)
+	ssRoot := filepath.Dir(filepath.Dir(evt))
+	a := NewWithOptions(nil, ssRoot)
+	res, err := a.ParseSessionFile(context.Background(), evt, 0)
+	if err != nil {
+		t.Fatalf("ParseSessionFile: %v", err)
+	}
+
+	byMsg := map[string]models.ToolEvent{}
+	for _, te := range res.ToolEvents {
+		byMsg[te.SourceEventID] = te
+	}
+	preRow, ok := byMsg["as-pre"]
+	if !ok {
+		t.Fatalf("pre-effort assistant_text row not found")
+	}
+	if preRow.Metadata != nil && preRow.Metadata.EffortLevel != "" {
+		t.Errorf("pre-effort row EffortLevel = %q, want empty (reasoningEffort not yet seen)", preRow.Metadata.EffortLevel)
+	}
+	postRow, ok := byMsg["as-post"]
+	if !ok {
+		t.Fatalf("post-effort assistant_text row not found")
+	}
+	if postRow.Metadata == nil || postRow.Metadata.EffortLevel != "high" {
+		t.Fatalf("post-effort row Metadata = %+v, want EffortLevel=high", postRow.Metadata)
+	}
+	laterRow, ok := byMsg["as-later"]
+	if !ok {
+		t.Fatalf("later assistant_text row not found")
+	}
+	if laterRow.Metadata == nil || laterRow.Metadata.EffortLevel != "high" {
+		t.Fatalf("later row Metadata = %+v, want EffortLevel=high (must persist as session state)", laterRow.Metadata)
+	}
+}
+
+// TestParseEventsJSONL_ReasoningEffortMergesWithPermissionMetadata pins
+// that effortMetadata composes with (never clobbers) metadata already
+// populated for another reason — here permission.completed's
+// PermissionApprovalKind/PermissionLocationKey.
+func TestParseEventsJSONL_ReasoningEffortMergesWithPermissionMetadata(t *testing.T) {
+	uuid := "5c51d44b-5a9f-4b23-85ff-0fddaadf2212"
+	modelChange := `{"type":"session.model_change","data":{"previousModel":"gpt-5-mini","newModel":"gpt-5-mini","reasoningEffort":"medium"},"id":"mc1","timestamp":"2026-04-20T18:01:00.000Z","parentId":"e1"}`
+	permReq := `{"type":"permission.requested","data":{"requestId":"pr1","permissionRequest":{"kind":"shell","toolCallId":"tc1","fullCommandText":"go test ./...","intention":"run tests"}},"id":"pq1","timestamp":"2026-04-20T18:02:00.000Z","parentId":"mc1"}`
+	permCompleted := `{"type":"permission.completed","data":{"requestId":"pr1","toolCallId":"tc1","result":{"kind":"approved-for-session","locationKey":"/repo"}},"id":"pc1","timestamp":"2026-04-20T18:02:05.000Z","parentId":"pq1"}`
+
+	evt := writeMinimalEventsFile(t, uuid, modelChange, permReq, permCompleted)
+	ssRoot := filepath.Dir(filepath.Dir(evt))
+	a := NewWithOptions(nil, ssRoot)
+	res, err := a.ParseSessionFile(context.Background(), evt, 0)
+	if err != nil {
+		t.Fatalf("ParseSessionFile: %v", err)
+	}
+
+	var permRow *models.ToolEvent
+	for i := range res.ToolEvents {
+		if res.ToolEvents[i].SourceEventID == "pc1" {
+			permRow = &res.ToolEvents[i]
+		}
+	}
+	if permRow == nil {
+		t.Fatalf("permission.completed row (id=pc1) not found among %d ToolEvents", len(res.ToolEvents))
+	}
+	if permRow.Metadata == nil {
+		t.Fatalf("Metadata is nil, want PermissionApprovalKind + EffortLevel both set")
+	}
+	if permRow.Metadata.PermissionApprovalKind != "approved-for-session" {
+		t.Errorf("PermissionApprovalKind = %q, want %q", permRow.Metadata.PermissionApprovalKind, "approved-for-session")
+	}
+	if permRow.Metadata.PermissionLocationKey != "/repo" {
+		t.Errorf("PermissionLocationKey = %q, want %q", permRow.Metadata.PermissionLocationKey, "/repo")
+	}
+	if permRow.Metadata.EffortLevel != "medium" {
+		t.Errorf("EffortLevel = %q, want %q (must merge with permission metadata, not clobber it)", permRow.Metadata.EffortLevel, "medium")
+	}
+}

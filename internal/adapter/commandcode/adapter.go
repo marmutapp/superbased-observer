@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/marmutapp/superbased-observer/internal/adapter"
+	"github.com/marmutapp/superbased-observer/internal/adapter/cacheobs"
 	"github.com/marmutapp/superbased-observer/internal/contentcap"
 	"github.com/marmutapp/superbased-observer/internal/git"
 	"github.com/marmutapp/superbased-observer/internal/models"
@@ -143,6 +144,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 		unknownTool: map[string]bool{},
 		firstOffset: fromOffset,
 		sessionID:   sessionIDFromPath(path),
+		cacheAcc:    cacheobs.New(MaxBlocksPerSession),
 	}
 	// Read the header before seeking: on a resumed parse the session
 	// record is behind the cursor, but its inline cwd is the ONLY source
@@ -249,6 +251,9 @@ type parseState struct {
 	cwd string
 	// branch is the git branch resolved alongside the project root.
 	branch string
+	// remote is the normalized git remote resolved alongside the project
+	// root (see projectRoot).
+	remote string
 	// fallbackModel comes from the `<uuid>.meta.json` sidecar and is used
 	// only when a usage-bearing record carries no inline model. Loaded
 	// LAZILY (metaRead latches the one attempt per parse) so a resumed
@@ -256,6 +261,11 @@ type parseState struct {
 	// fallback — reading it only at offset 0 lost it on every resume.
 	fallbackModel string
 	metaRead      bool
+	// cacheAcc accumulates this parse call's running Tier-2 content-block
+	// delta (prompt/assistant text, tool calls, tool results, in wire
+	// order) and drains it into one CacheTurnObservation per usage-bearing
+	// record (see emitTokens / emitCacheObservation in cachetrack.go).
+	cacheAcc *cacheobs.Accumulator
 }
 
 // sidecarFallbackModel returns the `<uuid>.meta.json` model, reading the
@@ -381,6 +391,7 @@ func (st *parseState) projectRoot() string {
 	}
 	st.rootCache[cwd] = info.Root
 	st.branch = info.Branch
+	st.remote = git.NormalizeRemote(info.Remote)
 	return info.Root
 }
 
@@ -399,6 +410,7 @@ func (st *parseState) emitSessionStart(rec *rawLine, res *adapter.ParseResult) {
 		ProjectRoot:   root,
 		Timestamp:     parseTimestamp(rec.Timestamp),
 		GitBranch:     st.branch,
+		GitRemote:     st.remote,
 		Tool:          models.ToolCommandCode,
 		ActionType:    models.ActionSessionStart,
 		Target:        "startup",
@@ -482,6 +494,8 @@ func (st *parseState) emitToolUse(rec *rawLine, block rawBlock, ec emitCtx, res 
 		res.Warnings = append(res.Warnings,
 			fmt.Sprintf("unrecognised tool name %q normalized to %q", block.Name, action))
 	}
+	scrubbedInput := st.adapter.scrubber.RawJSON(block.Input)
+	accumulateToolCallCache(st.cacheAcc, block.Name, scrubbedInput)
 	idx := len(res.ToolEvents)
 	res.ToolEvents = append(res.ToolEvents, models.ToolEvent{
 		SourceFile:         st.path,
@@ -490,12 +504,13 @@ func (st *parseState) emitToolUse(rec *rawLine, block rawBlock, ec emitCtx, res 
 		ProjectRoot:        ec.root,
 		Timestamp:          ec.ts,
 		GitBranch:          st.branch,
+		GitRemote:          st.remote,
 		Model:              rec.Model,
 		Tool:               models.ToolCommandCode,
 		ActionType:         action,
 		Target:             st.adapter.scrubber.String(targetFromInput(block.Input, block.Name)),
 		RawToolName:        block.Name,
-		RawToolInput:       st.adapter.scrubber.RawJSON(block.Input),
+		RawToolInput:       scrubbedInput,
 		ContentBytes:       authoredBytes(action, block.Input),
 		PrecedingReasoning: ec.reasoning,
 		MessageID:          ec.msgID,
@@ -539,6 +554,7 @@ func (st *parseState) emitText(rec *rawLine, block rawBlock, ec emitCtx, res *ad
 		ProjectRoot:        ec.root,
 		Timestamp:          ec.ts,
 		GitBranch:          st.branch,
+		GitRemote:          st.remote,
 		Tool:               models.ToolCommandCode,
 		Target:             truncate(scrubbed, 200),
 		PrecedingReasoning: ec.reasoning,
@@ -550,12 +566,15 @@ func (st *parseState) emitText(rec *rawLine, block rawBlock, ec emitCtx, res *ad
 		ev.Model = rec.Model
 		ev.ActionType = models.ActionAssistantMessage
 		ev.RawToolName = models.ToolCommandCode + ".assistant_text"
-		ev.ToolOutput = st.adapter.scrubber.String(contentcap.Cap(block.Text, contentcap.DefaultMaxBytes))
+		capped := st.adapter.scrubber.String(contentcap.Cap(block.Text, contentcap.DefaultMaxBytes))
+		ev.ToolOutput = capped
+		accumulateTextCache(st.cacheAcc, capped, "assistant")
 	} else {
 		ev.SourceEventID = "prompt:" + ec.lineID
 		ev.ActionType = models.ActionUserPrompt
 		ev.RawToolName = models.ToolCommandCode + ".user_prompt"
 		ev.RawToolInput = scrubbed
+		accumulateTextCache(st.cacheAcc, scrubbed, "user")
 	}
 	res.ToolEvents = append(res.ToolEvents, ev)
 }
@@ -577,6 +596,7 @@ func (st *parseState) applyToolResult(block rawBlock, res *adapter.ParseResult) 
 	if out := toolResultText(block.Content); out != "" {
 		scrubbed := st.adapter.scrubber.String(contentcap.Cap(out, contentcap.DefaultMaxBytes))
 		ev.ToolOutput = scrubbed
+		accumulateToolResultCache(st.cacheAcc, scrubbed)
 		if isErr {
 			ev.ErrorMessage = truncate(scrubbed, 500)
 		}
@@ -596,12 +616,17 @@ func (st *parseState) emitTokens(rec *rawLine, lineID string, ts time.Time, root
 	if model == "" {
 		model = st.sidecarFallbackModel()
 	}
+	tokenSourceEventID := "tok:" + lineID
+	if obs := emitCacheObservation(st.cacheAcc, st.path, st.sessionID, tokenSourceEventID, model, ts, tp); obs != nil {
+		res.CacheObservations = append(res.CacheObservations, *obs)
+	}
 	res.TokenEvents = append(res.TokenEvents, models.TokenEvent{
 		SourceFile:          st.path,
-		SourceEventID:       "tok:" + lineID,
+		SourceEventID:       tokenSourceEventID,
 		SessionID:           st.sessionID,
 		ProjectRoot:         root,
 		GitBranch:           st.branch,
+		GitRemote:           st.remote,
 		Timestamp:           ts,
 		Tool:                models.ToolCommandCode,
 		Model:               model,

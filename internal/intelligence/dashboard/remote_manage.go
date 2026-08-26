@@ -116,12 +116,23 @@ func requireJSONConfirm(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-// setConfirmCookie mints a fresh double-submit confirm token, sets it as the
-// readable SameSite=Strict loopback cookie, and returns it for the JSON body.
-// Both the Remote panel (GET /api/remote/config) and the Terminal panel (GET
-// /api/terminal/policy) call this so each panel load carries its own token.
-func setConfirmCookie(w http.ResponseWriter) string {
-	token := mintConfirmToken()
+// setConfirmCookie reuses a well-formed double-submit token already carried by
+// this browser session, or mints one when absent. Multiple management panels
+// mount in parallel, so rotating the shared cookie on every GET can make an
+// otherwise valid sibling response stale before its Save request is sent.
+func setConfirmCookie(w http.ResponseWriter, r *http.Request) string {
+	token := ""
+	if ck, err := r.Cookie(remoteConfirmCookie); err == nil {
+		candidate := strings.TrimSpace(ck.Value)
+		if len(candidate) == 64 {
+			if _, err := hex.DecodeString(candidate); err == nil {
+				token = candidate
+			}
+		}
+	}
+	if token == "" {
+		token = mintConfirmToken()
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     remoteConfirmCookie,
 		Value:    token,
@@ -233,7 +244,7 @@ func (s *Server) handleRemoteConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	token := setConfirmCookie(w)
+	token := setConfirmCookie(w, r)
 
 	resp := map[string]any{
 		"confirm_token":   token,
@@ -326,6 +337,14 @@ func (s *Server) reloadLiveSecret(cfg config.Config) {
 func (s *Server) handleRemoteEnable(w http.ResponseWriter, r *http.Request) {
 	if !requireConfirmToken(w, r) {
 		return
+	}
+	// W5.1 org-governed feature gate: node.features.remote. Fail-open (nil
+	// FeatureGate, or no accepted policy) — see dashboard.Options.FeatureGate.
+	if s.opts.FeatureGate != nil {
+		if allowed, reason := s.opts.FeatureGate(nodeFeatureRemote); !allowed {
+			http.Error(w, reason, http.StatusForbidden)
+			return
+		}
 	}
 	var body struct {
 		Host          string `json:"host"`
@@ -451,6 +470,15 @@ func (s *Server) handleRemoteSetAllowTerminal(w http.ResponseWriter, r *http.Req
 		return
 	}
 	next := *body.AllowTerminal
+	// W5.1 org-governed feature gate: node.features.remote — gates only the
+	// ENABLE direction (an org that disabled remote must never block a node
+	// from turning a remote capability OFF). Fail-open on nil gate.
+	if next && s.opts.FeatureGate != nil {
+		if allowed, reason := s.opts.FeatureGate(nodeFeatureRemote); !allowed {
+			http.Error(w, reason, http.StatusForbidden)
+			return
+		}
+	}
 	remoteManageMu.Lock()
 	defer remoteManageMu.Unlock()
 	// Fix 2: the config read-modify-write below joins the configWriteMu domain
@@ -545,6 +573,14 @@ func (s *Server) handleRemoteSetAllowTerminalView(w http.ResponseWriter, r *http
 		return
 	}
 	next := *body.AllowTerminalView
+	// W5.1 enable-only remote feature gate — same rationale as
+	// handleRemoteSetAllowTerminal above.
+	if next && s.opts.FeatureGate != nil {
+		if allowed, reason := s.opts.FeatureGate(nodeFeatureRemote); !allowed {
+			http.Error(w, reason, http.StatusForbidden)
+			return
+		}
+	}
 	remoteManageMu.Lock()
 	defer remoteManageMu.Unlock()
 	// Fix 2: the config read-modify-write below joins the configWriteMu domain
@@ -715,6 +751,14 @@ func (s *Server) handleRemoteAddDevice(w http.ResponseWriter, r *http.Request) {
 	if !requireConfirmToken(w, r) {
 		return
 	}
+	// W5.1 org-governed feature gate: node.features.remote. Fail-open (nil
+	// FeatureGate, or no accepted policy) — see dashboard.Options.FeatureGate.
+	if s.opts.FeatureGate != nil {
+		if allowed, reason := s.opts.FeatureGate(nodeFeatureRemote); !allowed {
+			http.Error(w, reason, http.StatusForbidden)
+			return
+		}
+	}
 	remoteManageMu.Lock()
 	defer remoteManageMu.Unlock()
 	// Fix 2: the config read-modify-write below joins the configWriteMu domain
@@ -771,6 +815,14 @@ type approveExecuteRequest struct {
 func (s *Server) handleRemoteApproveExecute(w http.ResponseWriter, r *http.Request) {
 	if !requireConfirmToken(w, r) {
 		return
+	}
+	// W5.1 org-governed feature gate: node.features.remote. Checked before
+	// any side effect. Fail-open on nil gate / no accepted policy.
+	if s.opts.FeatureGate != nil {
+		if allowed, reason := s.opts.FeatureGate(nodeFeatureRemote); !allowed {
+			http.Error(w, reason, http.StatusForbidden)
+			return
+		}
 	}
 	if s.opts.Remote == nil {
 		http.Error(w, "remote access is not configured", http.StatusServiceUnavailable)
@@ -924,6 +976,14 @@ func (s *Server) handleStandingTerminalStatus(w http.ResponseWriter, r *http.Req
 func (s *Server) handleStandingTerminalMint(w http.ResponseWriter, r *http.Request) {
 	if !requireConfirmToken(w, r) {
 		return
+	}
+	// W5.1 org-governed feature gate: node.features.remote. Checked before
+	// any side effect. Fail-open on nil gate / no accepted policy.
+	if s.opts.FeatureGate != nil {
+		if allowed, reason := s.opts.FeatureGate(nodeFeatureRemote); !allowed {
+			http.Error(w, reason, http.StatusForbidden)
+			return
+		}
 	}
 	remoteManageMu.Lock()
 	defer remoteManageMu.Unlock()

@@ -95,15 +95,18 @@ func newProxyStartCmd() *cobra.Command {
 						func() { _ = p.SetLaneTable(bootstrapUpstreams, bootstrapAutoLane) },
 						p.LaneTable,
 					)
-					// node.governance (admin-controlled Plane B) is passed
-					// nil here on purpose: `observer proxy start` runs no
-					// dashboard, so there is no surface for a governance
-					// body to govern. The family is still polled and
-					// reported; nothing is applied. Every call through the
-					// nil handle is a no-op by construction.
-					loadPolicyResourceLKG(ctx, pcfg, oc, store.New(pdb), admissionHandle, gw, nil, newLogger(pcfg.Observer.LogLevel))
+					// node.governance (admin-controlled Plane B) and
+					// node.features (org-parity W5.1) are both passed nil
+					// here on purpose: `observer proxy start` runs no
+					// dashboard, so there is no surface for either a
+					// governance body or a feature-gate body to govern. Both
+					// families are still polled and reported; nothing is
+					// applied. Every call through a nil handle is a no-op by
+					// construction (nodeFeaturesHandle.Allowed/TerminalAllowed
+					// both nil-check to "allowed").
+					loadPolicyResourceLKG(ctx, pcfg, oc, store.New(pdb), admissionHandle, gw, nil, nil, newLogger(pcfg.Observer.LogLevel))
 					pcleanup()
-					go runPolicyResourcePoller(ctx, pcfg, oc, admissionHandle, gw, nil, nil, newLogger(pcfg.Observer.LogLevel))
+					go runPolicyResourcePoller(ctx, pcfg, oc, admissionHandle, gw, nil, nil, nil, newLogger(pcfg.Observer.LogLevel))
 				} else {
 					fmt.Fprintf(cmd.ErrOrStderr(), "policy resource: LKG/poller skipped — db open failed: %v\n", perr)
 				}
@@ -458,6 +461,10 @@ func wireRouting(ctx context.Context, cfg config.Config, s *store.Store, opts *p
 	// local). It is the RoutingStateHandle's runningVersion — the org-layer
 	// running identity for the P0-6 reporter (R5-B2).
 	var composedOrgVersion int64
+	// orgBodyMode is the composed org body's [routing].mode, captured for the
+	// Arc 4 P3b managed-enforce lift (honored only for a managed node holding
+	// enforce.routing; ignored by ComposeOrgPolicy itself under §R23).
+	var orgBodyMode string
 	// §R19.1 org policy composition: the cached (signature-verified)
 	// org document's hard constraints intersect in; its soft rules
 	// rank under local. The cache never carries an enforce switch —
@@ -471,6 +478,7 @@ func wireRouting(ctx context.Context, cfg config.Config, s *store.Store, opts *p
 		} else {
 			spec = composed
 			composedOrgVersion = orgPol.Version
+			orgBodyMode = routingconfig.OrgBodyMode(orgPol.Body)
 			logger.Info("routing: org policy composed", "version", orgPol.Version)
 		}
 	}
@@ -512,6 +520,11 @@ func wireRouting(ctx context.Context, cfg config.Config, s *store.Store, opts *p
 	refresher := store.NewRoutingRefresher(s, policy, resolver, routingPriceFn(cost.NewEngine(cfg.Intelligence)))
 	go refresher.Run(ctx)
 	lr := newLiveRouter(policy, cfg.Routing.Mode, refresher, s, logger)
+	// Seed the composed org body mode so the managed-enforce lift (once
+	// start.go injects the predicate via SetManagedEnforce) can honor a
+	// managed node's cached enforce policy from the first request, before the
+	// first hot-reload cycle. No-op on a local-only node (orgBodyMode "").
+	lr.orgMode = orgBodyMode
 	opts.ModelRouter = lr
 	// §R7.2/§R18.3 calibration job: refreshes model_calibration
 	// through the existing one-owner seam and (auto_demote) grades
@@ -548,6 +561,7 @@ func wireRouting(ctx context.Context, cfg config.Config, s *store.Store, opts *p
 	lr.localSpec = localSpec
 	lr.handle = handle
 	handle.reload = lr.ReloadOrgPolicy
+	handle.setME = lr.SetManagedEnforce
 	if cfg.SelfObs.Enabled {
 		lr.SetSelfObs(selfObsSink, cfg.SelfObs.RoutingSampleN)
 	}

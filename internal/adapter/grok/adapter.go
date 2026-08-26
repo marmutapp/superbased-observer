@@ -214,11 +214,19 @@ type parseState struct {
 	metaCache map[string]*sessionMeta
 }
 
-// sessionMeta is the resolved model + project-root + branch for a session.
+// sessionMeta is the resolved model + project-root + branch + remote for a
+// session.
 type sessionMeta struct {
 	model       string
 	projectRoot string
 	gitBranch   string
+	gitRemote   string
+	// effortLevel is the session's reasoning-effort SETTING
+	// (summary.json's `reasoning_effort`, e.g. "low"/"medium"/"high") —
+	// a session-wide config knob, not per-turn reasoning content.
+	// Threaded into ActionMetadata.EffortLevel at every emission site,
+	// mirroring how model/gitBranch/gitRemote already ride sessionMeta.
+	effortLevel string
 }
 
 // loadSummary reads and resolves the summary.json sibling of an
@@ -243,34 +251,45 @@ func (a *Adapter) resolveMeta(summaryPath string) *sessionMeta {
 	if err := json.Unmarshal(body, &s); err != nil {
 		return nil
 	}
-	m := &sessionMeta{model: s.CurrentModelID, gitBranch: s.HeadBranch}
-	m.projectRoot = resolveProjectRoot(s.GitRootDir, s.Info.Cwd)
+	m := &sessionMeta{model: s.CurrentModelID, gitBranch: s.HeadBranch, effortLevel: strings.TrimSpace(s.ReasoningEffort)}
+	m.projectRoot, m.gitRemote = resolveProjectRoot(s.GitRootDir, s.Info.Cwd)
 	return m
 }
 
-// resolveProjectRoot resolves a session's project root from its
-// git_root_dir (primary) or cwd (fallback), translating a foreign-OS path
-// and stat-gating it before git.Resolve.
-func resolveProjectRoot(gitRootDir, cwd string) string {
+// effortMetadata folds a session's reasoning-effort SETTING into an
+// ActionMetadata, returning nil when the session never surfaced one (so
+// rows from summary-less or effort-less sessions keep a NULL metadata
+// column rather than an empty-but-allocated one).
+func effortMetadata(effort string) *models.ActionMetadata {
+	if effort == "" {
+		return nil
+	}
+	return &models.ActionMetadata{EffortLevel: effort}
+}
+
+// resolveProjectRoot resolves a session's project root (and its normalized
+// git remote) from its git_root_dir (primary) or cwd (fallback),
+// translating a foreign-OS path and stat-gating it before git.Resolve.
+func resolveProjectRoot(gitRootDir, cwd string) (root, remote string) {
 	candidate := strings.TrimSpace(gitRootDir)
 	if candidate == "" {
 		candidate = strings.TrimSpace(cwd)
 	}
 	if candidate == "" {
-		return ""
+		return "", ""
 	}
 	candidate = crossmount.TranslateForeignPath(candidate)
 	if _, err := os.Stat(candidate); err != nil {
 		// The path doesn't exist on this host (a foreign path we couldn't
 		// translate): return it verbatim rather than letting git.Resolve
 		// CWD-prefix the observer's own root onto it.
-		return filepath.Clean(candidate)
+		return filepath.Clean(candidate), ""
 	}
 	info, err := git.Resolve(candidate)
 	if err != nil {
-		return filepath.Clean(candidate)
+		return filepath.Clean(candidate), ""
 	}
-	return info.Root
+	return info.Root, git.NormalizeRemote(info.Remote)
 }
 
 // meta returns the resolved metadata for the current updates.jsonl parse,
@@ -356,12 +375,14 @@ func (st *parseState) emitUserPrompt(line *acpLine, res *adapter.ParseResult) {
 			ProjectRoot:   m.projectRoot,
 			Timestamp:     ts,
 			GitBranch:     m.gitBranch,
+			GitRemote:     m.gitRemote,
 			Model:         st.modelFor(),
 			Tool:          models.ToolGrok,
 			ActionType:    models.ActionSessionStart,
 			Target:        "startup",
 			RawToolName:   "grok.session_start",
 			Success:       true,
+			Metadata:      effortMetadata(m.effortLevel),
 		})
 	}
 	text := strings.TrimSpace(line.Params.Update.Content.firstText())
@@ -376,6 +397,7 @@ func (st *parseState) emitUserPrompt(line *acpLine, res *adapter.ParseResult) {
 		ProjectRoot:   m.projectRoot,
 		Timestamp:     ts,
 		GitBranch:     m.gitBranch,
+		GitRemote:     m.gitRemote,
 		Model:         st.modelFor(),
 		Tool:          models.ToolGrok,
 		ActionType:    models.ActionUserPrompt,
@@ -383,6 +405,7 @@ func (st *parseState) emitUserPrompt(line *acpLine, res *adapter.ParseResult) {
 		RawToolName:   "grok.user_prompt",
 		RawToolInput:  scrubbed,
 		Success:       true,
+		Metadata:      effortMetadata(m.effortLevel),
 	})
 	// A new user turn clears any dangling reasoning from a prior turn.
 	st.pendingReasoning = ""
@@ -404,6 +427,7 @@ func (st *parseState) emitAssistantMessage(line *acpLine, res *adapter.ParseResu
 		ProjectRoot:   m.projectRoot,
 		Timestamp:     tsFor(line),
 		GitBranch:     m.gitBranch,
+		GitRemote:     m.gitRemote,
 		Model:         st.modelFor(),
 		Tool:          models.ToolGrok,
 		ActionType:    models.ActionAssistantMessage,
@@ -411,6 +435,7 @@ func (st *parseState) emitAssistantMessage(line *acpLine, res *adapter.ParseResu
 		RawToolName:   "grok.assistant_message",
 		ToolOutput:    st.adapter.scrubber.String(contentcap.Cap(text, contentcap.DefaultMaxBytes)),
 		Success:       true,
+		Metadata:      effortMetadata(m.effortLevel),
 	}
 	if st.pendingReasoning != "" {
 		ev.PrecedingReasoning = st.adapter.scrubber.String(st.pendingReasoning)
@@ -433,6 +458,7 @@ func (st *parseState) emitToolCall(line *acpLine, res *adapter.ParseResult) {
 		ProjectRoot:   m.projectRoot,
 		Timestamp:     tsFor(line),
 		GitBranch:     m.gitBranch,
+		GitRemote:     m.gitRemote,
 		Model:         st.modelFor(),
 		Tool:          models.ToolGrok,
 		ActionType:    mapToolName(u.Title),
@@ -440,6 +466,7 @@ func (st *parseState) emitToolCall(line *acpLine, res *adapter.ParseResult) {
 		RawToolName:   u.Title,
 		RawToolInput:  scrubbedInput,
 		Success:       true,
+		Metadata:      effortMetadata(m.effortLevel),
 	}
 	if st.pendingReasoning != "" {
 		ev.PrecedingReasoning = st.adapter.scrubber.String(st.pendingReasoning)
@@ -531,6 +558,7 @@ func (a *Adapter) handleUnified(st *parseState, raw string, _ int, res *adapter.
 		SessionID:       line.Sid,
 		ProjectRoot:     meta.projectRoot,
 		GitBranch:       meta.gitBranch,
+		GitRemote:       meta.gitRemote,
 		Timestamp:       parseUnifiedTS(line.Ts),
 		Tool:            models.ToolGrok,
 		Model:           meta.model,

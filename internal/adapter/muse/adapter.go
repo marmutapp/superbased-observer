@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/marmutapp/superbased-observer/internal/adapter"
+	"github.com/marmutapp/superbased-observer/internal/adapter/cacheobs"
 	"github.com/marmutapp/superbased-observer/internal/contentcap"
 	"github.com/marmutapp/superbased-observer/internal/git"
 	"github.com/marmutapp/superbased-observer/internal/models"
@@ -156,6 +157,7 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 		firstOffset: fromOffset,
 		sessionID:   sessionIDFromPath(path),
 		isSubagent:  isSubagentLog(path),
+		cacheAcc:    cacheobs.New(MaxBlocksPerSession),
 	}
 	if err := st.readHeader(f); err != nil {
 		return adapter.ParseResult{}, err
@@ -269,9 +271,19 @@ type parseState struct {
 	// overridden by a `session.workspace_branch.observed` record when the
 	// log states one (grounded data beats an inferred one).
 	branch string
+	// remote is the normalized git remote, resolved alongside the project
+	// root (see projectRoot). Unlike branch, the log never states its own
+	// remote, so this is git.Resolve's value unconditionally.
+	remote string
 	// model is the most recent model id seen, used to stamp tool/message
 	// events that carry no model of their own.
 	model string
+	// cacheAcc accumulates this parse call's running Tier-2
+	// content-block delta (prompt / assistant messages / tool calls /
+	// tool results, in wire order) and drains it into one
+	// CacheTurnObservation per model_completed record (see
+	// emitTokens / emitCacheObservation in cachetrack.go).
+	cacheAcc *cacheobs.Accumulator
 }
 
 // sessionIDFromPath recovers the canonical session uuid from the log path.
@@ -500,6 +512,7 @@ func (st *parseState) projectRoot() string {
 	if st.branch == "" {
 		st.branch = info.Branch
 	}
+	st.remote = git.NormalizeRemote(info.Remote)
 	return info.Root
 }
 
@@ -522,6 +535,7 @@ func (st *parseState) base(rec *rawRecord) models.ToolEvent {
 		ProjectRoot: st.projectRoot(),
 		Timestamp:   parseTimestamp(rec.RecordedAt),
 		GitBranch:   st.branch,
+		GitRemote:   st.remote,
 		Tool:        models.ToolMuse,
 		IsSidechain: st.isSubagent,
 		Success:     true,
@@ -579,6 +593,7 @@ func (st *parseState) emitRunStart(rec *rawRecord, e *sessionEvent, lineStart in
 		return
 	}
 	scrubbed := st.adapter.scrubber.String(e.Prompt)
+	accumulatePromptCache(st.cacheAcc, scrubbed)
 	ev := st.base(rec)
 	ev.Target = truncate(scrubbed, 200)
 	ev.RawToolInput = scrubbed
@@ -607,7 +622,9 @@ func (st *parseState) emitAssistantMessage(rec *rawRecord, e *sessionEvent, line
 	ev.Model = st.model
 	ev.MessageID = e.MessageID
 	ev.Target = truncate(scrubbed, 200)
-	ev.ToolOutput = st.adapter.scrubber.String(contentcap.Cap(e.Text, contentcap.DefaultMaxBytes))
+	capped := st.adapter.scrubber.String(contentcap.Cap(e.Text, contentcap.DefaultMaxBytes))
+	ev.ToolOutput = capped
+	accumulateAssistantMessageCache(st.cacheAcc, capped)
 	res.ToolEvents = append(res.ToolEvents, ev)
 }
 
@@ -651,8 +668,10 @@ func (st *parseState) emitToolCalls(rec *rawRecord, e *sessionEvent, lineStart i
 		ev.Model = st.model
 		ev.MessageID = e.MessageID
 		ev.Target = st.adapter.scrubber.String(targetFromArgs(args, tc.Name))
-		ev.RawToolInput = st.adapter.scrubber.String(contentcap.Cap(tc.Args, contentcap.DefaultMaxBytes))
+		scrubbedArgs := st.adapter.scrubber.String(contentcap.Cap(tc.Args, contentcap.DefaultMaxBytes))
+		ev.RawToolInput = scrubbedArgs
 		ev.ContentBytes = authoredBytes(action, args)
+		accumulateToolCallCache(st.cacheAcc, tc.Name, scrubbedArgs)
 		idx := len(res.ToolEvents)
 		res.ToolEvents = append(res.ToolEvents, ev)
 		if tc.CallID == "" {
@@ -715,6 +734,7 @@ func (st *parseState) applyToolResults(e *sessionEvent, res *adapter.ParseResult
 		scrubbed := st.adapter.scrubber.String(contentcap.Cap(r.Text, contentcap.DefaultMaxBytes))
 		ev := &res.ToolEvents[idx]
 		ev.ToolOutput = scrubbed
+		accumulateToolResultCache(st.cacheAcc, scrubbed)
 		if !ev.Success && ev.ErrorMessage != "" {
 			ev.ErrorMessage = truncate(scrubbed, 500)
 		}
@@ -732,12 +752,17 @@ func (st *parseState) emitTokens(rec *rawRecord, e *sessionEvent, lineStart int6
 		st.model = e.Model
 	}
 	tp := tokenBundle(e.Usage)
+	tokenSourceEventID := "tok:" + eventKey(rec, lineStart)
+	if obs := emitCacheObservation(st.cacheAcc, st.path, st.sessionID, tokenSourceEventID, st.model, parseTimestamp(rec.RecordedAt), tp); obs != nil {
+		res.CacheObservations = append(res.CacheObservations, *obs)
+	}
 	res.TokenEvents = append(res.TokenEvents, models.TokenEvent{
 		SourceFile:          st.path,
-		SourceEventID:       "tok:" + eventKey(rec, lineStart),
+		SourceEventID:       tokenSourceEventID,
 		SessionID:           st.sessionID,
 		ProjectRoot:         st.projectRoot(),
 		GitBranch:           st.branch,
+		GitRemote:           st.remote,
 		Timestamp:           parseTimestamp(rec.RecordedAt),
 		Tool:                models.ToolMuse,
 		Model:               st.model,

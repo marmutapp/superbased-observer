@@ -141,15 +141,6 @@ func (u *assistantUsage) isZero() bool {
 	return u.InputTokens == 0 && u.OutputTokens == 0 && u.CacheReadTokens == 0
 }
 
-// toolCallData is `data` on a tool/call envelope.
-type toolCallData struct {
-	Turn      int    `json:"turn"`
-	Step      int    `json:"step"`
-	CallID    string `json:"callId"`
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
-}
-
 // toolResultData is `data` on a tool/result envelope.
 type toolResultData struct {
 	Turn    int           `json:"turn"`
@@ -194,6 +185,9 @@ func toolResultText(block contentBlock) string {
 var actionMap = map[string]string{
 	"ask_user_question": models.ActionAskUser,
 	"bash":              models.ActionRunCommand,
+	// pwsh is DSH's shell tool on Windows (live-observed 2026-08-26 on a
+	// /mnt/c/Users/<u>/.dsh Windows session); same run-command bucket as bash.
+	"pwsh": models.ActionRunCommand,
 	// create_goal / get_goal / update_goal are DSH's own goal-tracking
 	// tool trio — they record state back INTO the harness, not workspace
 	// state, so harness_call is the honest bucket (same reasoning as

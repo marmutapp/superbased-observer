@@ -656,11 +656,17 @@ func BuildStopTokenEvent(body []byte) (models.TokenEvent, bool, error) {
 // the IDENTICAL per-generation usage fields
 // (input_tokens / output_tokens / cache_read_tokens / cache_write_tokens,
 // model, generation_id — see TestBuildEvent_AfterAgentResponse), which
-// is why this is the PRIMARY cursor token path. Whether 3.14.x still
-// emits this payload shape — or fires hooks at all — is UNVERIFIED
-// (docs/audits/cursor-windows-capture-diagnosis-2026-08-07.md §2.6);
-// no cursor token_usage row has landed since 2026-05-24, so do not
-// treat "afterAgentResponse works" as a standing fact.
+// is why this is the PRIMARY cursor token path.
+//
+// 2026-08-22 LIVE AUDIT (C1 close-out): cursor 3.15.19 stop payloads now
+// carry NO usage fields at all — the hook fires, session_id is present,
+// and the payload keys are conversation/model/status/transcript_path
+// only (15 `no_usage_fields` forensic rows since Aug 19). No other local
+// surface carries per-generation tokens either (transcripts, store.db
+// blobs, ai-tracking.db all checked). The usage-field extraction below is
+// correct and stays ready; the gap is upstream. Do not treat either hook
+// as a working token source on 3.15.x.
+//
 // It shares the (source_file, source_event_id) identity with
 // the stop path via buildTokenEvent, so a generation seen on BOTH events
 // dedups to a single token_usage row (UNIQUE(source_file, source_event_id)

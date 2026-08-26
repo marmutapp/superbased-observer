@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/marmutapp/superbased-observer/internal/cachetrack"
+	"github.com/marmutapp/superbased-observer/internal/adapter/cacheobs"
 	"github.com/marmutapp/superbased-observer/internal/models"
 )
 
@@ -15,61 +15,7 @@ import (
 // budget, same OOM guard). When exceeded, subsequent observations
 // emit with BlockHashes=nil so the engine flips to KindReanchor
 // rather than running unbounded.
-const MaxBlocksPerSession = 4096
-
-// tier2Accumulator mirrors the claudecode template (see
-// internal/adapter/claudecode/adapter.go::tier2Accumulator). The
-// shape is adapter-independent per the spec §14.3 rollout pattern;
-// only the per-record argument shapes differ. Cap semantics +
-// pendingBlocks + compactionSeen flow identically.
-type tier2Accumulator struct {
-	pendingBlocks  []models.CacheBlockMeta
-	totalBlocks    int
-	compactionSeen bool
-	capExceeded    bool
-	maxBlocks      int
-}
-
-func newTier2Accumulator(maxBlocks int) *tier2Accumulator {
-	return &tier2Accumulator{maxBlocks: maxBlocks}
-}
-
-func (a *tier2Accumulator) observeContent(blocks []models.CacheBlockMeta) {
-	if a.capExceeded || len(blocks) == 0 {
-		return
-	}
-	a.pendingBlocks = append(a.pendingBlocks, blocks...)
-	a.totalBlocks += len(blocks)
-	if a.maxBlocks > 0 && a.totalBlocks > a.maxBlocks {
-		a.capExceeded = true
-		a.pendingBlocks = nil
-	}
-}
-
-func (a *tier2Accumulator) emit(
-	path, sessionID, messageID, model string,
-	ts int64,
-	usage models.CacheUsage,
-	fast bool,
-) models.CacheTurnObservation {
-	obs := models.CacheTurnObservation{
-		SourceFile:     path,
-		SourceEventID:  "cachetrack:" + messageID,
-		SessionID:      sessionID,
-		MessageID:      messageID,
-		Timestamp:      millisToTime(ts),
-		Model:          model,
-		Fast:           fast,
-		Usage:          usage,
-		CompactionSeen: a.compactionSeen,
-	}
-	if !a.capExceeded {
-		obs.BlockHashes = a.pendingBlocks
-	}
-	a.pendingBlocks = nil
-	a.compactionSeen = false
-	return obs
-}
+const MaxBlocksPerSession = cacheobs.DefaultMaxBlocksPerSession
 
 // loadCacheObservations walks every message + its parts (in
 // (session, message.time_created, part.time_created, part.id)
@@ -122,7 +68,7 @@ func (a *Adapter) loadCacheObservations(ctx context.Context, db *sql.DB, sourceF
 		return nil, nil
 	}
 
-	accBySession := map[string]*tier2Accumulator{}
+	accBySession := map[string]*cacheobs.Accumulator{}
 	var out []models.CacheTurnObservation
 
 	for _, m := range messages {
@@ -139,10 +85,10 @@ func (a *Adapter) loadCacheObservations(ctx context.Context, db *sql.DB, sourceF
 
 		acc := accBySession[m.SessionID]
 		if acc == nil {
-			acc = newTier2Accumulator(MaxBlocksPerSession)
+			acc = cacheobs.New(MaxBlocksPerSession)
 			accBySession[m.SessionID] = acc
 		}
-		acc.observeContent(blocks)
+		acc.ObserveBlocks(blocks)
 
 		// Emit only assistant messages with non-zero tokens AND
 		// whose own time_updated has crossed the cursor. This
@@ -168,21 +114,18 @@ func (a *Adapter) loadCacheObservations(ctx context.Context, db *sql.DB, sourceF
 			CacheReadTokens:     meta.Tokens.Cache.Read,
 			CacheCreationTokens: meta.Tokens.Cache.Write,
 		}
-		obs := acc.emit(sourceFile, m.SessionID, m.ID, model, ts, usage, false)
+		obs := acc.Emit(sourceFile, m.SessionID, m.ID, model, millisToTime(ts), usage, false)
 		// §15.3 boundary: when the routed (providerID, modelID) pair
 		// is implicit-cache shape (OpenAI / OpenRouter / deepseek /
 		// etc.), overlay ImplicitCache=true so the engine
 		// dispatches to the reduced attribution path. Anthropic-
-		// routed sessions are unchanged.
+		// routed sessions are unchanged. The implicit-cache path
+		// ignores BlockHashes — cacheobs.ApplyImplicitCacheOverlay
+		// clears it to keep the persisted-side cache_segments table
+		// free of rows that the engine will never read against.
+		// Same shape as the codex Tier-2 emitter in Phase 3.
 		provider := firstNonEmpty(meta.ProviderID, meta.Model.ProviderID)
-		if cachetrack.IsImplicitCacheProvider(provider, model) {
-			obs.ImplicitCache = true
-			// The implicit-cache path ignores BlockHashes — clear it
-			// to keep the persisted-side cache_segments table free of
-			// rows that the engine will never read against. Same
-			// shape as the codex Tier-2 emitter in Phase 3.
-			obs.BlockHashes = nil
-		}
+		obs = cacheobs.ApplyImplicitCacheOverlay(obs, provider, model)
 		out = append(out, obs)
 	}
 	return out, nil

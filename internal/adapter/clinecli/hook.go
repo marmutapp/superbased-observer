@@ -200,18 +200,27 @@ func dispatchHookEvent(ev *hookEvent, _ string, sc *scrub.Scrubber, pendingToolU
 	ts := parseIso8601Time(ev.Ts)
 	projectRoot := normalizeProjectRoot(ev.CWD)
 	meta := hookEventMetadata(ev)
+	isSubagent := ev.ParentAgentID != ""
 
 	switch ev.HookName {
 	case "agent_start":
+		actionType := models.ActionSessionStart
+		sourceEventID := "hook:ss:" + ev.SessionID
+		target := "cli"
+		if isSubagent {
+			actionType = models.ActionSubagentStart
+			sourceEventID = subagentHookEventID("start", ev)
+			target = "subagent"
+		}
 		tools = append(tools, models.ToolEvent{
 			SourceFile:    hookSourceFile,
-			SourceEventID: "hook:ss:" + ev.SessionID,
+			SourceEventID: sourceEventID,
 			SessionID:     ev.SessionID,
 			ProjectRoot:   projectRoot,
 			Timestamp:     ts,
 			Tool:          models.ToolClineCLI,
-			ActionType:    models.ActionSessionStart,
-			Target:        "cli",
+			ActionType:    actionType,
+			Target:        target,
 			Success:       true,
 			RawToolName:   "clinecli.hook.agent_start",
 			Metadata:      meta,
@@ -222,15 +231,23 @@ func dispatchHookEvent(ev *hookEvent, _ string, sc *scrub.Scrubber, pendingToolU
 		// distinct from agent_start so both fire (resume after
 		// a prior start within the same session is meaningful
 		// observability).
+		actionType := models.ActionSessionStart
+		sourceEventID := "hook:resume:" + ev.SessionID + ":i" + intToStr(ev.Iteration)
+		target := "resume"
+		if isSubagent {
+			actionType = models.ActionSubagentStart
+			sourceEventID = subagentHookEventID("resume", ev)
+			target = "subagent"
+		}
 		tools = append(tools, models.ToolEvent{
 			SourceFile:    hookSourceFile,
-			SourceEventID: "hook:resume:" + ev.SessionID + ":i" + intToStr(ev.Iteration),
+			SourceEventID: sourceEventID,
 			SessionID:     ev.SessionID,
 			ProjectRoot:   projectRoot,
 			Timestamp:     ts,
 			Tool:          models.ToolClineCLI,
-			ActionType:    models.ActionSessionStart,
-			Target:        "resume",
+			ActionType:    actionType,
+			Target:        target,
 			Success:       true,
 			RawToolName:   "clinecli.hook.agent_resume",
 			Metadata:      meta,
@@ -241,9 +258,13 @@ func dispatchHookEvent(ev *hookEvent, _ string, sc *scrub.Scrubber, pendingToolU
 		}
 		body := stripUserInputWrapper(ev.UserPromptSubmit.Prompt)
 		scrubbed := sc.String(body)
+		promptEventID := "hook:" + ev.SessionID + ":i" + intToStr(ev.Iteration) + ":user"
+		if isSubagent {
+			promptEventID = subagentHookEventID("user", ev)
+		}
 		tools = append(tools, models.ToolEvent{
 			SourceFile:    hookSourceFile,
-			SourceEventID: "hook:" + ev.SessionID + ":i" + intToStr(ev.Iteration) + ":user",
+			SourceEventID: promptEventID,
 			SessionID:     ev.SessionID,
 			ProjectRoot:   projectRoot,
 			Timestamp:     ts,
@@ -262,9 +283,13 @@ func dispatchHookEvent(ev *hookEvent, _ string, sc *scrub.Scrubber, pendingToolU
 		actionType := normalizeToolName(ev.ToolCall.Name)
 		scrubbedInput := sc.RawJSON(ev.ToolCall.Input)
 		target := extractTarget(ev.ToolCall.Name, ev.ToolCall.Input, sc)
+		toolEventID := "hook:" + ev.SessionID + ":i" + intToStr(ev.Iteration) + ":tool_use:" + ev.ToolCall.ID
+		if isSubagent {
+			toolEventID = subagentHookEventID("tool-use", ev) + ":" + ev.ToolCall.ID
+		}
 		tools = append(tools, models.ToolEvent{
 			SourceFile:    hookSourceFile,
-			SourceEventID: "hook:" + ev.SessionID + ":i" + intToStr(ev.Iteration) + ":tool_use:" + ev.ToolCall.ID,
+			SourceEventID: toolEventID,
 			SessionID:     ev.SessionID,
 			ProjectRoot:   projectRoot,
 			Timestamp:     ts,
@@ -277,7 +302,7 @@ func dispatchHookEvent(ev *hookEvent, _ string, sc *scrub.Scrubber, pendingToolU
 			Metadata:      meta,
 		})
 		// Stash the index so a subsequent tool_result hook can fill.
-		pendingToolUse[ev.SessionID+":"+ev.ToolCall.ID] = firstIdx + len(tools) - 1
+		pendingToolUse[hookPendingToolKey(ev, ev.ToolCall.ID)] = firstIdx + len(tools) - 1
 	case "tool_result":
 		if ev.ToolResult == nil {
 			return tools, tokens, warnings
@@ -288,7 +313,8 @@ func dispatchHookEvent(ev *hookEvent, _ string, sc *scrub.Scrubber, pendingToolU
 		// caller's pendingToolUse from earlier batches still applies
 		// across calls because parseHooksJSONL keeps the map across
 		// the whole scan.
-		idx, ok := pendingToolUse[ev.SessionID+":"+ev.ToolResult.ID]
+		pendingKey := hookPendingToolKey(ev, ev.ToolResult.ID)
+		idx, ok := pendingToolUse[pendingKey]
 		if !ok {
 			warnings = append(warnings, fmt.Sprintf("clinecli.dispatchHookEvent: tool_result for unknown call_id %s in session %s", ev.ToolResult.ID, ev.SessionID))
 			return tools, tokens, warnings
@@ -304,21 +330,29 @@ func dispatchHookEvent(ev *hookEvent, _ string, sc *scrub.Scrubber, pendingToolU
 		// the same scan) is the primary truth source. Drop the
 		// pending entry so the next hook isn't confused.
 		_ = idx
-		delete(pendingToolUse, ev.SessionID+":"+ev.ToolResult.ID)
+		delete(pendingToolUse, pendingKey)
 	case "agent_end":
 		status := "completed"
 		if ev.Turn != nil && ev.Turn.Status != "" {
 			status = ev.Turn.Status
 		}
+		actionType := models.ActionSessionEnd
+		sourceEventID := "hook:se:" + ev.SessionID + ":i" + intToStr(ev.Iteration)
+		target := status
+		if isSubagent {
+			actionType = models.ActionSubagentStop
+			sourceEventID = subagentHookEventID("stop", ev)
+			target = "subagent"
+		}
 		tools = append(tools, models.ToolEvent{
 			SourceFile:    hookSourceFile,
-			SourceEventID: "hook:se:" + ev.SessionID + ":i" + intToStr(ev.Iteration),
+			SourceEventID: sourceEventID,
 			SessionID:     ev.SessionID,
 			ProjectRoot:   projectRoot,
 			Timestamp:     ts,
 			Tool:          models.ToolClineCLI,
-			ActionType:    models.ActionSessionEnd,
-			Target:        status,
+			ActionType:    actionType,
+			Target:        target,
 			Success:       status == "completed",
 			RawToolName:   "clinecli.hook.agent_end",
 			Metadata:      meta,
@@ -328,9 +362,13 @@ func dispatchHookEvent(ev *hookEvent, _ string, sc *scrub.Scrubber, pendingToolU
 		if ev.Reason != "" {
 			reason = ev.Reason
 		}
+		abortEventID := "hook:abort:" + ev.SessionID + ":i" + intToStr(ev.Iteration)
+		if isSubagent {
+			abortEventID = subagentHookEventID("abort", ev)
+		}
 		tools = append(tools, models.ToolEvent{
 			SourceFile:    hookSourceFile,
-			SourceEventID: "hook:abort:" + ev.SessionID + ":i" + intToStr(ev.Iteration),
+			SourceEventID: abortEventID,
 			SessionID:     ev.SessionID,
 			ProjectRoot:   projectRoot,
 			Timestamp:     ts,
@@ -341,13 +379,37 @@ func dispatchHookEvent(ev *hookEvent, _ string, sc *scrub.Scrubber, pendingToolU
 			RawToolName:   "clinecli.hook.agent_abort",
 			Metadata:      meta,
 		})
+		if isSubagent {
+			// A child abort is both a turn outcome and the terminal edge of
+			// its lifecycle. Keep the turn_aborted row for failure analytics,
+			// then emit the failed closing bracket so the sub-agent read model
+			// does not leave this child permanently open.
+			tools = append(tools, models.ToolEvent{
+				SourceFile:    hookSourceFile,
+				SourceEventID: subagentHookEventID("abort-stop", ev),
+				SessionID:     ev.SessionID,
+				ProjectRoot:   projectRoot,
+				Timestamp:     ts,
+				Tool:          models.ToolClineCLI,
+				ActionType:    models.ActionSubagentStop,
+				Target:        "subagent",
+				Success:       false,
+				ErrorMessage:  truncate(sc.String(reason), 2048),
+				RawToolName:   "clinecli.hook.agent_abort",
+				Metadata:      meta,
+			})
+		}
 	case "agent_error":
 		if ev.Error == nil {
 			return tools, tokens, warnings
 		}
+		errorEventID := "hook:err:" + ev.SessionID + ":i" + intToStr(ev.Iteration)
+		if isSubagent {
+			errorEventID = subagentHookEventID("error", ev)
+		}
 		tools = append(tools, models.ToolEvent{
 			SourceFile:    hookSourceFile,
-			SourceEventID: "hook:err:" + ev.SessionID + ":i" + intToStr(ev.Iteration),
+			SourceEventID: errorEventID,
 			SessionID:     ev.SessionID,
 			ProjectRoot:   projectRoot,
 			Timestamp:     ts,
@@ -380,18 +442,46 @@ func dispatchHookEvent(ev *hookEvent, _ string, sc *scrub.Scrubber, pendingToolU
 	default:
 		warnings = append(warnings, fmt.Sprintf("clinecli.dispatchHookEvent: unknown hookName %q (session=%s ts=%s)", ev.HookName, ev.SessionID, ev.Ts))
 	}
+	if isSubagent {
+		for i := range tools {
+			tools[i].IsSidechain = true
+		}
+	}
 	return tools, tokens, warnings
+}
+
+// subagentHookEventID builds a stable lifecycle key that cannot collide when
+// multiple child agents share a Cline session. AgentID is part of the key when
+// available; iteration keeps malformed or older agent-less hooks distinct.
+func subagentHookEventID(kind string, ev *hookEvent) string {
+	id := subagentHookIdentity(ev)
+	return "hook:subagent:" + kind + ":" + ev.SessionID + ":" + id + ":i" + intToStr(ev.Iteration)
+}
+
+func hookPendingToolKey(ev *hookEvent, callID string) string {
+	if ev.ParentAgentID != "" {
+		return ev.SessionID + ":" + subagentHookIdentity(ev) + ":" + callID
+	}
+	return ev.SessionID + ":" + callID
+}
+
+func subagentHookIdentity(ev *hookEvent) string {
+	if ev.AgentID != "" {
+		return ev.AgentID
+	}
+	return "i" + intToStr(ev.Iteration)
 }
 
 // hookEventMetadata extracts ActionMetadata from a hook event's
 // agent / conversation / parent-agent identifiers. Hook payloads
-// carry less linkage than sessions.db rows (no team_name in the
-// hook envelope; no is_subagent flag), but the parent_agent_id +
-// agent_id + conversation_id can be lifted.
+// carry less linkage than sessions.db rows (no team_name or explicit
+// is_subagent flag), but parent_agent_id is an authoritative child signal
+// and lets us derive IsSubagent alongside the two agent identifiers.
 func hookEventMetadata(ev *hookEvent) *models.ActionMetadata {
 	m := models.ActionMetadata{
 		AgentID:       ev.AgentID,
 		ParentAgentID: ev.ParentAgentID,
+		IsSubagent:    ev.ParentAgentID != "",
 	}
 	if m.IsZero() {
 		return nil

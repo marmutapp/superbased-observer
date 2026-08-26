@@ -119,23 +119,36 @@ func CheckAdapter(tool string, cfg config.Config) (Check, bool) {
 		note(StatusWarn, "disabled in [observer.watch] enabled_adapters — the watcher will skip it (add \""+tool+"\" to re-enable)")
 	}
 
-	var present []string
-	for _, p := range found.WatchPaths() {
-		if dirExists(p) {
-			present = append(present, p)
-		}
-	}
-	if len(present) > 0 {
-		note(StatusOK, "watch path present: "+strings.Join(present, ", "))
+	ic, _ := integration.For(tool)
+
+	// The 5 *-web browser-capture adapters have no filesystem store at all
+	// (capture arrives over the extension's native-messaging bridge), so
+	// WatchPaths() is unconditionally nil for them and the generic
+	// watch-path check below would file an unconditional, misleading WARN
+	// on every install (docs/plans/adapter-parity-audit-2026-08-25.md
+	// §2.10). Dispatch on the capability SHAPE (CLAUDE.md #3), never tool
+	// name: HookBrowserExtension gets a probe of the signals that actually
+	// exist for this topology instead.
+	if ic.Hook.Mechanism == integration.HookBrowserExtension {
+		browserExtensionHealthNote(tool, cfg, note)
 	} else {
-		hint := strings.Join(found.WatchPaths(), ", ")
-		if hint == "" {
-			hint = "(no canonical path on this OS)"
+		var present []string
+		for _, p := range found.WatchPaths() {
+			if dirExists(p) {
+				present = append(present, p)
+			}
 		}
-		note(StatusWarn, "no watch path found ("+hint+") — is "+tool+" installed, and has it created a session yet?")
+		if len(present) > 0 {
+			note(StatusOK, "watch path present: "+strings.Join(present, ", "))
+		} else {
+			hint := strings.Join(found.WatchPaths(), ", ")
+			if hint == "" {
+				hint = "(no canonical path on this OS)"
+			}
+			note(StatusWarn, "no watch path found ("+hint+") — is "+tool+" installed, and has it created a session yet?")
+		}
 	}
 
-	ic, _ := integration.For(tool)
 	if ic.Proxy != nil {
 		ri := ic.Proxy
 		port := cfg.Proxy.Port

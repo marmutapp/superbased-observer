@@ -470,7 +470,7 @@ func runClaudeRoutedLaunch(opts claudeLauncherOptions, bin, proxyURL string, lau
 		launchArgs = forceClaudeSessionID(launchArgs)
 	}
 
-	return execClaudeChild(bin, launchArgs, env, continueDir)
+	return execClaudeChild(bin, launchArgs, env, continueDir, opts.configPath)
 }
 
 // claudeAttachEnv builds the profile env forwarded across the attach socket to

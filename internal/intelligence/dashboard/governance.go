@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/marmutapp/superbased-observer/internal/config"
 	"github.com/marmutapp/superbased-observer/internal/govern"
 	"github.com/marmutapp/superbased-observer/internal/policyfam/nodegov"
 )
@@ -213,5 +214,158 @@ func (s *Server) handleGovernance(w http.ResponseWriter, r *http.Request) {
 		// identical to a governed build's ungranted answer.
 		eff = govern.Resolve(govern.Delivered{}, nil, govern.LiveIdentity{}, time.Now())
 	}
-	writeJSON(w, eff)
+	writeJSON(w, governanceResponse{Effective: eff, Share: s.resolveShareBlock(eff)})
+}
+
+// governanceResponse is the wire shape of GET /api/governance: the resolved
+// posture, with the `share` block REPLACED by the resolved per-key rows the
+// Privacy page renders.
+//
+// The embedded Effective carries its own `share` field (the org's directives
+// as delivered, map[string]any). This outer field shadows it — encoding/json
+// resolves a tag collision in favour of the shallower field — which is the
+// point: serializing Effective verbatim emitted bare booleans
+// ({"share":{"cache_detail":true}}) where the SPA expects
+// {effective, local, source} objects, so every consumer read `.source` off a
+// boolean. That produced "not shared" for a tier the org had just RAISED and
+// an undefined label lookup, on the one card whose entire job is telling a
+// developer what their employer configured — and it fired only once an org
+// actually published a share directive, i.e. exactly when it mattered.
+type governanceResponse struct {
+	govern.Effective
+	Share map[string]governanceShareKey `json:"share,omitempty"`
+}
+
+// governanceShareKey is one row of the `share` block: what is in force, what
+// this machine's own config asks for, and which of the two decided it.
+//
+// Local is `any` and may be null: it is the node's own setting for the key,
+// and a key this build has no local counterpart for (see shareLocalTable) has
+// no honest value to report there.
+type governanceShareKey struct {
+	Effective any                `json:"effective"`
+	Local     any                `json:"local"`
+	Source    govern.ShareSource `json:"source"`
+	// PolicyVersion is the delivered body's version, so the Source column can
+	// name the policy that decided the row. Omitted on a dormant posture.
+	PolicyVersion int64 `json:"policy_version,omitempty"`
+}
+
+// shareLocalTable maps each org-directable share key (the closed
+// nodegov.ShareKeys vocabulary) onto this node's own [org_client.share]
+// setting. Table-driven rather than a switch so the coverage test can walk it
+// against nodegov.ShareKeys and fail the moment the vocabulary grows a key
+// this surface would silently mis-report.
+//
+// Values are `any` because the vocabulary is mixed-kind: bool for every tier,
+// []string for target_action_allowlist.
+var shareLocalTable = map[string]func(config.OrgClientShareConfig) any{
+	"full_content":            func(c config.OrgClientShareConfig) any { return c.FullContent },
+	"full_tool_bodies":        func(c config.OrgClientShareConfig) any { return c.FullToolBodies },
+	"routing_summary":         func(c config.OrgClientShareConfig) any { return c.RoutingSummary },
+	"cache_detail":            func(c config.OrgClientShareConfig) any { return c.CacheDetail },
+	"routing_detail":          func(c config.OrgClientShareConfig) any { return c.RoutingDetail },
+	"limit_gauge":             func(c config.OrgClientShareConfig) any { return c.LimitGauge },
+	"codeintel_detail":        func(c config.OrgClientShareConfig) any { return c.CodeintelDetail },
+	"process_detail":          func(c config.OrgClientShareConfig) any { return c.ProcessDetail },
+	"terminal_detail":         func(c config.OrgClientShareConfig) any { return c.TerminalDetail },
+	"policy_state":            func(c config.OrgClientShareConfig) any { return c.PolicyState },
+	"target_action_allowlist": func(c config.OrgClientShareConfig) any { return c.TargetActionAllowlist },
+	"obs.summary":             func(c config.OrgClientShareConfig) any { return c.Obs.Summary },
+	"obs.traces":              func(c config.OrgClientShareConfig) any { return c.Obs.Traces },
+	"obs.content":             func(c config.OrgClientShareConfig) any { return c.Obs.Content },
+	"obs.eval_summary":        func(c config.OrgClientShareConfig) any { return c.Obs.EvalSummary },
+	"obs.admission":           func(c config.OrgClientShareConfig) any { return c.Obs.Admission },
+	"obs.eval_items":          func(c config.OrgClientShareConfig) any { return c.Obs.EvalItems },
+}
+
+// resolveShareBlock resolves the org's delivered share directives against this
+// node's own [org_client.share] settings, one row per key the org PUBLISHED —
+// and only those, so the block's key set is unchanged and a key the org said
+// nothing about keeps resolving to "you" in the SPA without a row.
+//
+// The merge is govern's, not this package's: MergeBool/LowerList are the same
+// functions the push seam applies, so the "In force" column cannot drift from
+// what actually ships. Reading the node's own config here (the same
+// loadConfigForDashboard the Settings page uses) rather than taking an
+// injected ShareOptions keeps the seam count at zero — /api/governance is
+// fetched once per SPA mount, not on a hot path.
+func (s *Server) resolveShareBlock(eff govern.Effective) map[string]governanceShareKey {
+	if len(eff.Share) == 0 {
+		return nil
+	}
+	var local config.OrgClientShareConfig
+	if cfg, err := loadConfigForDashboard(s.opts.ConfigPath); err == nil {
+		local = cfg.OrgClient.Share
+	} else if s.opts.Logger != nil {
+		// A config this process cannot parse is a real condition, not a
+		// reason to drop the block: the org's directives are still in force
+		// and the developer still gets to see them. The rows degrade to the
+		// zero-value floor for `local`, which is what the push seam would
+		// also fall back to.
+		s.opts.Logger.Warn("governance: could not read local share settings", "error", err)
+	}
+	out := make(map[string]governanceShareKey, len(eff.Share))
+	for key, directive := range eff.Share {
+		row := governanceShareKey{PolicyVersion: eff.Version}
+		fn, known := shareLocalTable[key]
+		switch {
+		case !known:
+			// Unreachable while TestShareLocalTableCoversNodegovVocabulary
+			// passes — nodegov.Compile refuses any share key outside its own
+			// table on both the publish and the accept path. Kept so a drift
+			// shows the key with the org named as its only source, rather
+			// than dropping it (an invisible directive is the worst outcome
+			// on a transparency surface).
+			row.Effective, row.Local, row.Source = directive, nil, govern.ShareSourceOrg
+		case isListDirective(directive):
+			lv, _ := fn(local).([]string)
+			ev := eff.LowerList(key, lv)
+			// Normalize nil to [] on the wire only. govern preserves the
+			// nil/empty distinction because the ALGEBRA needs it; the SPA
+			// types both halves as string[] and renders either as "none", so
+			// emitting null here would buy nothing and break the type.
+			row.Effective, row.Local = orEmpty(ev), orEmpty(lv)
+			row.Source = sourceForList(lv, ev)
+		default:
+			lv, _ := fn(local).(bool)
+			// Gated (W-8), not the plain MergeBool/SourceForBool: this card
+			// is the transparency surface, so it must report the exact
+			// per-tier answer (ExtractionAuthorized) the push seam itself
+			// gates on, not MergeBool's documented conservative
+			// over-report. See internal/govern/sharetiers.go.
+			row.Effective = eff.MergeBoolGated(key, lv)
+			row.Local = lv
+			row.Source = eff.SourceForBoolGated(key, lv)
+		}
+		out[key] = row
+	}
+	return out
+}
+
+// isListDirective reports whether an org directive is the list-kind
+// (target_action_allowlist). Branching on the DIRECTIVE's shape rather than on
+// the key name keeps the kind knowledge in one place — nodegov's compiler,
+// which normalized it.
+func isListDirective(v any) bool {
+	_, ok := v.([]string)
+	return ok
+}
+
+// sourceForList attributes a list-valued key. The list algebra is
+// intersection-only in BOTH tenancies (there is no RaiseList), so the org can
+// only ever have narrowed the node's own list or left it alone.
+func sourceForList(local, effective []string) govern.ShareSource {
+	if len(effective) < len(local) {
+		return govern.ShareSourceOrg
+	}
+	return govern.ShareSourceBoth
+}
+
+// orEmpty renders a nil string slice as [] rather than null.
+func orEmpty(v []string) []string {
+	if v == nil {
+		return []string{}
+	}
+	return v
 }

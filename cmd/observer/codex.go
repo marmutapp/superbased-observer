@@ -428,7 +428,7 @@ func runCodexLauncher(ctx context.Context, opts codexLauncherOptions) error {
 	}
 	// proxyRouteProceed → the routed launch below injects `-c openai_base_url`.
 
-	return runCodexChild(ctx, opts, proxyURL, preflight)
+	return runCodexChild(ctx, opts, proxyURL, preflight, cfg.Observer.DBPath)
 }
 
 // runCodexChild resolves the codex binary, applies any --continue-from handover,
@@ -436,10 +436,11 @@ func runCodexLauncher(ctx context.Context, opts codexLauncherOptions) error {
 // codexLaunchArgs), wires OOB rollout-discovery for a daemon-spawned launch, and
 // execs codex — forwarding the exit code. preflight carries the app-server
 // processes detected upstream so the post-flight capture-rate check can reuse
-// them. Extracted from runCodexLauncher to keep its cyclomatic complexity in
-// bounds; the caller reaches it only on a proxyRouteProceed / neutralized
-// verdict.
-func runCodexChild(ctx context.Context, opts codexLauncherOptions, proxyURL string, preflight []codexipc.Process) error {
+// them; dbPath is the observer DB (cfg.Observer.DBPath) for the best-effort
+// launch-seed attribution row. Extracted from runCodexLauncher to keep its
+// cyclomatic complexity in bounds; the caller reaches it only on a
+// proxyRouteProceed / neutralized verdict.
+func runCodexChild(ctx context.Context, opts codexLauncherOptions, proxyURL string, preflight []codexipc.Process, dbPath string) error {
 	bin, binErr := resolveToolBin("codex", opts.codexPath, "--codex-path", opts.configPath, opts.stderr)
 	if binErr != nil {
 		return binErr
@@ -501,6 +502,11 @@ func runCodexChild(ctx context.Context, opts codexLauncherOptions, proxyURL stri
 	if err := child.Start(); err != nil {
 		return fmt.Errorf("exec codex: start: %w", err)
 	}
+	// Direct process attribution (migration 086): record the child pid now
+	// that Start has made it knowable; retract the seed when the child is
+	// reaped. Best-effort both ways — a seeding failure never affects the
+	// launch (see cmd/observer/launchseed.go).
+	recordLaunchSeed(dbPath, "codex", continueDir, child.Process.Pid, opts.stderr)
 	// discCancel is hoisted out of the discoverSession block so it can be
 	// fired the INSTANT child.Wait returns (F1), before the post-flight scan.
 	var discCancel context.CancelFunc

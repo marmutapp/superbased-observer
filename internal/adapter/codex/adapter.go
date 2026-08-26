@@ -177,6 +177,14 @@ type sessionContext struct {
 	Model     string `json:"model"`
 	Cwd       string `json:"cwd"`
 	GitBranch string `json:"git_branch"`
+	// GitRemote is the normalized "origin" remote for Cwd. Unlike
+	// GitBranch (sourced from the rollout JSONL's own git_branch
+	// field), Codex's JSONL never carries a remote — this is resolved
+	// via git.Resolve(Cwd) + git.NormalizeRemote at the same call
+	// sites that already resolve the project root (resolveProjectRoot
+	// / resolveProjectRemote, cached by rootCache), never unmarshaled
+	// from JSON. `json:"-"` keeps it out of the wire shape.
+	GitRemote string `json:"-"`
 	// EffortLevel is the per-turn reasoning effort the model was
 	// asked to use (minimal | low | medium | high). Populated from
 	// turn_context.payload.collaboration_mode.settings.reasoning_effort
@@ -833,6 +841,12 @@ func (a *Adapter) parseSessionFile(ctx context.Context, path string, fromOffset 
 	// so it must NOT re-emit — the guarded SQL would fire every poll.
 	sessionMetaObservedThisChunk := false
 
+	// rootCache is declared here (rather than after the resume block
+	// below) so the resume path can prime ctxState.GitRemote from the
+	// same cache the live parse's per-event resolveProjectRoot /
+	// resolveProjectRemote calls read from.
+	rootCache := map[string]projectGitInfo{}
+
 	// resumed carries the dedup state rebuilt from the pre-offset bytes
 	// (token-total baseline + already-emitted system-prompt hashes). It
 	// is applied to the seen* maps further down, where they're declared.
@@ -845,6 +859,14 @@ func (a *Adapter) parseSessionFile(ctx context.Context, path string, fromOffset 
 			lineOffset = pre.lineCount
 			forkTrack = pre.track
 			resumed = pre
+			// GitRemote is derived (not JSONL data), so
+			// mergeSessionContext never populates it — resolve it here
+			// from the prefetched Cwd, same as applyContext does for
+			// the live parse below.
+			if ctxState.Cwd != "" {
+				a.resolveProjectRoot(ctxState.Cwd, rootCache)
+				ctxState.GitRemote = a.resolveProjectRemote(ctxState.Cwd, rootCache)
+			}
 		}
 		if _, err := f.Seek(fromOffset, io.SeekStart); err != nil {
 			return adapter.ParseResult{}, fmt.Errorf("codex.ParseSessionFile: seek: %w", err)
@@ -861,7 +883,6 @@ func (a *Adapter) parseSessionFile(ctx context.Context, path string, fromOffset 
 	if tier := codexServiceTier(path); tier != "" {
 		ctxState.ServiceTier = tier
 	}
-	rootCache := map[string]string{}
 	pending := map[string]int{} // call_id → res.ToolEvents index
 	// patchInvocations is the SECONDARY index that lets a patch_apply_end
 	// find its own invocation row when the call_id join cannot: modern
@@ -976,6 +997,11 @@ func (a *Adapter) parseSessionFile(ctx context.Context, path string, fromOffset 
 		}
 		if sc.Cwd != "" {
 			ctxState.Cwd = sc.Cwd
+			// GitRemote is derived from Cwd (git.Resolve), not carried
+			// on the JSONL envelope like GitBranch — re-resolve (cache
+			// hit on repeat cwds) whenever cwd actually changes.
+			a.resolveProjectRoot(ctxState.Cwd, rootCache)
+			ctxState.GitRemote = a.resolveProjectRemote(ctxState.Cwd, rootCache)
 		}
 		if sc.GitBranch != "" {
 			ctxState.GitBranch = sc.GitBranch
@@ -1498,6 +1524,7 @@ func (a *Adapter) parseSessionFile(ctx context.Context, path string, fromOffset 
 						ProjectRoot:        projectRoot,
 						Timestamp:          ts,
 						GitBranch:          ctxState.GitBranch,
+						GitRemote:          ctxState.GitRemote,
 						Model:              ctxState.Model,
 						Tool:               models.ToolCodex,
 						ActionType:         models.ActionReadFile,
@@ -1756,6 +1783,7 @@ func (a *Adapter) parseSessionFile(ctx context.Context, path string, fromOffset 
 					SessionID:         ctxState.SessionID,
 					ProjectRoot:       projectRoot,
 					GitBranch:         ctxState.GitBranch,
+					GitRemote:         ctxState.GitRemote,
 					Timestamp:         ts,
 					Tool:              models.ToolCodex,
 					Model:             modelForTurn(turnID),
@@ -2185,6 +2213,7 @@ func (a *Adapter) parseSessionFile(ctx context.Context, path string, fromOffset 
 				SessionID:         ctxState.SessionID,
 				ProjectRoot:       projectRoot,
 				GitBranch:         ctxState.GitBranch,
+				GitRemote:         ctxState.GitRemote,
 				Timestamp:         ts,
 				Tool:              models.ToolCodex,
 				Model:             model,
@@ -2315,6 +2344,7 @@ func (a *Adapter) buildCustomToolCallEvent(
 		ProjectRoot:        projectRoot,
 		Timestamp:          ts,
 		GitBranch:          sess.GitBranch,
+		GitRemote:          sess.GitRemote,
 		Model:              sess.Model,
 		Tool:               models.ToolCodex,
 		ActionType:         actionType,
@@ -2409,6 +2439,7 @@ func (a *Adapter) buildPatchApplyStandaloneEvent(
 		ProjectRoot:        projectRoot,
 		Timestamp:          ts,
 		GitBranch:          sess.GitBranch,
+		GitRemote:          sess.GitRemote,
 		Model:              sess.Model,
 		Tool:               models.ToolCodex,
 		ActionType:         models.ActionEditFile,
@@ -2547,6 +2578,7 @@ func (a *Adapter) systemPromptEvent(
 		ProjectRoot:   projectRoot,
 		Timestamp:     ts,
 		GitBranch:     sess.GitBranch,
+		GitRemote:     sess.GitRemote,
 		Model:         sess.Model,
 		Tool:          models.ToolCodex,
 		ActionType:    models.ActionSystemPrompt,
@@ -2605,6 +2637,7 @@ func (a *Adapter) buildCompactedEvent(
 		ProjectRoot:   projectRoot,
 		Timestamp:     ts,
 		GitBranch:     sess.GitBranch,
+		GitRemote:     sess.GitRemote,
 		Model:         sess.Model,
 		Tool:          models.ToolCodex,
 		ActionType:    models.ActionContextCompacted,
@@ -2641,6 +2674,7 @@ func (a *Adapter) buildTurnAbortedEvent(
 		ProjectRoot:   projectRoot,
 		Timestamp:     ts,
 		GitBranch:     sess.GitBranch,
+		GitRemote:     sess.GitRemote,
 		Model:         sess.Model,
 		Tool:          models.ToolCodex,
 		ActionType:    models.ActionTurnAborted,
@@ -2696,6 +2730,7 @@ func (a *Adapter) buildMCPCallEndStandaloneEvent(
 		ProjectRoot:        projectRoot,
 		Timestamp:          ts,
 		GitBranch:          sess.GitBranch,
+		GitRemote:          sess.GitRemote,
 		Model:              sess.Model,
 		Tool:               models.ToolCodex,
 		ActionType:         models.ActionMCPCall,
@@ -2772,6 +2807,7 @@ func (a *Adapter) buildCodexErrorEvent(
 		ProjectRoot:   projectRoot,
 		Timestamp:     ts,
 		GitBranch:     sess.GitBranch,
+		GitRemote:     sess.GitRemote,
 		Model:         sess.Model,
 		Tool:          models.ToolCodex,
 		ActionType:    models.ActionAPIError,
@@ -3118,6 +3154,7 @@ func (a *Adapter) buildUserPromptEvent(sourceFile string, sess sessionContext, p
 		ProjectRoot:        projectRoot,
 		Timestamp:          ts,
 		GitBranch:          sess.GitBranch,
+		GitRemote:          sess.GitRemote,
 		Model:              sess.Model,
 		Tool:               models.ToolCodex,
 		ActionType:         models.ActionUserPrompt,
@@ -3216,6 +3253,7 @@ func (a *Adapter) buildAgentMessageEvent(sourceFile string, sess sessionContext,
 		ProjectRoot:   projectRoot,
 		Timestamp:     ts,
 		GitBranch:     sess.GitBranch,
+		GitRemote:     sess.GitRemote,
 		Model:         sess.Model,
 		Tool:          models.ToolCodex,
 		// One row per agent_message event — codex emits several per turn
@@ -3244,6 +3282,7 @@ func (a *Adapter) buildExecCommandEvent(sourceFile string, sess sessionContext, 
 		ProjectRoot:        projectRoot,
 		Timestamp:          ts,
 		GitBranch:          sess.GitBranch,
+		GitRemote:          sess.GitRemote,
 		Model:              sess.Model,
 		Tool:               models.ToolCodex,
 		ActionType:         models.ActionRunCommand,
@@ -3295,6 +3334,7 @@ func buildCodexRateLimitEvent(sourceFile string, sess sessionContext, projectRoo
 		ProjectRoot:   projectRoot,
 		Timestamp:     ts,
 		GitBranch:     sess.GitBranch,
+		GitRemote:     sess.GitRemote,
 		Model:         sess.Model,
 		Tool:          models.ToolCodex,
 		ActionType:    models.ActionRateLimit,
@@ -3316,6 +3356,7 @@ func (a *Adapter) buildWebSearchEvent(sourceFile string, sess sessionContext, pr
 		ProjectRoot:        projectRoot,
 		Timestamp:          ts,
 		GitBranch:          sess.GitBranch,
+		GitRemote:          sess.GitRemote,
 		Model:              sess.Model,
 		Tool:               models.ToolCodex,
 		ActionType:         models.ActionWebSearch,
@@ -3362,6 +3403,7 @@ func (a *Adapter) buildTaskCompleteEvent(sourceFile string, sess sessionContext,
 		ProjectRoot:        projectRoot,
 		Timestamp:          ts,
 		GitBranch:          sess.GitBranch,
+		GitRemote:          sess.GitRemote,
 		Model:              sess.Model,
 		Tool:               models.ToolCodex,
 		ActionType:         models.ActionTaskComplete,
@@ -3408,6 +3450,7 @@ func (a *Adapter) buildToolEvent(
 		ProjectRoot:        projectRoot,
 		Timestamp:          ts,
 		GitBranch:          sess.GitBranch,
+		GitRemote:          sess.GitRemote,
 		Model:              sess.Model,
 		Tool:               models.ToolCodex,
 		ActionType:         actionType,
@@ -3474,7 +3517,17 @@ func (a *Adapter) extractTarget(toolName string, rawInput json.RawMessage, proje
 	return ""
 }
 
-func (a *Adapter) resolveProjectRoot(cwd string, cache map[string]string) string {
+// projectGitInfo is the per-cwd cache entry for resolveProjectRoot /
+// resolveProjectRemote: the resolved project root and its normalized
+// "origin" remote, captured together from a single git.Resolve call so
+// the two never drift and the filesystem walk never happens twice for
+// the same cwd.
+type projectGitInfo struct {
+	Root   string
+	Remote string
+}
+
+func (a *Adapter) resolveProjectRoot(cwd string, cache map[string]projectGitInfo) string {
 	if cwd == "" {
 		return ""
 	}
@@ -3489,16 +3542,29 @@ func (a *Adapter) resolveProjectRoot(cwd string, cache map[string]string) string
 	// git.Resolve operates on the actual cross-mount path. No-op on
 	// Windows hosts and on cwds that already look like native paths.
 	cwd = crossmount.TranslateForeignPath(cwd)
-	if root, ok := cache[cwd]; ok {
-		return root
+	if entry, ok := cache[cwd]; ok {
+		return entry.Root
 	}
 	info, err := git.Resolve(cwd)
 	if err != nil {
-		cache[cwd] = cwd
+		cache[cwd] = projectGitInfo{Root: cwd}
 		return cwd
 	}
-	cache[cwd] = info.Root
+	cache[cwd] = projectGitInfo{Root: info.Root, Remote: git.NormalizeRemote(info.Remote)}
 	return info.Root
+}
+
+// resolveProjectRemote returns the normalized git remote for cwd, cached
+// alongside the project root by resolveProjectRoot. Callers must invoke
+// resolveProjectRoot for the same cwd first so the cache entry exists —
+// this never triggers its own git.Resolve call, to avoid resolving the
+// same cwd twice.
+func (a *Adapter) resolveProjectRemote(cwd string, cache map[string]projectGitInfo) string {
+	if cwd == "" {
+		return ""
+	}
+	cwd = crossmount.TranslateForeignPath(cwd)
+	return cache[cwd].Remote
 }
 
 func decodeOutput(raw json.RawMessage) string {
@@ -4027,6 +4093,9 @@ func mergeSessionContext(into, from sessionContext) sessionContext {
 	}
 	if from.GitBranch != "" {
 		into.GitBranch = from.GitBranch
+	}
+	if from.GitRemote != "" {
+		into.GitRemote = from.GitRemote
 	}
 	// EffortLevel follows the same sticky rule as applyContext — a
 	// later non-empty value wins, empty does NOT wipe a prior value.

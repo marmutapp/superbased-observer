@@ -103,7 +103,7 @@ type StructuredEnrichment struct {
 // 90 = EPHEMERAL_MESSAGE, so per-message wall-clock alignment for
 // markdown-derived rows + user-prompt extraction remain deferred —
 // see the Tier 3 section of the handoff doc.
-func ParseStructuredTrajectory(buf []byte, conversationID, projectRoot, sourceFile string, scrubber Scrubber) StructuredEnrichment {
+func ParseStructuredTrajectory(buf []byte, conversationID, projectRoot, gitRemote, sourceFile string, scrubber Scrubber) StructuredEnrichment {
 	var en StructuredEnrichment
 	if len(buf) == 0 || conversationID == "" {
 		return en
@@ -397,6 +397,7 @@ func ParseStructuredTrajectory(buf []byte, conversationID, projectRoot, sourceFi
 			SourceEventID:       "antigravity-struct-token:" + conversationID + ":" + intStr(i),
 			SessionID:           conversationID,
 			ProjectRoot:         projectRoot,
+			GitRemote:           gitRemote,
 			Timestamp:           ts,
 			Tool:                models.ToolAntigravity,
 			Model:               en.Model,
@@ -494,6 +495,7 @@ func ParseStructuredTrajectory(buf []byte, conversationID, projectRoot, sourceFi
 					SourceEventID:      "antigravity-struct-tool:" + conversationID + ":step:" + intStr(i),
 					SessionID:          conversationID,
 					ProjectRoot:        projectRoot,
+					GitRemote:          gitRemote,
 					Timestamp:          ts,
 					Tool:               models.ToolAntigravity,
 					Model:              en.Model,
@@ -514,6 +516,7 @@ func ParseStructuredTrajectory(buf []byte, conversationID, projectRoot, sourceFi
 					SourceEventID:      "antigravity-struct-artifact:" + conversationID + ":step:" + intStr(i),
 					SessionID:          conversationID,
 					ProjectRoot:        projectRoot,
+					GitRemote:          gitRemote,
 					Timestamp:          ts,
 					Tool:               models.ToolAntigravity,
 					Model:              en.Model,
@@ -538,6 +541,7 @@ func ParseStructuredTrajectory(buf []byte, conversationID, projectRoot, sourceFi
 					SourceEventID: "antigravity-struct-payload:" + conversationID + ":step:" + intStr(i) + ":user",
 					SessionID:     conversationID,
 					ProjectRoot:   projectRoot,
+					GitRemote:     gitRemote,
 					Timestamp:     ts,
 					Tool:          models.ToolAntigravity,
 					Model:         en.Model,
@@ -557,6 +561,7 @@ func ParseStructuredTrajectory(buf []byte, conversationID, projectRoot, sourceFi
 					SourceEventID: "antigravity-struct-payload:" + conversationID + ":step:" + intStr(i) + ":assistant",
 					SessionID:     conversationID,
 					ProjectRoot:   projectRoot,
+					GitRemote:     gitRemote,
 					Timestamp:     ts,
 					Tool:          models.ToolAntigravity,
 					Model:         en.Model,
@@ -588,6 +593,7 @@ func ParseStructuredTrajectory(buf []byte, conversationID, projectRoot, sourceFi
 					SourceEventID: "antigravity-struct-plan:" + conversationID + ":step:" + intStr(i),
 					SessionID:     conversationID,
 					ProjectRoot:   projectRoot,
+					GitRemote:     gitRemote,
 					Timestamp:     ts,
 					Tool:          models.ToolAntigravity,
 					Model:         en.Model,
@@ -614,6 +620,7 @@ func ParseStructuredTrajectory(buf []byte, conversationID, projectRoot, sourceFi
 					SourceEventID:      "antigravity-struct-final:" + conversationID + ":step:" + intStr(i),
 					SessionID:          conversationID,
 					ProjectRoot:        projectRoot,
+					GitRemote:          gitRemote,
 					Timestamp:          ts,
 					Tool:               models.ToolAntigravity,
 					Model:              en.Model,
@@ -694,6 +701,7 @@ func ParseStructuredTrajectory(buf []byte, conversationID, projectRoot, sourceFi
 				SourceEventID: "antigravity-struct-cmd:" + conversationID + ":term:" + t.uuid + ":" + intStr(int(t.startSec)),
 				SessionID:     conversationID,
 				ProjectRoot:   projectRoot,
+				GitRemote:     gitRemote,
 				Timestamp:     ts,
 				Tool:          models.ToolAntigravity,
 				Model:         en.Model,

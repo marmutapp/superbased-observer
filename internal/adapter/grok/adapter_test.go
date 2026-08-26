@@ -2,6 +2,7 @@ package grok
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -474,6 +475,55 @@ func TestTokenBundleNet(t *testing.T) {
 					got, tc.wantInput, tc.wantCache, tc.wantOut, tc.wantRe)
 			}
 		})
+	}
+}
+
+// TestParseUpdates_EffortLevelWired pins the grok half of
+// adapter-parity-audit-2026-08-25.md §2.5: summary.json's
+// reasoning_effort ("high" in the committed fixture) was parsed into
+// sessionSummary but never referenced anywhere — this asserts it now
+// lands in ActionMetadata.EffortLevel on every emitted ToolEvent for
+// the session (session_start, user_prompt, assistant_message, and tool
+// calls all share the one session-wide sessionMeta).
+func TestParseUpdates_EffortLevelWired(t *testing.T) {
+	a := newFixtureAdapter(t)
+	_, _, _, updates, _ := fixturePaths(t)
+
+	res, err := a.ParseSessionFile(context.Background(), updates, 0)
+	if err != nil {
+		t.Fatalf("ParseSessionFile: %v", err)
+	}
+	if len(res.ToolEvents) == 0 {
+		t.Fatalf("no ToolEvents parsed")
+	}
+	for _, e := range res.ToolEvents {
+		if e.Metadata == nil || e.Metadata.EffortLevel != "high" {
+			t.Errorf("event %s (%s): Metadata = %+v, want EffortLevel=high", e.SourceEventID, e.ActionType, e.Metadata)
+		}
+	}
+}
+
+// TestResolveMeta_EffortLevelEmptyWhenAbsent pins that a summary.json
+// without a reasoning_effort field resolves to an empty effortLevel
+// (and therefore effortMetadata returns nil, not an empty-but-allocated
+// ActionMetadata) — the honest "no grounded setting" case.
+func TestResolveMeta_EffortLevelEmptyWhenAbsent(t *testing.T) {
+	dir := t.TempDir()
+	summaryPath := filepath.Join(dir, "summary.json")
+	body := `{"info":{"id":"s1","cwd":"/home/dev/noeffort"},"current_model_id":"grok-4.5","git_root_dir":"/home/dev/noeffort","head_branch":"main"}`
+	if err := os.WriteFile(summaryPath, []byte(body), 0o644); err != nil { //nolint:gosec // test fixture
+		t.Fatalf("write summary.json: %v", err)
+	}
+	a := New()
+	m := a.resolveMeta(summaryPath)
+	if m == nil {
+		t.Fatalf("resolveMeta returned nil")
+	}
+	if m.effortLevel != "" {
+		t.Errorf("effortLevel = %q, want empty (reasoning_effort absent)", m.effortLevel)
+	}
+	if got := effortMetadata(m.effortLevel); got != nil {
+		t.Errorf("effortMetadata(%q) = %+v, want nil", m.effortLevel, got)
 	}
 }
 

@@ -53,7 +53,7 @@ func (s *Server) handleTerminalPolicy(w http.ResponseWriter, r *http.Request) {
 // free-text field), and honest state flags. It mints a fresh confirm token so
 // the PUT can echo it (§10).
 func (s *Server) handleTerminalPolicyGet(w http.ResponseWriter, r *http.Request) {
-	confirmTok := setConfirmCookie(w)
+	confirmTok := setConfirmCookie(w, r)
 	resp := map[string]any{
 		"confirm_token":         confirmTok,
 		"config_writable":       s.opts.ConfigPath != "",

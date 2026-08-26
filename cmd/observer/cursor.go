@@ -3,12 +3,15 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 
 	"github.com/spf13/cobra"
+
+	"github.com/marmutapp/superbased-observer/internal/config"
 )
 
 // cursorSubcommands are the cursor-agent argv tokens that are subcommands
@@ -164,7 +167,29 @@ func newCursorCmd() *cobra.Command {
 			child.Stdin = os.Stdin
 			child.Stdout = os.Stdout
 			child.Stderr = os.Stderr
-			if runErr := child.Run(); runErr != nil {
+			if startErr := child.Start(); startErr != nil {
+				return fmt.Errorf("exec cursor-agent: %w", startErr)
+			}
+			// Direct process attribution (migration 086): record the child pid
+			// now that Start has made it knowable; retract the seed when the
+			// child is reaped. Best-effort both ways — a seeding failure never
+			// affects the launch (see cmd/observer/launchseed.go).
+			dbPath := ""
+			if cfg, cErr := config.Load(config.LoadOptions{GlobalPath: configPath}); cErr == nil {
+				dbPath = cfg.Observer.DBPath
+			}
+			recordLaunchSeed(dbPath, "cursor", continueDir, child.Process.Pid, cmd.ErrOrStderr())
+			// Best-effort generic post-launch session discovery (WS-DISCOVERY):
+			// a no-op unless the trusted OOB channel is active AND "cursor"
+			// resolves to an adapter that declares session-file watch roots.
+			// Cancel the instant the child exits so a window cut short by exit
+			// never announces a candidate that only looked unique because the
+			// scan stopped early.
+			discoverCancel := maybeStartGenericDiscovery(context.Background(), "cursor", continueDir)
+			if discoverCancel != nil {
+				defer discoverCancel()
+			}
+			if runErr := child.Wait(); runErr != nil {
 				var ee *exec.ExitError
 				if errors.As(runErr, &ee) {
 					return exitErr(ee.ExitCode())

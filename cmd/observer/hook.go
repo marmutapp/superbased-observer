@@ -1446,6 +1446,10 @@ func buildClaudeSubagentStartEvent(body []byte) (models.ToolEvent, bool) {
 	ev := baseToolEvent(p.claudeBaseEnvelope, models.ActionSubagentStart, "subagent_start")
 	if p.AgentID != "" {
 		ev.SourceEventID = p.AgentID + ":subagent_start"
+		// Structured sub-agent identity (alongside the legacy RawToolName
+		// carry): feeds /api/session/<id>/subagents grouping without
+		// raw-field scraping.
+		ev.Metadata = &models.ActionMetadata{AgentID: p.AgentID}
 	}
 	ev.Target = p.AgentType
 	ev.RawToolName = p.AgentID
@@ -1500,6 +1504,12 @@ func buildClaudeSubagentStopEvent(body []byte) (models.ToolEvent, bool) {
 		ev.Target = filepath.Base(p.AgentTranscriptPath)
 	}
 	ev.RawToolName = p.AgentID
+	if p.AgentID != "" {
+		// Structured sub-agent identity (alongside the legacy RawToolName
+		// carry): feeds /api/session/<id>/subagents grouping without
+		// raw-field scraping.
+		ev.Metadata = &models.ActionMetadata{AgentID: p.AgentID}
+	}
 	if p.LastAssistantMessage != "" {
 		// Land the assistant's final message in BOTH
 		// raw_tool_input (the dashboard-rendered body) AND

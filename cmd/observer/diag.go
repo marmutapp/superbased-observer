@@ -18,6 +18,7 @@ import (
 
 	"github.com/marmutapp/superbased-observer/internal/config"
 	"github.com/marmutapp/superbased-observer/internal/db"
+	"github.com/marmutapp/superbased-observer/internal/dblease"
 	"github.com/marmutapp/superbased-observer/internal/diag"
 )
 
@@ -188,7 +189,22 @@ func loadConfigAndDB(ctx context.Context, configPath string) (config.Config, *sq
 	if err := os.MkdirAll(filepath.Dir(cfg.Observer.DBPath), 0o755); err != nil {
 		return config.Config{}, nil, func() {}, fmt.Errorf("ensure db dir: %w", err)
 	}
-	database, err := db.Open(ctx, db.Options{Path: cfg.Observer.DBPath})
+	// T1.4b (2026-08-26 disk/compute remediation plan): thread the
+	// operator-tunable [observer.db] block into every db.Open call made
+	// through this one central opener, instead of only the ones that
+	// happened to construct db.Options by hand. Zero/empty config values
+	// pass through unchanged — db.Open's own defaulting logic (built-in
+	// 1024 MB heap / "memory" temp_store / 16 conns / 5 min idle) applies
+	// exactly as it does for an unconfigured [observer.db] block; a
+	// negative HardHeapLimitMB stays negative through the MB→bytes
+	// multiply, preserving the negative-disables convention.
+	database, err := db.Open(ctx, db.Options{
+		Path:               cfg.Observer.DBPath,
+		HardHeapLimitBytes: int64(cfg.Observer.DB.HardHeapLimitMB) * (1 << 20),
+		TempStore:          cfg.Observer.DB.TempStore,
+		MaxOpenConns:       cfg.Observer.DB.MaxOpenConns,
+		ConnMaxIdleTime:    time.Duration(cfg.Observer.DB.ConnMaxIdleSeconds) * time.Second,
+	})
 	if err != nil {
 		return config.Config{}, nil, func() {}, fmt.Errorf("open db %s: %w", cfg.Observer.DBPath, err)
 	}
@@ -203,6 +219,21 @@ func loadConfigAndDB(ctx context.Context, configPath string) (config.Config, *sq
 // already serving. Called from a single goroutine per daemon process
 // (`observer start` / `observer proxy start` / `observer watch`).
 //
+// T2.2 (2026-08-26 disk/compute remediation plan, P1-D): above
+// [observer.db].integrity_check_max_gb the quick_check half is skipped —
+// its cost scales with the whole file, not with the work the daemon came
+// to do, and on a very large DB it was the dominant startup CPU cost. The
+// backfill half always runs regardless (cheap after its done-marker).
+// `observer doctor` is unaffected — internal/diag/doctor.go's
+// checkDBIntegrity calls `PRAGMA quick_check` directly and
+// unconditionally, independent of this gate, as the authoritative
+// on-demand probe.
+//
+// T2.3 (P1-F): guarded by a dblease so only one observer process on this
+// machine runs this pass per tick; a second process fails open (proceeds
+// anyway) on any lease error and simply skips its own pass when another
+// process legitimately holds the lease.
+//
 // Fail-soft: a corruption result is logged loudly (Error, pointing at
 // `observer doctor`) but never cancels the caller — the daemon is already up,
 // and a false alarm from a transient read must not take it down. Uses its own
@@ -214,7 +245,28 @@ func runStartupDBMaintenance(ctx context.Context, configPath string) {
 	}
 	defer cleanup()
 	logger := newLogger(cfg.Observer.LogLevel)
+
+	release, proceed := acquireMaintenanceLease(cfg, "db-maintenance", logger)
+	defer release()
+	if !proceed {
+		return
+	}
+
 	started := time.Now()
+	if skip, sizeBytes := dbIntegrityCheckShouldSkip(cfg); skip {
+		logger.Info(fmt.Sprintf(
+			"database integrity check skipped (DB > %d GB) — run `observer doctor db` to verify on demand",
+			cfg.Observer.DB.IntegrityCheckMaxGB,
+		),
+			"db_bytes", sizeBytes)
+		if err := db.RunStartupBackfillOnly(ctx, database); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			logger.Error("db path-hash backfill failed", "err", err, "elapsed_ms", time.Since(started).Milliseconds())
+		}
+		return
+	}
 	if err := db.RunStartupMaintenance(ctx, database); err != nil {
 		if errors.Is(err, context.Canceled) {
 			return
@@ -224,6 +276,49 @@ func runStartupDBMaintenance(ctx context.Context, configPath string) {
 		return
 	}
 	logger.Info("db integrity check ok (background)", "elapsed_ms", time.Since(started).Milliseconds())
+}
+
+// dbIntegrityCheckShouldSkip reports whether the AUTOMATIC startup
+// `PRAGMA quick_check` should be skipped because the DB file exceeds
+// [observer.db].integrity_check_max_gb (T2.2). Stat failures fail open
+// (never skip — an unreadable size shouldn't silently disable the
+// probe). ≤ 0 disables the gate: quick_check always runs.
+func dbIntegrityCheckShouldSkip(cfg config.Config) (skip bool, sizeBytes int64) {
+	maxGB := cfg.Observer.DB.IntegrityCheckMaxGB
+	if maxGB <= 0 {
+		return false, 0
+	}
+	fi, err := os.Stat(cfg.Observer.DBPath)
+	if err != nil {
+		return false, 0
+	}
+	sizeBytes = fi.Size()
+	limit := int64(maxGB) << 30
+	return sizeBytes > limit, sizeBytes
+}
+
+// acquireMaintenanceLease is the shared T2.3 dblease wrapper for the
+// daemon's automatic maintenance entry points (this file's
+// runStartupDBMaintenance, prune.go's retentionTickLoop/runRetention, and
+// codeintel.go's runCodeIntelOnStart): a lease held by ANOTHER process
+// (acquired=false, err==nil) means this pass legitimately skips — some
+// other observer process is already doing the work. Any lease ERROR
+// (e.g. the lock directory couldn't be created) must never block real
+// work, so it fails open and proceeds as if the lease were held. The
+// returned release is always safe to defer, even on the skip/error paths
+// (it's a no-op there).
+func acquireMaintenanceLease(cfg config.Config, name string, logger *slog.Logger) (release func(), proceed bool) {
+	release, acquired, err := dblease.TryAcquire(filepath.Dir(cfg.Observer.DBPath), name)
+	if err != nil {
+		logger.Debug("dblease: acquire failed, proceeding without cross-process coordination",
+			"lease", name, "err", err)
+		return func() {}, true
+	}
+	if !acquired {
+		logger.Debug("skipped: another observer holds the lease", "lease", name)
+		return func() {}, false
+	}
+	return release, true
 }
 
 // printReport renders a diag.Report as one line per check, with optional

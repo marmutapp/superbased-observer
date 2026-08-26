@@ -4,6 +4,69 @@ All notable changes to SuperBased Observer are documented here.
 
 ## [Unreleased]
 
+## [1.32.0] — 2026-08-26
+
+### Fixed
+
+- **fix(retention): the daemon no longer runs unbounded full-database
+  `VACUUM`s** — the retention size-cap's automatic, looping bare `VACUUM`
+  (which could write tens of GiB of SQLite temp files on large databases and
+  fill the host disk) is removed from every automatic path. Size-cap
+  reclamation is now a single bounded pass (aged-actions shed + WAL
+  checkpoint + incremental vacuum where enabled); full compaction is
+  operator-triggered via `observer prune --vacuum`, which now also requires
+  the daemon to be down and ~2× free disk headroom.
+- **fix(db): connection-scoped pragmas apply to every pooled connection** —
+  `synchronous`, `temp_store`, and a new `hard_heap_limit` memory backstop
+  moved into the SQLite DSN (previously they were applied post-open to one
+  arbitrary pooled connection, letting other connections spill temp files to
+  disk with default settings). The pool is now bounded
+  (`SetMaxOpenConns`/`SetConnMaxIdleTime`), and a regression test pins the
+  pragma set on N concurrent connections. Applied to the node DB, the org
+  server DB, and the edge WAL store.
+- **fix(db): startup integrity check is size-gated** — `PRAGMA quick_check`
+  (which reads every page and could run for over an hour on multi-GiB
+  databases) is skipped above a configurable size threshold
+  (`integrity_check_max_gb`, default 8) with a 10-minute deadline;
+  `observer doctor db` remains the explicit, authoritative integrity path.
+- **fix(observer): cross-process maintenance lease** — retention,
+  maintenance, and codeintel-on-start acquire a flock-based lease so
+  concurrent observer processes cannot duplicate expensive maintenance work;
+  codeintel index-on-start gained an aggregate deadline.
+- **perf(store): org-push snapshot queries no longer sort or scan far more
+  than they ship** — three per-tick reads fixed, each verified with
+  `EXPLAIN QUERY PLAN` and selection-equivalence tests: session network
+  events (per-session cap pushed into SQL via `ROW_NUMBER()` so the body
+  join fires only on surviving rows, migration 089), session process rows
+  (same cap pushdown, plus the per-run event count now seeks a new
+  `process_run_id` index instead of aggregating the whole `process_events`
+  table per tick, migration 090), and the codeintel dev + teams-tier
+  aggregates (Cartesian-product joins rewritten to pre-aggregate per
+  file). On the profiled node these were ~55% of steady-state daemon CPU.
+- **fix(arena): Windows build** — unix-only process-group syscalls in
+  `internal/arena` are build-tagged, restoring `GOOS=windows` builds (and
+  the win32 npm/VSIX artifacts).
+
+### Added
+
+- **feat(observer): env-gated pprof endpoint** — `OBSERVER_PPROF_ADDR`
+  (loopback-only, default off, fail-soft) serves `net/http/pprof` for the
+  daemon's lifetime, so steady-state CPU consumers can be named empirically.
+- **feat(observer): temp-file watchdog + startup guidance** — a background
+  check WARNs when deleted-but-open SQLite temp files exceed a threshold
+  (the failure mode that silently consumed ~80 GiB inside WSL), a
+  stale-binary check WARNs when the running executable no longer matches
+  the on-disk build, and daemon startup states that full integrity checks
+  and compaction are operator-triggered.
+
+### Docs
+
+- Root-cause audit + remediation plan for the disk/compute exhaustion
+  incident, and a steady-state CPU audit (pprof-named findings, a full
+  background-loop cadence inventory, and prevention guidance) with its
+  remediation plan — see `docs/audits/` and `docs/plans/`
+  (`*2026-08-26*`).
+
 ## [1.31.0] — 2026-08-17
 
 ### Added

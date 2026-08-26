@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -290,6 +291,76 @@ func TestTerminalLaunchMapsServiceErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTerminalLaunchFeatureGate pins the W5.1 org-governed enforcement seam
+// (dashboard.Options.TerminalFeatureGate, checked in handleTerminalLaunch
+// before any launch work begins): nil gate is fail-open (existing behavior,
+// unaffected by this wave), a gate that denies stops the launch at 403
+// carrying its reason verbatim, and a gate that allows lets the launch
+// proceed to the manager exactly as before. requestedSandbox is threaded
+// through from the request body, not hard-coded, so the gate can apply
+// sandbox_required policy.
+func TestTerminalLaunchFeatureGate(t *testing.T) {
+	newServerWithGate := func(t *testing.T, lm LaunchManager, gate func(bool) (bool, string)) *Server {
+		t.Helper()
+		tdir := t.TempDir()
+		database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = database.Close() })
+		s, err := New(Options{DB: database, LaunchManager: lm, TerminalFeatureGate: gate})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+
+	t.Run("nil gate fail-open", func(t *testing.T) {
+		lm := &fakeLaunchManager{}
+		s := newLaunchTestServer(t, lm) // Options.TerminalFeatureGate left nil
+		rec := postTerminalLaunch(t, s.Handler(), "codex", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("gate denies → 403 with its reason", func(t *testing.T) {
+		lm := &fakeLaunchManager{}
+		var gotSandbox bool
+		gate := func(sandbox bool) (bool, string) {
+			gotSandbox = sandbox
+			return false, "disabled by organization policy — request access via 'observer org request'"
+		}
+		s := newServerWithGate(t, lm, gate)
+		rec := postTerminalLaunch(t, s.Handler(), "codex", "")
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
+		}
+		if got := rec.Body.String(); !strings.Contains(got, "disabled by organization policy") {
+			t.Errorf("body = %q, want the gate's denial reason verbatim", got)
+		}
+		if gotSandbox {
+			t.Error("requestedSandbox = true, want false (request had no sandbox flag)")
+		}
+		if lm.lastFreshSpec.Tool != "" {
+			t.Errorf("launch manager was invoked (fresh spec = %+v), want the gate to short-circuit before it", lm.lastFreshSpec)
+		}
+	})
+
+	t.Run("gate allows → launch proceeds", func(t *testing.T) {
+		lm := &fakeLaunchManager{}
+		gate := func(bool) (bool, string) { return true, "" }
+		s := newServerWithGate(t, lm, gate)
+		rec := postTerminalLaunch(t, s.Handler(), "codex", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+		}
+		if lm.lastFreshSpec.Tool != "codex" {
+			t.Errorf("fresh spec = %+v, want the launch to have reached the manager", lm.lastFreshSpec)
+		}
+	})
 }
 
 func TestTerminalLaunchSuccess(t *testing.T) {
@@ -706,4 +777,63 @@ func TestLaunchWSUnknownHandleClosed(t *testing.T) {
 		t.Error("expected the server to close the already-attached session")
 	}
 	c.CloseNow()
+}
+
+// TestSiblingLaunchFeatureGates pins the 2026-08-25 adversarial-review fix:
+// the three terminal-spawning entry points that sit BESIDE handleTerminalLaunch
+// (session continue-from launch, session native resume, tools launch) must all
+// consult the same W5.1 org-governed TerminalFeatureGate before any side
+// effect — a denied gate stops each at 403 carrying the reason verbatim, and
+// the launch manager is never called. These paths have no sandbox lane, so
+// they present requestedSandbox=false (an org sandbox_required policy denies
+// them, correctly fail-closed).
+func TestSiblingLaunchFeatureGates(t *testing.T) {
+	const denyReason = "disabled by organization policy — request access via 'observer org request'"
+	newDenyServer := func(t *testing.T, lm LaunchManager) *Server {
+		t.Helper()
+		tdir := t.TempDir()
+		database, err := openTestDB(context.Background(), db.Options{Path: filepath.Join(tdir, "d.db")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = database.Close() })
+		s, err := New(Options{DB: database, LaunchManager: lm, TerminalFeatureGate: func(sandbox bool) (bool, string) {
+			if sandbox {
+				t.Errorf("sibling launch paths must present requestedSandbox=false")
+			}
+			return false, denyReason
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+
+	cases := []struct {
+		name string
+		path string
+		body string
+	}{
+		{"session launch", "/api/session/sess-1/launch", `{"to":"codex"}`},
+		{"session resume", "/api/session/sess-1/resume", `{}`},
+		{"tools launch", "/api/tools/launch", `{"tool":"codex"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			lm := &fakeLaunchManager{}
+			s := newDenyServer(t, lm)
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			rec := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), denyReason) {
+				t.Errorf("deny reason not surfaced verbatim: %s", rec.Body.String())
+			}
+			if !reflect.DeepEqual(lm.lastSpec, LaunchSpec{}) || !reflect.DeepEqual(lm.lastResumeSpec, ResumeLaunchSpec{}) {
+				t.Errorf("launch manager reached despite denied gate: %+v / %+v", lm.lastSpec, lm.lastResumeSpec)
+			}
+		})
+	}
 }

@@ -221,7 +221,7 @@ func (a *Adapter) parseProcessLog(_ context.Context, path string, fromOffset int
 	// TokenEvents for a session it hasn't seen in the same batch, so
 	// without this the log-parser-only path silently drops every
 	// upserted token row (Tier 1 then never lands in DB).
-	projectRoot, branch := resolveProjectFromSibling(path, st.sessionID)
+	projectRoot, branch, remote := resolveProjectFromSibling(path, st.sessionID)
 
 	// Some process logs never emit `[INFO] Using default model: …` and carry
 	// no response-body model either. Fall back to the sibling
@@ -244,6 +244,9 @@ func (a *Adapter) parseProcessLog(_ context.Context, path string, fromOffset int
 		}
 		if out.TokenEvents[i].GitBranch == "" {
 			out.TokenEvents[i].GitBranch = branch
+		}
+		if out.TokenEvents[i].GitRemote == "" {
+			out.TokenEvents[i].GitRemote = remote
 		}
 	}
 
@@ -278,9 +281,9 @@ func (a *Adapter) parseProcessLog(_ context.Context, path string, fromOffset int
 //
 // The log file lives at `<home>/.copilot/logs/process-*.log`; the
 // session-state dir is at `<home>/.copilot/session-state/<sessionID>/`.
-func resolveProjectFromSibling(logPath, sessionID string) (string, string) {
+func resolveProjectFromSibling(logPath, sessionID string) (string, string, string) {
 	if sessionID == "" {
-		return "", ""
+		return "", "", ""
 	}
 	// <home>/.copilot/logs/...log → <home>/.copilot
 	copilotRoot := filepath.Dir(filepath.Dir(logPath))
@@ -289,11 +292,13 @@ func resolveProjectFromSibling(logPath, sessionID string) (string, string) {
 }
 
 // resolveProjectFromWorkspaceYAML reads a Copilot CLI workspace.yaml
-// at the given path and returns (projectRoot, branch). Returns ("", "")
-// when the file is missing or carries no usable git_root/cwd. Path
-// candidates are translated through crossmount.TranslateForeignPath
-// for WSL2 ↔ Windows session capture, then resolved through
-// git.Resolve to find the actual repo root.
+// at the given path and returns (projectRoot, branch, remote). Returns
+// ("", "", "") when the file is missing or carries no usable
+// git_root/cwd. Path candidates are translated through
+// crossmount.TranslateForeignPath for WSL2 ↔ Windows session capture,
+// then resolved through git.Resolve to find the actual repo root; remote
+// is the normalized "origin" remote when git.Resolve found one, and ""
+// otherwise (honest gap, not fabricated).
 //
 // workspace.yaml carries `cwd`, `git_root`, `branch` as simple
 // `key: value` lines — flat enough to parse without a YAML lib.
@@ -302,10 +307,10 @@ func resolveProjectFromSibling(logPath, sessionID string) (string, string) {
 // path needs this because some Copilot CLI sessions log a drive-root
 // cwd (e.g. "E:\\") in session.start.context, while workspace.yaml
 // carries the actual repo root.
-func resolveProjectFromWorkspaceYAML(yamlPath string) (string, string) {
+func resolveProjectFromWorkspaceYAML(yamlPath string) (string, string, string) {
 	f, err := os.Open(yamlPath)
 	if err != nil {
-		return "", ""
+		return "", "", ""
 	}
 	defer f.Close()
 	var cwd, gitRoot, branch string
@@ -330,7 +335,7 @@ func resolveProjectFromWorkspaceYAML(yamlPath string) (string, string) {
 		candidate = cwd
 	}
 	if candidate == "" {
-		return "", branch
+		return "", branch, ""
 	}
 	translated := crossmount.TranslateForeignPath(candidate)
 	if translated == "" {
@@ -341,9 +346,9 @@ func resolveProjectFromWorkspaceYAML(yamlPath string) (string, string) {
 		if info.Branch != "" && branch == "" {
 			branch = info.Branch
 		}
-		return info.Root, branch
+		return info.Root, branch, git.NormalizeRemote(info.Remote)
 	}
-	return translated, branch
+	return translated, branch, ""
 }
 
 func splitYAMLLine(line string) (key, value string, ok bool) {

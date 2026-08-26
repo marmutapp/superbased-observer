@@ -108,6 +108,9 @@ func TestProcResolver_Resolve_DirectPIDHit(t *testing.T) {
 	// 127.0.0.1:54321 (hex "0100007F:D431"), rem_address is
 	// 127.0.0.1:8820 (hex "0100007F:2274").
 	procDir := writeProcSocket(t, 4242, 12345, "0100007F:D431", "0100007F:2274", 1)
+	// Live process matching the row's Tool — required now that hits
+	// are validated before being trusted.
+	writeProc(t, procDir, 4242, "node", "node\x00/usr/local/bin/claude-code\x00")
 
 	r := NewProcResolver(st, procDir, time.Minute)
 	sid, ok, err := r.Resolve(ctx, "127.0.0.1:54321")
@@ -131,6 +134,7 @@ func TestProcResolver_Resolve_AncestorWalk(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 	procDir := writeProcSocket(t, 200, 55555, "0100007F:1F40", "0100007F:2274", 100)
+	writeProc(t, procDir, 100, "node", "node\x00/opt/claude-code/cli.js\x00")
 
 	r := NewProcResolver(st, procDir, time.Minute)
 	sid, ok, err := r.Resolve(ctx, "127.0.0.1:8000")
@@ -181,6 +185,7 @@ func TestProcResolver_CacheHit(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 	procDir := writeProcSocket(t, 500, 7777, "0100007F:1F40", "0100007F:2274", 1)
+	writeProc(t, procDir, 500, "node", "node\x00/usr/local/bin/claude-code\x00")
 
 	r := NewProcResolver(st, procDir, time.Minute)
 	if _, _, err := r.Resolve(ctx, "127.0.0.1:8000"); err != nil {
@@ -278,6 +283,7 @@ func TestProcResolver_ResolveCWD_BridgeEntryWins(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 	procDir := writeProcSocket(t, 800, 53535, "0100007F:1F40", "0100007F:2274", 1)
+	writeProc(t, procDir, 800, "node", "node\x00/usr/local/bin/claude-code\x00")
 	if err := os.Symlink(t.TempDir(), filepath.Join(procDir, "800", "cwd")); err != nil {
 		t.Fatalf("symlink cwd: %v", err)
 	}
@@ -301,6 +307,7 @@ func TestProcResolver_ResolveTool(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 	procDir := writeProcSocket(t, 4242, 12345, "0100007F:D431", "0100007F:2274", 1)
+	writeProc(t, procDir, 4242, "node", "node\x00/usr/local/bin/kilo-code-cli/cli.js\x00")
 
 	r := NewProcResolver(st, procDir, time.Minute)
 	tool, ok, err := r.ResolveTool(ctx, "127.0.0.1:54321")
@@ -325,5 +332,95 @@ func TestProcResolver_ResolveTool(t *testing.T) {
 	tool, ok, err = r.ResolveTool(ctx, "127.0.0.1:1")
 	if err != nil || ok || tool != "" {
 		t.Fatalf("miss: got %q ok=%v err=%v, want clean miss", tool, ok, err)
+	}
+}
+
+// TestProcResolver_StaleRow_IdentityMismatchRejected reproduces the
+// live 2026-08-21 defect: a bridge row survives until the 6h prune
+// after its process exits, the OS recycles the pid onto an unrelated
+// binary, and the ancestor walk of a fresh shell's connection stamps
+// that shell with the dead session's id. The resolver must refuse the
+// hit — the pid is alive but its comm/cmdline no longer matches the
+// row's Tool — and report a clean miss.
+func TestProcResolver_StaleRow_IdentityMismatchRejected(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	// Stale row: pid 200 used to be the claude-code process behind
+	// "sess-dead"; that pid now runs tail.
+	if err := st.Write(ctx, Entry{PID: 200, SessionID: "sess-dead", Tool: "claude-code"}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	// Socket owner 300 is an unrelated bash whose parent chain reaches
+	// the recycled pid.
+	procDir := writeProcSocket(t, 300, 60606, "0100007F:1F40", "0100007F:2274", 200)
+	writeProc(t, procDir, 300, "bash", "bash\x00")
+	writeProc(t, procDir, 200, "tail", "tail\x00-f\x00app.log\x00")
+
+	r := NewProcResolver(st, procDir, time.Minute)
+	sid, ok, err := r.Resolve(ctx, "127.0.0.1:8000")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if ok || sid != "" {
+		t.Fatalf("stale row attributed: sid=%q ok=%v, want clean miss", sid, ok)
+	}
+}
+
+// TestProcResolver_StaleRow_WalkContinuesToLiveAncestor pins that a
+// rejected stale hit does not mask a legitimate row higher in the
+// ancestor chain: the walk skips the mismatching pid and resolves via
+// the live, identity-matching grandparent instead.
+func TestProcResolver_StaleRow_WalkContinuesToLiveAncestor(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	if err := st.Write(ctx, Entry{PID: 200, SessionID: "sess-stale", Tool: "claude-code"}); err != nil {
+		t.Fatalf("Write stale: %v", err)
+	}
+	if err := st.Write(ctx, Entry{PID: 100, SessionID: "sess-live", Tool: "claude-code"}); err != nil {
+		t.Fatalf("Write live: %v", err)
+	}
+	procDir := writeProcSocket(t, 300, 70707, "0100007F:1F40", "0100007F:2274", 200)
+	writeProc(t, procDir, 300, "bash", "bash\x00")
+	writeProc(t, procDir, 200, "tail", "tail\x00-f\x00app.log\x00")
+	// Re-chain the middle pid under the valid ancestor (the generic
+	// fixture wires every ancestor straight to init).
+	if err := os.WriteFile(filepath.Join(procDir, "200", "status"), []byte("Name:\ttail\nPPid:\t100\n"), 0o644); err != nil {
+		t.Fatalf("rewrite status: %v", err)
+	}
+	writeProc(t, procDir, 100, "node", "node\x00/usr/local/bin/claude-code\x00")
+
+	r := NewProcResolver(st, procDir, time.Minute)
+	sid, ok, err := r.Resolve(ctx, "127.0.0.1:8000")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if !ok || sid != "sess-live" {
+		t.Fatalf("Resolve: sid=%q ok=%v, want sess-live true", sid, ok)
+	}
+}
+
+// TestProcResolver_StaleRow_DeadPIDRejected covers the vanished-pid
+// half of validation: the bridge row's pid has no /proc entry at all,
+// so validateProcess finds no comm, rejects the hit, and the result is
+// a clean miss — never attribution to the dead session.
+func TestProcResolver_StaleRow_DeadPIDRejected(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	if err := st.Write(ctx, Entry{PID: 250, SessionID: "sess-dead", Tool: "claude-code"}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	// Socket owner 300 chains to the dead pid...
+	procDir := writeProcSocket(t, 300, 80808, "0100007F:1F40", "0100007F:2274", 250)
+	writeProc(t, procDir, 300, "bash", "bash\x00")
+	// ...whose process table entry is gone entirely (fixture wrote a
+	// placeholder status for it; delete the whole dir).
+	if err := os.RemoveAll(filepath.Join(procDir, "250")); err != nil {
+		t.Fatalf("remove dead pid dir: %v", err)
+	}
+
+	r := NewProcResolver(st, procDir, time.Minute)
+	sid, ok, err := r.Resolve(ctx, "127.0.0.1:8000")
+	if err != nil || ok || sid != "" {
+		t.Fatalf("dead pid attributed: sid=%q ok=%v err=%v, want clean miss", sid, ok, err)
 	}
 }

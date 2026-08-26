@@ -67,6 +67,7 @@ func TestSynthesizeHistoryUserPromptsFiltersByConv(t *testing.T) {
 		pbPath,
 		"aaaa1111-2222-3333-4444-555555555555",
 		"/home/u/code/proj-a",
+		"",
 		"aaaa1111-2222-3333-4444-555555555555",
 		scrub.New(),
 		entries,
@@ -109,6 +110,7 @@ func TestSynthesizeHistoryUserPromptsDedupesAgainstExisting(t *testing.T) {
 		pbPath,
 		"aaaa1111-2222-3333-4444-555555555555",
 		"/home/u/code/proj-a",
+		"",
 		"aaaa1111-2222-3333-4444-555555555555",
 		scrub.New(),
 		entries,
@@ -133,8 +135,8 @@ func TestSourceEventIDsAreIdempotent(t *testing.T) {
 	cliRoot, _ := cliRootsFor(pbPath)
 	entries := readCLIHistoryEntries(cliRoot)
 
-	out1 := synthesizeHistoryUserPrompts(pbPath, "aaaa1111-2222-3333-4444-555555555555", "/p", "aaaa1111-2222-3333-4444-555555555555", scrub.New(), entries, nil)
-	out2 := synthesizeHistoryUserPrompts(pbPath, "aaaa1111-2222-3333-4444-555555555555", "/p", "aaaa1111-2222-3333-4444-555555555555", scrub.New(), entries, nil)
+	out1 := synthesizeHistoryUserPrompts(pbPath, "aaaa1111-2222-3333-4444-555555555555", "/p", "", "aaaa1111-2222-3333-4444-555555555555", scrub.New(), entries, nil)
+	out2 := synthesizeHistoryUserPrompts(pbPath, "aaaa1111-2222-3333-4444-555555555555", "/p", "", "aaaa1111-2222-3333-4444-555555555555", scrub.New(), entries, nil)
 	if len(out1) != len(out2) {
 		t.Fatalf("non-deterministic event count: %d vs %d", len(out1), len(out2))
 	}

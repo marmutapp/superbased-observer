@@ -15,7 +15,11 @@
 //     socket inode matching the proxy's client remote addr, locates the
 //     owning pid via /proc/[pid]/fd, and walks the ancestor chain (PPid
 //     in /proc/[pid]/status) until it finds a pid registered in the
-//     bridge table. On other platforms the resolver is a no-op stub.
+//     bridge table. A hit is trusted only after validating against the
+//     live process table — liveness + tool identity — because rows
+//     outlive their process until the prune cycle and a recycled pid
+//     must never attribute (a miss beats a wrong link). On other
+//     platforms the resolver is a no-op stub.
 //
 // Spec references: §9 (proxy), §14 (hook protocol).
 package pidbridge

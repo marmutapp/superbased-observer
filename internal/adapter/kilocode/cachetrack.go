@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/marmutapp/superbased-observer/internal/cachetrack"
+	"github.com/marmutapp/superbased-observer/internal/adapter/cacheobs"
 	"github.com/marmutapp/superbased-observer/internal/models"
 )
 
@@ -15,65 +15,7 @@ import (
 // budget, same OOM guard). When exceeded, subsequent observations
 // emit with BlockHashes=nil so the engine flips to KindReanchor
 // rather than running unbounded.
-const MaxBlocksPerSession = 4096
-
-// tier2Accumulator mirrors the claudecode template (see
-// internal/adapter/claudecode/adapter.go::tier2Accumulator)
-// adapted for kilo-cli's part shape. Behaviour matches the
-// opencode adapter byte-for-byte — kilo-cli is an OpenCode fork
-// and the part type set is identical with stable additions
-// (metadata.openrouter.reasoning_details on tools; tokens.total
-// on message; mode/parentID/path.root on message) that are NOT
-// chain-bearing per the audit doc
-// (cachetrack-kilo-cli-tier2-audit-2026-06-09.md).
-type tier2Accumulator struct {
-	pendingBlocks  []models.CacheBlockMeta
-	totalBlocks    int
-	compactionSeen bool
-	capExceeded    bool
-	maxBlocks      int
-}
-
-func newTier2Accumulator(maxBlocks int) *tier2Accumulator {
-	return &tier2Accumulator{maxBlocks: maxBlocks}
-}
-
-func (a *tier2Accumulator) observeContent(blocks []models.CacheBlockMeta) {
-	if a.capExceeded || len(blocks) == 0 {
-		return
-	}
-	a.pendingBlocks = append(a.pendingBlocks, blocks...)
-	a.totalBlocks += len(blocks)
-	if a.maxBlocks > 0 && a.totalBlocks > a.maxBlocks {
-		a.capExceeded = true
-		a.pendingBlocks = nil
-	}
-}
-
-func (a *tier2Accumulator) emit(
-	path, sessionID, messageID, model string,
-	ts int64,
-	usage models.CacheUsage,
-	fast bool,
-) models.CacheTurnObservation {
-	obs := models.CacheTurnObservation{
-		SourceFile:     path,
-		SourceEventID:  "cachetrack:" + messageID,
-		SessionID:      sessionID,
-		MessageID:      messageID,
-		Timestamp:      millisToTime(ts),
-		Model:          model,
-		Fast:           fast,
-		Usage:          usage,
-		CompactionSeen: a.compactionSeen,
-	}
-	if !a.capExceeded {
-		obs.BlockHashes = a.pendingBlocks
-	}
-	a.pendingBlocks = nil
-	a.compactionSeen = false
-	return obs
-}
+const MaxBlocksPerSession = cacheobs.DefaultMaxBlocksPerSession
 
 // loadCacheObservations walks every message + its parts (in
 // (session, message.time_created, part.time_created, part.id)
@@ -120,7 +62,7 @@ func (a *CLIAdapter) loadCacheObservations(ctx context.Context, db *sql.DB, sour
 		return nil, nil
 	}
 
-	accBySession := map[string]*tier2Accumulator{}
+	accBySession := map[string]*cacheobs.Accumulator{}
 	var out []models.CacheTurnObservation
 
 	for _, m := range messages {
@@ -137,10 +79,10 @@ func (a *CLIAdapter) loadCacheObservations(ctx context.Context, db *sql.DB, sour
 
 		acc := accBySession[m.SessionID]
 		if acc == nil {
-			acc = newTier2Accumulator(MaxBlocksPerSession)
+			acc = cacheobs.New(MaxBlocksPerSession)
 			accBySession[m.SessionID] = acc
 		}
-		acc.observeContent(blocks)
+		acc.ObserveBlocks(blocks)
 
 		if meta.Role != "assistant" || m.TimeUpdate <= fromOffset {
 			continue
@@ -162,17 +104,14 @@ func (a *CLIAdapter) loadCacheObservations(ctx context.Context, db *sql.DB, sour
 			CacheReadTokens:     meta.Tokens.Cache.Read,
 			CacheCreationTokens: meta.Tokens.Cache.Write,
 		}
-		obs := acc.emit(sourceFile, m.SessionID, m.ID, model, ts, usage, false)
+		obs := acc.Emit(sourceFile, m.SessionID, m.ID, model, millisToTime(ts), usage, false)
 		// §15.3 boundary: overlay ImplicitCache for routed implicit-
 		// cache providers. Kilo-auto family stays Anthropic-shape
 		// (the Gateway is Anthropic-backed for kilo-auto/* per the
 		// v1.8.2 audit); other provider strings (openai, openrouter,
 		// deepseek, etc.) route to implicit per the routing table.
 		provider := firstNonEmpty(meta.ProviderID, meta.Model.ProviderID)
-		if cachetrack.IsImplicitCacheProvider(provider, model) {
-			obs.ImplicitCache = true
-			obs.BlockHashes = nil
-		}
+		obs = cacheobs.ApplyImplicitCacheOverlay(obs, provider, model)
 		out = append(out, obs)
 	}
 	return out, nil

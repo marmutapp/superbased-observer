@@ -31,6 +31,18 @@ export type ComboOption = {
   rightMeta?: ReactNode;
   // Optional tooltip on the popover row.
   title?: string;
+  // When true, the row renders dimmed/non-interactive: clicking or pressing
+  // Enter on it is a no-op (the row stays visible with its `title` reason —
+  // the honest-disabled-copy convention, never simply hidden). Mirrors a
+  // native `<option disabled>`. Optional — every existing caller that never
+  // sets this keeps its current always-selectable behavior.
+  disabled?: boolean;
+  // Optional group heading rendered once, above the first row in `options`
+  // whose groupLabel differs from the row before it (mirrors a native
+  // `<optgroup label>`). Rows without a groupLabel render ungrouped. Grouping
+  // follows the ORDER options are given in — callers should pre-sort by
+  // group.
+  groupLabel?: string;
 };
 
 export function ComboChip({
@@ -44,6 +56,7 @@ export function ComboChip({
   placeholder = "Filter…",
   emptyHint = "No matches.",
   buttonValueRender,
+  fullWidth = false,
 }: {
   value: string;
   onChange: (next: string) => void;
@@ -59,6 +72,12 @@ export function ComboChip({
   // isn't in the options list). Lets ToolSelect render a ToolDot +
   // pretty label without coupling that detail into the primitive.
   buttonValueRender?: (selected: ComboOption | undefined) => ReactNode;
+  // When true, the trigger stretches to fill its container width (space-
+  // between label/value and the chevron) instead of the resting inline chip
+  // size — for form-field contexts (a modal, a settings panel) where the
+  // control should match the width of adjacent inputs. Default false keeps
+  // every existing filter-bar caller pixel-identical.
+  fullWidth?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -76,15 +95,18 @@ export function ComboChip({
   }, [options, query]);
 
   // Reset state when the popover opens/closes so each open starts
-  // fresh with the active row at the top.
+  // fresh with the active row at the top (the first ENABLED row, so a
+  // leading disabled group header row doesn't eat the first Enter).
   useEffect(() => {
     if (open) {
       setQuery("");
-      setActiveIdx(0);
+      const firstEnabled = options.findIndex((o) => !o.disabled);
+      setActiveIdx(firstEnabled >= 0 ? firstEnabled : 0);
       // Focus the search input on next paint so the autofocus
       // doesn't fight the popover's mount animation.
       requestAnimationFrame(() => inputRef.current?.focus());
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
   // Click-outside closes.
@@ -109,18 +131,33 @@ export function ComboChip({
 
   function selectIdx(i: number) {
     const opt = filtered[i];
-    if (!opt) return;
+    // A disabled row (mirrors native `<option disabled>`) can be highlighted
+    // via keyboard/hover but never actually chosen — no onChange, popover
+    // stays open so the user can pick a different row.
+    if (!opt || opt.disabled) return;
     onChange(opt.value);
     setOpen(false);
+  }
+
+  // nextEnabledIdx walks from `from` in `dir` (+1/-1), skipping disabled
+  // rows, and returns the first enabled index found (or `from` unchanged if
+  // every remaining row in that direction is disabled).
+  function nextEnabledIdx(from: number, dir: 1 | -1): number {
+    let i = from;
+    while (i + dir >= 0 && i + dir <= filtered.length - 1) {
+      i += dir;
+      if (!filtered[i]?.disabled) return i;
+    }
+    return from;
   }
 
   function onKey(e: React.KeyboardEvent) {
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setActiveIdx((i) => Math.min(filtered.length - 1, i + 1));
+      setActiveIdx((i) => nextEnabledIdx(Math.min(i, filtered.length - 1), 1));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      setActiveIdx((i) => Math.max(0, i - 1));
+      setActiveIdx((i) => nextEnabledIdx(i, -1));
     } else if (e.key === "Enter") {
       e.preventDefault();
       selectIdx(activeIdx);
@@ -131,7 +168,7 @@ export function ComboChip({
   }
 
   return (
-    <div ref={rootRef} className={clsx("relative", className)}>
+    <div ref={rootRef} className={clsx("relative", fullWidth && "w-full", className)}>
       <Tooltip
         content={`${label}: ${selected?.searchable ?? value}`}
         disabled={open}
@@ -143,28 +180,34 @@ export function ComboChip({
         aria-expanded={open}
         className={clsx(
           "flex h-7 items-center gap-1.5 rounded-2 border bg-bg-2 px-2 text-[11px] text-fg-1 transition-colors",
+          fullWidth && "w-full justify-between",
           open
             ? "border-accent"
             : "border-line-2 hover:bg-bg-3 hover:text-fg-0",
         )}
       >
-        {icon}
-        <span className="text-fg-3">{label}</span>
-        {buttonValueRender ? (
-          buttonValueRender(selected)
-        ) : (
-          <b className="font-semibold text-fg-0">
-            {selected?.label ?? value}
-          </b>
-        )}
+        <span className={clsx("flex min-w-0 items-center gap-1.5", fullWidth && "flex-1 truncate")}>
+          {icon}
+          <span className="text-fg-3">{label}</span>
+          {buttonValueRender ? (
+            buttonValueRender(selected)
+          ) : (
+            <b className={clsx("font-semibold text-fg-0", fullWidth && "min-w-0 truncate")}>
+              {selected?.label ?? value}
+            </b>
+          )}
+        </span>
         <ChevronDown />
       </button>
       </Tooltip>
 
       {open && (
         <div
-          className="absolute left-0 top-[calc(100%+4px)] z-50 overflow-hidden rounded-3 border border-line-2 bg-bg-1 shadow-drawer"
-          style={{ width: popoverWidth }}
+          className={clsx(
+            "absolute left-0 top-[calc(100%+4px)] z-50 overflow-hidden rounded-3 border border-line-2 bg-bg-1 shadow-drawer",
+            fullWidth && "w-full",
+          )}
+          style={fullWidth ? undefined : { width: popoverWidth }}
           role="listbox"
           aria-label={label}
         >
@@ -194,31 +237,49 @@ export function ComboChip({
               filtered.map((o, i) => {
                 const sel = o.value === value;
                 const active = i === activeIdx;
+                // A group header renders once, right before the first row
+                // whose groupLabel differs from the previous (filtered) row's
+                // — mirrors a native <optgroup label>. Rows without a
+                // groupLabel never trigger a header.
+                const prevGroup = i > 0 ? filtered[i - 1].groupLabel : undefined;
+                const showGroupHeader = !!o.groupLabel && o.groupLabel !== prevGroup;
                 return (
-                  <Tooltip key={o.value} content={o.title ?? null} side="right" disabled={!o.title}>
-                  <button
-                    type="button"
-                    data-idx={i}
-                    role="option"
-                    aria-selected={sel}
-                    onMouseEnter={() => setActiveIdx(i)}
-                    onClick={() => selectIdx(i)}
-                    className={clsx(
-                      "flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-[11.5px] transition-colors",
-                      active ? "bg-bg-3" : "bg-transparent",
-                      sel ? "text-accent" : "text-fg-1",
+                  <div key={o.value}>
+                    {showGroupHeader && (
+                      <div className="mt-1 px-2.5 pb-1 pt-1.5 text-[10px] font-medium uppercase tracking-wide text-fg-4 first:mt-0">
+                        {o.groupLabel}
+                      </div>
                     )}
-                  >
-                    {o.leading}
-                    <span className="min-w-0 flex-1 truncate">{o.label}</span>
-                    {o.rightMeta && (
-                      <span className="shrink-0 font-mono text-[10.5px] text-fg-3">
-                        {o.rightMeta}
-                      </span>
-                    )}
-                    {sel && <CheckIcon />}
-                  </button>
-                  </Tooltip>
+                    <Tooltip content={o.title ?? null} side="right" disabled={!o.title}>
+                    <button
+                      type="button"
+                      data-idx={i}
+                      role="option"
+                      aria-selected={sel}
+                      aria-disabled={o.disabled}
+                      onMouseEnter={() => setActiveIdx(i)}
+                      onClick={() => selectIdx(i)}
+                      className={clsx(
+                        "flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-[11.5px] transition-colors",
+                        o.disabled
+                          ? "cursor-not-allowed text-fg-4 opacity-50"
+                          : [
+                              active ? "bg-bg-3" : "bg-transparent",
+                              sel ? "text-accent" : "text-fg-1",
+                            ],
+                      )}
+                    >
+                      {o.leading}
+                      <span className="min-w-0 flex-1 truncate">{o.label}</span>
+                      {o.rightMeta && (
+                        <span className="shrink-0 font-mono text-[10.5px] text-fg-3">
+                          {o.rightMeta}
+                        </span>
+                      )}
+                      {sel && !o.disabled && <CheckIcon />}
+                    </button>
+                    </Tooltip>
+                  </div>
                 );
               })
             )}

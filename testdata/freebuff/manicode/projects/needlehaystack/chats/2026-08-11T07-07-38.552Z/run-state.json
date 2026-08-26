@@ -1,0 +1,16 @@
+{
+  "sessionState": {
+    "fileContext": {
+      "projectRoot": "/home/dev/needlehaystack",
+      "cwd": "/home/dev/needlehaystack"
+    },
+    "mainAgentState": {
+      "contextTokenCount": 41230,
+      "creditsUsed": 0,
+      "directCreditsUsed": 0,
+      "agentType": "base2-free-deepseek-flash",
+      "stepsRemaining": 199,
+      "subagents": []
+    }
+  }
+}

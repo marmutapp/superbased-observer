@@ -59,7 +59,7 @@ func TestComposeOrgSpec_ModeIsLocalOnly(t *testing.T) {
 			}
 
 			orgModeBefore := org.Mode
-			got := ComposeOrgSpec(local, org)
+			got := ComposeOrgSpec(local, org, false)
 			if got.Mode != tc.want {
 				t.Errorf("composed Mode = %q, want %q (org body mode %q must be ignored)", got.Mode, tc.want, tc.orgMode)
 			}
@@ -79,6 +79,49 @@ func TestComposeOrgSpec_ModeIsLocalOnly(t *testing.T) {
 			}
 			if org.Mode != orgModeBefore {
 				t.Errorf("org spec mutated: Mode = %q, want %q", org.Mode, orgModeBefore)
+			}
+		})
+	}
+}
+
+// TestComposeOrgSpec_ManagedEnforceHonorsOrgMode is the Arc 4 P3 §R23 lift for
+// egress: with orgEnforce=true (managed + enforce.egress) the org body's mode
+// is honored as authored, overriding the local layer, with observe/off left as
+// a real opt-out.
+func TestComposeOrgSpec_ManagedEnforceHonorsOrgMode(t *testing.T) {
+	orgIn := PolicyInput{
+		Rules: []RuleInput{{Name: "org-deny", When: WhenInput{VerdictAtLeast: "deny"}, Deny: true, Reason: "org", ReasonCode: string(ReasonFlaggedLocal)}},
+	}
+	cases := []struct {
+		orgMode   string
+		localMode string
+		hasLocal  bool
+		want      string
+	}{
+		{orgMode: ModeEnforce, hasLocal: false, want: ModeEnforce},
+		{orgMode: ModeEnforce, localMode: ModeOff, hasLocal: true, want: ModeEnforce},
+		{orgMode: ModeAdvise, localMode: ModeEnforce, hasLocal: true, want: ModeAdvise},
+		{orgMode: ModeOff, localMode: ModeEnforce, hasLocal: true, want: ModeOff},
+	}
+	for _, tc := range cases {
+		t.Run(tc.orgMode+"/"+tc.localMode, func(t *testing.T) {
+			oi := orgIn
+			oi.Mode = tc.orgMode
+			org, err := Compile(oi)
+			if err != nil {
+				t.Fatalf("compile org: %v", err)
+			}
+			var local *PolicySpec
+			if tc.hasLocal {
+				ls, err := Compile(PolicyInput{Mode: tc.localMode})
+				if err != nil {
+					t.Fatalf("compile local: %v", err)
+				}
+				local = &ls
+			}
+			got := ComposeOrgSpec(local, org, true)
+			if got.Mode != tc.want {
+				t.Errorf("managed-enforce composed Mode = %q, want %q (org mode %q honored)", got.Mode, tc.want, tc.orgMode)
 			}
 		})
 	}

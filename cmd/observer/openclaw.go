@@ -131,6 +131,7 @@ func newOpenclawCmd() *cobra.Command {
 				args:     args,
 				proxyURL: resolved,
 				env:      map[string]string{"OPENAI_BASE_URL": strings.TrimRight(resolved, "/") + "/v1"},
+				dbPath:   cfg.Observer.DBPath,
 				stderr:   cmd.ErrOrStderr(),
 			})
 		},
@@ -207,7 +208,19 @@ func runOpenclawContinue(cmd *cobra.Command, p openclawContinueParams) error {
 	child.Stdin = os.Stdin
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
-	if rErr := child.Run(); rErr != nil {
+	if rErr := child.Start(); rErr != nil {
+		return fmt.Errorf("exec openclaw: %w", rErr)
+	}
+	// Direct process attribution (migration 086): record the child pid now
+	// that Start has made it knowable; retract the seed when the child is
+	// reaped. Best-effort both ways — a seeding failure never affects the
+	// launch (see cmd/observer/launchseed.go).
+	dbPath := ""
+	if cfg, cErr := config.Load(config.LoadOptions{GlobalPath: p.configPath}); cErr == nil {
+		dbPath = cfg.Observer.DBPath
+	}
+	recordLaunchSeed(dbPath, "openclaw", cwd, child.Process.Pid, cmd.ErrOrStderr())
+	if rErr := child.Wait(); rErr != nil {
 		var ee *exec.ExitError
 		if errors.As(rErr, &ee) {
 			return exitErr(ee.ExitCode())

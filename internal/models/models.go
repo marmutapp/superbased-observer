@@ -432,6 +432,32 @@ const (
 	// interactive-seed/resume contract — see the package doc for the full
 	// record-shape reference and the honest known-gaps list.
 	ToolJunie = "junie"
+	// ToolZcode is Z.AI's zcode CLI ("zcode"; npm `zcode-app-cli`), an
+	// OpenCode fork. Structural transposition of internal/adapter/opencode
+	// with ONE difference: OpenCode's per-message token bundle is ZEROED in
+	// zcode, so tokens come from zcode's own model_usage table (per-call,
+	// provider_id/model_id, full cache split; netInput = input_tokens -
+	// cache_read) and the watermark includes model_usage. SQLite store at
+	// ~/.zcode/cli/db/db.sqlite (same layout Linux/macOS/Windows). See
+	// internal/adapter/zcode and docs/zcode-adapter.md.
+	ToolZcode = "zcode"
+	// ToolMistralCode is Mistral AI's `vibe` CLI ("mistral-code"; uv-tool
+	// console script, Python 3.12+). Per-session-dir store at
+	// ~/.vibe/logs/session/<...>/ (messages.jsonl + meta.json). Tokens are
+	// SESSION-LEVEL from meta.json/stats (session_prompt_tokens GROSS →
+	// netted vs session_cached_tokens; ON CONFLICT MAX-upgrade); no
+	// per-message usage. See internal/adapter/mistralcode and
+	// docs/mistral-code-adapter.md.
+	ToolMistralCode = "mistral-code"
+	// ToolFreebuff is Freebuff ("freebuff"; npm `freebuff`), the Manicode →
+	// Codebuff → Freebuff lineage. Store under the legacy manicode dir:
+	// ~/.config/manicode/projects/<slug>/chats/<RFC3339>/chat-messages.json
+	// (+ run-state.json for the real cwd; `.config/manicode` on EVERY OS).
+	// The whole-file cursor is a MESSAGE COUNT (the array is rewritten in
+	// place). THIN store: NO billable tokens (contextTokenCount is a
+	// context-window size, not usage) — sessions + actions only. See
+	// internal/adapter/freebuff and docs/freebuff-adapter.md.
+	ToolFreebuff = "freebuff"
 )
 
 // Normalized action types. See spec §5. Adapters map their tool-specific
@@ -1128,13 +1154,23 @@ type Action struct {
 // It carries everything needed to insert an Action plus upsert its Session
 // and Project.
 type ToolEvent struct {
-	SourceFile         string
-	SourceEventID      string
-	SessionID          string
-	ProjectRoot        string
-	Timestamp          time.Time
-	TurnIndex          int
-	GitBranch          string
+	SourceFile    string
+	SourceEventID string
+	SessionID     string
+	ProjectRoot   string
+	Timestamp     time.Time
+	TurnIndex     int
+	GitBranch     string
+	// GitRemote is the adapter's normalized "origin" remote (via
+	// git.NormalizeRemote — see internal/git/normalize.go), mirroring
+	// GitBranch: adapters that resolve project git metadata set both
+	// from the same internal/git.Info. Empty when the adapter has no
+	// git remote to offer (a non-git project root, or an adapter whose
+	// project-root resolution never calls internal/git — see the Team
+	// Project Identity Mapping plan, 2026-08-21, §0.4). Flows to
+	// Store.Ingest -> UpsertProject as the project-level identity
+	// signal used for cross-machine/cross-developer team grouping.
+	GitRemote          string
 	Model              string
 	Tool               string
 	ActionType         string
@@ -1216,11 +1252,17 @@ type ActionOutcomeUpdate struct {
 // owning session even for JSONL lines that have usage data but no tool_use
 // block (e.g. subagent compaction turns).
 type TokenEvent struct {
-	SourceFile          string
-	SourceEventID       string
-	SessionID           string
-	ProjectRoot         string
-	GitBranch           string
+	SourceFile    string
+	SourceEventID string
+	SessionID     string
+	ProjectRoot   string
+	GitBranch     string
+	// GitRemote is the adapter's normalized "origin" remote, mirroring
+	// ToolEvent.GitRemote exactly (see that field's doc comment). Set
+	// from the same per-session state GitBranch already flows through
+	// wherever an adapter builds TokenEvent and ToolEvent from the same
+	// source.
+	GitRemote           string
 	Timestamp           time.Time
 	Tool                string
 	Model               string
@@ -1274,6 +1316,14 @@ type TokenEvent struct {
 	// persisted as NULL otherwise.
 	OrgID     string
 	UserEmail string
+	// IsSidechain marks usage rows emitted inside a sub-agent runtime —
+	// the token-usage analogue of [Action.IsSidechain] (migration 010):
+	// claudecode reads the flag straight off each transcript line, so a
+	// sub-agent's turns land on the PARENT's session flagged 1 and the
+	// per-sub-agent token/cost rollups (dashboard sub-agents view,
+	// migration 087) can bucket them without a separate session row.
+	// NODE-LOCAL — not on the org-push wire.
+	IsSidechain bool
 }
 
 // APITurn is one request/response pair observed by the proxy. Accurate token
@@ -1581,6 +1631,44 @@ type SessionProcessSeed struct {
 	// cmdline must contain for the seed to validate (e.g. "cline",
 	// "qwen") — the identity guard against pid recycling.
 	ExecHint string
+}
+
+// SubagentActionRef is the lean per-action projection the session-detail
+// sub-agents read model consumes (store.SidechainActionsForSession). It
+// carries identity + lifecycle shape only — never tool bodies. NODE-LOCAL:
+// derived entirely from actions rows already pinned out of the org-push
+// wire's content columns; no wire surface of its own.
+type SubagentActionRef struct {
+	ID          int64
+	Timestamp   time.Time
+	ActionType  string
+	Target      string
+	Success     bool
+	DurationMs  int64
+	RawToolName string
+	// Metadata carries the structured sub-agent identity when the capture
+	// path stamped it (hook SubagentStart/Stop, transcript agent-name
+	// rows). Nil otherwise — the read model then falls back to time-window
+	// grouping.
+	Metadata *ActionMetadata
+	// IsSidechain marks activity inside a sub-agent runtime (migration 010).
+	IsSidechain bool
+}
+
+// SubagentTokenRef is the lean per-usage-row projection the session-detail
+// sub-agents read model consumes (store.SidechainTokenUsageForSession) —
+// the token half of buildSubagentSummaries' input, alongside
+// [SubagentActionRef]. It carries usage magnitudes only — never prompts,
+// outputs, model ids, or source paths. NODE-LOCAL: derived entirely from
+// token_usage rows flagged is_sidechain (migration 087), a column with no
+// org-push wire surface; this type has none of its own either.
+type SubagentTokenRef struct {
+	Timestamp           time.Time
+	InputTokens         int64
+	OutputTokens        int64
+	CacheReadTokens     int64
+	CacheCreationTokens int64
+	EstimatedCostUSD    float64
 }
 
 // SessionLineage is a codex-session fork/subagent lineage marker an

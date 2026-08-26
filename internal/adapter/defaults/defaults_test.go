@@ -138,6 +138,21 @@ var shapeFixturePathByAdapter = map[string]string{
 	"perplexity-web": "/tmp/foreign/browser/perplexity-web/turn.json",
 	"gemini-web":     "/tmp/foreign/browser/gemini-web/turn.json",
 	"copilot-web":    "/tmp/foreign/browser/copilot-web/turn.json",
+	// zcode (Z.AI's OpenCode fork) — same SQLite-state-store shape as
+	// opencode/kilo-code-cli (db.sqlite / db.sqlite-wal basename only),
+	// under .zcode/cli/db/.
+	"zcode": "/tmp/foreign/.zcode/cli/db/db.sqlite",
+	// mistral-code (`vibe`) — fixed basename messages.jsonl under
+	// .vibe/logs/session/<session-id>/. The shape predicate binds the
+	// `/.vibe/logs/session/` segment plus the exact basename, which is
+	// what rejects the sibling meta.json.
+	"mistral-code": "/tmp/foreign/.vibe/logs/session/088a17fc/messages.jsonl",
+	// freebuff (CodebuffAI) — fixed basename chat-messages.json under
+	// .config/manicode/projects/<slug>/chats/<RFC3339>/. The shape
+	// predicate binds the `/manicode/projects/` + `/chats/` segments plus
+	// the exact basename, which is what rejects the sibling
+	// run-state.json.
+	"freebuff": "/tmp/foreign/.config/manicode/projects/slug/chats/2026-08-11T07-07-38.552Z/chat-messages.json",
 }
 
 // TestAllAdapters_IsSessionFile_RequiresUnderWatchRoots is the

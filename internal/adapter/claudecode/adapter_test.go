@@ -1101,6 +1101,38 @@ func TestServerToolUseAbsentImpliesZero(t *testing.T) {
 	}
 }
 
+// TestSidechainTokenEventsFlagged pins migration 087's capture half: the
+// line-level `isSidechain` bit rides TokenEvent.IsSidechain exactly as it
+// already rides the tool events, so sub-agent usage rows persist flagged
+// and the dashboard's per-sub-agent token/cost rollup can bucket them.
+// Pre-fix only the ToolEvents carried the bit — usage rows silently
+// counted toward no window.
+func TestSidechainTokenEventsFlagged(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "sidechain-tok.jsonl")
+	body := `{"type":"assistant","sessionId":"s-side","cwd":"/tmp","uuid":"u-main","timestamp":"2026-08-21T10:00:00Z","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"text","text":"main"}],"usage":{"input_tokens":100,"output_tokens":10}}}
+{"type":"assistant","sessionId":"s-side","cwd":"/tmp","uuid":"u-side","isSidechain":true,"timestamp":"2026-08-21T10:00:05Z","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"text","text":"side"}],"usage":{"input_tokens":200,"output_tokens":20}}}
+`
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := New()
+	res, err := a.ParseSessionFile(context.Background(), p, 0)
+	if err != nil {
+		t.Fatalf("ParseSessionFile: %v", err)
+	}
+	if len(res.TokenEvents) != 2 {
+		t.Fatalf("expected 2 TokenEvents, got %d", len(res.TokenEvents))
+	}
+	for _, ev := range res.TokenEvents {
+		want := ev.SourceEventID == "u-side" // no msg.id → line uuid is the key
+		if got := ev.IsSidechain; got != want {
+			t.Errorf("TokenEvent %s IsSidechain=%v want %v", ev.SourceEventID, got, want)
+		}
+	}
+}
+
 // TestFastModeSpeedCaptured pins the JSONL-path fast-tier capture: Opus
 // 4.8's interactive `/fast` mode sends speed:"fast" on the request, and
 // the response usage envelope — which the on-disk transcript mirrors —

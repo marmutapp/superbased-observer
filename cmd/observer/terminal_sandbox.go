@@ -207,6 +207,7 @@ func (r *sandboxRuntime) ProbeSandbox(ctx context.Context) dashboard.SandboxAvai
 			Verdict:   sandbox.VerdictDisabledByConfig,
 			Reason:    "[terminal.sandbox].enabled is false on this daemon",
 			HomeMode:  r.homeMode(),
+			DefaultOn: r.cfg.DefaultOn,
 			Sources:   r.sources(),
 			Tools:     r.tools(),
 		}
@@ -228,6 +229,7 @@ func (r *sandboxRuntime) ProbeSandbox(ctx context.Context) dashboard.SandboxAvai
 		Backend:        av.Backend,
 		BackendVersion: av.BackendVersion,
 		HomeMode:       r.homeMode(),
+		DefaultOn:      r.cfg.DefaultOn,
 		Sources:        r.sources(),
 		Tools:          r.tools(),
 	}

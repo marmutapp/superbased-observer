@@ -93,17 +93,34 @@ func governanceShareProvider(cfg config.OrgClientConfig, ngov *nodeGovernanceHan
 	}
 }
 
-// lowerShareOptions applies the lowering merge, one row per share key.
+// lowerShareOptions applies the lowering merge, one row per share key, then —
+// for a MANAGED node only — the Enterprise-Managed extraction RAISE.
 //
-// Every row is `local AND org` (or an intersection for the list), so the
-// result can only ever share LESS than the node's own config. AdminManaged
-// is deliberately absent: it is excluded from the org vocabulary entirely,
-// so nothing here can touch it, and shipsRawContent() can therefore only
-// move true → false under any org body, grant, or signing key.
+// The lowering rows are `local AND org` (or an intersection for the list), so
+// on an INDIVIDUAL node the result can only ever share LESS than the node's
+// own config. AdminManaged is deliberately absent from the org vocabulary, so
+// nothing here can touch it.
+//
+// The RAISE block is the sanctioned lift for the enterprise plane: on a node
+// that enrolled MANAGED and was granted the relevant extraction authority, the
+// admin may turn extraction tiers ON remotely (full observer-DB access). It is
+// applied AFTER lowering and gated per-tier on the GrantsXxxExtraction
+// predicates (Arc 4 P4a split the former one-bloc GrantsManagedExtraction gate
+// into independent per-tier gates), and RaiseBool itself no-ops unless
+// Effective.Managed — so an individual node is structurally excluded and
+// shipsRawContent()/shipsToolBodies() can still only go true → false there
+// under any org body, grant, or signing key.
 func lowerShareOptions(local store.ShareOptions, eff govern.Effective) store.ShareOptions {
 	out := local
 	out.FullContent = eff.LowerBool("full_content", local.FullContent)
+	out.FullToolBodies = eff.LowerBool("full_tool_bodies", local.FullToolBodies)
 	out.RoutingSummary = eff.LowerBool("routing_summary", local.RoutingSummary)
+	out.CacheDetail = eff.LowerBool("cache_detail", local.CacheDetail)
+	out.RoutingDetail = eff.LowerBool("routing_detail", local.RoutingDetail)
+	out.LimitGauge = eff.LowerBool("limit_gauge", local.LimitGauge)
+	out.CodeintelDetail = eff.LowerBool("codeintel_detail", local.CodeintelDetail)
+	out.ProcessDetail = eff.LowerBool("process_detail", local.ProcessDetail)
+	out.TerminalDetail = eff.LowerBool("terminal_detail", local.TerminalDetail)
 	out.ObsSummary = eff.LowerBool("obs.summary", local.ObsSummary)
 	out.ObsTraces = eff.LowerBool("obs.traces", local.ObsTraces)
 	out.ObsContent = eff.LowerBool("obs.content", local.ObsContent)
@@ -111,7 +128,84 @@ func lowerShareOptions(local store.ShareOptions, eff govern.Effective) store.Sha
 	out.ObsAdmission = eff.LowerBool("obs.admission", local.ObsAdmission)
 	out.ObsEvalItems = eff.LowerBool("obs.eval_items", local.ObsEvalItems)
 	out.TargetActionAllowlist = eff.LowerList("target_action_allowlist", local.TargetActionAllowlist)
+
+	// Enterprise-Managed Tenancy extraction raise (managed plane only;
+	// structurally inert on the individual plane). The raise is the exact
+	// MIRROR of the lowering above for every boolean tier: the admin's org body
+	// decides which tiers go on (RaiseBool flips a tier true only where the
+	// body's `share` block set it true).
+	//
+	// W-8: the per-tier gate is no longer spelled out here as one
+	// eff.GrantsXxxExtraction() if-block per tier — that was a second,
+	// DUPLICATE encoding of the exact key -> extraction-authority mapping
+	// internal/govern/sharetiers.go now owns as the single source of truth
+	// (the same table backs the dashboard Privacy card's "in force" column
+	// via MergeBoolGated/SourceForBoolGated, so the seam and every
+	// transparency surface read the gate off ONE table and can never
+	// disagree). shareRaiseFields below is only the get/set plumbing this
+	// loop needs to reach store.ShareOptions' fields; govern.ExtractionAuthorized
+	// is the one place the gate itself is decided — including the operator
+	// ruling that the three highest-sensitivity tiers (codeintel/process/
+	// terminal) each require their OWN token and are never satisfied by the
+	// extract.managed umbrella alone. The list tier (target_action_allowlist)
+	// is intentionally NOT raised — RaiseBool is boolean-only, and an
+	// allowlist RAISE would need a RaiseList sibling with union semantics if
+	// it is ever wanted; it is one of sharetiers.go's two documented
+	// exemptions. admin_managed is absent from the org vocabulary in BOTH
+	// directions by construction.
+	for _, f := range shareRaiseFields {
+		if !govern.ExtractionAuthorized(eff, f.Key) {
+			continue
+		}
+		f.Set(&out, eff.RaiseBool(f.Key, f.Get(&out)))
+	}
 	return out
+}
+
+// shareRaiseField is one boolean [org_client.share] tier's get/set plumbing
+// into store.ShareOptions, keyed by the same key string
+// internal/govern/sharetiers.go maps to an extraction authority. Get/Set are
+// small enough that a reflection-based table would buy nothing over explicit
+// closures, and closures keep this list a plain, greppable data table
+// (CLAUDE.md "decision logic is table-driven, not nested conditionals").
+type shareRaiseField struct {
+	Key string
+	Get func(*store.ShareOptions) bool
+	Set func(*store.ShareOptions, bool)
+}
+
+// shareRaiseFields is every boolean tier lowerShareOptions may raise on the
+// managed plane — one row per shareTierTable entry in
+// internal/govern/sharetiers.go (the list tier and the two exemptions
+// documented there are absent here for the same reasons). Order does not
+// matter: every row touches a distinct ShareOptions field, so this loop
+// commutes with the eff.GrantsXxxExtraction()-block form it replaces.
+var shareRaiseFields = []shareRaiseField{
+	{"full_tool_bodies", func(o *store.ShareOptions) bool { return o.FullToolBodies }, func(o *store.ShareOptions, v bool) { o.FullToolBodies = v }},
+	{"full_content", func(o *store.ShareOptions) bool { return o.FullContent }, func(o *store.ShareOptions, v bool) { o.FullContent = v }},
+	{"routing_summary", func(o *store.ShareOptions) bool { return o.RoutingSummary }, func(o *store.ShareOptions, v bool) { o.RoutingSummary = v }},
+	{"routing_detail", func(o *store.ShareOptions) bool { return o.RoutingDetail }, func(o *store.ShareOptions, v bool) { o.RoutingDetail = v }},
+	{"cache_detail", func(o *store.ShareOptions) bool { return o.CacheDetail }, func(o *store.ShareOptions, v bool) { o.CacheDetail = v }},
+	{"limit_gauge", func(o *store.ShareOptions) bool { return o.LimitGauge }, func(o *store.ShareOptions, v bool) { o.LimitGauge = v }},
+	// Full traces / obs family (Arc 4 P5b) — the obs T2 structure + T3
+	// content tiers plus the eval/admission tiers the obs dashboard shows.
+	{"obs.summary", func(o *store.ShareOptions) bool { return o.ObsSummary }, func(o *store.ShareOptions, v bool) { o.ObsSummary = v }},
+	{"obs.traces", func(o *store.ShareOptions) bool { return o.ObsTraces }, func(o *store.ShareOptions, v bool) { o.ObsTraces = v }},
+	{"obs.content", func(o *store.ShareOptions) bool { return o.ObsContent }, func(o *store.ShareOptions, v bool) { o.ObsContent = v }},
+	{"obs.eval_summary", func(o *store.ShareOptions) bool { return o.ObsEvalSummary }, func(o *store.ShareOptions, v bool) { o.ObsEvalSummary = v }},
+	{"obs.admission", func(o *store.ShareOptions) bool { return o.ObsAdmission }, func(o *store.ShareOptions, v bool) { o.ObsAdmission = v }},
+	{"obs.eval_items", func(o *store.ShareOptions) bool { return o.ObsEvalItems }, func(o *store.ShareOptions, v bool) { o.ObsEvalItems = v }},
+	// Highest-sensitivity per-tier extraction raises (Arc 4 P5f-h). Each
+	// gates on its OWN managed authority, NOT the umbrella extract.managed
+	// alias — by operator ruling, granting the headline tiers (cache/
+	// routing/predictions) must NOT also unlock the developer's
+	// source-symbol graph, process trees, or terminal/remote-audit
+	// activity. internal/govern/sharetiers.go encodes this via the strict
+	// (non-umbrella) GrantsXxxExtraction predicates for exactly these three
+	// keys — see its shareTierRow.Authorized doc comment.
+	{"codeintel_detail", func(o *store.ShareOptions) bool { return o.CodeintelDetail }, func(o *store.ShareOptions, v bool) { o.CodeintelDetail = v }},
+	{"process_detail", func(o *store.ShareOptions) bool { return o.ProcessDetail }, func(o *store.ShareOptions, v bool) { o.ProcessDetail = v }},
+	{"terminal_detail", func(o *store.ShareOptions) bool { return o.TerminalDetail }, func(o *store.ShareOptions, v bool) { o.TerminalDetail = v }},
 }
 
 // grantRenewer owns the renewal clock for one daemon run.

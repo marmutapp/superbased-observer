@@ -127,7 +127,7 @@ func (a *Adapter) parseSession(ctx context.Context, db *sql.DB, sourceFile strin
 	}
 
 	sessionID := scopedSessionID(s.ID, sourceFile)
-	projectRoot := a.resolveProjectRoot(s.WorkingDir)
+	projectRoot, gitRemote := a.resolveProjectRoot(s.WorkingDir)
 	model := modelName(s.ModelConfigJSON)
 
 	// Decode each message's blocks once; collect tool results by call id.
@@ -157,11 +157,11 @@ func (a *Adapter) parseSession(ctx context.Context, db *sql.DB, sourceFile strin
 
 	var tools []models.ToolEvent
 	for _, dm := range decoded {
-		tools = append(tools, a.eventsForMessage(sourceFile, projectRoot, model, sessionID, dm.row, dm.blocks, results)...)
+		tools = append(tools, a.eventsForMessage(sourceFile, projectRoot, gitRemote, model, sessionID, dm.row, dm.blocks, results)...)
 	}
 
 	var tokens []models.TokenEvent
-	if tok, ok := a.tokenEvent(sourceFile, projectRoot, model, sessionID, s); ok {
+	if tok, ok := a.tokenEvent(sourceFile, projectRoot, gitRemote, model, sessionID, s); ok {
 		tokens = append(tokens, tok)
 	}
 	return tools, tokens, warns
@@ -171,7 +171,7 @@ func (a *Adapter) parseSession(ctx context.Context, db *sql.DB, sourceFile strin
 // A text block emits a user_prompt (role=user) or assistant_message
 // (role=assistant); a toolRequest emits the mapped tool action; a
 // toolResponse is consumed into the results map and never emitted alone.
-func (a *Adapter) eventsForMessage(sourceFile, projectRoot, model, sessionID string, m messageRow, blocks []contentBlock, results map[string]toolResult) []models.ToolEvent {
+func (a *Adapter) eventsForMessage(sourceFile, projectRoot, gitRemote, model, sessionID string, m messageRow, blocks []contentBlock, results map[string]toolResult) []models.ToolEvent {
 	when := secondsToTime(m.Created)
 	isUser := strings.EqualFold(m.Role, "user")
 	var out []models.ToolEvent
@@ -183,15 +183,15 @@ func (a *Adapter) eventsForMessage(sourceFile, projectRoot, model, sessionID str
 				continue
 			}
 			if isUser {
-				out = append(out, a.userPromptEvent(sourceFile, projectRoot, sessionID, m, i, body))
+				out = append(out, a.userPromptEvent(sourceFile, projectRoot, gitRemote, sessionID, m, i, body))
 			} else {
-				out = append(out, a.assistantTextEvent(sourceFile, projectRoot, model, sessionID, m, i, body))
+				out = append(out, a.assistantTextEvent(sourceFile, projectRoot, gitRemote, model, sessionID, m, i, body))
 			}
 		case "toolRequest":
 			if b.ToolCall == nil {
 				continue
 			}
-			out = append(out, a.toolCallEvent(sourceFile, projectRoot, model, sessionID, when, m, i, b, results))
+			out = append(out, a.toolCallEvent(sourceFile, projectRoot, gitRemote, model, sessionID, when, m, i, b, results))
 		case "toolResponse":
 			// consumed into results; not emitted on its own.
 		}
@@ -199,13 +199,14 @@ func (a *Adapter) eventsForMessage(sourceFile, projectRoot, model, sessionID str
 	return out
 }
 
-func (a *Adapter) userPromptEvent(sourceFile, projectRoot, sessionID string, m messageRow, idx int, body string) models.ToolEvent {
+func (a *Adapter) userPromptEvent(sourceFile, projectRoot, gitRemote, sessionID string, m messageRow, idx int, body string) models.ToolEvent {
 	preview := a.scrub(truncate(body, 500))
 	return models.ToolEvent{
 		SourceFile:    sourceFile,
 		SourceEventID: "prompt:" + msgKey(m) + ":" + strconv.Itoa(idx),
 		SessionID:     sessionID,
 		ProjectRoot:   projectRoot,
+		GitRemote:     gitRemote,
 		Timestamp:     secondsToTime(m.Created),
 		Tool:          models.ToolGoose,
 		ActionType:    models.ActionUserPrompt,
@@ -216,7 +217,7 @@ func (a *Adapter) userPromptEvent(sourceFile, projectRoot, sessionID string, m m
 	}
 }
 
-func (a *Adapter) assistantTextEvent(sourceFile, projectRoot, model, sessionID string, m messageRow, idx int, body string) models.ToolEvent {
+func (a *Adapter) assistantTextEvent(sourceFile, projectRoot, gitRemote, model, sessionID string, m messageRow, idx int, body string) models.ToolEvent {
 	preview := a.scrub(truncate(body, 200))
 	output := a.scrub(contentcap.Cap(body, contentcap.DefaultMaxBytes))
 	return models.ToolEvent{
@@ -224,6 +225,7 @@ func (a *Adapter) assistantTextEvent(sourceFile, projectRoot, model, sessionID s
 		SourceEventID: "text:" + msgKey(m) + ":" + strconv.Itoa(idx),
 		SessionID:     sessionID,
 		ProjectRoot:   projectRoot,
+		GitRemote:     gitRemote,
 		Timestamp:     secondsToTime(m.Created),
 		Model:         model,
 		Tool:          models.ToolGoose,
@@ -236,7 +238,7 @@ func (a *Adapter) assistantTextEvent(sourceFile, projectRoot, model, sessionID s
 	}
 }
 
-func (a *Adapter) toolCallEvent(sourceFile, projectRoot, model, sessionID string, when time.Time, m messageRow, idx int, b contentBlock, results map[string]toolResult) models.ToolEvent {
+func (a *Adapter) toolCallEvent(sourceFile, projectRoot, gitRemote, model, sessionID string, when time.Time, m messageRow, idx int, b contentBlock, results map[string]toolResult) models.ToolEvent {
 	name := b.ToolCall.Value.Name
 	args := b.ToolCall.Value.Arguments
 	actionType, target := mapTool(name, args)
@@ -262,6 +264,7 @@ func (a *Adapter) toolCallEvent(sourceFile, projectRoot, model, sessionID string
 		SourceEventID: sourceID,
 		SessionID:     sessionID,
 		ProjectRoot:   projectRoot,
+		GitRemote:     gitRemote,
 		Timestamp:     when,
 		Model:         model,
 		Tool:          models.ToolGoose,
@@ -286,7 +289,7 @@ func (a *Adapter) toolCallEvent(sourceFile, projectRoot, model, sessionID string
 // accumulated_input − accumulated_cache_read (clamped ≥0). A token-EMPTY
 // provider-error session (all NULL/0) yields no event. sessionID is the
 // store-scoped id (see scopedSessionID).
-func (a *Adapter) tokenEvent(sourceFile, projectRoot, model, sessionID string, s sessionRow) (models.TokenEvent, bool) {
+func (a *Adapter) tokenEvent(sourceFile, projectRoot, gitRemote, model, sessionID string, s sessionRow) (models.TokenEvent, bool) {
 	in := s.AccInput.Int64
 	out := s.AccOutput.Int64
 	cr := s.AccCacheRead.Int64
@@ -304,6 +307,7 @@ func (a *Adapter) tokenEvent(sourceFile, projectRoot, model, sessionID string, s
 		SourceEventID:       "tokens:" + sessionID,
 		SessionID:           sessionID,
 		ProjectRoot:         projectRoot,
+		GitRemote:           gitRemote,
 		Timestamp:           parseUTC(s.UpdatedAt),
 		Tool:                models.ToolGoose,
 		Model:               model,

@@ -118,7 +118,7 @@ func readCLIHistoryEntries(cliRoot string) []historyJSONLEntry {
 // pipeline — used only to elide history entries the bridge already
 // surfaced (string-equality on Target after truncation).
 func synthesizeHistoryUserPrompts(
-	sessionPath, conversationID, projectRoot, sessionID string,
+	sessionPath, conversationID, projectRoot, gitRemote, sessionID string,
 	scrubber Scrubber,
 	historyEntries []historyJSONLEntry,
 	existing []models.ToolEvent,
@@ -150,6 +150,7 @@ func synthesizeHistoryUserPrompts(
 			SourceEventID: eid,
 			SessionID:     sessionID,
 			ProjectRoot:   projectRoot,
+			GitRemote:     gitRemote,
 			Timestamp:     time.UnixMilli(e.Timestamp).UTC(),
 			Tool:          models.ToolAntigravity,
 			ActionType:    models.ActionUserPrompt,
@@ -184,7 +185,7 @@ func synthesizeHistoryUserPrompts(
 // resolver picks the right per-turn file. Previously gated to CLI
 // only because desktop's plaintext trace wasn't known; that gating
 // is now in the caller's responsibility (it isn't — see adapter.go).
-func (a *Adapter) augmentResultFromHistory(sessionPath, conversationID, projectRoot string, res *adapter.ParseResult) int {
+func (a *Adapter) augmentResultFromHistory(sessionPath, conversationID, projectRoot, gitRemote string, res *adapter.ParseResult) int {
 	// Primary: layout-appropriate brain/<uuid> transcript (CLI:
 	// transcript.jsonl; desktop: overview.txt). Both decode through
 	// readCLITranscriptEntries — same schema.
@@ -196,6 +197,9 @@ func (a *Adapter) augmentResultFromHistory(sessionPath, conversationID, projectR
 			// conversations), retroactively patch every emitted event
 			// once we discover the real workspace from metadata. Keeps
 			// the augmentation path symmetric across all entry sites.
+			// extractProjectRootFromTranscript has no git remote of its
+			// own (it isn't a git.Resolve call site), so gitRemote is
+			// deliberately left as-is rather than cleared or guessed.
 			if projectRoot == "[antigravity]" {
 				if derived := extractProjectRootFromTranscript(transcript); derived != "" {
 					projectRoot = derived
@@ -204,7 +208,7 @@ func (a *Adapter) augmentResultFromHistory(sessionPath, conversationID, projectR
 			}
 			extraU, extraA := a.loadPersistedTargetCoverage(sessionPath)
 			synth := synthesizeTranscriptEvents(
-				sessionPath, conversationID, projectRoot, conversationID,
+				sessionPath, conversationID, projectRoot, gitRemote, conversationID,
 				a.scrubber, transcript, res.ToolEvents,
 				extraU, extraA,
 			)
@@ -225,7 +229,7 @@ func (a *Adapter) augmentResultFromHistory(sessionPath, conversationID, projectR
 		return 0
 	}
 	synth := synthesizeHistoryUserPrompts(
-		sessionPath, conversationID, projectRoot, conversationID,
+		sessionPath, conversationID, projectRoot, gitRemote, conversationID,
 		a.scrubber, entries, res.ToolEvents,
 	)
 	if len(synth) == 0 {
@@ -253,6 +257,24 @@ func projectRootFromResult(res *adapter.ParseResult, conversationID string) stri
 	}
 	_ = conversationID
 	return "[antigravity]"
+}
+
+// gitRemoteFromResult is projectRootFromResult's sibling: it pulls
+// the normalized git remote off the same ToolEvent that carried the
+// project root, so history.jsonl augmentation rows attribute to the
+// identical (root, remote) pair as the bridge/decrypt-surfaced rows
+// for the same conversation. Returns "" when no event carries one
+// (no git remote configured, or the workspace wasn't git-resolved).
+func gitRemoteFromResult(res *adapter.ParseResult, conversationID string) string {
+	if res != nil {
+		for _, ev := range res.ToolEvents {
+			if ev.ProjectRoot != "" {
+				return ev.GitRemote
+			}
+		}
+	}
+	_ = conversationID
+	return ""
 }
 
 // historyOnlyResult builds a ParseResult populated entirely from
@@ -289,9 +311,9 @@ func (a *Adapter) historyOnlyResult(sessionPath string, fi os.FileInfo) *adapter
 		return nil
 	}
 	conversationID := uuidFromFilename(sessionPath)
-	projectRoot := "[antigravity]"
+	projectRoot, gitRemote := "[antigravity]", ""
 	if idx := a.lookupIndexEntry(sessionPath, conversationID); idx != nil && idx.workspaceURI != "" {
-		projectRoot = decodeFileURIToRoot(idx.workspaceURI)
+		projectRoot, gitRemote = decodeFileURIToRoot(idx.workspaceURI)
 	}
 	// Primary: layout-appropriate brain/<uuid>/...txt|jsonl.
 	if path := transcriptPathFor(sessionPath, conversationID); path != "" {
@@ -311,7 +333,7 @@ func (a *Adapter) historyOnlyResult(sessionPath string, fi os.FileInfo) *adapter
 			}
 			extraU, extraA := a.loadPersistedTargetCoverage(sessionPath)
 			synth := synthesizeTranscriptEvents(
-				sessionPath, conversationID, projectRoot, conversationID,
+				sessionPath, conversationID, projectRoot, gitRemote, conversationID,
 				a.scrubber, transcript, nil,
 				extraU, extraA,
 			)
@@ -345,7 +367,7 @@ func (a *Adapter) historyOnlyResult(sessionPath string, fi os.FileInfo) *adapter
 		return nil
 	}
 	synth := synthesizeHistoryUserPrompts(
-		sessionPath, conversationID, projectRoot, conversationID,
+		sessionPath, conversationID, projectRoot, gitRemote, conversationID,
 		a.scrubber, entries, nil,
 	)
 	if len(synth) == 0 {

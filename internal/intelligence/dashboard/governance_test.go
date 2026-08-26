@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -244,5 +247,177 @@ func TestGovernanceEndpointDormantWithoutProvider(t *testing.T) {
 	}
 	if eff.HiddenSections == nil {
 		t.Fatal("hidden_sections is null rather than [] — the SPA would have to null-check every list")
+	}
+}
+
+// writeShareConfig writes a config.toml carrying only an [org_client.share]
+// block and returns its path — the node's OWN sharing settings, the `local`
+// half of every row the governance endpoint resolves.
+func writeShareConfig(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[org_client.share]\n"+body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
+}
+
+// TestGovernanceShareBlockIsObjectShaped is the regression for the T8
+// serialization defect.
+//
+// The handler used to serialize govern.Effective verbatim, so `share` went
+// out as the org's raw directives — bare booleans. web/src/lib/governance.ts
+// declares each entry as {effective, local, source}, and Privacy.tsx reads
+// .source and .effective off it, so every row rendered a raised tier as "not
+// shared" and looked its label up under `undefined`. This asserts the object
+// shape at the BYTE level (not just that a tolerant decode succeeds), because
+// a bare `true` decodes into the struct without error — as null fields.
+func TestGovernanceShareBlockIsObjectShaped(t *testing.T) {
+	eff := govern.Effective{
+		Active: true, State: govern.StateApplied, Version: 21, Managed: true,
+		// extract.cache is the per-tier authority W-8's ExtractionAuthorized
+		// gate requires before cache_detail's raise below is honest — see
+		// internal/govern/sharetiers.go. Without it MergeBoolGated leaves
+		// cache_detail lowered, which is exactly the over-report bug this
+		// gate exists to close.
+		Authority:      []string{govern.AuthorityExtractCache},
+		HiddenSections: []string{}, ReadOnlySections: []string{},
+		HiddenSettings: []string{}, ReadOnlySettings: []string{},
+		Share: map[string]any{
+			"cache_detail":            true,  // local false + managed + extract.cache ⇒ RAISED
+			"full_content":            false, // local true                            ⇒ LOWERED
+			"routing_summary":         true,  // local true                            ⇒ PINNED
+			"target_action_allowlist": []string{"bash", "read"},
+		},
+	}
+	cfgPath := writeShareConfig(t, "full_content = true\nrouting_summary = true\ncache_detail = false\ntarget_action_allowlist = [\"bash\", \"write\"]\n")
+	s := newRemoteTestServer(t, Options{
+		ConfigPath: cfgPath,
+		Governance: func(context.Context) govern.Effective { return eff },
+	})
+
+	rec := httptest.NewRecorder()
+	s.guardedHandler("127.0.0.1:8081").ServeHTTP(rec, loopbackRequest(http.MethodGet, "/api/governance"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/governance = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+
+	// Byte-level: every entry must be a JSON object, never a bare scalar.
+	var envelope struct {
+		Share map[string]json.RawMessage `json:"share"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode envelope: %v (%s)", err, rec.Body.String())
+	}
+	if len(envelope.Share) != len(eff.Share) {
+		t.Fatalf("share has %d rows, want %d (%s)", len(envelope.Share), len(eff.Share), rec.Body.String())
+	}
+	for key, raw := range envelope.Share {
+		if len(raw) == 0 || raw[0] != '{' {
+			t.Errorf("share[%q] = %s — the SPA reads .source/.effective off this and would render undefined", key, raw)
+		}
+	}
+
+	var got struct {
+		Share map[string]governanceShareKey `json:"share"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode share block: %v", err)
+	}
+	cases := []struct {
+		key       string
+		effective any
+		local     any
+		source    govern.ShareSource
+	}{
+		{"cache_detail", true, false, govern.ShareSourceOrgRaised},
+		{"full_content", false, true, govern.ShareSourceOrg},
+		{"routing_summary", true, true, govern.ShareSourceBoth},
+		{"target_action_allowlist", []any{"bash"}, []any{"bash", "write"}, govern.ShareSourceOrg},
+	}
+	for _, tc := range cases {
+		row, ok := got.Share[tc.key]
+		if !ok {
+			t.Errorf("share is missing %q", tc.key)
+			continue
+		}
+		if !reflect.DeepEqual(row.Effective, tc.effective) {
+			t.Errorf("share[%q].effective = %#v, want %#v", tc.key, row.Effective, tc.effective)
+		}
+		if !reflect.DeepEqual(row.Local, tc.local) {
+			t.Errorf("share[%q].local = %#v, want %#v", tc.key, row.Local, tc.local)
+		}
+		if row.Source != tc.source {
+			t.Errorf("share[%q].source = %q, want %q", tc.key, row.Source, tc.source)
+		}
+		if row.PolicyVersion != eff.Version {
+			t.Errorf("share[%q].policy_version = %d, want %d", tc.key, row.PolicyVersion, eff.Version)
+		}
+	}
+}
+
+// TestGovernanceShareRaiseIsInertOnAnIndividualNode pins the tenancy half at
+// the HTTP layer: the SAME org body on an UNMANAGED node raises nothing and
+// is attributed to nobody but the developer.
+func TestGovernanceShareRaiseIsInertOnAnIndividualNode(t *testing.T) {
+	eff := govern.Effective{
+		Active: true, State: govern.StateApplied, Version: 21,
+		HiddenSections: []string{}, ReadOnlySections: []string{},
+		HiddenSettings: []string{}, ReadOnlySettings: []string{},
+		Share: map[string]any{"cache_detail": true},
+	}
+	s := newRemoteTestServer(t, Options{
+		ConfigPath: writeShareConfig(t, "cache_detail = false\n"),
+		Governance: func(context.Context) govern.Effective { return eff },
+	})
+	rec := httptest.NewRecorder()
+	s.guardedHandler("127.0.0.1:8081").ServeHTTP(rec, loopbackRequest(http.MethodGet, "/api/governance"))
+	var got struct {
+		Share map[string]governanceShareKey `json:"share"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v (%s)", err, rec.Body.String())
+	}
+	row := got.Share["cache_detail"]
+	if row.Effective != false || row.Source != govern.ShareSourceLocal {
+		t.Fatalf("individual node reported effective=%v source=%q, want false/you — raising is managed-only", row.Effective, row.Source)
+	}
+}
+
+// TestGovernanceShareBlockAbsentWithoutDirectives keeps the solo/dormant wire
+// shape byte-identical: no org directives ⇒ no `share` key at all, which is
+// what governance.ts documents as "no org sharing directives".
+func TestGovernanceShareBlockAbsentWithoutDirectives(t *testing.T) {
+	s := newRemoteTestServer(t, Options{})
+	rec := httptest.NewRecorder()
+	s.guardedHandler("127.0.0.1:8081").ServeHTTP(rec, loopbackRequest(http.MethodGet, "/api/governance"))
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, present := raw["share"]; present {
+		t.Fatalf("dormant posture emitted a share block: %s", rec.Body.String())
+	}
+}
+
+// TestShareLocalTableCoversNodegovVocabulary pins the dashboard's
+// key → local-setting table to the POLICY-side vocabulary. nodegov.Compile
+// refuses any share key outside ShareKeys, so covering that table is exactly
+// what makes resolveShareBlock's unknown-key fallback unreachable — and what
+// stops a newly added share key from silently reporting the wrong `local`.
+func TestShareLocalTableCoversNodegovVocabulary(t *testing.T) {
+	for _, k := range nodegov.ShareKeys {
+		if _, ok := shareLocalTable[k.Key]; !ok {
+			t.Errorf("share key %q is org-directable but shareLocalTable has no local counterpart — the Privacy page would mis-report it", k.Key)
+		}
+	}
+	vocab := map[string]bool{}
+	for _, k := range nodegov.ShareKeys {
+		vocab[k.Key] = true
+	}
+	for key := range shareLocalTable {
+		if !vocab[key] {
+			t.Errorf("shareLocalTable knows %q but no org can direct it — dead row", key)
+		}
 	}
 }

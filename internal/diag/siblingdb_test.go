@@ -80,3 +80,48 @@ func TestDetectCrossEnvSiblingDBs_SkipsSameFile(t *testing.T) {
 		t.Errorf("same-file candidate must be skipped, got %+v", got)
 	}
 }
+
+// TestDetectSiblingObservers_CrossOS: the cross-OS straddle surfaces as a
+// coarse (Origin, OS) descriptor with no path (Arc 4 P6b content-floor).
+func TestDetectSiblingObservers_CrossOS(t *testing.T) {
+	nativeHome := t.TempDir()
+	foreignHome := t.TempDir()
+	daemonDB := mkObserverDB(t, nativeHome)
+	mkObserverDB(t, foreignHome)
+
+	homes := []crossmount.HomeRoot{
+		{Path: nativeHome, OS: "linux", Origin: "native"},
+		{Path: foreignHome, OS: "windows", Origin: "wsl-mnt:marmu"},
+	}
+	got := DetectSiblingObservers(daemonDB, homes)
+	if len(got) != 1 {
+		t.Fatalf("got %d want 1: %+v", len(got), got)
+	}
+	if got[0].Origin != "wsl-mnt:marmu" || got[0].OS != "windows" {
+		t.Errorf("descriptor = %+v", got[0])
+	}
+}
+
+// TestDetectSiblingObservers_NativeAltUnderCustomPath: a default-location
+// native observer.db is flagged as "native-alt" ONLY when the daemon runs a
+// custom dbPath (a parallel default install); with the default dbPath it is the
+// daemon's own DB and must never fire.
+func TestDetectSiblingObservers_NativeAltUnderCustomPath(t *testing.T) {
+	nativeHome := t.TempDir()
+	defaultDB := mkObserverDB(t, nativeHome) // ~/.observer/observer.db
+	homes := []crossmount.HomeRoot{
+		{Path: nativeHome, OS: "linux", Origin: "native"},
+	}
+
+	// Daemon on a CUSTOM path → the default-location DB is a parallel install.
+	customDB := filepath.Join(t.TempDir(), "custom", "observer.db")
+	got := DetectSiblingObservers(customDB, homes)
+	if len(got) != 1 || got[0].Origin != "native-alt" {
+		t.Fatalf("custom-path daemon must flag native-alt, got %+v", got)
+	}
+
+	// Daemon on the DEFAULT path → no false positive on its own DB.
+	if got := DetectSiblingObservers(defaultDB, homes); len(got) != 0 {
+		t.Errorf("default-path daemon must not flag its own DB, got %+v", got)
+	}
+}

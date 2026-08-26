@@ -87,3 +87,70 @@ func TestObsEndUserSpendKeepsBatchNonEmpty(t *testing.T) {
 		t.Fatalf("aggregate-only end-user batch reported Empty; it would be dropped")
 	}
 }
+
+// stubEgressProviders wires the T8 egress seam with one canned decision row
+// carrying both content-bearing columns (Tenant/User) so the strip path is
+// observable.
+func stubEgressProviders() ObsOrgProviders {
+	return ObsOrgProviders{
+		Egress: func(context.Context, orgcontract.ObsCursor, int) (orgcontract.ObsEgressBatch, error) {
+			return orgcontract.ObsEgressBatch{Events: []orgcontract.ObsEgressRow{{
+				TS: "2026-08-24T10:00:00Z", Mode: "enforce", RuleName: "block-frontier",
+				Action: "deny", ReasonCode: "policy", RowHash: "rh-1",
+				Tenant: "acme", User: "end-user-9",
+			}}}, nil
+		},
+	}
+}
+
+// TestObsEgressComposeGating pins the T8 tier's behavioral contract (org-parity
+// W5.3): the feed rides ONLY under ShareOptions.ObsEgress (its own node-side
+// opt-in, independent of AdminManaged/FullContent), and within an opted-in
+// tier the Tenant/User content columns ship raw only under shipsRawContent()
+// — stripped otherwise, mirroring the T6 admission posture.
+func TestObsEgressComposeGating(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name        string
+		share       ShareOptions
+		wantPresent bool
+		wantContent bool
+	}{
+		{"nothing opted in", ShareOptions{}, false, false},
+		{"admin managed but no egress opt-in", ShareOptions{AdminManaged: true}, false, false},
+		{"egress opt-in, metadata-only", ShareOptions{ObsEgress: true}, true, false},
+		{"egress opt-in + full content", ShareOptions{ObsEgress: true, FullContent: true}, true, true},
+		{"egress opt-in + admin managed", ShareOptions{ObsEgress: true, AdminManaged: true}, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := newTestStore(t)
+			s.SetObsOrgProviders(stubEgressProviders())
+			batch, err := s.SelectUnpushedSince(ctx, PushCursor{}, 1<<20, "org-1", "dev@acme.example", tc.share, ScopeOptions{})
+			if err != nil {
+				t.Fatalf("SelectUnpushedSince: %v", err)
+			}
+			got := len(batch.ObsEgressDecisions) > 0
+			if got != tc.wantPresent {
+				t.Fatalf("ObsEgressDecisions present = %v, want %v", got, tc.wantPresent)
+			}
+			if !tc.wantPresent {
+				return
+			}
+			r := batch.ObsEgressDecisions[0]
+			if r.OrgID != "org-1" || r.UserEmail != "dev@acme.example" {
+				t.Errorf("row not stamped with org/pusher: %+v", r)
+			}
+			if r.Action != "deny" || r.RowHash != "rh-1" {
+				t.Errorf("decision fields not carried verbatim: %+v", r)
+			}
+			if tc.wantContent {
+				if r.Tenant != "acme" || r.User != "end-user-9" {
+					t.Errorf("tenant/user should ship raw under shipsRawContent(): %+v", r)
+				}
+			} else if r.Tenant != "" || r.User != "" {
+				t.Errorf("tenant/user leaked without shipsRawContent(): tenant=%q user=%q", r.Tenant, r.User)
+			}
+		})
+	}
+}

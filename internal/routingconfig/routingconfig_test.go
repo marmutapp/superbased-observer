@@ -196,3 +196,28 @@ func TestLocalUpstreamRouting(t *testing.T) {
 		t.Error("empty config produced non-nil outputs")
 	}
 }
+
+// TestOrgBodyMode pins the Arc 4 P3b mode extractor: it reads [routing].mode
+// from an org body (header or bare fragment), returns "" when absent or
+// unparseable, and NEVER affects ComposeOrgPolicy (which still ignores mode).
+func TestOrgBodyMode(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"header enforce", "[routing]\nmode = \"enforce\"\n", "enforce"},
+		{"header advise", "[routing]\nmode = \"advise\"\n", "advise"},
+		{"bare fragment", "mode = \"enforce\"\n", "enforce"},
+		{"absent mode", "[routing]\nenabled = true\n", ""},
+		{"empty body", "", ""},
+		{"garbage", "this is : not : toml =", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := OrgBodyMode(tc.body); got != tc.want {
+				t.Errorf("OrgBodyMode(%q) = %q, want %q", tc.body, got, tc.want)
+			}
+		})
+	}
+}

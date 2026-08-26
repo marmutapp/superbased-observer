@@ -621,7 +621,7 @@ func TestParseStructuredTrajectory_E371fdb1WireBytes(t *testing.T) {
 	if err != nil {
 		t.Skipf("fixture not present (%v) — capture via PROBE_E371=1 go test -run TestProbeE371fdb1", err)
 	}
-	en := ParseStructuredTrajectory(raw, "e371fdb1-568d-4edc-90b7-2dd94f3a7fae", "/home/marmutapp/superbased-observer", "/tmp/test.pb", identityScrubber{})
+	en := ParseStructuredTrajectory(raw, "e371fdb1-568d-4edc-90b7-2dd94f3a7fae", "/home/marmutapp/superbased-observer", "", "/tmp/test.pb", identityScrubber{})
 	if en.Model != "claude-sonnet-4-6" {
 		t.Errorf("Model = %q, want claude-sonnet-4-6", en.Model)
 	}

@@ -68,6 +68,49 @@ func getConfirm(t *testing.T, h http.Handler) (*http.Cookie, string) {
 	return ck, resp.ConfirmToken
 }
 
+func TestConfirmCookieReusedAcrossManagementGETs(t *testing.T) {
+	_, h := newManageServer(t)
+	var ck *http.Cookie
+	var echoValue string
+	ck, echoValue = getConfirm(t, h)
+	for _, path := range []string{"/api/terminal/policy", "/api/terminal/sandbox/config", "/api/remote/config"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Host = "127.0.0.1:8080"
+		req.AddCookie(ck)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d: %s", path, rec.Code, rec.Body.String())
+		}
+		var body struct {
+			ConfirmToken string `json:"confirm_token"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body.ConfirmToken != echoValue {
+			t.Fatalf("GET %s rotated shared token: got %q want original", path, body.ConfirmToken)
+		}
+	}
+
+	// The token captured before all sibling GETs remains valid for the save.
+	req := httptest.NewRequest(http.MethodPut, "/api/terminal/policy", strings.NewReader(`{
+		"allow_fresh_agent":false,
+		"allowed_tools":[],
+		"allowed_project_roots":[],
+		"allow_shell":false
+	}`))
+	req.Host = "127.0.0.1:8080"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(remoteConfirmHeader, echoValue)
+	req.AddCookie(ck)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("policy save after sibling GETs = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 // TestArmVerbsRequireConfirmToken pins §10 CSRF hardening negatives across
 // enable/disable/rotate.
 func TestArmVerbsRequireConfirmToken(t *testing.T) {

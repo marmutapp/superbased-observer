@@ -473,6 +473,14 @@ observer grok --continue-from <session-id>
 # hermes + kimi-code have no TUI seed → doc-assisted: write the doc + open the TUI
 observer hermes --continue-from <session-id>
 observer kimi --continue-from <session-id>
+
+# zcode seeds via its interactive --prompt/-p flag; mistral-code (vibe) via
+# its bare positional [PROMPT] (both launched non-proxied)
+observer zcode --continue-from <session-id>
+observer vibe --continue-from <session-id>
+
+# freebuff has no seed lane → doc-assisted, like hermes/kimi-code
+observer freebuff --continue-from <session-id>
 ```
 
 Under the hood `--continue-from` runs the exact same handoff as
@@ -520,6 +528,9 @@ command's own flags, not just the top-level help.
 | droid | `droid` | trailing positional `droid "<h>"` — `--help` states `Usage: droid [options] [command] [prompt...]` with the worked example `droid "review app.tsx"   Start with an initial prompt`; **launched non-proxied** (built-in-model path has no base-URL knob, BYOK lane unprobed) | trailing positional (a leading `exec`/management verb is refused, not seeded) | `droid exec "<h>"` |
 | open-interpreter | `open-interpreter` (alias `interpreter`) | trailing positional `interpreter "<h>"` — this fork's OWN help: `Usage: interpreter [OPTIONS] [PROMPT]`, `[PROMPT]  Optional user prompt to start the session`; **launched non-proxied** (it is codex, but its base-URL lane is unprobed — the launcher injects NO `-c openai_base_url`) | trailing positional (codex-shaped subcommand map) | `interpreter exec "<h>"` |
 | command-code | `command-code` (alias `commandcode`) | trailing positional `commandcode "<h>"` — `--help` lists `commandcode "message"   Start with initial message`; **launched non-proxied** (its API-URL knob points at Command Code's own closed gateway) | trailing positional (`-p`/`--print` and `--no-session` refused) | `commandcode -p "<h>"` |
+| zcode | `zcode` | `--prompt`/`-p "<h>"` — zcode's own docs describe this as the interactive seed lane (`zcode --help`); the bare command with no prompt opens the TUI unseeded; **launched non-proxied** (Z.AI OAuth, no base-URL knob) | flag value (`--prompt`, conflicts with `-p`/`--print`) | — |
+| mistral-code | `vibe` | trailing positional `vibe "<h>"` (bare `[PROMPT]`) opens a seeded interactive session; **launched non-proxied** (API-key auth, `vibe_base_url`/`api_base` lane unprobed) | trailing positional | `-p`/`--prompt` |
+| freebuff | `freebuff` | **none** — `freebuff --help` (2026-08-18) exposes only `login` and `--continue`, no positional prompt or one-shot flag → **DocAssisted** (write doc + open the TUI); **launched non-proxied** (CodebuffAI backend, no base-URL knob) | n/a (doc-assisted) | — |
 
 **Absent by convention:** this table lists ONLY tools with a grounded
 `Handoff.Launch` row, so an adapter appears here the moment (and only when) its
@@ -553,17 +564,25 @@ Notes that bit us / matter:
   doc, prints its path, and opens `hermes --tui` for you to reference or
   paste. For a fully headless continue you can also run
   `hermes -z "$(cat HANDOFF-<id>.md)"`.
+- **freebuff**: `freebuff --help` (2026-08-18) exposes only a `login`
+  subcommand and `--continue` — no positional prompt, no one-shot flag, no
+  TUI initial-message flag at all. So like hermes/kimi-code it is wired
+  **DocAssisted**: `observer freebuff --continue-from` writes the handover
+  doc, prints its path, and opens the bare `freebuff` TUI for you to
+  reference or paste in yourself.
 
 Semantics (all deliberate):
 
-- **Which launchers.** Twenty-two, one per interactive CLI harness (see the
-  seed-contract table below for the exact per-adapter mechanism). Twenty are
-  **Seeded** (`observer claude|codex|gemini|pi|opencode|copilot-cli|cline-cli|
-  kilo|cursor|openclaw|antigravity-cli|qwen|kiro|grok|qoder|goose|devin|droid|
-  open-interpreter|command-code --continue-from`) — they declare the `inject_prompt`
-  lane and inject the handover as the first prompt. Two are **DocAssisted**
-  (`observer hermes|kimi --continue-from`) — they write the doc + open the TUI
-  (neither tool has a seed flag). Each launcher passes its own tool as the handoff
+- **Which launchers.** Twenty-five, one per interactive CLI harness (see the
+  seed-contract table below for the exact per-adapter mechanism; this list is
+  not yet extended for the 2026-08-06 `muse`/`prime-agent` wave, tracked
+  separately). Twenty-two are **Seeded** (`observer claude|codex|gemini|pi|
+  opencode|copilot-cli|cline-cli|kilo|cursor|openclaw|antigravity-cli|qwen|
+  kiro|grok|qoder|goose|devin|droid|open-interpreter|command-code|zcode|vibe
+  --continue-from`) — they declare the `inject_prompt` lane and inject the
+  handover as the first prompt. Three are **DocAssisted**
+  (`observer hermes|kimi|freebuff --continue-from`) — they write the doc +
+  open the TUI (none of the three has a seed flag). Each launcher passes its own tool as the handoff
   TARGET, and the svc validates the delivery lane against that tool's grounded
   capability, so the wiring dispatches on capability shape, never a tool-name
   branch. The injection STRATEGY is declared data — a `promptInjection`

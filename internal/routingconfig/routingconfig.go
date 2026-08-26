@@ -10,12 +10,38 @@ package routingconfig
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 
 	"github.com/marmutapp/superbased-observer/internal/config"
 	"github.com/marmutapp/superbased-observer/internal/routing"
 )
+
+// OrgBodyMode extracts the [routing].mode token from an org-distributed
+// routing body ("" when absent or unparseable). ComposeOrgPolicy structurally
+// IGNORES this mode on the individual plane (§R23: no remote enforce toggle).
+// The Arc 4 P3b managed-enforce lift is the SOLE consumer: cmd/observer honors
+// this mode only for a managed node that holds the enforce.routing authority,
+// leaving every non-managed node's routing posture entirely node-owned.
+func OrgBodyMode(orgBody string) string {
+	// Prefer the [routing] header form (the shape the org actually distributes);
+	// toml does not error on an unrelated top-level key, so a bare fragment
+	// leaves org.Routing.Mode empty and we fall through to the bare parse.
+	var org struct {
+		Routing config.RoutingConfig `toml:"routing"`
+	}
+	if err := toml.Unmarshal([]byte(orgBody), &org); err == nil {
+		if m := strings.TrimSpace(org.Routing.Mode); m != "" {
+			return m
+		}
+	}
+	var bare config.RoutingConfig
+	if err := toml.Unmarshal([]byte(orgBody), &bare); err == nil {
+		return strings.TrimSpace(bare.Mode)
+	}
+	return ""
+}
 
 // Spec mirrors the [routing] config section into the routing package's
 // compiler input.

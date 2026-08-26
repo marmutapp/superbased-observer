@@ -3,69 +3,14 @@ package clinecli
 import (
 	"encoding/json"
 
-	"github.com/marmutapp/superbased-observer/internal/cachetrack"
+	"github.com/marmutapp/superbased-observer/internal/adapter/cacheobs"
 	"github.com/marmutapp/superbased-observer/internal/models"
 )
 
 // MaxBlocksPerSession caps the per-session Tier-2 accumulator's
 // running block count. Matches the claudecode template's cap
 // (same memory budget, same OOM guard).
-const MaxBlocksPerSession = 4096
-
-// tier2Accumulator mirrors the claudecode template (see
-// internal/adapter/claudecode/adapter.go::tier2Accumulator).
-// cline-cli's Anthropic-shape content blocks fold in cleanly:
-// the audit (cachetrack-cline-cli-tier2-audit-2026-06-09.md)
-// confirms NO block-level volatile fields exist, so the canonical
-// marshaller is a straight struct-encode per type.
-type tier2Accumulator struct {
-	pendingBlocks  []models.CacheBlockMeta
-	totalBlocks    int
-	compactionSeen bool
-	capExceeded    bool
-	maxBlocks      int
-}
-
-func newTier2Accumulator(maxBlocks int) *tier2Accumulator {
-	return &tier2Accumulator{maxBlocks: maxBlocks}
-}
-
-func (a *tier2Accumulator) observeContent(blocks []models.CacheBlockMeta) {
-	if a.capExceeded || len(blocks) == 0 {
-		return
-	}
-	a.pendingBlocks = append(a.pendingBlocks, blocks...)
-	a.totalBlocks += len(blocks)
-	if a.maxBlocks > 0 && a.totalBlocks > a.maxBlocks {
-		a.capExceeded = true
-		a.pendingBlocks = nil
-	}
-}
-
-func (a *tier2Accumulator) emit(
-	path, sessionID, messageID, model string,
-	tsMillis int64,
-	usage models.CacheUsage,
-	fast bool,
-) models.CacheTurnObservation {
-	obs := models.CacheTurnObservation{
-		SourceFile:     path,
-		SourceEventID:  "cachetrack:" + messageID,
-		SessionID:      sessionID,
-		MessageID:      messageID,
-		Timestamp:      unixMilliToTime(tsMillis),
-		Model:          model,
-		Fast:           fast,
-		Usage:          usage,
-		CompactionSeen: a.compactionSeen,
-	}
-	if !a.capExceeded {
-		obs.BlockHashes = a.pendingBlocks
-	}
-	a.pendingBlocks = nil
-	a.compactionSeen = false
-	return obs
-}
+const MaxBlocksPerSession = cacheobs.DefaultMaxBlocksPerSession
 
 // buildCacheObservations walks every session's messages in order
 // and emits one CacheTurnObservation per assistant message whose
@@ -93,11 +38,11 @@ func buildCacheObservations(sessions []sessionRow, dbPath string) []models.Cache
 		if msgPath == "" || len(s.Messages.Messages) == 0 {
 			continue
 		}
-		acc := newTier2Accumulator(MaxBlocksPerSession)
+		acc := cacheobs.New(MaxBlocksPerSession)
 		for mi := range s.Messages.Messages {
 			m := &s.Messages.Messages[mi]
 			blocks := accumulateCacheBlocksTier2(m.Content, m.Role)
-			acc.observeContent(blocks)
+			acc.ObserveBlocks(blocks)
 
 			if m.Role != "assistant" || m.Metrics == nil {
 				continue
@@ -116,7 +61,7 @@ func buildCacheObservations(sessions []sessionRow, dbPath string) []models.Cache
 				CacheReadTokens:     m.Metrics.CacheReadTokens,
 				CacheCreationTokens: m.Metrics.CacheWriteTokens,
 			}
-			obs := acc.emit(msgPath, s.ID, m.ID, model, m.Ts, usage, false)
+			obs := acc.Emit(msgPath, s.ID, m.ID, model, unixMilliToTime(m.Ts), usage, false)
 			// §15.3 boundary: cline-cli supports per-message
 			// provider switching via m.ModelInfo. When routed to an
 			// implicit-cache provider (deepseek-flash via OpenRouter
@@ -124,10 +69,7 @@ func buildCacheObservations(sessions []sessionRow, dbPath string) []models.Cache
 			// OpenAI, or any other table-listed implicit family),
 			// overlay ImplicitCache=true. Anthropic-routed sessions
 			// are unchanged.
-			if cachetrack.IsImplicitCacheProvider(provider, model) {
-				obs.ImplicitCache = true
-				obs.BlockHashes = nil
-			}
+			obs = cacheobs.ApplyImplicitCacheOverlay(obs, provider, model)
 			out = append(out, obs)
 		}
 	}

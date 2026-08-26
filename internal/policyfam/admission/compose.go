@@ -25,9 +25,22 @@ package admission
 // longer disable a locally-enforcing node, and a published
 // {"mode":"enforce"} can no longer escalate a locally-observing one.
 //
+// orgEnforce is the Arc 4 P3 §R23 LIFT for Enterprise-Managed Tenancy: when
+// the node enrolled managed AND holds the enforce.admission authority
+// (govern.Effective.GrantsAdmissionEnforcement, resolved at the boundary and
+// carried in on OrgLayerMeta.ManagedEnforce), the org body's mode is HONORED
+// as authored — the org may turn enforcement on. There is NO coercion
+// (operator decision): the composed mode is exactly org.Mode, so publishing
+// observe/off stays a real per-cohort opt-out. On the individual plane
+// orgEnforce is always false (the token is stripped there), so the "never
+// server-forced" invariant above is untouched for every non-managed node.
+//
 // local may be nil (no local layer installed).
-func ComposeOrgSpec(local *PolicySpec, org PolicySpec) PolicySpec {
+func ComposeOrgSpec(local *PolicySpec, org PolicySpec, orgEnforce bool) PolicySpec {
 	out := org
+	if orgEnforce {
+		return out // org.Mode honored as authored
+	}
 	out.Mode = ModeOff
 	if local != nil {
 		out.Mode = local.Mode

@@ -48,3 +48,53 @@ func DetectCrossEnvSiblingDBs(dbPath string, homes []crossmount.HomeRoot) []Sibl
 	}
 	return out
 }
+
+// SiblingObserver is a coarse descriptor of a second observer.db on this
+// machine that the managed daemon does not own — tamper-EVIDENCE (Arc 4 P6b,
+// plan §9) of a parallel/bypass observer. It carries ONLY the crossmount origin
+// and OS labels, never a filesystem path, because it feeds the org
+// managed-integrity wire whose content-floor forbids paths/usernames.
+type SiblingObserver struct {
+	Origin string // coarse crossmount origin label, e.g. "wsl-mnt:marmu" or "native-alt"
+	OS     string
+}
+
+// DetectSiblingObservers returns coarse descriptors of observer.db files on
+// this machine that differ from the daemon's own dbPath. It generalises
+// DetectCrossEnvSiblingDBs from a local start.go WARN into the fleet-signal
+// input the managed-integrity probe reports to the org:
+//
+//   - the cross-OS Windows↔WSL straddles DetectCrossEnvSiblingDBs already finds,
+//     re-labelled to drop the path; PLUS
+//   - a native-home default-location observer.db that differs from a CUSTOM
+//     daemon dbPath (labelled "native-alt"). This fires ONLY when the daemon
+//     runs a non-default dbPath — an MDM-pinned managed node — and a
+//     default-location DB also exists, i.e. a likely parallel default install.
+//     When the daemon uses the default path (the common case) the candidate IS
+//     dbPath and is skipped, so there is no false positive.
+//
+// EVIDENCE, not proof: a determined developer on a machine they control can
+// place or hide a DB anywhere; this catches the ordinary cases and feeds the
+// admin a signal, it is not a security boundary (§5 MDM gate is the lock).
+func DetectSiblingObservers(dbPath string, homes []crossmount.HomeRoot) []SiblingObserver {
+	var out []SiblingObserver
+	for _, s := range DetectCrossEnvSiblingDBs(dbPath, homes) {
+		out = append(out, SiblingObserver{Origin: s.Origin, OS: s.OS})
+	}
+	want := filepath.Clean(dbPath)
+	for _, h := range homes {
+		if h.Origin != "native" {
+			continue
+		}
+		cand := filepath.Join(h.Path, ".observer", "observer.db")
+		if filepath.Clean(cand) == want {
+			continue
+		}
+		fi, err := os.Stat(cand)
+		if err != nil || fi.IsDir() {
+			continue
+		}
+		out = append(out, SiblingObserver{Origin: "native-alt", OS: h.OS})
+	}
+	return out
+}

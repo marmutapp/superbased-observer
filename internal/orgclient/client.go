@@ -31,6 +31,14 @@ const (
 	maxBackoff     = 30 * time.Second
 	backoffFactor  = 2
 	jitterFraction = 0.25
+	// authFailMaxBackoff caps the retry cadence for a REJECTED credential
+	// (ErrAuthFailed). Auth failures are retryable, not terminal (see runLoop):
+	// the loop re-reads its bearer + signing key every cycle, so a re-enrol or
+	// key rotation recovers on the next cycle without a restart. The climb
+	// starts at initialBackoff (a prompt re-enrol recovers within the first,
+	// fast retries) and settles here so a genuinely-revoked node does not spam
+	// the server — a much slower steady state than maxBackoff.
+	authFailMaxBackoff = 5 * time.Minute
 )
 
 // ErrNotEnrolled is returned by push operations when the agent is not enrolled
@@ -38,10 +46,12 @@ const (
 // retryable error — the caller waits for an enrol rather than backing off.
 var ErrNotEnrolled = errors.New("orgclient: not enrolled")
 
-// ErrAuthFailed is returned when the server rejects the bearer or the per-push
-// signature (401/403). The push loop treats it as terminal: it stops pushing
-// and surfaces the failure (dashboard + org_push_log) rather than retrying a
-// credential the server has rejected.
+// ErrAuthFailed is returned when the server rejects the credential or the
+// per-push signature (401/403). It is RETRYABLE, not terminal: the push/poll
+// loop re-reads its credentials every cycle, so a re-enrol or key rotation
+// recovers on the next cycle without a process restart. runLoop backs off on a
+// dedicated capped track (authFailMaxBackoff) so a genuinely-revoked node
+// settles to a slow cadence instead of spamming the server.
 var ErrAuthFailed = errors.New("orgclient: authentication failed")
 
 // Client runs the agent side of the Teams enrolment + push protocol: it
@@ -66,6 +76,17 @@ type Client struct {
 	// SetRoutingOutcomeSink.
 	guardOutcomeSink   func(GuardFetchOutcome)
 	routingOutcomeSink func(RoutingFetchOutcome)
+
+	// integrityCollector is the Arc 4 P6b managed-integrity probe seam (plan
+	// §9): a nil-defaulted func that returns this host's coarse tamper-evidence
+	// labels (sibling-observer origins, drifted AI-tool names). It is injected
+	// by cmd/observer so the client never imports internal/diag or
+	// internal/proxyroute (the boundary), and it is consulted ONLY inside
+	// PushLoop and ONLY for a managed node — so it rides the existing push cycle
+	// (no new timer/host/connection, the announce.go discipline) and the
+	// individual plane never computes or sends an integrity signal. Nil = an
+	// exact no-op. Set via SetIntegrityCollector.
+	integrityCollector func() (siblings, drifted []string)
 
 	// routingReloadSink is the P0-7 router hot-reload trigger (docs/plans/
 	// plane-a-p0-7-guard-router-hotreload-plan.md §2.2/§4.5): a nil-defaulted
@@ -171,13 +192,21 @@ func ShareOptionsFromConfig(cfg config.OrgClientConfig) store.ShareOptions {
 		FullContent:           cfg.Share.FullContent,
 		TargetActionAllowlist: cfg.Share.TargetActionAllowlist,
 		AdminManaged:          cfg.Share.AdminManaged,
+		FullToolBodies:        cfg.Share.FullToolBodies,
 		RoutingSummary:        cfg.Share.RoutingSummary,
+		CacheDetail:           cfg.Share.CacheDetail,
+		RoutingDetail:         cfg.Share.RoutingDetail,
+		LimitGauge:            cfg.Share.LimitGauge,
+		CodeintelDetail:       cfg.Share.CodeintelDetail,
+		ProcessDetail:         cfg.Share.ProcessDetail,
+		TerminalDetail:        cfg.Share.TerminalDetail,
 		ObsSummary:            cfg.Share.Obs.Summary,
 		ObsTraces:             cfg.Share.Obs.Traces,
 		ObsContent:            cfg.Share.Obs.Content,
 		ObsEvalSummary:        cfg.Share.Obs.EvalSummary,
 		ObsAdmission:          cfg.Share.Obs.Admission,
 		ObsEvalItems:          cfg.Share.Obs.EvalItems,
+		ObsEgress:             cfg.Share.Obs.Egress,
 	}
 }
 
@@ -331,6 +360,12 @@ func (c *Client) Enroll(ctx context.Context, orgURL, token string) (*store.Enrol
 		UserEmail:    er.UserEmail,
 		EnrolledAt:   time.Now().UTC().Format(time.RFC3339),
 		BearerKeyID:  c.cfg.KeychainID,
+		// Tenancy rides on the enrol response at the same authenticated-TLS
+		// trust level as OrgID/OrgName; empty is normalised to individual by
+		// WriteEnrolment. Managed makes the govern resolver honour the
+		// managed authorities carried in the SIGNED grant (ConsentMode set in
+		// evaluateGrantOffer).
+		Tenancy: er.Tenancy,
 	}
 
 	// Plane-A P0-5 (plan §6.9 / R6-B2 / R3-B2 / Codex B1): activate the new
@@ -422,6 +457,27 @@ type GrantOffer struct {
 	Generation   int64
 	KeyPinSHA256 string
 	ReceiptHash  string
+	// Tenancy is the enrolment class from the enrol response (individual vs
+	// managed). The node-side grant writer maps managed → govern
+	// ConsentMode=managed, which is the signal the govern resolver branches
+	// on to honour the managed-only authorities carried in this grant.
+	Tenancy string
+	// ConsentMode / ConsentActor are the ACP-P6c consent evidence, resolved
+	// ONCE here so cmd/observer records a single answer rather than choosing
+	// between two sources of it.
+	//
+	// PREFERENCE ORDER, and why it matters: the copy bound into the SIGNED
+	// grant wins, because by the time this struct exists that copy has been
+	// verified under the key this very enrolment pinned. The enrol response's
+	// envelope fields are the fallback — they ride at plain authenticated-TLS
+	// trust, so anything able to rewrite them could equally have rewritten
+	// the tenancy. Preferring the signed copy means the strongest statement
+	// available is the one the node writes down and shows an auditor.
+	//
+	// Both empty is the token rail, where the node resolves its consent mode
+	// from Tenancy exactly as it did before P6c.
+	ConsentMode  string
+	ConsentActor string
 }
 
 // evaluateGrantOffer runs the accept gates for an offered grant. EVERY
@@ -473,12 +529,22 @@ func (c *Client) evaluateGrantOffer(er *orgcontract.EnrollResponse, orgURL, orgK
 			return nil
 		}
 	}
+	consentMode, consentActor := g.ConsentMode, g.ConsentActor
+	if consentMode == "" {
+		// No evidence inside the verified grant: fall back to the response
+		// envelope. See GrantOffer.ConsentMode for why this order and not the
+		// other one.
+		consentMode, consentActor = er.ConsentMode, er.ConsentActor
+	}
 	return &GrantOffer{
 		Grant:        g,
 		OrgKey:       orgKey,
 		Generation:   generation,
 		KeyPinSHA256: pinnedKeyHash,
 		ReceiptHash:  orgcontract.EnrolmentGrantReceiptHash(g),
+		Tenancy:      er.Tenancy,
+		ConsentMode:  consentMode,
+		ConsentActor: consentActor,
 	}
 }
 
@@ -619,16 +685,39 @@ func (c *Client) PushOnce(ctx context.Context) (PushResult, error) {
 	}
 
 	env := orgcontract.PushEnvelope{
-		AgentVersion:     c.agentVersion,
-		CursorFrom:       maxCursor(cur),
-		CursorTo:         maxCursor(batch.Cursor),
-		Sessions:         batch.Sessions,
-		Actions:          batch.Actions,
-		APITurns:         batch.APITurns,
-		TokenUsage:       batch.TokenUsage,
-		RoutingSummaries: batch.RoutingSummaries,
-		GuardEvents:      batch.GuardEvents,
-		OTelContent:      batch.OTelContent,
+		AgentVersion:              c.agentVersion,
+		CursorFrom:                maxCursor(cur),
+		CursorTo:                  maxCursor(batch.Cursor),
+		Sessions:                  batch.Sessions,
+		Actions:                   batch.Actions,
+		APITurns:                  batch.APITurns,
+		TokenUsage:                batch.TokenUsage,
+		RoutingSummaries:          batch.RoutingSummaries,
+		CacheSummaries:            batch.CacheSummaries,
+		CodeintelSummaries:        batch.CodeintelSummaries,
+		ProcessSummaries:          batch.ProcessSummaries,
+		SessionVerbositySummaries: batch.SessionVerbositySummaries,
+		SessionCacheSummaries:     batch.SessionCacheSummaries,
+		SessionProcesses:          batch.SessionProcesses,
+		SessionNetworkEvents:      batch.SessionNetworkEvents,
+		AdvisorSuggestions:        batch.AdvisorSuggestions,
+		ProjectPatterns:           batch.ProjectPatterns,
+		BenchmarkRuns:             batch.BenchmarkRuns,
+		BenchmarkAttempts:         batch.BenchmarkAttempts,
+		CompressionStats:          batch.CompressionStats,
+		RoutingDevRows:            batch.RoutingDevRows,
+		CodeintelDevRows:          batch.CodeintelDevRows,
+		TerminalRuns:              batch.TerminalRuns,
+		TerminalCommands:          batch.TerminalCommands,
+		RemoteAudit:               batch.RemoteAudit,
+		GuardPins:                 batch.GuardPins,
+		GuardApprovals:            batch.GuardApprovals,
+		TerminalSummaries:         batch.TerminalSummaries,
+		RemoteAuditSummaries:      batch.RemoteAuditSummaries,
+		RoutingDetails:            batch.RoutingDetails,
+		LimitGauges:               batch.LimitGauges,
+		GuardEvents:               batch.GuardEvents,
+		OTelContent:               batch.OTelContent,
 		// Org-tier observability (obs-org-tier plan). Each slice is
 		// composed by orgpush.go::composeObsTiers only under its own
 		// [org_client.share] flag; nil/empty when the node hasn't opted
@@ -652,7 +741,8 @@ func (c *Client) PushOnce(ctx context.Context) (PushResult, error) {
 		// [org_client.share.obs] eval_items opt-in; nil/empty otherwise. Item
 		// content excerpts are gated by shipsRawContent() in composeObsTiers;
 		// the score metadata + content_hash always ship.
-		ObsEvalItems: batch.ObsEvalItems,
+		ObsEvalItems:       batch.ObsEvalItems,
+		ObsEgressDecisions: batch.ObsEgressDecisions, // T8
 	}
 	raw, err := json.Marshal(env)
 	if err != nil {
@@ -724,11 +814,12 @@ func (c *Client) PushOnce(ctx context.Context) (PushResult, error) {
 var errIdle = errors.New("orgclient: idle cycle")
 
 // PushLoop runs the push cycle until ctx is cancelled (clean ctx-cancel
-// returns ctx.Err) or an auth failure stops it (returns nil — a stopped loop
-// is a surfaced condition, not a daemon-fatal error: P1, never break the host
-// tool). Each cycle waits one interval, then re-reads the enrolment state, so
-// an `observer enroll`/`unenroll` on a running daemon takes effect within one
-// interval without a restart. Retryable failures shorten the next wait to the
+// returns ctx.Err); it does not otherwise return (P1, never break the host
+// tool). Each cycle waits one interval, then re-reads the enrolment state AND
+// its credentials, so an `observer enroll`/`unenroll`/rotation on a running
+// daemon takes effect within one interval WITHOUT a restart — including
+// recovery from a rejected credential (ErrAuthFailed is retryable, not
+// terminal; see runLoop). Retryable failures shorten the next wait to the
 // current backoff (exponential, jittered); a success resets the backoff.
 func (c *Client) PushLoop(ctx context.Context) error {
 	return c.runLoop(ctx, c.pushInterval(), func(ctx context.Context) error {
@@ -765,18 +856,39 @@ func (c *Client) PushLoop(ctx context.Context) error {
 		if _, aerr := c.FetchOrgAnnouncement(ctx); aerr != nil && !errors.Is(aerr, ErrNotEnrolled) {
 			c.logger.Warn("org announcement fetch failed", "err", aerr)
 		}
+		// Arc 4 P6b managed-integrity probe rides the SAME cycle (plan §9,
+		// announce.go discipline: no new timer/host/connection). MANAGED nodes
+		// only — an individual node never computes a fingerprint or a signal, so
+		// the individual plane is untouched by construction. A report failure
+		// never affects push health (P1).
+		if c.integrityCollector != nil && enr.IsManaged() {
+			siblings, drifted := c.integrityCollector()
+			if _, ierr := c.ReportIntegrity(ctx, siblings, drifted); ierr != nil && !errors.Is(ierr, ErrNotEnrolled) {
+				c.logger.Warn("org managed-integrity report failed", "err", ierr)
+			}
+		}
 		return err
 	})
+}
+
+// SetIntegrityCollector installs the Arc 4 P6b managed-integrity evidence
+// collector (plan §9). It must be called before PushLoop starts. The collector
+// is consulted only inside PushLoop and only for a managed node; see the
+// integrityCollector field comment.
+func (c *Client) SetIntegrityCollector(fn func() (siblings, drifted []string)) {
+	c.integrityCollector = fn
 }
 
 // runLoop is the timing core of PushLoop, parameterised on the per-cycle
 // action so the backoff/interval/stop behaviour can be tested with a pure
 // scripted action under testing/synctest (no real I/O). The action's return
 // drives the next wait: nil (success) → interval + backoff reset; errIdle →
-// interval (no backoff); ErrAuthFailed → stop; any other error → jittered
-// exponential backoff.
+// interval (no backoff); ErrAuthFailed → capped-backoff retry on a dedicated
+// track (never terminal — self-heals on a re-enrol/rotation without a restart);
+// any other error → jittered exponential backoff.
 func (c *Client) runLoop(ctx context.Context, interval time.Duration, action func(context.Context) error) error {
 	backoff := initialBackoff
+	authBackoff := initialBackoff
 	sleep := interval
 	for {
 		select {
@@ -792,8 +904,17 @@ func (c *Client) runLoop(ctx context.Context, interval time.Duration, action fun
 		case errors.Is(err, errIdle):
 			sleep = interval
 		case errors.Is(err, ErrAuthFailed):
-			c.logger.Error("org push: authentication failed, stopping push loop", "err", err)
-			return nil
+			// A rejected credential is RETRYABLE, not terminal. Each cycle
+			// re-reads the bearer + signing key from the store, so a re-enrol or
+			// key rotation writes fresh credentials that the next cycle loads and
+			// recovers from WITHOUT a process restart — the proxy/data plane is
+			// never bounced. Back off on a dedicated, higher-capped track so a
+			// genuinely-revoked node settles to a slow cadence instead of
+			// spamming, while a prompt re-enrol still recovers within the first
+			// (fast) retries.
+			c.logger.Warn("org push: authentication failed, retrying (re-enrol or rotate to recover)", "err", err, "backoff", authBackoff.String())
+			sleep = jitter(authBackoff)
+			authBackoff = nextBackoffCapped(authBackoff, authFailMaxBackoff)
 		case err != nil:
 			c.logger.Warn("org push failed, backing off", "err", err, "backoff", backoff.String())
 			sleep = jitter(backoff)
@@ -801,6 +922,7 @@ func (c *Client) runLoop(ctx context.Context, interval time.Duration, action fun
 		default:
 			sleep = interval
 			backoff = initialBackoff
+			authBackoff = initialBackoff
 		}
 	}
 }
@@ -880,9 +1002,16 @@ func maxCursor(c store.PushCursor) int64 {
 
 // nextBackoff doubles d, capped at maxBackoff.
 func nextBackoff(d time.Duration) time.Duration {
+	return nextBackoffCapped(d, maxBackoff)
+}
+
+// nextBackoffCapped doubles d, capped at ceiling. It backs the two runLoop
+// backoff tracks: retryable errors climb to maxBackoff, rejected credentials
+// (ErrAuthFailed) climb to the slower authFailMaxBackoff.
+func nextBackoffCapped(d, ceiling time.Duration) time.Duration {
 	d *= backoffFactor
-	if d > maxBackoff {
-		d = maxBackoff
+	if d > ceiling {
+		d = ceiling
 	}
 	return d
 }

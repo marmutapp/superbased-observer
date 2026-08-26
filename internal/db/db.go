@@ -66,6 +66,113 @@ type Options struct {
 	// sets it is `observer db import`, which validates an UNTRUSTED
 	// foreign database file before merging it into the live one.
 	IntegrityCheck bool
+
+	// MaxOpenConns bounds the pool (see [database/sql.DB.SetMaxOpenConns]).
+	// Zero (unset) applies the built-in default of 16 — generous enough for
+	// proxy + watcher + dashboard + hook subprocesses to run concurrently
+	// without opening an unbounded number of physical connections, each of
+	// which is a candidate temp-file holder under the pragmas below. Go's
+	// SetMaxOpenConns(0) means unlimited, which is exactly what this field
+	// exists to avoid, so there is no "explicitly unlimited" sentinel here
+	// — a caller that truly wants that can call SetMaxOpenConns(0) on the
+	// returned *sql.DB itself.
+	MaxOpenConns int
+
+	// ConnMaxIdleTime bounds how long an idle pooled connection is kept
+	// before being closed (see [database/sql.DB.SetConnMaxIdleTime]). Zero
+	// (unset) applies a 5-minute default, reaping idle connections so a
+	// bursty caller doesn't pin a pool's worth of physical connections
+	// (and their per-connection temp-file state) open indefinitely.
+	ConnMaxIdleTime time.Duration
+
+	// HardHeapLimitBytes sets `PRAGMA hard_heap_limit` on the DSN so it
+	// applies to EVERY pooled connection (see applyPragmas's comment for
+	// why the DSN, not a post-open ExecContext, is the only place this can
+	// be applied correctly). SQLite's heap limit is process-global —
+	// verified empirically (2026-08-26, modernc.org/sqlite v1.48.2): once
+	// any connection in the process sets it, a later connection that opens
+	// WITHOUT the pragma still reads the same limit back. Every connection
+	// re-setting the same value on open is therefore idempotent, not
+	// additive. This is the in-memory backstop: it bounds SQLite's
+	// page-cache / in-memory sort growth so a pathological query fails fast
+	// with SQLITE_NOMEM instead of exhausting host RAM. (With the default
+	// TempStore == "file", temp b-trees and VACUUM scratch go to disk and
+	// are NOT bounded by this — that is deliberate; see TempStore.) Zero
+	// (unset)
+	// applies a 1 GiB default. A NEGATIVE value explicitly disables the
+	// pragma (omitted from the DSN entirely) — the standing zero-means-
+	// unset / negative-means-disabled convention used elsewhere in this
+	// codebase (see internal/processobs/lateseed.go). `hard_heap_limit`
+	// confirmed accepted as a `_pragma=` DSN term by modernc.org/sqlite
+	// v1.48.2 (2026-08-26 verification for the disk/compute remediation
+	// plan; see docs/plans/observer-disk-compute-remediation-plan-
+	// 2026-08-26.md Phase 1, T1.6).
+	HardHeapLimitBytes int64
+
+	// TempStore selects `PRAGMA temp_store` on the DSN: "file" (SQLite
+	// value 1 — spill temp b-trees/VACUUM scratch to disk), "memory"
+	// (SQLite value 2 — hold temp in RAM, bounded by HardHeapLimitBytes),
+	// or "default" (omit the pragma; whatever the build ships with). Empty
+	// (unset) applies "file".
+	//
+	// FILE is the default deliberately (docs/plans/observer-disk-compute-
+	// remediation-plan-2026-08-26.md Phase 1, revised 2026-08-26): once the
+	// automatic looping VACUUM (P0-A) is removed and the recurring
+	// unindexed sorts (P1-C) are de-spilled, disk-backed temp no longer
+	// runs away — while MEMORY would silently break the one legitimate
+	// heavy path left, the operator's `observer prune --vacuum`, which on a
+	// multi-GB DB builds a whole-file temp copy that MEMORY would try to
+	// hold in RAM and fail SQLITE_NOMEM against HardHeapLimitBytes (or OOM
+	// the host without it). FILE keeps that VACUUM working and can never
+	// OOM; HardHeapLimitBytes still bounds in-memory page-cache/sort
+	// growth, and any residual disk spill is bounded + surfaced by the
+	// temp watchdog (cmd/observer/tempwatch.go). The per-connection
+	// CONSISTENCY of this pragma across the pool — via the DSN, not a
+	// post-open ExecContext — is the actual P0-B fix; FILE-vs-MEMORY is the
+	// value, and FILE is the safe one.
+	TempStore string
+}
+
+// SQLite's own `PRAGMA temp_store` / `PRAGMA synchronous` integer values,
+// used when rendering DSN `_pragma=` terms.
+const (
+	sqliteTempStoreFile     = 1
+	sqliteTempStoreMemory   = 2
+	sqliteSynchronousNormal = 1 // NORMAL; matches internal/edge/wal/store.go.
+)
+
+// defaultMaxOpenConns, defaultConnMaxIdleTime, and defaultHardHeapLimitBytes
+// are the Options zero-value fallbacks applied inside Open — see the
+// matching Options field doc comments for the rationale.
+const (
+	defaultMaxOpenConns       = 16
+	defaultConnMaxIdleTime    = 5 * time.Minute
+	defaultHardHeapLimitBytes = int64(1) << 30 // 1 GiB
+)
+
+// dsnTempStoreAndHeapTerms renders the `&_pragma=temp_store(N)` and
+// `&_pragma=hard_heap_limit(N)` DSN terms for the given resolved
+// (defaults-applied) TempStore mode and heap-limit byte count. tempStore ==
+// "default" and hardHeapLimitBytes <= 0 each omit their own term — see
+// Options.TempStore / Options.HardHeapLimitBytes for what each mode means.
+func dsnTempStoreAndHeapTerms(tempStore string, hardHeapLimitBytes int64) string {
+	var b strings.Builder
+	switch tempStore {
+	case "memory":
+		fmt.Fprintf(&b, "&_pragma=temp_store(%d)", sqliteTempStoreMemory)
+	case "default":
+		// Omit the pragma entirely — inherit the driver/SQLite default.
+	default: // "file" (also the fallback for an unrecognized value) — the
+		// safe, never-OOM choice: a large operator VACUUM or a pathological
+		// unindexed sort spills to disk (bounded, surfaced by the temp
+		// watchdog) rather than failing SQLITE_NOMEM against hard_heap_limit
+		// or exhausting host RAM.
+		fmt.Fprintf(&b, "&_pragma=temp_store(%d)", sqliteTempStoreFile)
+	}
+	if hardHeapLimitBytes > 0 {
+		fmt.Fprintf(&b, "&_pragma=hard_heap_limit(%d)", hardHeapLimitBytes)
+	}
+	return b.String()
 }
 
 // Open opens (or creates) the SQLite database at opts.Path, enables WAL mode,
@@ -107,17 +214,59 @@ func Open(ctx context.Context, opts Options) (*sql.DB, error) {
 	if busy <= 0 {
 		busy = 30 * time.Second
 	}
+	maxOpenConns := opts.MaxOpenConns
+	if maxOpenConns == 0 {
+		maxOpenConns = defaultMaxOpenConns
+	}
+	connMaxIdleTime := opts.ConnMaxIdleTime
+	if connMaxIdleTime == 0 {
+		connMaxIdleTime = defaultConnMaxIdleTime
+	}
+	// Zero means "unset, apply the default"; negative means "explicitly
+	// disabled" — see the Options.HardHeapLimitBytes doc comment.
+	hardHeapLimitBytes := opts.HardHeapLimitBytes
+	if hardHeapLimitBytes == 0 {
+		hardHeapLimitBytes = defaultHardHeapLimitBytes
+	} else if hardHeapLimitBytes < 0 {
+		hardHeapLimitBytes = 0
+	}
+	tempStore := opts.TempStore
+	if tempStore == "" {
+		tempStore = "file"
+	}
 
+	// Pin the memory/durability pragmas on the DSN so modernc.org/sqlite
+	// applies them to EVERY pooled connection the *sql.DB ever opens —
+	// applyPragmas below runs its ExecContext calls against whatever ONE
+	// connection the pool happens to hand it, which silently left every
+	// OTHER connection on SQLite's compile-time defaults (TEMP_STORE=1,
+	// file-backed). That gap is the root cause of the P0-B disk-exhaustion
+	// incident: `temp_store=MEMORY` applied to one connection meant every
+	// other connection's sort/hash/VACUUM temp spilled, unmonitored, to
+	// /var/tmp. See docs/plans/observer-disk-compute-remediation-plan-
+	// 2026-08-26.md Phase 1 and internal/edge/wal/store.go, which fixed
+	// this class for journal_mode/synchronous but not temp_store, and not
+	// here. hard_heap_limit is included for the same per-connection
+	// reason, even though the underlying SQLite limit is process-global
+	// (re-setting the same value on each connection is idempotent) — it
+	// bounds in-memory page-cache / sort growth so a pathological query
+	// fails fast with SQLITE_NOMEM instead of exhausting host RAM. temp
+	// b-trees and VACUUM scratch default to disk (temp_store=file — see
+	// Options.TempStore for why FILE, not MEMORY), so a large operator
+	// VACUUM still succeeds; the temp watchdog surfaces any runaway spill.
 	dsn := opts.Path
 	if opts.Path != ":memory:" {
-		dsn = fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)&_pragma=foreign_keys(1)&_txlock=immediate",
-			sqlitedsn.Escape(opts.Path), busy.Milliseconds())
+		dsn = fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)&_pragma=foreign_keys(1)&_pragma=synchronous(%d)%s&_txlock=immediate",
+			sqlitedsn.Escape(opts.Path), busy.Milliseconds(), sqliteSynchronousNormal,
+			dsnTempStoreAndHeapTerms(tempStore, hardHeapLimitBytes))
 	}
 
 	database, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("db.Open: sql.Open: %w", err)
 	}
+	database.SetMaxOpenConns(maxOpenConns)
+	database.SetConnMaxIdleTime(connMaxIdleTime)
 	if err := database.PingContext(ctx); err != nil {
 		_ = database.Close()
 		return nil, fmt.Errorf("db.Open: ping: %w", err)
@@ -181,15 +330,18 @@ func applyPragmas(ctx context.Context, db *sql.DB, path string) error {
 			return err
 		}
 	}
-	pragmas := []string{
-		"PRAGMA foreign_keys = ON",
-		"PRAGMA synchronous = NORMAL",
-		"PRAGMA temp_store = MEMORY",
-	}
-	for _, p := range pragmas {
-		if _, err := db.ExecContext(ctx, p); err != nil {
-			return fmt.Errorf("db.Open: %s: %w", p, err)
-		}
+	// synchronous and temp_store used to be set HERE, post-open — which
+	// only reaches the one pooled connection database/sql happened to
+	// hand ExecContext, leaving every OTHER connection on SQLite's
+	// defaults (this was the P0-B disk-exhaustion root cause; see Open's
+	// dsn construction above). They are now DSN `_pragma=` terms so every
+	// connection the pool ever opens carries them — do not re-add them
+	// here. foreign_keys is likewise already a DSN term for the
+	// file-backed path; it stays here too as a harmless idempotent
+	// belt-and-suspenders that also covers ":memory:", whose DSN carries
+	// no pragma terms at all.
+	if _, err := db.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
+		return fmt.Errorf("db.Open: PRAGMA foreign_keys = ON: %w", err)
 	}
 	return nil
 }
@@ -221,6 +373,16 @@ func isBusy(err error) bool {
 	return false
 }
 
+// integrityCheckTimeout bounds a single `PRAGMA quick_check` run (T2.2,
+// 2026-08-26 disk/compute remediation plan, P1-D). quick_check has no
+// built-in deadline of its own — it just keeps checksumming pages — so a
+// pathological file (or one on a stalled/degraded filesystem) could hang
+// the background maintenance goroutine indefinitely. 10 minutes is well
+// above the >120s measured cost on the 14.7 GB reference install; a probe
+// that is genuinely still running past this is more useful reported as a
+// timeout (logged, non-fatal) than left to hang silently.
+const integrityCheckTimeout = 10 * time.Minute
+
 // RunStartupMaintenance runs the post-open, one-time-per-DB work the daemon
 // otherwise pays for inside [Open]: the schema-034 path-hash backfill
 // (idempotent — short-circuits on a schema_meta done-marker after the first
@@ -237,6 +399,15 @@ func isBusy(err error) bool {
 //
 // Idempotent and safe to call from exactly one goroutine per process; do not
 // fan it out (the underlying quick_check has no benefit run twice).
+//
+// T2.2 (2026-08-26 disk/compute remediation plan, P1-D): on a very large
+// DB even a single quick_check pass is expensive enough that the daemon
+// should skip it automatically and rely on the on-demand `observer doctor`
+// path instead. Callers that need to size-gate the probe (rather than
+// unconditionally running it, as this function does) should call
+// [RunStartupBackfillOnly] for the cheap always-run half and reach for
+// their own db.RunStartupMaintenance-equivalent when under the threshold
+// — see cmd/observer/diag.go::runStartupDBMaintenance for the wiring.
 func RunStartupMaintenance(ctx context.Context, database *sql.DB) error {
 	if err := backfillPathHashes(ctx, database); err != nil {
 		return fmt.Errorf("db.RunStartupMaintenance: backfill path hashes: %w", err)
@@ -247,7 +418,23 @@ func RunStartupMaintenance(ctx context.Context, database *sql.DB) error {
 	return nil
 }
 
+// RunStartupBackfillOnly runs just the schema-034 path-hash backfill half
+// of [RunStartupMaintenance] — the cheap, idempotent pass (short-circuits
+// on its schema_meta done-marker after the first successful run) — without
+// the expensive `PRAGMA quick_check`. It exists for a caller that has
+// decided to skip the integrity probe (T2.2's size gate: a DB over
+// [observer.db].integrity_check_max_gb) but still wants the backfill kept
+// current every startup.
+func RunStartupBackfillOnly(ctx context.Context, database *sql.DB) error {
+	if err := backfillPathHashes(ctx, database); err != nil {
+		return fmt.Errorf("db.RunStartupBackfillOnly: backfill path hashes: %w", err)
+	}
+	return nil
+}
+
 func integrityCheck(ctx context.Context, db *sql.DB) error {
+	ctx, cancel := context.WithTimeout(ctx, integrityCheckTimeout)
+	defer cancel()
 	var result string
 	if err := db.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&result); err != nil {
 		return fmt.Errorf("db.Open: quick_check: %w", err)

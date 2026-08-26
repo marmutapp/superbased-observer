@@ -117,6 +117,15 @@ func newStartCmd() *cobra.Command {
 			// `effective` the instant it writes a new pinned map (§1.6 /
 			// review M3).
 			cfgForLock, govOutcome, lockErr := config.LoadGovernance(config.LoadOptions{GlobalPath: configPath})
+
+			// T3.3: WARN once, right at startup, if this daemon is running
+			// on a replaced/deleted binary (e.g. a build/release overwrote
+			// bin/observer while this process kept its original inode open)
+			// — that silently runs old code no matter what's on disk now.
+			if msg := staleBinaryWarning(); msg != "" {
+				fmt.Fprint(cmd.ErrOrStderr(), msg)
+			}
+
 			if lockErr == nil {
 				binary, _ := absoluteBinaryPath()
 				lockPath, lerr := diag.WriteLock(filepath.Dir(cfgForLock.Observer.DBPath), diag.LockInfo{
@@ -237,6 +246,14 @@ func newStartCmd() *cobra.Command {
 			// on a build with no DB) the handle resolves to the dormant
 			// posture, which is exactly an ungranted node.
 			ngov := newNodeGovernanceHandle(nil, slog.Default())
+			// ONE daemon-lifetime node.features install seam (org-parity
+			// W5.1): holds the accepted per-feature governance body, read by
+			// the dashboard's terminal/remote/routing-apply/patterns-write
+			// enforcement seams via FeatureGate/TerminalFeatureGate below.
+			// nil-safe (a nil *nodeFeaturesHandle answers "allowed" from
+			// every method — see nodeFeaturesHandle.Allowed), so it is safe
+			// to construct unconditionally even when lockErr != nil.
+			nf := newNodeFeaturesHandle()
 			if lockErr == nil {
 				// The daemon is the ONE writer of the governance sidecar
 				// (CLAUDE.md #4). Every other process — hooks, `observer
@@ -265,6 +282,16 @@ func newStartCmd() *cobra.Command {
 					// provider resolves cfg.Share ∧ Effective.Share on every
 					// push, reading the same handle the dashboard guard reads.
 					orgClient.SetShareProvider(governanceShareProvider(cfgForLock.OrgClient, ngov))
+					// Arc 4 P6b managed-integrity probe (plan §9): the collector
+					// gathers this host's coarse tamper-evidence each push cycle.
+					// The client consults it only for a managed node, so this is
+					// inert on the individual plane.
+					dbPath := cfgForLock.Observer.DBPath
+					if home, herr := os.UserHomeDir(); herr == nil {
+						orgClient.SetIntegrityCollector(func() ([]string, []string) {
+							return collectManagedIntegritySignals(dbPath, home)
+						})
+					}
 				}
 			}
 
@@ -358,7 +385,14 @@ func newStartCmd() *cobra.Command {
 					// build; here it is the daemon's single install seam, so
 					// the route guard, the SPA and the P0-6 report can never
 					// disagree about what this node applies.
-					Governance:            ngov.Effective,
+					Governance: ngov.Effective,
+					// Org-parity W5.1: the same one-owner node.features
+					// handle the LKG loader and poller install into, above.
+					// nil-safe methods (see nodeFeaturesHandle.Allowed /
+					// TerminalAllowed) so an ungoverned/solo node's seams
+					// fail open exactly like Governance's nil convention.
+					FeatureGate:           nf.Allowed,
+					TerminalFeatureGate:   nf.TerminalAllowed,
 					DB:                    database,
 					DBPath:                cfg.Observer.DBPath,
 					CostEngine:            cost.NewEngine(cfg.Intelligence),
@@ -585,7 +619,7 @@ func newStartCmd() *cobra.Command {
 			// (orgClient nil) or the node has never enrolled.
 			if orgClient != nil {
 				if pcfg, pdb, pcleanup, perr := loadConfigAndDB(ctx, configPath); perr == nil {
-					loadPolicyResourceLKG(ctx, pcfg, orgClient, store.New(pdb), admissionHandle, gw, ngov, newLogger(pcfg.Observer.LogLevel))
+					loadPolicyResourceLKG(ctx, pcfg, orgClient, store.New(pdb), admissionHandle, gw, ngov, nf, newLogger(pcfg.Observer.LogLevel))
 					pcleanup()
 				} else {
 					fmt.Fprintf(cmd.ErrOrStderr(), "policy resource: LKG load skipped — db open failed: %v\n", perr)
@@ -593,6 +627,12 @@ func newStartCmd() *cobra.Command {
 			}
 
 			g, gctx := errgroup.WithContext(ctx)
+			// Diagnostic profiling server (default OFF). Armed only when
+			// OBSERVER_PPROF_ADDR names a loopback host:port; loopback is
+			// enforced and any bind failure is fail-soft. Started first so a
+			// profile can capture the daemon's steady-state background loops
+			// (CPU-audit work-stream). See cmd/observer/pprof.go.
+			maybeServePprof(gctx, os.Getenv(pprofEnvVar), cmd.OutOrStdout(), cmd.ErrOrStderr())
 			// The governance sidecar writer (§1.4). Unconditional and
 			// self-gating: it returns immediately when no sidecar path was
 			// attached, and on an ungranted node it writes a DORMANT file
@@ -626,6 +666,7 @@ func newStartCmd() *cobra.Command {
 				// One concise heads-up so the multi-minute quick_check on a
 				// large DB isn't silent — the dashboard is already serving.
 				fmt.Fprintln(cmd.OutOrStdout(), "  (background) verifying database integrity — does not block the dashboard")
+				fmt.Fprintln(cmd.OutOrStdout(), "  full integrity check + compaction are on-demand: `observer doctor db`, `observer prune --vacuum`")
 				runStartupDBMaintenance(gctx, configPath)
 				return nil
 			})
@@ -646,6 +687,26 @@ func newStartCmd() *cobra.Command {
 			// proxy/watcher/dashboard. ≤ 0 disables the tick.
 			g.Go(func() error {
 				retentionTickLoop(gctx, configPath)
+				return nil
+			})
+			// WAL watchdog (§1e follow-through, 2026-08-22): WARN + TRUNCATE
+			// checkpoint once observer.db-wal exceeds
+			// [observer.retention].wal_alert_mb, so a stall-era "frames all
+			// checkpointed but file never released" state can never again
+			// sit at 15.5 GB unnoticed. P1 fail-soft like the retention
+			// sibling; wal_alert_mb <= 0 disables.
+			g.Go(func() error {
+				walWatchdogLoop(gctx, configPath)
+				return nil
+			})
+			// Temp-file / deleted-open watchdog (T3.1, P2-I,
+			// docs/plans/observer-disk-compute-remediation-plan-2026-08-26.md):
+			// WARNs once the monitored SQLite temp dir (T1.4a, tempwatch.go)
+			// plus this process's own deleted-but-open files cross a
+			// threshold — visible before the disk fills, not discovered
+			// after. Same P1 fail-soft posture as every sibling loop.
+			g.Go(func() error {
+				tempWatchdogLoop(gctx, configPath)
 				return nil
 			})
 			if dashboardServer != nil {
@@ -746,6 +807,15 @@ func newStartCmd() *cobra.Command {
 						fmt.Fprintf(cmd.ErrOrStderr(), "routing: org policy hot-reload failed: %v\n", rerr)
 					}
 				})
+				// Arc 4 P3b managed-enforce (§R23 lift): let the live router
+				// honor the org routing body's mode ONLY on a managed node that
+				// holds enforce.routing. Resolved live from the governance grant;
+				// nil-safe + inert on every individual/BYO node (the token is
+				// stripped there). Injected here, where both the router handle
+				// and the governance handle exist (buildProxy predates ngov).
+				routingHandle.SetManagedEnforce(func() bool {
+					return ngov.Effective(context.Background()).GrantsRoutingEnforcement()
+				})
 				// P0-5 policy-resource → P0-6 reporter seam: when the
 				// policy-state reporter is enabled below, its
 				// recordPolicyResource sink is handed to the policy-resource
@@ -763,7 +833,7 @@ func newStartCmd() *cobra.Command {
 						rlogger := newLogger(rcfg.Observer.LogLevel)
 						rst := store.New(rdb)
 						rguard := acquireProcessGuard(gctx, rcfg, rst, rlogger)
-						rep := buildPolicyStateReporter(orgClient, rguard, rst, admissionHandle, routingHandle, gw, ngov, rcfg, version, rlogger)
+						rep := buildPolicyStateReporter(orgClient, rguard, rst, admissionHandle, routingHandle, gw, ngov, nf, rcfg, version, rlogger)
 						orgClient.SetGuardOutcomeSink(rep.recordGuard)
 						orgClient.SetRoutingOutcomeSink(rep.recordRouting)
 						policyResourceSink = rep.recordPolicyResource
@@ -824,7 +894,7 @@ func newStartCmd() *cobra.Command {
 					if !ok {
 						return nil
 					}
-					runPolicyResourcePoller(gctx, pcfg, orgClient, admissionHandle, gw, ngov, policyResourceSink, newLogger(pcfg.Observer.LogLevel))
+					runPolicyResourcePoller(gctx, pcfg, orgClient, admissionHandle, gw, ngov, nf, policyResourceSink, newLogger(pcfg.Observer.LogLevel))
 					return nil
 				})
 				// Grant renewal (§4). P1 like every sibling loop: it never

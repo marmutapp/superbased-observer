@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"sort"
 	"strings"
@@ -40,14 +41,31 @@ func newPruneCmd() *cobra.Command {
 			}
 			defer cleanup()
 
+			// T2.3 (2026-08-26 disk/compute remediation plan, P1-F): a
+			// plain `observer prune` races the daemon's own retention
+			// tick (retentionTickLoop in this file) against the same DB —
+			// refuse it while the daemon is live, same as --vacuum below.
+			// The dblease used by the daemon's own passes only protects
+			// against two AUTOMATIC passes overlapping; a manual,
+			// operator-invoked prune deserves a clear message up front
+			// rather than silently losing the lease race.
+			addr := fmt.Sprintf("127.0.0.1:%d", cfg.Proxy.Port)
+			if portUp(addr) {
+				return fmt.Errorf(
+					"prune: the observer daemon is live on %s and already runs its own retention pass — a manual `observer prune` would race it.\n"+
+						"Let the daemon's periodic tick handle it, or stop the daemon first (docs/daemon-restart-runbook.md: route OFF → stop → prune → relaunch → route ON) for an ad-hoc pass",
+					addr,
+				)
+			}
+
 			// --vacuum needs exclusive access: a full VACUUM rewrites the
 			// whole file under an exclusive lock and needs ~2x disk
 			// headroom — running it against a live daemon would stall
-			// every proxied session. Refuse while anything answers on the
-			// proxy port; the daemon-restart runbook describes the safe
-			// window (route off → stop → prune --vacuum → relaunch).
+			// every proxied session. The blanket live-daemon guard above
+			// already covers this case too; kept as an explicit check so
+			// the --vacuum error message stays specific if the guard
+			// above is ever loosened.
 			if vacuum {
-				addr := fmt.Sprintf("127.0.0.1:%d", cfg.Proxy.Port)
 				if portUp(addr) {
 					return fmt.Errorf(
 						"prune --vacuum: the observer daemon is live on %s — a full VACUUM needs exclusive DB access.\n"+
@@ -81,6 +99,29 @@ func newPruneCmd() *cobra.Command {
 			// reclaims freed pages live via PRAGMA incremental_vacuum —
 			// no more restart-window VACUUMs needed to shrink the file.
 			if vacuum {
+				// T0.3 (2026-08-26 disk/compute remediation plan): a bare
+				// VACUUM rewrites the whole DB file to a fresh temp copy
+				// before atomically replacing the original, so it needs
+				// roughly 2x the current file size in free disk headroom
+				// for the duration of the run. Refuse up front rather than
+				// let VACUUM fail (or fill the disk) partway through a
+				// multi-GB file. Best-effort: statfs is unix-only, so this
+				// is skipped (not failed) on platforms where
+				// diskHeadroomCheckSupported is false.
+				if diskHeadroomCheckSupported {
+					dbSize := fileSizeOrZero(cfg.Observer.DBPath)
+					needed := uint64(dbSize) * 2
+					if free, ferr := statfsFreeBytes(cfg.Observer.DBPath); ferr == nil && free < needed {
+						return fmt.Errorf(
+							"prune --vacuum: not enough free disk space for a full VACUUM — it rewrites the whole %s DB to a temp copy and needs roughly 2x headroom (need ~%s free, have %s free, short by %s). Free up space or move observer.db_path to a volume with more room, then retry",
+							humanBytes(dbSize), humanBytes(int64(needed)), humanBytes(int64(free)), humanBytes(int64(needed-free)),
+						)
+					}
+					// ferr != nil: best-effort — an unreadable statfs
+					// (an exotic filesystem, a permissions quirk) doesn't
+					// block an operator-requested vacuum; it just means
+					// this guard couldn't weigh in.
+				}
 				mode, verr := retention.ConvertToIncrementalVacuum(cmd.Context(), database)
 				if verr != nil {
 					return fmt.Errorf("prune --vacuum: %w", verr)
@@ -407,6 +448,23 @@ func runRetention(ctx context.Context, cfg config.Config, database *sql.DB) (ret
 	return res, nil
 }
 
+// runRetentionLeased wraps runRetention with the T2.3 (P1-F) cross-process
+// "retention" dblease so multiple observer processes on the same machine
+// (proxy, watcher, a manual `observer prune`) don't run a retention pass
+// against the same DB at once. ran=false means another process legitimately
+// holds the lease this round — res/err are zero and the caller should
+// simply skip this pass, not treat it as a failure. Any lease mechanism
+// error fails open (ran=true, proceeds normally) per dblease's contract.
+func runRetentionLeased(ctx context.Context, cfg config.Config, database *sql.DB, logger *slog.Logger) (res retention.Result, ran bool, err error) {
+	release, proceed := acquireMaintenanceLease(cfg, "retention", logger)
+	defer release()
+	if !proceed {
+		return retention.Result{}, false, nil
+	}
+	res, err = runRetention(ctx, cfg, database)
+	return res, true, err
+}
+
 // retentionTickLoop is the daemon's periodic maintenance tick (Ticket B):
 // it re-runs the full runRetention pass every
 // [observer.retention].interval_hours while `observer start` is up, so a
@@ -435,7 +493,10 @@ func retentionTickLoop(ctx context.Context, configPath string) {
 	// BEFORE the interval_hours<=0 early return so disabling the periodic
 	// tick doesn't also disable the startup prune.
 	if cfg.Observer.Retention.PruneOnStartup {
-		if res, err := runRetention(ctx, cfg, database); err != nil {
+		if res, ran, err := runRetentionLeased(ctx, cfg, database, logger); !ran {
+			// Another observer process holds the "retention" lease this
+			// round (T2.3, P1-F) — it's already doing this pass.
+		} else if err != nil {
 			if !errors.Is(err, context.Canceled) {
 				logger.Warn("retention startup pass failed", "err", err)
 			}
@@ -466,7 +527,12 @@ func retentionTickLoop(ctx context.Context, configPath string) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			res, err := runRetention(ctx, cfg, database)
+			res, ran, err := runRetentionLeased(ctx, cfg, database, logger)
+			if !ran {
+				// Another observer process holds the "retention" lease
+				// this round (T2.3, P1-F) — skip, it's already running.
+				continue
+			}
 			if err != nil {
 				if !errors.Is(err, context.Canceled) {
 					logger.Warn("retention tick failed", "err", err)

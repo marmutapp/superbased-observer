@@ -387,6 +387,15 @@
         "meta"
       ]
     },
+    "freebuff": {
+      "categories": [
+        "file",
+        "cmd",
+        "search",
+        "web",
+        "agent"
+      ]
+    },
     "gemini-cli": {
       "categories": [
         "file",
@@ -463,6 +472,18 @@
       "categories": [
         "file",
         "cmd",
+        "meta"
+      ]
+    },
+    "mistral-code": {
+      "categories": [
+        "file",
+        "cmd",
+        "search",
+        "web",
+        "agent",
+        "skill",
+        "user",
         "meta"
       ]
     },
@@ -557,6 +578,16 @@
         "web",
         "mcp",
         "user",
+        "meta"
+      ]
+    },
+    "zcode": {
+      "categories": [
+        "file",
+        "cmd",
+        "search",
+        "web",
+        "agent",
         "meta"
       ]
     }

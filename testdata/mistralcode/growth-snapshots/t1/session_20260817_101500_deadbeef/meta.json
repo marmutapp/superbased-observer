@@ -1,0 +1,28 @@
+{
+  "session_id": "deadbeef-1111-2222-3333-444455556666",
+  "start_time": "2026-08-17T10:15:00.000000+00:00",
+  "environment": {
+    "working_directory": "/home/dev/samplerepo"
+  },
+  "stats": {
+    "steps": 1,
+    "session_prompt_tokens": 4000,
+    "session_completion_tokens": 120,
+    "session_cached_tokens": 2500,
+    "session_total_llm_tokens": 4120,
+    "input_price_per_million": 1.5,
+    "output_price_per_million": 7.5,
+    "cached_input_price_per_million": 0.15,
+    "session_cost": 0.0033
+  },
+  "config": {
+    "active_model": "",
+    "models": {
+      "mistral-medium-3.5": {
+        "input_price": 1.5,
+        "output_price": 7.5,
+        "cached_input_price": 0.15
+      }
+    }
+  }
+}

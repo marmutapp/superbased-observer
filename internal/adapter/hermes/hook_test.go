@@ -208,6 +208,84 @@ func TestBuildToolEvent_MalformedJSONReturnsError(t *testing.T) {
 	}
 }
 
+// TestBuildToolEvent_SubagentStart pins the subagent_start mapping —
+// forward-compatible groundwork since the bundled plugin bridge
+// doesn't fire this event today (see the BuildToolEvent doc comment).
+// The row must carry IsSidechain=true to mark the child's own
+// runtime bracket starting.
+func TestBuildToolEvent_SubagentStart(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{
+		"event": "subagent_start",
+		"session_id": "parent-sess",
+		"child_role": "code-reviewer",
+		"cwd": "/home/dev/project",
+		"timestamp": 1717500000.5
+	}`)
+	evt, ok, err := BuildToolEvent(EventSubagentStart, body, nil)
+	if err != nil {
+		t.Fatalf("BuildToolEvent: %v", err)
+	}
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if evt.ActionType != models.ActionSubagentStart {
+		t.Errorf("ActionType = %q, want %q", evt.ActionType, models.ActionSubagentStart)
+	}
+	if !evt.IsSidechain {
+		t.Error("IsSidechain = false, want true (child's own runtime bracket)")
+	}
+	if evt.Target != "code-reviewer" {
+		t.Errorf("Target = %q, want child_role", evt.Target)
+	}
+	if evt.SessionID != "parent-sess" {
+		t.Errorf("SessionID = %q", evt.SessionID)
+	}
+	if !evt.Success {
+		t.Error("Success = false, want true")
+	}
+	if evt.SourceEventID != "parent-sess:subagent_start:1717500000500" {
+		t.Errorf("SourceEventID = %q, want timestamp-derived key", evt.SourceEventID)
+	}
+}
+
+// TestBuildToolEvent_SubagentStop pins the existing subagent_stop
+// mapping (previously untested). IsSidechain must be true here too —
+// it already was before this change, this test just pins it.
+func TestBuildToolEvent_SubagentStop(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{
+		"event": "subagent_stop",
+		"session_id": "parent-sess",
+		"child_summary": "Reviewed the diff, found 2 issues",
+		"child_status": "completed",
+		"duration_ms": 4200,
+		"timestamp": 1717500999
+	}`)
+	evt, ok, err := BuildToolEvent(EventSubagentStop, body, nil)
+	if err != nil {
+		t.Fatalf("BuildToolEvent: %v", err)
+	}
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if evt.ActionType != models.ActionSubagentStop {
+		t.Errorf("ActionType = %q, want %q", evt.ActionType, models.ActionSubagentStop)
+	}
+	if !evt.IsSidechain {
+		t.Error("IsSidechain = false, want true")
+	}
+	if evt.Target != "completed" {
+		t.Errorf("Target = %q, want child_status", evt.Target)
+	}
+	if !evt.Success {
+		t.Error("Success = false, want true (child_status completed)")
+	}
+	if evt.DurationMs != 4200 {
+		t.Errorf("DurationMs = %d, want 4200", evt.DurationMs)
+	}
+}
+
 // TestBuildTokenEvent_HappyPath pins the post_api_request -> TokenEvent
 // translation. usage{input_tokens, output_tokens, cache_*} land
 // directly; model strips provider prefix; Source/Reliability are

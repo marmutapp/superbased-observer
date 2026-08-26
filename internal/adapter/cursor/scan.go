@@ -117,7 +117,7 @@ func (a *Adapter) WatchPaths() []string { return a.roots }
 // normalised to `/` so the matcher works against backslash-shaped
 // strings even on Linux (where filepath.Base wouldn't split on `\`).
 func (a *Adapter) IsSessionFile(path string) bool {
-	if !matchesSessionShape(path) && !matchesStoreDBShape(path) {
+	if !matchesSessionShape(path) && !matchesStoreDBShape(path) && !matchesStateDBShape(path) {
 		return false
 	}
 	return adapter.UnderAnyWatchRoot(path, a.WatchPaths())
@@ -178,9 +178,14 @@ func matchesSessionShape(path string) bool {
 // time, so the polling fallback only re-parses on file growth.
 func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset int64) (adapter.ParseResult, error) {
 	// store.db blob stores carry the system prompt + prompt budget;
-	// transcripts carry the per-turn activity. Dispatch by shape.
+	// state.vscdb carries the global (cross-project, incl. empty-window)
+	// conversation index; transcripts carry the per-turn activity.
+	// Dispatch by shape.
 	if matchesStoreDBShape(path) {
 		return a.parseStoreDBFile(path, fromOffset)
+	}
+	if matchesStateDBShape(path) {
+		return a.parseStateDBFile(ctx, path, fromOffset)
 	}
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -824,6 +829,12 @@ func defaultRoots() []string {
 		// backfilled, on WSL and Windows (/mnt/c) alike.
 		roots = append(roots, filepath.Join(h.Path, ".cursor", "projects"))
 		roots = append(roots, filepath.Join(h.Path, ".cursor", "chats"))
+		// globalStorage/state.vscdb → the ONLY on-disk record of an
+		// empty-window / no-folder conversation (no projects/ or
+		// chats/ entry exists for those at all). See statedb.go.
+		if dir := cursorGlobalStorageDir(h); dir != "" {
+			roots = append(roots, dir)
+		}
 	}
 	return roots
 }

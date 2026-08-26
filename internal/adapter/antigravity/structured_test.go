@@ -39,7 +39,7 @@ func TestParseStructuredTrajectory_Synthetic(t *testing.T) {
 	wrapperBody := append(append(append(append(step1, step2...), step3...), turn1...), turn2...)
 	wire := protowire.AppendBytesField(nil, 1, wrapperBody) // 1 (Trajectory)
 
-	got := ParseStructuredTrajectory(wire, "uuid-test", "/tmp/proj", "/tmp/uuid-test.pb", nil)
+	got := ParseStructuredTrajectory(wire, "uuid-test", "/tmp/proj", "", "/tmp/uuid-test.pb", nil)
 
 	if got.Model != "claude-sonnet-4-5" {
 		t.Errorf("Model = %q, want claude-sonnet-4-5", got.Model)
@@ -129,7 +129,7 @@ func TestParseStructuredTrajectory_RealFB48(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	got := ParseStructuredTrajectory(buf, "fb48b020-3513-4298-8ea2-bbce3756bd31", "/mnt/c/programsx/regulation", path, nil)
+	got := ParseStructuredTrajectory(buf, "fb48b020-3513-4298-8ea2-bbce3756bd31", "/mnt/c/programsx/regulation", "", path, nil)
 	if got.Model == "" {
 		t.Error("Model empty — verification path is broken (1.3.3.28 should yield claude-sonnet-4-5)")
 	}
@@ -318,7 +318,7 @@ func TestParseStructuredTrajectory_ArtifactExtraction(t *testing.T) {
 	)
 	wire := protowire.AppendBytesField(nil, 1, append(append(step1, step2...), turn1...))
 
-	got := ParseStructuredTrajectory(wire, "uuid-art", "/tmp/proj", "/tmp/uuid-art.pb", nil)
+	got := ParseStructuredTrajectory(wire, "uuid-art", "/tmp/proj", "", "/tmp/uuid-art.pb", nil)
 
 	if len(got.ToolEvents) != 2 {
 		t.Fatalf("ToolEvents count = %d, want 2 (one per artifact step)", len(got.ToolEvents))
@@ -377,7 +377,7 @@ func TestParseStructuredTrajectory_UserPromptExtraction(t *testing.T) {
 	step := buildUserPromptStep(t, 1769687860, "Refactor the parser to use a state machine.")
 	wire := protowire.AppendBytesField(nil, 1, append(step, turn1...))
 
-	got := ParseStructuredTrajectory(wire, "uuid-up", "/tmp/proj", "/tmp/uuid-up.pb", nil)
+	got := ParseStructuredTrajectory(wire, "uuid-up", "/tmp/proj", "", "/tmp/uuid-up.pb", nil)
 
 	if len(got.ToolEvents) != 1 {
 		t.Fatalf("ToolEvents count = %d, want 1", len(got.ToolEvents))
@@ -407,7 +407,7 @@ func TestParseStructuredTrajectory_AssistantTextExtraction(t *testing.T) {
 	step := buildAssistantTextStep(t, 1769687860, "I'll analyze the search implementation and propose improvements.")
 	wire := protowire.AppendBytesField(nil, 1, append(step, turn1...))
 
-	got := ParseStructuredTrajectory(wire, "uuid-at", "/tmp/proj", "/tmp/uuid-at.pb", nil)
+	got := ParseStructuredTrajectory(wire, "uuid-at", "/tmp/proj", "", "/tmp/uuid-at.pb", nil)
 
 	if len(got.ToolEvents) != 1 {
 		t.Fatalf("ToolEvents count = %d, want 1", len(got.ToolEvents))
@@ -479,7 +479,7 @@ func TestParseStructuredTrajectory_PlanStepExtraction(t *testing.T) {
 	)
 	wire := protowire.AppendBytesField(nil, 1, append(step, turn1...))
 
-	got := ParseStructuredTrajectory(wire, "uuid-plan", "/tmp/proj", "/tmp/uuid-plan.pb", nil)
+	got := ParseStructuredTrajectory(wire, "uuid-plan", "/tmp/proj", "", "/tmp/uuid-plan.pb", nil)
 
 	if len(got.ToolEvents) != 1 {
 		t.Fatalf("ToolEvents count = %d, want 1", len(got.ToolEvents))
@@ -517,7 +517,7 @@ func TestParseStructuredTrajectory_FinalSummaryExtraction(t *testing.T) {
 	)
 	wire := protowire.AppendBytesField(nil, 1, append(step, turn1...))
 
-	got := ParseStructuredTrajectory(wire, "uuid-final", "/tmp/proj", "/tmp/uuid-final.pb", nil)
+	got := ParseStructuredTrajectory(wire, "uuid-final", "/tmp/proj", "", "/tmp/uuid-final.pb", nil)
 
 	if len(got.ToolEvents) != 1 {
 		t.Fatalf("ToolEvents count = %d, want 1", len(got.ToolEvents))
@@ -595,7 +595,7 @@ func TestParseStructuredTrajectory_ArtifactBrainFallback(t *testing.T) {
 		"## Task list updates",
 	)
 	wire := protowire.AppendBytesField(nil, 1, append(step, turn1...))
-	got := ParseStructuredTrajectory(wire, "uuid-art", "/tmp/proj", "/tmp/uuid-art.pb", nil)
+	got := ParseStructuredTrajectory(wire, "uuid-art", "/tmp/proj", "", "/tmp/uuid-art.pb", nil)
 	if len(got.ToolEvents) != 1 {
 		t.Fatalf("ToolEvents count = %d, want 1", len(got.ToolEvents))
 	}
@@ -675,7 +675,7 @@ func TestParseStructuredTrajectory_ReasoningNeverMintsAnAction(t *testing.T) {
 	}
 	wire := protowire.AppendBytesField(nil, 1, append(body, turn...))
 
-	got := ParseStructuredTrajectory(wire, "uuid-b3", "/tmp/proj", "/tmp/uuid-b3.pb", nil)
+	got := ParseStructuredTrajectory(wire, "uuid-b3", "/tmp/proj", "", "/tmp/uuid-b3.pb", nil)
 
 	byTarget := map[string]models.ToolEvent{}
 	for _, ev := range got.ToolEvents {
@@ -719,7 +719,7 @@ func TestParseStructuredTrajectory_ReasoningPreferredOverAssistantSelfPreview(t 
 	body = append(body, buildB3Step(t, 1769687910, "", "", "No thinking here.", "")...)
 	wire := protowire.AppendBytesField(nil, 1, append(body, turn...))
 
-	got := ParseStructuredTrajectory(wire, "uuid-b3b", "/tmp/proj", "/tmp/uuid-b3b.pb", nil)
+	got := ParseStructuredTrajectory(wire, "uuid-b3b", "/tmp/proj", "", "/tmp/uuid-b3b.pb", nil)
 
 	byTarget := map[string]models.ToolEvent{}
 	for _, ev := range got.ToolEvents {

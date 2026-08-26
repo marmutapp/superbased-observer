@@ -113,21 +113,22 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 // STAT-GATED before git.Resolve: a path that isn't locally reachable is
 // returned as-is, because git.Resolve's filepath.Abs would otherwise
 // CWD-prefix the observer's own repo onto the foreign string. Empty cwds
-// fall back to "[goose]".
-func (a *Adapter) resolveProjectRoot(workingDir string) string {
+// fall back to "[goose]". Returns (root, gitRemote); gitRemote is "" when
+// the working dir isn't inside a git repo (or isn't reachable at all).
+func (a *Adapter) resolveProjectRoot(workingDir string) (root, gitRemote string) {
 	wd := strings.TrimSpace(workingDir)
 	if wd == "" {
-		return "[goose]"
+		return "[goose]", ""
 	}
 	wd = crossmount.TranslateForeignPath(wd)
 	if _, err := os.Stat(wd); err != nil {
-		return wd
+		return wd, ""
 	}
 	info, err := git.Resolve(wd)
 	if err != nil {
-		return wd
+		return wd, ""
 	}
-	return info.Root
+	return info.Root, git.NormalizeRemote(info.Remote)
 }
 
 // scrub applies the plaintext scrubber, tolerating a nil scrubber.

@@ -129,8 +129,8 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 		return adapter.ParseResult{NewOffset: fromOffset}, nil
 	}
 
-	projectRoot := a.resolveProjectRoot(path)
-	tools, tokens := a.parseTranscript(ctx, data, path, projectRoot)
+	projectRoot, gitRemote := a.resolveProjectRoot(path)
+	tools, tokens := a.parseTranscript(ctx, data, path, projectRoot, gitRemote)
 
 	return adapter.ParseResult{
 		ToolEvents:  tools,
@@ -144,10 +144,12 @@ func (a *Adapter) ParseSessionFile(ctx context.Context, path string, fromOffset 
 // own directory. Foreign-mount (Windows) paths are translated to their
 // /mnt/c equivalent and stat-gated before git.Resolve, so a Windows-side
 // repo doesn't misfile under the observer's own repo.
-func (a *Adapter) resolveProjectRoot(path string) string {
+// Returns (root, gitRemote); gitRemote is "" when the directory isn't
+// inside a git repo.
+func (a *Adapter) resolveProjectRoot(path string) (root, gitRemote string) {
 	dir := filepath.Dir(path)
 	if dir == "" || dir == "." || dir == string(filepath.Separator) {
-		return "[aider]"
+		return "[aider]", ""
 	}
 	if translated := crossmount.TranslateForeignPath(dir); translated != dir {
 		if _, err := os.Stat(translated); err == nil {
@@ -156,9 +158,9 @@ func (a *Adapter) resolveProjectRoot(path string) string {
 	}
 	info, err := git.Resolve(dir)
 	if err != nil {
-		return dir
+		return dir, ""
 	}
-	return info.Root
+	return info.Root, git.NormalizeRemote(info.Remote)
 }
 
 // scrub applies the plaintext scrubber, tolerating a nil scrubber.

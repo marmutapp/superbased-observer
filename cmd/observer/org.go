@@ -16,7 +16,10 @@ import (
 
 	"github.com/marmutapp/superbased-observer/internal/config"
 	"github.com/marmutapp/superbased-observer/internal/db"
+	"github.com/marmutapp/superbased-observer/internal/govern"
+	"github.com/marmutapp/superbased-observer/internal/intelligence/advisor"
 	"github.com/marmutapp/superbased-observer/internal/orgclient"
+	"github.com/marmutapp/superbased-observer/internal/orgcontract"
 	"github.com/marmutapp/superbased-observer/internal/proxyroute"
 	"github.com/marmutapp/superbased-observer/internal/store"
 )
@@ -80,6 +83,12 @@ func buildOrgBundle(ctx context.Context, configPath string) (orgBundle, error) {
 	// push path can compose the opt-in tiers without internal/store importing
 	// internal/obs. A no-op (zero providers) when obs is disabled / no_obs.
 	st.SetObsOrgProviders(obsOrgProviders(ctx, cfg, database, logger))
+	// Wire the advisor org-wire seam the same way (W3.2): advisor owns the
+	// digest + advisor_state reads; store reaches them only through this
+	// injected provider.
+	st.SetAdvisorOrgProvider(func(ctx context.Context) ([]orgcontract.AdvisorSuggestionRow, error) {
+		return advisor.OrgSuggestionRows(ctx, database)
+	})
 	bs := orgclient.OpenBearerStore(cfg.OrgClient.KeychainID, filepath.Dir(cfg.Observer.DBPath), logger)
 	client := orgclient.New(cfg.OrgClient, st, bs, version, nil, logger)
 	client.SetPolicyResourceCacheDir(policyResourceCacheDir(cfg))
@@ -131,6 +140,7 @@ func newEnrollCmd() *cobra.Command {
 	var (
 		configPath       string
 		linkURL          string
+		idpURL           string
 		writeBlock       bool
 		wireClients      bool
 		acceptGovernance bool
@@ -140,7 +150,11 @@ func newEnrollCmd() *cobra.Command {
 		Short: "Enrol this agent in an organisation's Observer server",
 		Long: `Exchanges a one-time enrolment token for a long-lived bearer.
 
-Three ways to supply credentials, in priority order:
+Four ways to supply credentials, in priority order:
+  --idp <org-url>          Sign in with your organisation account instead of
+                           being handed a code. Prints a short code and a URL;
+                           approve in a browser on any device. Enrols this
+                           machine as organisation-managed.
   --link <url>             A magic link the admin shared
                            (form: ` + "`http(s)://<host>/enrol/<code>`" + `)
   <org-url> <token>        Positional pair (legacy form)
@@ -156,7 +170,7 @@ enrolment is ever shared (the push cursor seeds at the current
 high-water id).`,
 		Args: cobra.MaximumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			orgURL, token, err := resolveEnrolCredentials(linkURL, args)
+			orgURL, token, err := resolveEnrolCredentials(linkURL, idpURL, args)
 			if err != nil {
 				return err
 			}
@@ -166,6 +180,17 @@ high-water id).`,
 			}
 			defer b.cleanup()
 			c, enabled := b.client, b.cfg.OrgClient.Enabled
+			// ACP-P6c: --idp obtains the one-time enrolment code through an
+			// IdP-verified browser approval instead of an admin handing one
+			// over. Everything after this point is the SAME path the code
+			// rail takes — the flow's whole design is that it produces an
+			// ordinary enrolment code, not a second kind of enrolment.
+			if idpURL != "" {
+				flow := &idpEnrolFlow{client: c, out: cmd.OutOrStdout()}
+				if token, err = flow.Run(cmd.Context(), orgURL); err != nil {
+					return err
+				}
+			}
 			enr, offer, err := c.Enroll(cmd.Context(), orgURL, token)
 			if err != nil {
 				return err
@@ -173,14 +198,24 @@ high-water id).`,
 			out := cmd.OutOrStdout()
 			fmt.Fprintf(out, "Enrolled in %s (org_id %s) as %s.\n", enr.OrgName, enr.OrgID, enr.UserEmail)
 			fmt.Fprintf(out, "Pushing to %s.\n", enr.OrgServerURL)
+			// Arc 4 P6a — managed enrolment binds this machine (plan §9). The
+			// fingerprint is computed + sent ONLY for a managed node; an
+			// individual/BYO node never emits a machine identity. Best-effort:
+			// never fails the enrolment, just reports the outcome.
+			if enr.IsManaged() {
+				bindRes, bindErr := c.BindMachine(cmd.Context())
+				printManagedBindOutcome(out, bindRes, bindErr)
+			}
 			// Admin-controlled Plane B (spec §2.3): the org may have offered
 			// a GOVERNANCE GRANT alongside the enrolment. It is written only
 			// after a human confirms it here — orgclient verified the
 			// signature under the key this enrolment pinned, but consent is
 			// a CLI concern, and a grant nobody agreed to would make the
 			// whole consent model a lie.
+			var gOut grantOutcome
 			if offer != nil {
-				if err := confirmAndStoreGrant(cmd, b.store, offer, acceptGovernance); err != nil {
+				gOut, err = confirmAndStoreGrant(cmd, b.store, offer, acceptGovernance)
+				if err != nil {
 					return err
 				}
 			}
@@ -188,12 +223,43 @@ high-water id).`,
 				cfgPath, werr := resolveConfigPath(configPath)
 				if werr != nil {
 					fmt.Fprintf(out, "\nWarn: could not resolve config path to write [org_client] block: %v\n", werr)
-				} else if added, werr := ensureOrgClientBlock(cfgPath, enr.OrgServerURL); werr != nil {
-					fmt.Fprintf(out, "\nWarn: could not write [org_client] block to %s: %v\n", cfgPath, werr)
-				} else if added {
-					fmt.Fprintf(out, "\nWrote default [org_client] block to %s — restart `observer start` to begin pushing.\n", cfgPath)
-				} else if !enabled {
-					fmt.Fprintln(out, "\nNote: [org_client] enabled = false — set it to true and restart `observer start` to begin pushing.")
+				} else {
+					if added, werr := ensureOrgClientBlock(cfgPath, enr.OrgServerURL); werr != nil {
+						fmt.Fprintf(out, "\nWarn: could not write [org_client] block to %s: %v\n", cfgPath, werr)
+					} else if added {
+						fmt.Fprintf(out, "\nWrote default [org_client] block to %s — start `observer start` to begin pushing.\n", cfgPath)
+						fmt.Fprintln(out, "  (A daemon already running with org push enabled picks up a re-enrolment within one push interval — no restart needed.)")
+					} else if !enabled {
+						fmt.Fprintln(out, "\nNote: [org_client] enabled = false — set it to true and restart `observer start` to begin pushing.")
+					}
+					// W-5 (operator ruling): managed sign-in IS the consent —
+					// an accepted grant on a MANAGED enrolment auto-writes the
+					// node-side [org_client.policy] keys the governed
+					// families need, instead of leaving the developer to find
+					// and hand-edit a fourth config key before extraction or
+					// enforcement can flow at all. Never-server-forced still
+					// holds: this is a node-side write the enrolment makes,
+					// same idiom as the [org_client] block above, and the
+					// node can edit or delete it at any time.
+					//
+					// managedPolicyFamiliesToWrite is the single owner of the
+					// gate (declined / individual-tenancy / authority-that-
+					// governs-nothing all resolve to nil, never a write) — a
+					// real function under test, not logic re-derived in a
+					// test file, so a future edit that loosens the gate here
+					// fails a named test rather than silently starting to
+					// write policy blocks for enrolments that never
+					// consented to it.
+					if families := managedPolicyFamiliesToWrite(gOut); len(families) > 0 {
+						if added, werr := ensureManagedPolicyBlock(cfgPath, families); werr != nil {
+							fmt.Fprintf(out, "\nWarn: could not write [org_client.policy] block to %s: %v\n", cfgPath, werr)
+						} else if added {
+							fmt.Fprintf(out, "\nWrote [org_client.policy] block to %s for the families this grant governs:\n", cfgPath)
+							fmt.Fprintf(out, "  accept_families = %s\n", quotedTomlStringList(families))
+							fmt.Fprintf(out, "  preauthorize_enforce = %s\n", quotedTomlStringList(families))
+							fmt.Fprintln(out, "  Edit or remove this block at any time; only a future accepted grant writes it again.")
+						}
+					}
 				}
 			} else if !enabled {
 				fmt.Fprintln(out, "\nNote: [org_client] enabled = false — set it to true and restart `observer start` to begin pushing.")
@@ -263,6 +329,8 @@ high-water id).`,
 	}
 	cmd.Flags().StringVar(&configPath, "config", "", "Path to config.toml (defaults to ~/.observer/config.toml)")
 	cmd.Flags().StringVar(&linkURL, "link", "", "Enrol magic link (http(s)://host/enrol/<code>)")
+	cmd.Flags().StringVar(&idpURL, "idp", "",
+		"Enrol by signing in with your organisation account at this server (http(s)://host); prints a code to approve in a browser on any device")
 	cmd.Flags().BoolVar(&writeBlock, "write-block", true, "auto-write a default [org_client] block to config.toml (use --write-block=false to skip)")
 	cmd.Flags().BoolVar(&wireClients, "wire-clients", true, "auto-register hooks + MCP + proxy routing for every detected AI client (use --wire-clients=false to skip)")
 	cmd.Flags().BoolVar(&acceptGovernance, "accept-governance", false,
@@ -271,11 +339,28 @@ high-water id).`,
 }
 
 // resolveEnrolCredentials resolves (orgURL, token) from one of:
+//   - --idp http(s)://host                → (http(s)://host, "") — the code is
+//     obtained later by idpEnrolFlow, so this form deliberately returns none
 //   - --link http(s)://host/enrol/<code>  → (http(s)://host, <code>)
 //   - positional [org-url, token]         → as supplied
 //
 // Returns a usage error when neither form provides both pieces.
-func resolveEnrolCredentials(linkURL string, args []string) (string, string, error) {
+//
+// The forms are MUTUALLY EXCLUSIVE and that is enforced rather than resolved
+// by precedence: a developer who passes both a code and --idp has two
+// different enrolments in mind, and silently picking one would enrol the
+// machine under a tenancy they did not choose.
+func resolveEnrolCredentials(linkURL, idpURL string, args []string) (string, string, error) {
+	if idpURL != "" {
+		if linkURL != "" || len(args) > 0 {
+			return "", "", errors.New("observer enroll: --idp cannot be combined with --link or a positional enrolment code; pick one way to enrol")
+		}
+		u, err := url.Parse(idpURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return "", "", fmt.Errorf("invalid --idp URL %q (need http(s)://host)", idpURL)
+		}
+		return u.Scheme + "://" + u.Host, "", nil
+	}
 	if linkURL != "" {
 		u, err := url.Parse(linkURL)
 		if err != nil || u.Scheme == "" || u.Host == "" {
@@ -391,6 +476,105 @@ func ensureOrgClientBlock(path, orgServerURL string) (bool, error) {
 	return true, nil
 }
 
+// hasOrgClientPolicyTableHeader reports whether body already declares a
+// real [org_client.policy] TOML table, matching only a header at the start
+// of a line (after indentation) — the same prefix-match idiom
+// hasOrgClientTableHeader uses, for the same reason (a comment mentioning
+// the table name must not false-positive the idempotence check).
+func hasOrgClientPolicyTableHeader(body string) bool {
+	for _, ln := range strings.Split(body, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(ln), "[org_client.policy]") {
+			return true
+		}
+	}
+	return false
+}
+
+// quotedTomlStringList renders items as a TOML inline array of quoted
+// strings, e.g. ["admission.input", "node.governance"].
+func quotedTomlStringList(items []string) string {
+	quoted := make([]string, len(items))
+	for i, s := range items {
+		quoted[i] = strconv.Quote(s)
+	}
+	return "[" + strings.Join(quoted, ", ") + "]"
+}
+
+// managedPolicyFamiliesToWrite is the W-5 gate: it decides whether an
+// enrolment RunE should write an [org_client.policy] block at all, and for
+// which families. It returns nil — never write — unless the grant was
+// actually ACCEPTED (a declined or refused grant governs nothing), the
+// enrolment is MANAGED tenancy (an individual/BYO node's managed sign-in
+// was never the consent act; nothing here is auto-written for it), and the
+// accepted authority governs at least one policy family
+// (govern.GovernedFamilies already returns nil for an authority list that
+// is empty, unrecognised, or only the retired capture.raise token).
+//
+// This is the single owner of that three-part condition — org.go's RunE
+// calls it rather than re-deriving it inline, so the gate is one real
+// function under test instead of logic that could silently drift between
+// the call site and whatever a test asserts about it.
+func managedPolicyFamiliesToWrite(g grantOutcome) []string {
+	if !g.Accepted || !g.Managed {
+		return nil
+	}
+	return govern.GovernedFamilies(g.Authority)
+}
+
+// ensureManagedPolicyBlock appends an [org_client.policy] block with
+// accept_families and preauthorize_enforce set to families when one is not
+// already present (W-5). It mirrors ensureOrgClientBlock exactly: an
+// append-only, comment-preserving, 0600 text write, idempotent via a
+// header-only presence check so a node's own hand edit — including editing
+// the block down to nothing and deleting it — is never clobbered on a later
+// `observer enroll` (Never-server-forced: this is a node-side config write
+// the enrolment makes, not a server override, and the node's own state
+// always wins).
+//
+// Both keys are set to the SAME family list: the operator ruling for W-5 is
+// that managed sign-in is the consent for exactly the families the accepted
+// grant's authority governs, for both installing (accept_families) and
+// live-enforcing (preauthorize_enforce) those families — a family the grant
+// does not govern is never added to either list.
+func ensureManagedPolicyBlock(path string, families []string) (bool, error) {
+	if len(families) == 0 {
+		return false, nil
+	}
+	body, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return false, err
+	}
+	if hasOrgClientPolicyTableHeader(string(body)) {
+		return false, nil
+	}
+	list := quotedTomlStringList(families)
+	block := "\n[org_client.policy]\n" +
+		"# Written automatically by `observer enroll` when this machine accepted a\n" +
+		"# managed-organisation governance grant: managed sign-in is treated as the\n" +
+		"# consent for the policy families that grant's authority governs, so you are\n" +
+		"# not separately asked to hand-edit these keys. You may edit or remove this\n" +
+		"# block at any time — the organisation cannot rewrite it remotely; only a\n" +
+		"# future `observer enroll` in which you accept a grant writes it again.\n" +
+		"# Removing it re-imposes manual consent: these families revert to \"reported\n" +
+		"# but never durably installed\" until you (or a future accepted grant) add\n" +
+		"# them back.\n" +
+		"# See docs/teams-getting-started.md and `observer org grant show`.\n" +
+		"accept_families = " + list + "\n" +
+		"preauthorize_enforce = " + list + "\n"
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return false, err
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	if _, err := f.WriteString(block); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func newUnenrollCmd() *cobra.Command {
 	var configPath string
 	cmd := &cobra.Command{
@@ -483,6 +667,8 @@ func newOrgCmd() *cobra.Command {
 		newOrgBackfillCmd(),
 		newOrgEmitManagedSettingsCmd(),
 		newOrgGrantCmd(),
+		newOrgRequestCmd(),
+		newOrgRequestsCmd(),
 	)
 	return cmd
 }
@@ -781,4 +967,25 @@ func errSuffix(s string) string {
 		return ""
 	}
 	return " (" + s + ")"
+}
+
+// printManagedBindOutcome reports the result of the Arc 4 P6a managed machine-
+// binding step (plan §9) in one line. It never fails the enrolment: a binding
+// problem is a note or warning, because the node is already enrolled and
+// pushing. io.Writer is taken as the concrete cmd out to avoid importing io.
+func printManagedBindOutcome(out interface{ Write([]byte) (int, error) }, res orgcontract.ManagedBindResponse, err error) {
+	switch {
+	case errors.Is(err, orgclient.ErrManagedBindRefused):
+		fmt.Fprintln(out, "\nNotice: this machine is already bound to another managed node in your org. The bind was refused and your admin has been notified.")
+	case err != nil:
+		fmt.Fprintf(out, "\nWarn: managed machine-binding could not be recorded (enrolment is unaffected): %v\n", err)
+	case res.Collision:
+		fmt.Fprintln(out, "\nNotice: this machine is already bound to another managed node in your org. Your admin has been notified.")
+	case res.Status == orgclient.ManagedBindUnbindable:
+		fmt.Fprintln(out, "\nNote: this host has no stable machine identity, so the managed node shows as unbound to your admin.")
+	case res.Status == orgclient.ManagedBindUnavailable:
+		// Older server without the managed-bind route — nothing to report.
+	default:
+		fmt.Fprintf(out, "Bound this machine to your managed node (%s).\n", res.Status)
+	}
 }

@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/marmutapp/superbased-observer/internal/machineid"
 	"github.com/marmutapp/superbased-observer/internal/orgcontract"
 )
 
@@ -102,6 +103,27 @@ func (c *ReportSeqCounter) readPersisted() int64 {
 		return 0
 	}
 	return v
+}
+
+// ManagedMachineIdentity returns this host's org-salted machine fingerprint
+// (W-4, the same identity BindMachine presents) when — and only when — the
+// node is currently enrolled under managed tenancy. It mirrors BindMachine's
+// fail-open tolerance exactly: no enrolment, a load error, an individual/BYO
+// enrolment, or a machine-id resolution error all return "" rather than
+// propagating an error, because a report() caller has no error path to hand
+// this to (report() is a fire-and-forget P1 posture) and an empty identity is
+// simply the correct wire value for an unmanaged node — MachineIdentity is
+// `omitempty` on PolicyStateReport.
+func (c *Client) ManagedMachineIdentity(ctx context.Context) string {
+	enr, err := c.store.LoadEnrolment(ctx)
+	if err != nil || enr == nil || !enr.IsManaged() {
+		return ""
+	}
+	mid, err := machineid.ForOrg(enr.OrgID)
+	if err != nil {
+		return ""
+	}
+	return mid
 }
 
 // PostPolicyState ships ONE effective-policy-state snapshot to the org server's

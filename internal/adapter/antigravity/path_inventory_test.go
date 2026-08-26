@@ -201,7 +201,7 @@ func TestStructuredReasoningTokenCapture(t *testing.T) {
 			t.Logf("[%s] skip: no plaintext", sid)
 			continue
 		}
-		en := ParseStructuredTrajectory(raw, sid, "[probe]", "/tmp/"+sid+".pb", nil)
+		en := ParseStructuredTrajectory(raw, sid, "[probe]", "", "/tmp/"+sid+".pb", nil)
 		var sumOutput, sumReasoning int64
 		var nonZeroReasoning int
 		for _, te := range en.TokenEvents {
@@ -262,7 +262,7 @@ func TestEmittedReasoningAndFinalSummary(t *testing.T) {
 			t.Logf("[%s] skip: no plaintext", sid)
 			continue
 		}
-		en := ParseStructuredTrajectory(raw, sid, "[probe]", path, nil)
+		en := ParseStructuredTrajectory(raw, sid, "[probe]", "", path, nil)
 		byRaw := map[string]int{}
 		for _, e := range en.ToolEvents {
 			byRaw[e.RawToolName]++

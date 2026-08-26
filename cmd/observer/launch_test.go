@@ -256,6 +256,79 @@ func TestApplyBaseURLEnv(t *testing.T) {
 	})
 }
 
+func TestAgentRuntimeEnv(t *testing.T) {
+	t.Run("empty dir is off (nil)", func(t *testing.T) {
+		if got := agentRuntimeEnv(""); got != nil {
+			t.Errorf("agentRuntimeEnv(\"\") = %v, want nil (feature off)", got)
+		}
+		if got := agentRuntimeEnv("   "); got != nil {
+			t.Errorf("agentRuntimeEnv(whitespace) = %v, want nil", got)
+		}
+	})
+
+	t.Run("relocates config/cache/state + pkg caches, never data", func(t *testing.T) {
+		got := agentRuntimeEnv("/opt/agent-runtime")
+		want := map[string]string{
+			"XDG_CONFIG_HOME":       "/opt/agent-runtime/config",
+			"XDG_CACHE_HOME":        "/opt/agent-runtime/cache",
+			"XDG_STATE_HOME":        "/opt/agent-runtime/state",
+			"npm_config_cache":      "/opt/agent-runtime/npm",
+			"BUN_INSTALL_CACHE_DIR": "/opt/agent-runtime/bun",
+		}
+		for k, v := range want {
+			if got[k] != v {
+				t.Errorf("agentRuntimeEnv[%s] = %q, want %q", k, got[k], v)
+			}
+		}
+		// XDG_DATA_HOME must NOT be relocated: agents write session storage
+		// there and the watcher reads it under $HOME/.local/share.
+		if _, ok := got["XDG_DATA_HOME"]; ok {
+			t.Error("agentRuntimeEnv must not set XDG_DATA_HOME (would blind the watcher)")
+		}
+		if len(got) != len(want) {
+			t.Errorf("agentRuntimeEnv returned %d keys, want %d: %v", len(got), len(want), got)
+		}
+	})
+}
+
+func TestApplyAgentRuntimeEnv(t *testing.T) {
+	t.Run("off: base env untouched", func(t *testing.T) {
+		base := []string{"PATH=/bin", "HOME=/home/me"}
+		got := applyAgentRuntimeEnv(base, "")
+		if len(got) != len(base) {
+			t.Errorf("applyAgentRuntimeEnv(off) changed env: %v", got)
+		}
+	})
+
+	t.Run("on: layers runtime keys + creates dirs", func(t *testing.T) {
+		dir := t.TempDir()
+		got := applyAgentRuntimeEnv([]string{"PATH=/bin"}, dir)
+		if envValue(got, "XDG_CONFIG_HOME") != filepath.Join(dir, "config") {
+			t.Errorf("XDG_CONFIG_HOME = %q", envValue(got, "XDG_CONFIG_HOME"))
+		}
+		if envValue(got, "XDG_DATA_HOME") != "" {
+			t.Error("XDG_DATA_HOME was set — must stay on the share for capture")
+		}
+		// dirs are created so the agent's package manager can write into them.
+		for _, sub := range []string{"config", "cache", "state", "npm", "bun"} {
+			if fi, err := os.Stat(filepath.Join(dir, sub)); err != nil || !fi.IsDir() {
+				t.Errorf("expected dir %s to be created: err=%v", sub, err)
+			}
+		}
+	})
+
+	t.Run("on: user's own XDG_CONFIG_HOME wins", func(t *testing.T) {
+		dir := t.TempDir()
+		got := applyAgentRuntimeEnv([]string{"XDG_CONFIG_HOME=/my/own"}, dir)
+		if envValue(got, "XDG_CONFIG_HOME") != "/my/own" {
+			t.Errorf("user XDG_CONFIG_HOME clobbered: %q", envValue(got, "XDG_CONFIG_HOME"))
+		}
+		if countKey(got, "XDG_CONFIG_HOME") != 1 {
+			t.Errorf("XDG_CONFIG_HOME appears %d times, want 1", countKey(got, "XDG_CONFIG_HOME"))
+		}
+	})
+}
+
 func TestEnvValue(t *testing.T) {
 	env := []string{"A=1", "B=2", "A=3"}
 	if got := envValue(env, "A"); got != "3" { // last wins

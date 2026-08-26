@@ -440,7 +440,7 @@ func TestParseSessionFile_ResolveProjectRootTranslatesForeignCwd(t *testing.T) {
 		t.Skip("foreign-cwd translation to /mnt/c is a Linux/WSL-daemon-reading-Windows-mount behavior; on a Windows host a C:\\ path is native and correctly stays untranslated")
 	}
 	a := NewWithOptions(nil, []string{t.TempDir()})
-	cache := map[string]string{}
+	cache := map[string]projectGitInfo{}
 	got := a.resolveProjectRoot(`C:\programsx\open-code-test`, cache)
 	// git.Resolve will fail to find a .git dir under /mnt/c on this
 	// host; the fallback path stores the (translated) cwd directly.
@@ -1065,5 +1065,95 @@ func setupOpenCodeDBWithTokens(t *testing.T, path string) {
 		if _, err := db.Exec(stmt); err != nil {
 			t.Fatalf("exec %q: %v", stmt, err)
 		}
+	}
+}
+
+// TestLoadSessionLineages pins the session.parent_id → SessionLineage
+// emission: linked children carry ParentThreadID + ThreadSource="subagent",
+// unlinked/empty-parent rows are skipped, and a pre-parent_id schema
+// degrades to "no linkage" instead of failing the parse.
+func TestLoadSessionLineages(t *testing.T) {
+	tests := []struct {
+		name    string
+		schema  string // session-table DDL (controls the parent_id column)
+		rows    []string
+		want    []models.SessionLineage
+		wantNil bool
+	}{
+		{
+			name:   "linked children emitted as subagent lineage",
+			schema: `CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL, time_updated INTEGER NOT NULL, parent_id TEXT)`,
+			rows: []string{
+				`INSERT INTO session(id, directory, time_updated, parent_id) VALUES ('ses_parent', '/tmp/oc', 100, NULL)`,
+				`INSERT INTO session(id, directory, time_updated, parent_id) VALUES ('ses_child1', '/tmp/oc', 200, 'ses_parent')`,
+				`INSERT INTO session(id, directory, time_updated, parent_id) VALUES ('ses_child2', '/tmp/oc', 300, 'ses_parent')`,
+			},
+			want: []models.SessionLineage{
+				{SessionID: "ses_child1", ParentThreadID: "ses_parent", ThreadSource: "subagent"},
+				{SessionID: "ses_child2", ParentThreadID: "ses_parent", ThreadSource: "subagent"},
+			},
+		},
+		{
+			name:   "empty parent_id string skipped",
+			schema: `CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL, time_updated INTEGER NOT NULL, parent_id TEXT)`,
+			rows: []string{
+				`INSERT INTO session(id, directory, time_updated, parent_id) VALUES ('ses_a', '/tmp/oc', 100, '')`,
+				`INSERT INTO session(id, directory, time_updated, parent_id) VALUES ('ses_b', '/tmp/oc', 200, 'ses_a')`,
+			},
+			want: []models.SessionLineage{
+				{SessionID: "ses_b", ParentThreadID: "ses_a", ThreadSource: "subagent"},
+			},
+		},
+		{
+			name:    "pre-parent_id schema degrades to no linkage",
+			schema:  `CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL, time_updated INTEGER NOT NULL)`,
+			rows:    []string{`INSERT INTO session(id, directory, time_updated) VALUES ('ses_1', '/tmp/oc', 100)`},
+			wantNil: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dbPath := filepath.Join(dir, "opencode.db")
+			db, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(tt.schema); err != nil {
+				t.Fatal(err)
+			}
+			for _, stmt := range tt.rows {
+				if _, err := db.Exec(stmt); err != nil {
+					t.Fatalf("exec %q: %v", stmt, err)
+				}
+			}
+			db.Close()
+
+			a := NewWithOptions(nil, []string{dir})
+			got, err := a.loadSessionLineages(context.Background(), func() *sql.DB {
+				d, err := openReadOnlyDB(dbPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return d
+			}())
+			if err != nil {
+				t.Fatalf("loadSessionLineages: %v", err)
+			}
+			if tt.wantNil {
+				if got != nil {
+					t.Fatalf("want nil lineages, got %v", got)
+				}
+				return
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %d lineages, want %d: %+v", len(got), len(tt.want), got)
+			}
+			for i, w := range tt.want {
+				if got[i] != w {
+					t.Errorf("lineage[%d] = %+v, want %+v", i, got[i], w)
+				}
+			}
+		})
 	}
 }

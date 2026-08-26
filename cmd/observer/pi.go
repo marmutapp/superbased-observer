@@ -154,6 +154,7 @@ func newPiCmd() *cobra.Command {
 				dir:      continueDir,
 				proxyURL: resolved,
 				env:      nil, // pi routes via models.json, not an env var
+				dbPath:   cfg.Observer.DBPath,
 				stderr:   os.Stderr,
 			})
 		},

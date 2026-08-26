@@ -3,13 +3,18 @@ import { useLocation } from "react-router-dom";
 import { ChartShell, Pill } from "@/components/primitives";
 import { useApi } from "@/lib/useApi";
 import { fetchJSON } from "@/lib/api";
-import type { ProjectRow, ProjectsResponse } from "@/lib/types";
+import type {
+  ProjectRow,
+  ProjectsResponse,
+  SandboxAvailability,
+} from "@/lib/types";
 import { markRestartPending } from "@/lib/restartPending";
 import {
   useTerminalStatuses,
   AgentStatusBadge,
 } from "@/components/useTerminalStatuses";
 import { WorkspaceGrid } from "@/components/workspace/WorkspaceGrid";
+import { ArenaTab } from "@/components/arena/ArenaTab";
 
 async function postConfirmJSON<T>(
   path: string,
@@ -117,14 +122,14 @@ export function TerminalsPage() {
 
   // Workspace vs Settings tab (dock-grid design D1): the grid IS the page;
   // the policy/remote/standing/status/history content moves behind Settings.
-  const [tab, setTab] = useState<"workspace" | "settings">("workspace");
+  const [tab, setTab] = useState<"workspace" | "settings" | "arena">("workspace");
   // Deep-link: /terminals?tab=workspace|settings (the provider's requestDock
   // navigates here so a queued "Add to grid" always lands on the grid, even
   // if this page was left on the Settings tab).
   const location = useLocation();
   useEffect(() => {
     const want = new URLSearchParams(location.search).get("tab");
-    if (want === "workspace" || want === "settings") setTab(want);
+    if (want === "workspace" || want === "settings" || want === "arena") setTab(want);
   }, [location.search]);
 
   // Local editable copy of the policy, seeded from the server.
@@ -287,7 +292,9 @@ export function TerminalsPage() {
           <p className="mt-0.5 text-[12px] text-fg-3">
             {tab === "workspace"
               ? "Your terminal workspace — run and arrange multiple live terminals on one grid."
-              : "Launch policy, live agent status, and run history for the embedded terminal. Launch policy is an owner-local setting — it only saves from this machine."}
+              : tab === "arena"
+                ? "Run one prompt against several agent harnesses in isolated worktrees, compare judged scorecards, keep the winner."
+                : "Launch policy, live agent status, and run history for the embedded terminal. Launch policy is an owner-local setting — it only saves from this machine."}
           </p>
         </div>
         <div className="flex gap-1 rounded-2 border border-line-2 bg-bg-1 p-0.5 text-[12px]">
@@ -313,6 +320,17 @@ export function TerminalsPage() {
           >
             Settings
           </button>
+          <button
+            type="button"
+            onClick={() => setTab("arena")}
+            className={
+              tab === "arena"
+                ? "rounded-[6px] bg-bg-3 px-3 py-1 text-fg-1"
+                : "rounded-[6px] px-3 py-1 text-fg-3 hover:text-fg-1"
+            }
+          >
+            Arena
+          </button>
         </div>
       </div>
 
@@ -326,6 +344,8 @@ export function TerminalsPage() {
           onOpenSettings={() => setTab("settings")}
         />
       )}
+
+      {tab === "arena" && <ArenaTab />}
 
       {tab === "settings" && (
         <>
@@ -427,6 +447,64 @@ export function TerminalsPage() {
               </div>
             )}
           </div>
+
+          {/* Save error surfaced inline — the server rejects the WHOLE write on
+              any bad entry (incl. a rejected project root) with a message
+              naming which field/entry, so the operator can fix it here or in
+              the Folder Selection card below (same shared state + save()). */}
+          {err && (
+            <div className="rounded-2 border border-danger/40 bg-danger/10 px-3 py-2 text-[12px] text-danger">
+              {err}
+            </div>
+          )}
+
+          <div className="flex items-center gap-3 pt-1">
+            <button
+              type="button"
+              disabled={busy || !p?.config_writable}
+              onClick={save}
+              className="rounded-2 border border-accent/50 bg-accent/15 px-3 py-1 text-[12px] text-accent hover:bg-accent/25 disabled:opacity-50"
+            >
+              {busy ? "saving…" : "Save launch policy"}
+            </button>
+            {saved && <span className="text-[11px] text-ok">Saved.</span>}
+            {p?.restart_required_on_save && (
+              <span className="text-[11px] text-fg-3">
+                Takes effect on the next daemon restart (the policy is read at start-up).
+              </span>
+            )}
+          </div>
+        </div>
+      </ChartShell>
+
+      {/* Folder Selection (bug 4b): the allow-list management surface for
+          [terminal.launch].allowed_project_roots, split out of the launch-
+          policy card above into its own section since it's a distinct
+          concern (WHERE an agent may run vs. WHETHER/WHICH one may). It is
+          wired to the exact same `roots`/`newRoot`/`rootSuggestions` state
+          and `addRoot`/`addRootValue`/`save` handlers as the card above —
+          Save here submits the FULL policy (allow_fresh_agent + allowed_tools
+          + allowed_project_roots + allow_shell), never a roots-only payload,
+          because the PUT handler (handleTerminalPolicyPut) overwrites all
+          four fields unconditionally from the request body. A partial write
+          from here would silently reset fresh-launch/tools/shell back off. */}
+      <ChartShell
+        title="Folder Selection"
+        sub="The allow-list of project folders a fresh agent (or plain shell) may be launched into — from here, or from the folder picker in New Terminal. A folder's descendants are permitted too (adding /home/you/work also allow-lists /home/you/work/anything-under-it); the server re-canonicalizes and symlink-checks every entry on save."
+        right={
+          <Pill variant={roots.length === 0 ? "neutral" : "success"}>
+            {roots.length === 0 ? "no folders allowed" : `${roots.length} folder${roots.length === 1 ? "" : "s"} allowed`}
+          </Pill>
+        }
+      >
+        <div className="space-y-4 p-1 text-[12px]">
+          {!p?.config_writable && (
+            <div className="rounded-2 border border-line-2 bg-bg-2 px-3 py-2 text-fg-3">
+              This dashboard was started without a writable config path, so the allow-list can't be edited
+              here. Edit <code className="text-fg-2">[terminal.launch].allowed_project_roots</code> in your
+              config.toml instead.
+            </div>
+          )}
 
           <div>
             <div className="mb-1 text-[11px] text-fg-3">
@@ -534,9 +612,6 @@ export function TerminalsPage() {
             )}
           </div>
 
-          {/* Save error surfaced inline in the editor — the server rejects the
-              WHOLE write on any bad entry with a "project root %q rejected: …"
-              message that names which root, so the operator can fix it here. */}
           {err && (
             <div className="rounded-2 border border-danger/40 bg-danger/10 px-3 py-2 text-[12px] text-danger">
               {err}
@@ -550,7 +625,7 @@ export function TerminalsPage() {
               onClick={save}
               className="rounded-2 border border-accent/50 bg-accent/15 px-3 py-1 text-[12px] text-accent hover:bg-accent/25 disabled:opacity-50"
             >
-              {busy ? "saving…" : "Save launch policy"}
+              {busy ? "saving…" : "Save folder allow-list"}
             </button>
             {saved && <span className="text-[11px] text-ok">Saved.</span>}
             {p?.restart_required_on_save && (
@@ -561,6 +636,8 @@ export function TerminalsPage() {
           </div>
         </div>
       </ChartShell>
+
+      <SandboxSettingsCard />
 
       {/* Terminal limits — the two runtime bounds live-applied to the PTY
           manager (POST /api/terminal/limits). Unlike the launch policy above,
@@ -718,5 +795,367 @@ export function TerminalsPage() {
         </>
       )}
     </div>
+  );
+}
+
+type TerminalSandboxConfig = {
+  enabled: boolean;
+  backend: string;
+  home_mode: "tmpfs" | "readonly";
+  default_on: boolean;
+  allow_remote_clone: boolean;
+  remote_allowed_hosts: string[];
+  allow_worktree_source: boolean;
+  workspaces_dir: string;
+  workspace_retention_days: number;
+  mask_paths: string[];
+  extra_ro_binds: string[];
+  extra_rw_binds: string[];
+  prep_timeout_seconds: number;
+};
+
+type TerminalSandboxConfigResponse = {
+  confirm_token: ConfirmToken;
+  config_writable: boolean;
+  restart_required_on_save: boolean;
+  sandbox: TerminalSandboxConfig;
+};
+
+type ConfirmToken = string;
+
+function splitConfigList(value: string): string[] {
+  // Preserve a trailing empty row while the operator types; the server trims
+  // and de-duplicates on save. Filtering here would eat each newly-entered
+  // newline and make multi-line editing impossible in a controlled textarea.
+  return value.replace(/\r/g, "").split("\n");
+}
+
+// SandboxSettingsCard is the missing dashboard editor for the complete
+// [terminal.sandbox] block. The live probe is intentionally shown alongside
+// the saved config: a save binds only after restart, so the UI never implies
+// that a newly-enabled sandbox is already protecting launches.
+function SandboxSettingsCard() {
+  const settings = useApi<TerminalSandboxConfigResponse>(
+    "/api/terminal/sandbox/config",
+  );
+  const probe = useApi<SandboxAvailability>("/api/terminal/sandbox");
+  const [draft, setDraft] = useState<TerminalSandboxConfig | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    if (settings.data?.sandbox) setDraft(settings.data.sandbox);
+  }, [settings.data]);
+
+  function update<K extends keyof TerminalSandboxConfig>(
+    key: K,
+    value: TerminalSandboxConfig[K],
+  ) {
+    setSaved(false);
+    setDraft((cur) => (cur ? { ...cur, [key]: value } : cur));
+  }
+
+  async function saveSandbox() {
+    if (!draft || !settings.data?.confirm_token) {
+      setErr("Sandbox settings are not ready — reload the page.");
+      return;
+    }
+    if (
+      (draft.allow_remote_clone || draft.extra_rw_binds.some((p) => p.trim() !== "")) &&
+      !window.confirm(
+        "This sandbox configuration expands authority: remote clone lets the daemon make a network git request with your ambient credentials, and read-write binds expose host paths inside the sandbox. Save these settings?",
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    setSaved(false);
+    try {
+      const res = await fetchJSON<{ restart_required: boolean }>(
+        "/api/terminal/sandbox/config",
+        undefined,
+        {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Observer-Confirm": settings.data.confirm_token,
+          },
+          body: JSON.stringify(draft),
+        },
+      );
+      if (res.restart_required) markRestartPending("terminal-sandbox");
+      setSaved(true);
+      settings.reload();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const writable = !!settings.data?.config_writable;
+  const live = probe.data;
+
+  return (
+    <ChartShell
+      title="Sandbox isolation"
+      sub="Run supported agents inside bubblewrap with an isolated home and an explicit workspace. Saved settings bind on the next daemon restart."
+      right={
+        <Pill variant={live?.available ? "success" : "neutral"}>
+          {live?.available ? "available now" : "not active"}
+        </Pill>
+      }
+    >
+      <div className="space-y-4 p-1 text-[12px]">
+        {!writable && settings.data && (
+          <div className="rounded-2 border border-line-2 bg-bg-2 px-3 py-2 text-fg-3">
+            This dashboard has no writable config path. Edit{" "}
+            <code className="text-fg-2">[terminal.sandbox]</code> in config.toml instead.
+          </div>
+        )}
+
+        <div
+          className={`rounded-2 border px-3 py-2 ${
+            live?.available
+              ? "border-ok/40 bg-ok/10 text-ok"
+              : "border-line-2 bg-bg-2 text-fg-3"
+          }`}
+        >
+          <span className="font-medium">Running daemon: </span>
+          {live?.available
+            ? `${live.backend ?? "bwrap"} ${live.backend_version ?? ""} available; home is ${live.home_mode ?? "isolated"}.`
+            : live?.reason ?? "Sandbox probe has not returned yet."}
+          {draft?.enabled && !live?.available && (
+            <span className="ml-1 text-warn">
+              If you just enabled it, restart the daemon before relying on the boundary.
+            </span>
+          )}
+        </div>
+
+        {!draft ? (
+          <div className="text-fg-3">Loading sandbox configuration…</div>
+        ) : (
+          <>
+            <div className="grid gap-3 md:grid-cols-2">
+              <label className="flex items-start gap-2 rounded-2 border border-line-2 bg-bg-1 p-3">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={draft.enabled}
+                  disabled={!writable}
+                  onChange={(e) => update("enabled", e.target.checked)}
+                />
+                <span>
+                  <span className="font-medium text-fg-1">Enable sandbox support</span>
+                  <span className="block text-[11px] text-fg-3">
+                    Master switch. Supported launches may use the boundary after restart.
+                  </span>
+                </span>
+              </label>
+              <label className="flex items-start gap-2 rounded-2 border border-line-2 bg-bg-1 p-3">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={draft.default_on}
+                  disabled={!writable}
+                  onChange={(e) => update("default_on", e.target.checked)}
+                />
+                <span>
+                  <span className="font-medium text-fg-1">Default sandbox on</span>
+                  <span className="block text-[11px] text-fg-3">
+                    Pre-check “Run in sandbox” for each new-terminal launch; it remains overridable.
+                  </span>
+                </span>
+              </label>
+            </div>
+
+            <div className="grid gap-3 md:grid-cols-2">
+              <label className="space-y-1">
+                <span className="font-medium text-fg-1">Home isolation</span>
+                <select
+                  value={draft.home_mode}
+                  disabled={!writable}
+                  onChange={(e) => update("home_mode", e.target.value as "tmpfs" | "readonly")}
+                  className="w-full rounded-2 border border-line-2 bg-bg-1 px-2 py-1 text-fg-1 disabled:opacity-50"
+                >
+                  <option value="tmpfs">tmpfs — hide the real home (recommended)</option>
+                  <option value="readonly">readonly — expose the real home read-only</option>
+                </select>
+              </label>
+              <label className="space-y-1">
+                <span className="font-medium text-fg-1">Backend</span>
+                <input
+                  value={draft.backend}
+                  readOnly
+                  className="w-full rounded-2 border border-line-2 bg-bg-2 px-2 py-1 font-mono text-fg-3"
+                />
+                <span className="block text-[11px] text-fg-3">bwrap is the only v1 backend.</span>
+              </label>
+            </div>
+
+            <div className="grid gap-3 md:grid-cols-2">
+              <label className="flex items-start gap-2 rounded-2 border border-warn/30 bg-warn/5 p-3">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={draft.allow_remote_clone}
+                  disabled={!writable}
+                  onChange={(e) => update("allow_remote_clone", e.target.checked)}
+                />
+                <span>
+                  <span className="font-medium text-fg-1">Allow remote clone</span>
+                  <span className="block text-[11px] text-fg-3">
+                    The daemon may run git clone over the network with your ambient credentials.
+                  </span>
+                </span>
+              </label>
+              <label className="flex items-start gap-2 rounded-2 border border-warn/30 bg-warn/5 p-3">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={draft.allow_worktree_source}
+                  disabled={!writable}
+                  onChange={(e) => update("allow_worktree_source", e.target.checked)}
+                />
+                <span>
+                  <span className="font-medium text-fg-1">Allow git worktree source</span>
+                  <span className="block text-[11px] text-fg-3">
+                    Requires the main repo&apos;s .git directory read-write inside the boundary.
+                  </span>
+                </span>
+              </label>
+            </div>
+
+            <SandboxListField
+              label="Remote allowed hosts"
+              hint="One hostname per line. Empty means any host once remote clone is enabled."
+              value={draft.remote_allowed_hosts}
+              disabled={!writable}
+              onChange={(v) => update("remote_allowed_hosts", v)}
+            />
+
+            <details className="rounded-2 border border-line-2 bg-bg-1 p-3">
+              <summary className="cursor-pointer font-medium text-fg-1">
+                Workspace lifecycle and advanced binds
+              </summary>
+              <div className="mt-3 space-y-3">
+                <label className="block space-y-1">
+                  <span className="font-medium text-fg-2">Workspaces directory</span>
+                  <input
+                    value={draft.workspaces_dir}
+                    disabled={!writable}
+                    placeholder="default: &lt;observer dir&gt;/workspaces"
+                    onChange={(e) => update("workspaces_dir", e.target.value)}
+                    className="w-full rounded-2 border border-line-2 bg-bg-0 px-2 py-1 font-mono text-[11px] text-fg-1 disabled:opacity-50"
+                  />
+                  <span className="block text-[11px] text-fg-3">Must be an absolute path when set.</span>
+                </label>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <label className="space-y-1">
+                    <span className="font-medium text-fg-2">Retention days</span>
+                    <input
+                      type="number"
+                      min={0}
+                      step={1}
+                      value={draft.workspace_retention_days}
+                      disabled={!writable}
+                      onChange={(e) => update("workspace_retention_days", Number(e.target.value))}
+                      className="w-full rounded-2 border border-line-2 bg-bg-0 px-2 py-1 text-fg-1 disabled:opacity-50"
+                    />
+                    <span className="block text-[11px] text-fg-3">0 keeps prepared workspaces forever.</span>
+                  </label>
+                  <label className="space-y-1">
+                    <span className="font-medium text-fg-2">Preparation timeout (seconds)</span>
+                    <input
+                      type="number"
+                      min={0}
+                      step={1}
+                      value={draft.prep_timeout_seconds}
+                      disabled={!writable}
+                      onChange={(e) => update("prep_timeout_seconds", Number(e.target.value))}
+                      className="w-full rounded-2 border border-line-2 bg-bg-0 px-2 py-1 text-fg-1 disabled:opacity-50"
+                    />
+                  </label>
+                </div>
+                <SandboxListField
+                  label="Mask paths"
+                  hint="Absolute host paths to hide with tmpfs, one per line."
+                  value={draft.mask_paths}
+                  disabled={!writable}
+                  onChange={(v) => update("mask_paths", v)}
+                />
+                <SandboxListField
+                  label="Extra read-only binds"
+                  hint="Absolute paths exposed read-only inside the sandbox."
+                  value={draft.extra_ro_binds}
+                  disabled={!writable}
+                  onChange={(v) => update("extra_ro_binds", v)}
+                />
+                <SandboxListField
+                  label="Extra read-write binds"
+                  hint="Authority-expanding: these host paths become writable inside the sandbox."
+                  value={draft.extra_rw_binds}
+                  disabled={!writable}
+                  warn
+                  onChange={(v) => update("extra_rw_binds", v)}
+                />
+              </div>
+            </details>
+
+            {err && (
+              <div className="rounded-2 border border-danger/40 bg-danger/10 px-3 py-2 text-danger">
+                {err}
+              </div>
+            )}
+            <div className="flex flex-wrap items-center gap-3 pt-1">
+              <button
+                type="button"
+                disabled={busy || !writable}
+                onClick={saveSandbox}
+                className="rounded-2 border border-accent/50 bg-accent/15 px-3 py-1 text-accent hover:bg-accent/25 disabled:opacity-50"
+              >
+                {busy ? "saving…" : "Save sandbox configuration"}
+              </button>
+              {saved && <span className="text-[11px] text-ok">Saved.</span>}
+              <span className="text-[11px] text-fg-3">
+                Restart required; active terminals are not retroactively sandboxed.
+              </span>
+            </div>
+          </>
+        )}
+      </div>
+    </ChartShell>
+  );
+}
+
+function SandboxListField({
+  label,
+  hint,
+  value,
+  disabled,
+  warn = false,
+  onChange,
+}: {
+  label: string;
+  hint: string;
+  value: string[];
+  disabled: boolean;
+  warn?: boolean;
+  onChange: (value: string[]) => void;
+}) {
+  return (
+    <label className="block space-y-1">
+      <span className={`font-medium ${warn ? "text-warn" : "text-fg-2"}`}>{label}</span>
+      <textarea
+        rows={Math.max(2, Math.min(5, value.length + 1))}
+        value={value.join("\n")}
+        disabled={disabled}
+        onChange={(e) => onChange(splitConfigList(e.target.value))}
+        className="w-full rounded-2 border border-line-2 bg-bg-0 px-2 py-1 font-mono text-[11px] text-fg-1 disabled:opacity-50"
+      />
+      <span className="block text-[11px] text-fg-3">{hint}</span>
+    </label>
   );
 }

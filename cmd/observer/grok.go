@@ -6,6 +6,8 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+
+	"github.com/marmutapp/superbased-observer/internal/config"
 )
 
 // newGrokCmd implements `observer grok` — launches xAI's Grok Build terminal
@@ -14,14 +16,17 @@ import (
 // prompt (`grok "<handover>"` opens an interactive session pre-loaded with
 // the mission — seed lane verified live 2026-07-09).
 //
-// NON-PROXIED on purpose. Grok speaks OpenAI-Responses-shaped traffic to a
-// non-default host (cli-chat-proxy.grok.com) — a /up/<id> upstream-seam
-// candidate (RouteStatusAfterUpstream in the integration registry) — but no
-// observer-routed turn has confirmed api_turns capture, so the launcher
-// execs `grok` with the caller's own environment. Token capture happens via
-// observer's local grok adapter (the sid-correlated ~/.grok/logs/
-// unified.jsonl splits), not the proxy. It never sets an API key or a base
-// URL.
+// NON-PROXIED BY DEFAULT. Grok speaks OpenAI-Responses-shaped traffic to a
+// non-default host (cli-chat-proxy.grok.com) via the observer proxy's
+// `/up/grok` upstream seam — a live, working route (RouteStatusRoutableNow
+// in the integration registry: an observer-routed turn landed a real
+// api_turns row, id 23025). The launcher itself stays non-proxied by
+// default — exec inherits the caller's environment unmodified, no base URL
+// is set — because routing is opt-in: pass `--proxy` to inject
+// GROK_CLI_CHAT_PROXY_BASE_URL and route through the proxy instead. Without
+// `--proxy`, token capture happens via observer's local grok adapter (the
+// sid-correlated ~/.grok/logs/unified.jsonl splits). It never sets an API
+// key.
 func newGrokCmd() *cobra.Command {
 	var (
 		configPath   string
@@ -30,6 +35,7 @@ func newGrokCmd() *cobra.Command {
 		carry        string
 		fromMessage  int
 		fromTime     string
+		useProxy     bool
 		attach       *bool
 		noAttach     *bool
 		resume       *string
@@ -37,11 +43,13 @@ func newGrokCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "grok [-- grok-args...]",
 		Short: "Launch Grok Build; with --continue-from, seed a handover as grok's positional prompt",
-		Long: "Wraps xAI's Grok Build terminal agent (`grok`). This launcher is\n" +
-			"NON-PROXIED — grok's upstream is a non-default host whose /up/<id>\n" +
-			"proxy lane is unprobed. Token capture happens via observer's local\n" +
-			"grok adapter (session bundles + the sid-correlated unified.jsonl\n" +
-			"token log), not the proxy.\n\n" +
+		Long: "Wraps xAI's Grok Build terminal agent (`grok`). NON-PROXIED BY\n" +
+			"DEFAULT — token capture happens via observer's local grok adapter\n" +
+			"(session bundles + the sid-correlated unified.jsonl token log), not\n" +
+			"the proxy. Pass --proxy to opt in: this injects\n" +
+			"GROK_CLI_CHAT_PROXY_BASE_URL pointed at the observer proxy's\n" +
+			"/up/grok upstream (a live, verified route — api_turns id 23025) so\n" +
+			"grok's traffic to cli-chat-proxy.grok.com is captured + compressed.\n\n" +
 			"grok supports a top-level `--model` flag to select which model\n" +
 			"the session uses (pass it after `--` with your other grok args).\n\n" +
 			"With --continue-from <session-id> the launcher distills a handover\n" +
@@ -68,7 +76,7 @@ func newGrokCmd() *cobra.Command {
 				flagAttach:   *attach,
 				flagNoAttach: *noAttach,
 				incompatible: continueFamilyEngaged(continueFrom, carry, fromMessage, fromTime),
-				passthrough:  append(grokAttachPassthrough(binPath), resumeAttachPassthrough(*resume)...),
+				passthrough:  append(grokAttachPassthrough(binPath, useProxy), resumeAttachPassthrough(*resume)...),
 				toolArgs:     args,
 				stderr:       cmd.ErrOrStderr(),
 			})
@@ -123,7 +131,30 @@ func newGrokCmd() *cobra.Command {
 				continueDir = cwd
 			}
 
-			return runSeedOnlyLaunch("grok", bin, args, continueDir)
+			if !useProxy {
+				// Best-effort attribution config: a load failure just disables
+				// the launch seed (recordLaunchSeed treats "" as off).
+				dbPath := ""
+				if cfg, cErr := config.Load(config.LoadOptions{GlobalPath: configPath}); cErr == nil {
+					dbPath = cfg.Observer.DBPath
+				}
+				return runSeedOnlyLaunchSeeded(dbPath, "grok", "grok", bin, args, continueDir)
+			}
+			cfg, cErr := config.Load(config.LoadOptions{GlobalPath: configPath})
+			if cErr != nil {
+				return fmt.Errorf("load config: %w", cErr)
+			}
+			resolved := resolveProxyURL(cfg.Proxy.Port, "")
+			return runEnvLauncher(envLauncherSpec{
+				tool:     "grok",
+				bin:      bin,
+				args:     args,
+				dir:      continueDir,
+				proxyURL: resolved,
+				env:      map[string]string{"GROK_CLI_CHAT_PROXY_BASE_URL": resolved + "/up/grok/v1"},
+				dbPath:   cfg.Observer.DBPath,
+				stderr:   cmd.ErrOrStderr(),
+			})
 		},
 	}
 	cmd.Flags().StringVar(&configPath, "config", "", "Path to config.toml (defaults to ~/.observer/config.toml); used to resolve the source session for --continue-from")
@@ -132,18 +163,25 @@ func newGrokCmd() *cobra.Command {
 	cmd.Flags().StringVar(&carry, "carry", "", "Carry mode for --continue-from: metadata|distilled|distilled_tail|full|full_cache (default from [handoff] config)")
 	cmd.Flags().IntVar(&fromMessage, "from-message", 0, "With --continue-from: fork after this 1-based transcript message (default: last message)")
 	cmd.Flags().StringVar(&fromTime, "from-time", "", "With --continue-from: fork after the last message at or before this RFC3339 time")
+	cmd.Flags().BoolVar(&useProxy, "proxy", false, "Opt in to routing grok's traffic through the observer proxy (sets GROK_CLI_CHAT_PROXY_BASE_URL at the proxy's /up/grok upstream). Default off: grok runs with your own environment unmodified and token capture uses the local grok adapter instead.")
 	attach, noAttach = registerAttachFlags(cmd, "grok")
 	resume = registerResumeFlag(cmd, "grok")
 	return cmd
 }
 
-// grokAttachPassthrough forwards the --grok-path wrapper flag to the
-// daemon-spawned inner `observer grok` launcher when set (nil otherwise).
-func grokAttachPassthrough(grokPath string) []string {
+// grokAttachPassthrough forwards the --grok-path wrapper flag (when set) and
+// the opt-in --proxy flag (when engaged) to the daemon-spawned inner
+// `observer grok` launcher, so an attached session honors the same routing
+// choice as the operator's original invocation.
+func grokAttachPassthrough(grokPath string, useProxy bool) []string {
+	var out []string
 	if grokPath != "" {
-		return []string{"--grok-path", grokPath}
+		out = append(out, "--grok-path", grokPath)
 	}
-	return nil
+	if useProxy {
+		out = append(out, "--proxy")
+	}
+	return out
 }
 
 // grokSubcommands are the grok argv tokens that are subcommands, not a

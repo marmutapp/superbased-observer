@@ -1,0 +1,55 @@
+package orgcontract
+
+// CodeintelDevRow is the W2.4 per-developer/project code-intelligence wire
+// row: one row per (org_id, user_email, project_hash, language), mirroring
+// internal/store/codeintelsummary.go's SelectCodeintelSummaries aggregation
+// exactly (same COUNT(DISTINCT ...) math over the node's codeintel_files /
+// codeintel_nodes / codeintel_edges tables) but composed under the
+// shipsRawContent() gate (enterprise-raw wire) instead of the
+// share.CodeintelDetail opt-in tier. This is DELIBERATELY a new
+// table/row, not a retrofit of CodeintelSummaryRow/codeintel_summaries —
+// the existing teams-tier surface stays byte-identical and
+// admin-only/identity-blind (see
+// docs/plans/org-parity-full-depth-plan-2026-08-24.md §0, §4 "W2.4").
+//
+// ProjectHash stays the stable join/dedup key (the same one-way
+// domain-separated hash CodeintelSummaryRow carries), and ProjectRoot
+// carries the RAW git-root path alongside it — codeintel_files.project IS
+// the raw path, and the enterprise posture ships raw paths to the admin
+// (plan §0.1, operator ruling 2026-08-24: "all paths shall be carried").
+// The teams-tier CodeintelSummaryRow remains hash-only and untouched.
+// Symbol names / signatures / per-file paths are not at this row's grain
+// (project × language counts); they belong to the org-wide search /
+// codeintel drill tracks.
+type CodeintelDevRow struct {
+	// OrgID / UserEmail are the agent-stamped attribution (same stamping
+	// rule as every other wire row — see ingest.go forcePusherOrgID /
+	// forcePusherEmail).
+	OrgID     string `json:"org_id,omitempty"`
+	UserEmail string `json:"user_email,omitempty"`
+
+	// ProjectHash is hashCodeintelProject(project) — opaque, one-way,
+	// domain-separated SHA-256 hex. Natural key component (with
+	// Language) on the server, same hash CodeintelSummaryRow carries.
+	ProjectHash string `json:"project_hash"`
+	// ProjectRoot is the RAW git-root path (codeintel_files.project,
+	// verbatim) — enterprise wire under shipsRawContent(), so the admin
+	// sees the real repository identity, not just a hash (§0.1). Empty on
+	// rows pushed by older agents (both-direction compat).
+	ProjectRoot string `json:"project_root,omitempty"`
+	// Language is the resolved codeintel.Language for this bucket
+	// (codeintel_files.lang).
+	Language string `json:"language"`
+
+	// Files / Symbols / Edges are COUNT(DISTINCT ...) over
+	// codeintel_files / codeintel_nodes / codeintel_edges for this
+	// (project, lang) bucket — identical math to CodeintelSummaryRow.
+	Files   int64 `json:"files"`
+	Symbols int64 `json:"symbols"`
+	Edges   int64 `json:"edges"`
+
+	// LastIndexed is MAX(codeintel_files.indexed_at) for this bucket — a
+	// unix-seconds timestamp of the most recent successful index pass,
+	// 0 if the bucket has never completed one.
+	LastIndexed int64 `json:"last_indexed"`
+}
