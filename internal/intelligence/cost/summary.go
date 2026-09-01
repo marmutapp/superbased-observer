@@ -729,6 +729,7 @@ func (e *Engine) loadProxyRows(ctx context.Context, db *sql.DB, opts Options, si
 		where = append(where, "at.timestamp >= ?")
 		args = append(args, since.UTC().Format(time.RFC3339Nano))
 	}
+	where = append(where, proxyNoiseWhere("at"))
 	if !opts.Until.IsZero() {
 		where = append(where, "at.timestamp < ?")
 		args = append(args, opts.Until.UTC().Format(time.RFC3339Nano))
@@ -815,6 +816,7 @@ func (e *Engine) loadJSONLRows(ctx context.Context, db *sql.DB, opts Options, si
 		where = append(where, "tu.timestamp >= ?")
 		args = append(args, since.UTC().Format(time.RFC3339Nano))
 	}
+	where = append(where, jsonlNoiseWhere("tu"))
 	if !opts.Until.IsZero() {
 		where = append(where, "tu.timestamp < ?")
 		args = append(args, opts.Until.UTC().Format(time.RFC3339Nano))
@@ -900,6 +902,7 @@ func (e *Engine) loadSummaryCallRows(ctx context.Context, db *sql.DB, opts Optio
 		where = append(where, "timestamp >= ?")
 		args = append(args, since.UTC().Format(time.RFC3339Nano))
 	}
+	where = append(where, summaryCallNoiseWhere())
 	if !opts.Until.IsZero() {
 		where = append(where, "timestamp < ?")
 		args = append(args, opts.Until.UTC().Format(time.RFC3339Nano))
@@ -951,6 +954,41 @@ func (e *Engine) loadSummaryCallRows(ctx context.Context, db *sql.DB, opts Optio
 		return nil, fmt.Errorf("cost.Summary: summary_calls rows: %w", err)
 	}
 	return out, nil
+}
+
+func proxyNoiseWhere(alias string) string {
+	return fmt.Sprintf(`COALESCE(%[1]s.model, '') != '<synthetic>' AND (
+		COALESCE(%[1]s.input_tokens, 0) != 0 OR
+		COALESCE(%[1]s.output_tokens, 0) != 0 OR
+		COALESCE(%[1]s.cache_read_tokens, 0) != 0 OR
+		COALESCE(%[1]s.cache_creation_tokens, 0) != 0 OR
+		COALESCE(%[1]s.cache_creation_1h_tokens, 0) != 0 OR
+		COALESCE(%[1]s.web_search_requests, 0) != 0 OR
+		COALESCE(%[1]s.cost_usd, 0) != 0
+	)`, alias)
+}
+
+func jsonlNoiseWhere(alias string) string {
+	return fmt.Sprintf(`COALESCE(%[1]s.model, '') != '<synthetic>' AND (
+		COALESCE(%[1]s.input_tokens, 0) != 0 OR
+		COALESCE(%[1]s.output_tokens, 0) != 0 OR
+		COALESCE(%[1]s.cache_read_tokens, 0) != 0 OR
+		COALESCE(%[1]s.cache_creation_tokens, 0) != 0 OR
+		COALESCE(%[1]s.cache_creation_1h_tokens, 0) != 0 OR
+		COALESCE(%[1]s.reasoning_tokens, 0) != 0 OR
+		COALESCE(%[1]s.web_search_requests, 0) != 0 OR
+		COALESCE(%[1]s.estimated_cost_usd, 0) != 0
+	)`, alias)
+}
+
+func summaryCallNoiseWhere() string {
+	return `COALESCE(model, '') != '<synthetic>' AND (
+		COALESCE(input_tokens, 0) != 0 OR
+		COALESCE(output_tokens, 0) != 0 OR
+		COALESCE(cache_read_tokens, 0) != 0 OR
+		COALESCE(cache_creation_tokens, 0) != 0 OR
+		COALESCE(cost_usd, 0) != 0
+	)`
 }
 
 // bucket holds the in-progress aggregation for one group key.

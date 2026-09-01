@@ -4,6 +4,18 @@ All notable changes to SuperBased Observer are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **perf(cost): push historical noise filtering into SQLite** — cost
+  summaries now exclude synthetic-model and all-zero token rows in the source
+  queries before Go allocates raw rows or runs per-turn rollups. The Go-side
+  noise guard remains as a defensive backstop.
+- **perf(db): gate low-value `observer db vacuum` rebuilds** — the CLI and
+  dashboard vacuum path now checks reclaimable free pages first, skips the
+  full-file rebuild below `max(64 MiB, 2% of DB size)`, bounds the rebuild
+  with a 10-minute context timeout, and exposes `--force` for explicit
+  operator compaction.
+
 ## [1.32.0] — 2026-08-26
 
 ### Fixed
@@ -2981,6 +2993,7 @@ All notable changes to SuperBased Observer are documented here.
 
 - **Contact email domain migrated `marmut.app` → `superbased.app`** across
   documentation, package metadata, and the website source.
+
 
 ## [1.8.4] — 2026-06-12
 

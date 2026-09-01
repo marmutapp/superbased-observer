@@ -137,3 +137,42 @@ func TestVacuumAndBackupInto(t *testing.T) {
 		t.Errorf("freed = %d, want >= -%d (one page of VACUUM rounding)", freed, sqlitePageSize)
 	}
 }
+
+func TestVacuumWithOptionsSkipsBelowReclaimableThreshold(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "s.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	res, err := VacuumWithOptions(ctx, database, VacuumOptions{MinReclaimableBytes: 1 << 30})
+	if err != nil {
+		t.Fatalf("VacuumWithOptions: %v", err)
+	}
+	if res.Ran {
+		t.Fatal("VacuumWithOptions ran despite reclaimable bytes being below threshold")
+	}
+	if res.ReclaimableBytes >= 1<<30 {
+		t.Fatalf("test database unexpectedly has %d reclaimable bytes", res.ReclaimableBytes)
+	}
+	if res.FreedBytes != 0 {
+		t.Errorf("skipped vacuum freed bytes = %d, want 0", res.FreedBytes)
+	}
+}
+
+func TestVacuumRequiredBytesUsesLargerOfAbsoluteAndRatioThresholds(t *testing.T) {
+	opts := VacuumOptions{
+		MinReclaimableBytes: 64 << 20,
+		MinReclaimableRatio: 0.02,
+	}
+	if got, want := vacuumRequiredBytes(1<<30, opts), int64(64<<20); got != want {
+		t.Errorf("small DB threshold = %d, want %d", got, want)
+	}
+	if got, want := vacuumRequiredBytes(40<<30, opts), int64(858993459); got != want {
+		t.Errorf("40 GiB DB threshold = %d, want %d", got, want)
+	}
+	if got := vacuumRequiredBytes(40<<30, VacuumOptions{}); got != 0 {
+		t.Errorf("force/zero gate threshold = %d, want 0", got)
+	}
+}

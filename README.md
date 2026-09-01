@@ -1056,7 +1056,7 @@ lint-gated policy editor, budget guardrails, evidence downloads) — see the
 | `observer contract [--json]` | The published stability contract: every MCP tool with its tier (stable / conditional / experimental) plus each adapter's public capability row. `--json` emits the `contract_version`-stamped artifact an integrator pins. Prose: [`docs/mcp-contract.md`](docs/mcp-contract.md). |
 | `observer adapters [--json]` | The full adapter capability matrix (proxy / surface / hook / MCP / native / token / handoff / attach / resume), generated from the capability registry. |
 | `observer prune` | Run retention now. |
-| `observer db stats\|vacuum\|backup` | Storage manager: per-table size breakdown (index + FTS5 shadow bytes folded in), reclaim free pages with bytes-freed report, online snapshot via `VACUUM INTO` (safe while the daemon runs; refuses overwrite). |
+| `observer db stats\|vacuum\|backup` | Storage manager: per-table size breakdown (index + FTS5 shadow bytes folded in), reclaim free pages with bytes-freed report, online snapshot via `VACUUM INTO` (safe while the daemon runs; refuses overwrite). `db vacuum` skips the full rebuild when reclaimable space is below `max(64 MiB, 2% of DB size)`; pass `--force` to compact anyway. |
 | `observer db import <path> [--dry-run]` | Merge another `observer.db` (a stranded install from another OS / home dir) into this node's. Idempotent single-transaction merge; `--dry-run` rolls the same transaction back for exact counts. Migrates the source first — point it at a copy. |
 | `observer metrics [--port N]` | Prometheus `/metrics` endpoint. |
 | `observer export {json\|csv\|xlsx}` | Dump tables for external analysis. |
