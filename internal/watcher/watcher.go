@@ -760,6 +760,9 @@ func (w *Watcher) pollCursors(ctx context.Context) error {
 // The registry is still queried per call so dynamically-added
 // adapters appear without restarting Watch.
 func (w *Watcher) adapterFor(path string) adapter.Adapter {
+	if byRoot := w.snapshotByRoot(); len(byRoot) > 0 {
+		return adapterForPath(byRoot, path)
+	}
 	byRoot := map[string]adapter.Adapter{}
 	for _, a := range w.registry.Detected(w.allow) {
 		for _, root := range a.WatchPaths() {
