@@ -70,7 +70,10 @@ func newDBStatsCmd() *cobra.Command {
 }
 
 func newDBVacuumCmd() *cobra.Command {
-	var configPath string
+	var (
+		configPath string
+		force      bool
+	)
 	cmd := &cobra.Command{
 		Use:   "vacuum",
 		Short: "Rebuild the database file to reclaim free pages (needs the write lock; pick a quiet moment)",
@@ -80,18 +83,39 @@ func newDBVacuumCmd() *cobra.Command {
 				return err
 			}
 			defer cleanup()
-			fmt.Fprintln(cmd.OutOrStdout(), "vacuum: rebuilding — this can take a while on large databases…")
-			freed, err := db.Vacuum(cmd.Context(), database)
+			opts := db.VacuumOptions{
+				MinReclaimableBytes: defaultVacuumMinReclaimableBytes,
+				MinReclaimableRatio: defaultVacuumMinReclaimableRatio,
+				Timeout:             defaultVacuumTimeout,
+			}
+			if force {
+				opts.MinReclaimableBytes = 0
+				opts.MinReclaimableRatio = 0
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), "vacuum: checking reclaimable free pages…")
+			res, err := db.VacuumWithOptions(cmd.Context(), database, opts)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "vacuum complete: %s reclaimed\n", fmtBytesIEC(freed))
+			if !res.Ran {
+				fmt.Fprintf(cmd.OutOrStdout(), "vacuum skipped: %s reclaimable is below the %s threshold for this %s database (use --force to run anyway)\n",
+					fmtBytesIEC(res.ReclaimableBytes), fmtBytesIEC(res.RequiredBytes), fmtBytesIEC(res.TotalBytes))
+				return nil
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "vacuum complete: %s reclaimed\n", fmtBytesIEC(res.FreedBytes))
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&configPath, "config", "", "Path to config.toml")
+	cmd.Flags().BoolVar(&force, "force", false, "Run VACUUM even when reclaimable free pages are below the default threshold")
 	return cmd
 }
+
+const (
+	defaultVacuumMinReclaimableBytes int64 = 64 << 20
+	defaultVacuumMinReclaimableRatio       = 0.02
+	defaultVacuumTimeout                   = 10 * time.Minute
+)
 
 func newDBBackupCmd() *cobra.Command {
 	var (

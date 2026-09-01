@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Storage manager primitives (usability arc P6.8). This file is the
@@ -161,22 +162,90 @@ func resolveOwner(name string, owners map[string]string, ftsTables []string) str
 	return name
 }
 
+// VacuumOptions controls the guarded VACUUM path.
+type VacuumOptions struct {
+	// MinReclaimableBytes skips the rebuild when the freelist is smaller
+	// than this threshold. Zero always runs.
+	MinReclaimableBytes int64
+	// MinReclaimableRatio skips the rebuild when reclaimable bytes are less
+	// than this fraction of the current DB size. Zero disables the ratio gate.
+	MinReclaimableRatio float64
+	// Timeout bounds the rebuild. Zero leaves the caller's context as-is.
+	Timeout time.Duration
+}
+
+// VacuumResult reports whether VACUUM ran and how many bytes it reclaimed.
+type VacuumResult struct {
+	Ran              bool
+	FreedBytes       int64
+	ReclaimableBytes int64
+	TotalBytes       int64
+	RequiredBytes    int64
+}
+
 // Vacuum rebuilds the database file, returning the freed bytes
 // (before − after, from page accounting). VACUUM needs the write lock
 // and temporarily doubles disk usage; run it at a quiet moment.
 func Vacuum(ctx context.Context, database *sql.DB) (freedBytes int64, err error) {
-	before, err := fileBytes(ctx, database)
+	res, err := VacuumWithOptions(ctx, database, VacuumOptions{})
 	if err != nil {
 		return 0, err
 	}
+	return res.FreedBytes, nil
+}
+
+// VacuumWithOptions is Vacuum plus an optional reclaimable-byte gate and
+// timeout. It lets automatic/UI-triggered maintenance avoid a full-file
+// rebuild when SQLite has little or nothing to reclaim, while preserving the
+// old unconditional behavior when options are zero.
+func VacuumWithOptions(ctx context.Context, database *sql.DB, opts VacuumOptions) (VacuumResult, error) {
+	if opts.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, opts.Timeout)
+		defer cancel()
+	}
+	reclaimable, err := reclaimableBytes(ctx, database)
+	if err != nil {
+		return VacuumResult{}, err
+	}
+	total, err := fileBytes(ctx, database)
+	if err != nil {
+		return VacuumResult{}, err
+	}
+	required := vacuumRequiredBytes(total, opts)
+	if required > 0 && reclaimable < required {
+		return VacuumResult{
+			Ran:              false,
+			ReclaimableBytes: reclaimable,
+			TotalBytes:       total,
+			RequiredBytes:    required,
+		}, nil
+	}
 	if _, err := database.ExecContext(ctx, "VACUUM"); err != nil {
-		return 0, fmt.Errorf("db.Vacuum: %w", err)
+		return VacuumResult{}, fmt.Errorf("db.Vacuum: %w", err)
 	}
 	after, err := fileBytes(ctx, database)
 	if err != nil {
-		return 0, err
+		return VacuumResult{}, err
 	}
-	return before - after, nil
+	return VacuumResult{
+		Ran:              true,
+		FreedBytes:       total - after,
+		ReclaimableBytes: reclaimable,
+		TotalBytes:       total,
+		RequiredBytes:    required,
+	}, nil
+}
+
+func vacuumRequiredBytes(total int64, opts VacuumOptions) int64 {
+	required := opts.MinReclaimableBytes
+	if opts.MinReclaimableRatio > 0 && total > 0 {
+		ratioRequired := int64(float64(total) * opts.MinReclaimableRatio)
+		if ratioRequired > required {
+			required = ratioRequired
+		}
+	}
+	return required
 }
 
 // BackupInto writes a consistent snapshot of the live database to
@@ -208,4 +277,15 @@ func fileBytes(ctx context.Context, database *sql.DB) (int64, error) {
 		return 0, fmt.Errorf("db: page_count: %w", err)
 	}
 	return pageSize * pageCount, nil
+}
+
+func reclaimableBytes(ctx context.Context, database *sql.DB) (int64, error) {
+	var pageSize, freelist int64
+	if err := database.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
+		return 0, fmt.Errorf("db: page_size: %w", err)
+	}
+	if err := database.QueryRowContext(ctx, "PRAGMA freelist_count").Scan(&freelist); err != nil {
+		return 0, fmt.Errorf("db: freelist_count: %w", err)
+	}
+	return pageSize * freelist, nil
 }
