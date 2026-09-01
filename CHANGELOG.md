@@ -4,6 +4,12 @@ All notable changes to SuperBased Observer are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **perf(watcher): reuse the live root map during file dispatch** — avoids
+  re-scanning every detected adapter on each poll/write re-dispatch, reducing
+  steady-state watcher CPU during high-churn session files.
+
 ## [1.32.0] — 2026-08-26
 
 ### Fixed

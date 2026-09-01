@@ -396,6 +396,18 @@ func TestNewClampsNegativePollInterval(t *testing.T) {
 	}
 }
 
+func TestAdapterForUsesLiveRootIndex(t *testing.T) {
+	t.Parallel()
+	w, _, root := setup(t)
+	stub := &stubRetryAdapter{name: "stub", root: root}
+	w.byRoot = map[string]adapter.Adapter{root: stub}
+
+	got := w.adapterFor(filepath.Join(root, "nested", "value.stub"))
+	if got != stub {
+		t.Fatalf("adapterFor used registry scan instead of live root index: got %T want %T", got, stub)
+	}
+}
+
 // TestCodexShortSessionMultiPassIngest reproduces the live failure mode
 // reported 2026-05-06: a short ChatGPT-auth Codex rollout grows in three
 // chunks (leading prompts, then function_call + token_count, then final
